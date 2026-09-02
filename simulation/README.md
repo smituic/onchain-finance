@@ -10,4 +10,4 @@ This is the framework-agnostic simulation/ledger layer described in [ARCHITECTUR
 
 ## Status
 
-Empty. No swap/earn/borrow/liquidation logic has been implemented yet — that's product feature work for a later task, not part of the initial scaffold.
+Initial state and a v0 swap are implemented (fixed-rate, zero fee/slippage — see `actions/swap.ts`). Earn, borrow, and liquidation logic have not been implemented yet.
