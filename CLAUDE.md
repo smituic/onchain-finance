@@ -29,3 +29,13 @@ Before doing substantive work, be aware of these documents and treat them as sou
 - When a task implies a decision that one of the docs above marks as open or undecided, surface that instead of quietly deciding it yourself.
 - As real architectural or design decisions get made, update ARCHITECTURE.md / DESIGN.md to reflect reality rather than leaving them purely aspirational.
 - No app has been scaffolded yet as of the creation of this file — do not assume a framework, folder structure, or dependency exists until it's actually been set up in this repo.
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

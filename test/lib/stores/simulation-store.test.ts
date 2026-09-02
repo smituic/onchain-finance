@@ -1,6 +1,12 @@
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createInitialState, toMicroUnits } from "@/simulation";
-import { createSimulationStore, SIMULATION_STORE_NAME } from "@/lib/stores/simulation-store";
+import {
+  createSimulationStore,
+  SIMULATION_STORE_NAME,
+  useHasSimulationHydrated,
+  useSimulationStore,
+} from "@/lib/stores/simulation-store";
 
 describe("simulation store", () => {
   beforeEach(() => {
@@ -76,6 +82,34 @@ describe("simulation store", () => {
       const persisted = JSON.parse(raw as string);
 
       expect(Object.keys(persisted.state)).toEqual(["state"]);
+    });
+  });
+
+  describe("useHasSimulationHydrated", () => {
+    it("reflects false before rehydration and true after", async () => {
+      const { result } = renderHook(() => useHasSimulationHydrated());
+
+      expect(result.current).toBe(false);
+
+      await act(async () => {
+        await useSimulationStore.persist.rehydrate();
+      });
+
+      expect(result.current).toBe(true);
+    });
+
+    it("reflects true immediately for a component that mounts after hydration already finished", async () => {
+      // Regression test: hasHydrated must live in the store itself, updated
+      // via a listener registered once at store-creation time — not via a
+      // per-component effect subscription, which would race against
+      // whichever component's effect calls rehydrate() first and could
+      // permanently miss the one-shot completion event.
+      await act(async () => {
+        await useSimulationStore.persist.rehydrate();
+      });
+
+      const { result } = renderHook(() => useHasSimulationHydrated());
+      expect(result.current).toBe(true);
     });
   });
 });
