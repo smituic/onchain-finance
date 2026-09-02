@@ -28,7 +28,6 @@ To avoid locking in a visual identity before the product is proven, the followin
 
 - Exact color palette (hex values, theming system)
 - Typeface(s)
-- Component library or design system dependency
 - Iconography style
 - Dark mode vs. light mode as default
 
@@ -39,6 +38,8 @@ Until these are decided intentionally (and this document updated), early UI work
 - "Icons that feel custom and quiet, not a generic default icon set."
 
 When we do lock these in, this document should be updated with the actual decisions and rationale, and this section removed.
+
+**Component foundation, for clarity:** shadcn/ui has been chosen (see [ARCHITECTURE.md](ARCHITECTURE.md)) as a source of accessible, unstyled primitives — dialogs, tooltips, popovers, and the like. This is an implementation detail, not a visual identity: components are copied into the codebase and restyled to match whatever this document eventually specifies, rather than kept in shadcn's default look. Choosing it does not decide any of the undecided items above.
 
 ## Education & Contextual Moments
 
