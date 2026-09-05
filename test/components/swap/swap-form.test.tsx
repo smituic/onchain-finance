@@ -13,11 +13,14 @@ describe("SwapForm", () => {
     });
   });
 
-  it("shows a rate preview for a valid amount", () => {
+  it("shows a rate preview and its price impact for a valid amount", () => {
     render(<SwapForm />);
     fireEvent.change(screen.getByLabelText("From USDC"), { target: { value: "3000" } });
 
-    expect(screen.getByText(/You'll receive/)).toHaveTextContent("You'll receive ≈ 1 ETH");
+    expect(screen.getByText(/You'll receive/)).toHaveTextContent("You'll receive ≈ 0.961538 ETH");
+    expect(screen.getByText(/reference price you'd expect/)).toHaveTextContent(
+      'At today\'s reference price you\'d expect ≈ 1 ETH. This trade is large enough relative to available liquidity to move the price by 4.00% (its "price impact").',
+    );
   });
 
   it("submits a swap and updates balances immediately", () => {
@@ -25,7 +28,7 @@ describe("SwapForm", () => {
     fireEvent.change(screen.getByLabelText("From USDC"), { target: { value: "3000" } });
     fireEvent.click(screen.getByRole("button", { name: "Swap" }));
 
-    expect(useSimulationStore.getState().state.balances.ETH).toBe(toMicroUnits(1));
+    expect(useSimulationStore.getState().state.balances.ETH).toBe(961_538);
     expect(useSimulationStore.getState().state.balances.USDC).toBe(toMicroUnits(7_000));
     expect(screen.getByText(/Swapped successfully/)).toBeInTheDocument();
   });

@@ -19,4 +19,10 @@ describe("createInitialState", () => {
       expect(balance).toBeGreaterThanOrEqual(0);
     }
   });
+
+  it("starts with a genesis pool priced at exactly $3,000/ETH", () => {
+    const state = createInitialState();
+    expect(state.pool.reserves.USDC).toBe(75_000_000_000);
+    expect(state.pool.reserves.ETH).toBe(25_000_000);
+  });
 });

@@ -12,3 +12,8 @@ export function formatAssetAmount(amountMicroUnits: number, assetId: AssetId): s
   const amount = fromMicroUnits(amountMicroUnits).toLocaleString("en-US", { maximumFractionDigits: 6 });
   return `${amount} ${ASSETS[assetId].symbol}`;
 }
+
+/** Formats a SwapReceipt's integer priceImpactBps for display, e.g. "11.76%". */
+export function formatPriceImpactPercent(priceImpactBps: number): string {
+  return `${(priceImpactBps / 100).toFixed(2)}%`;
+}

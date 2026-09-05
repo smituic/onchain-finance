@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import {
   applyAction,
+  createInitialPoolReserves,
   createInitialState,
   type Action,
   type ActionResult,
@@ -22,6 +23,9 @@ export type SimulationStore = {
 };
 
 export const SIMULATION_STORE_NAME = "onchain-finance:simulation";
+
+/** Shape of what `partialize` below persists: just the financial state. */
+type PersistedSimulationState = { state: { balances: SimulationState["balances"]; pool?: SimulationState["pool"] } };
 
 export function createSimulationStore() {
   const store = create<SimulationStore>()(
@@ -46,6 +50,23 @@ export function createSimulationStore() {
         // `useSimulationStore.persist.rehydrate()` after mount (e.g. in a
         // client-only effect) to load any persisted state.
         skipHydration: true,
+        // Bumped when `state`'s shape changes (here: adding `pool`). A
+        // pre-v1 persisted entry has no pool of its own to restore — it
+        // never existed — so migration keeps the user's existing balances
+        // and seeds a fresh genesis pool, rather than discarding balances.
+        version: 1,
+        migrate: (persisted, version) => {
+          const typed = persisted as PersistedSimulationState;
+          if (version < 1) {
+            return {
+              state: {
+                balances: typed.state.balances,
+                pool: { reserves: createInitialPoolReserves() },
+              },
+            } satisfies PersistedSimulationState;
+          }
+          return typed;
+        },
       },
     ),
   );

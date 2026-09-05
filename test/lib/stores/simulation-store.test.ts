@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
-import { createInitialState, toMicroUnits } from "@/simulation";
+import { createInitialPoolReserves, createInitialState, toMicroUnits } from "@/simulation";
 import {
   createSimulationStore,
   SIMULATION_STORE_NAME,
@@ -27,7 +27,7 @@ describe("simulation store", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(store.getState().state).toEqual(result.state);
-    expect(store.getState().state.balances.ETH).toBe(toMicroUnits(1));
+    expect(store.getState().state.balances.ETH).toBe(961_538);
   });
 
   it("leaves state unchanged on a failed dispatch", () => {
@@ -66,6 +66,17 @@ describe("simulation store", () => {
       await second.persist.rehydrate();
 
       expect(second.getState().state).toEqual(persistedState);
+    });
+
+    it("migrates a pre-pool (v0) persisted entry: keeps balances, seeds a genesis pool", async () => {
+      const oldBalances = { USDC: toMicroUnits(4_000), ETH: toMicroUnits(2) };
+      localStorage.setItem(SIMULATION_STORE_NAME, JSON.stringify({ state: { state: { balances: oldBalances } }, version: 0 }));
+
+      const store = createSimulationStore();
+      await store.persist.rehydrate();
+
+      expect(store.getState().state.balances).toEqual(oldBalances);
+      expect(store.getState().state.pool.reserves).toEqual(createInitialPoolReserves());
     });
 
     it("persists only `state`, not `dispatch`", () => {

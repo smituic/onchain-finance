@@ -10,4 +10,4 @@ This is the framework-agnostic simulation/ledger layer described in [ARCHITECTUR
 
 ## Status
 
-Initial state and a v0 swap are implemented (fixed-rate, zero fee/slippage — see `actions/swap.ts`). Earn, borrow, and liquidation logic have not been implemented yet.
+Initial state, swap, and a constant-product (x*y=k) liquidity pool are implemented (`pool.ts`, `actions/swap.ts`) — swap execution now depends on trade size relative to pool reserves (price impact), still zero fee. Portfolio valuation (`valuation.ts`) intentionally still marks assets at the static reference prices in `assets.ts`, not the pool's live price — a known simplification, not an oversight. Earn, borrow, and liquidation logic have not been implemented yet.

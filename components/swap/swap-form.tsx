@@ -3,10 +3,10 @@
 import { useState } from "react";
 import Link from "next/link";
 import { ArrowDownUp } from "lucide-react";
-import { applyAction, ASSETS, type AssetId } from "@/simulation";
+import { applyAction, getPoolSpotPriceMicroUsd, type AssetId } from "@/simulation";
 import { useSimulationStore } from "@/lib/stores/simulation-store";
 import { parseAmountToMicroUnits } from "@/lib/parse-amount";
-import { formatAssetAmount, formatUsd } from "@/lib/format";
+import { formatAssetAmount, formatPriceImpactPercent, formatUsd } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -32,7 +32,7 @@ export function SwapForm() {
 
   const parseError = amountInput.trim() !== "" && amountInMicroUnits === null ? "Enter a valid amount." : null;
   const errorMessage = parseError ?? (preview && !preview.ok ? preview.error : null);
-  const amountOut = preview?.ok ? preview.state.balances[toAsset] - state.balances[toAsset] : null;
+  const receipt = preview?.ok ? preview.swap : undefined;
 
   function handleFlip() {
     setFromAsset(toAsset);
@@ -43,9 +43,8 @@ export function SwapForm() {
   function trySubmit() {
     if (amountInMicroUnits === null) return;
     const result = dispatch({ type: "swap", fromAsset, toAsset, amountIn: amountInMicroUnits });
-    if (result.ok) {
-      const delta = result.state.balances[toAsset] - state.balances[toAsset];
-      setJustSwapped({ amountOut: delta, toAsset });
+    if (result.ok && result.swap) {
+      setJustSwapped({ amountOut: result.swap.amountOut, toAsset });
       setAmountInput("");
     }
   }
@@ -68,7 +67,7 @@ export function SwapForm() {
               trySubmit();
             }}
           >
-            <p className="text-sm text-muted-foreground">1 ETH = {formatUsd(Number(ASSETS.ETH.priceMicroUsd))}</p>
+            <p className="text-sm text-muted-foreground">1 ETH ≈ {formatUsd(getPoolSpotPriceMicroUsd(state.pool))}</p>
 
             <div className="flex flex-col gap-1.5">
               <div className="flex items-center justify-between">
@@ -108,10 +107,18 @@ export function SwapForm() {
 
             {errorMessage ? <p className="text-sm text-destructive">{errorMessage}</p> : null}
 
-            {amountOut !== null && !errorMessage ? (
-              <p className="text-sm text-muted-foreground">
-                You&apos;ll receive ≈ {formatAssetAmount(amountOut, toAsset)}
-              </p>
+            {receipt && !errorMessage ? (
+              <div className="flex flex-col gap-1 text-sm text-muted-foreground">
+                <p>You&apos;ll receive ≈ {formatAssetAmount(receipt.amountOut, toAsset)}</p>
+                {receipt.priceImpactBps > 0 ? (
+                  <p>
+                    At today&apos;s reference price you&apos;d expect ≈{" "}
+                    {formatAssetAmount(receipt.referenceAmountOut, toAsset)}. This trade is large enough relative to
+                    available liquidity to move the price by {formatPriceImpactPercent(receipt.priceImpactBps)}{" "}
+                    (its &quot;price impact&quot;).
+                  </p>
+                ) : null}
+              </div>
             ) : null}
 
             <Button type="submit" size="lg" disabled={!preview?.ok}>

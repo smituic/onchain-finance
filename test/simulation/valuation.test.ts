@@ -10,10 +10,12 @@ describe("getPortfolioValueMicroUsd", () => {
   it("contributes zero for a zero balance", () => {
     const state = createInitialState();
     expect(state.balances.ETH).toBe(0);
-    expect(getPortfolioValueMicroUsd(state)).toBe(getPortfolioValueMicroUsd({ balances: { ...state.balances } }));
+    expect(getPortfolioValueMicroUsd(state)).toBe(
+      getPortfolioValueMicroUsd({ balances: { ...state.balances }, pool: state.pool }),
+    );
   });
 
-  it("is conserved (mod rounding dust) across a zero-fee swap", () => {
+  it("only ever loses value (mod rounding + price impact) across a swap, never gains", () => {
     const state = createInitialState();
     const before = getPortfolioValueMicroUsd(state);
 
