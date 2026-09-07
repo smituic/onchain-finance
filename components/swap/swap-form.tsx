@@ -6,11 +6,12 @@ import { ArrowDownUp } from "lucide-react";
 import { applyAction, getPoolSpotPriceMicroUsd, type AssetId } from "@/simulation";
 import { useSimulationStore } from "@/lib/stores/simulation-store";
 import { parseAmountToMicroUnits } from "@/lib/parse-amount";
-import { formatAssetAmount, formatPriceImpactPercent, formatUsd } from "@/lib/format";
+import { formatAssetAmount, formatUsd } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { PriceImpactNote } from "@/components/swap/price-impact-note";
 
 const OTHER_ASSET: Record<AssetId, AssetId> = { USDC: "ETH", ETH: "USDC" };
 
@@ -108,16 +109,9 @@ export function SwapForm() {
             {errorMessage ? <p className="text-sm text-destructive">{errorMessage}</p> : null}
 
             {receipt && !errorMessage ? (
-              <div className="flex flex-col gap-1 text-sm text-muted-foreground">
+              <div className="flex flex-col gap-2 text-sm text-muted-foreground">
                 <p>You&apos;ll receive ≈ {formatAssetAmount(receipt.amountOut, toAsset)}</p>
-                {receipt.priceImpactBps > 0 ? (
-                  <p>
-                    At today&apos;s reference price you&apos;d expect ≈{" "}
-                    {formatAssetAmount(receipt.referenceAmountOut, toAsset)}. This trade is large enough relative to
-                    available liquidity to move the price by {formatPriceImpactPercent(receipt.priceImpactBps)}{" "}
-                    (its &quot;price impact&quot;).
-                  </p>
-                ) : null}
+                <PriceImpactNote receipt={receipt} toAsset={toAsset} />
               </div>
             ) : null}
 

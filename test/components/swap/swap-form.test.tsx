@@ -13,14 +13,29 @@ describe("SwapForm", () => {
     });
   });
 
-  it("shows a rate preview and its price impact for a valid amount", () => {
+  it("shows a rate preview and its price-impact explainer for a trade above the threshold", () => {
     render(<SwapForm />);
     fireEvent.change(screen.getByLabelText("From USDC"), { target: { value: "3000" } });
 
     expect(screen.getByText(/You'll receive/)).toHaveTextContent("You'll receive ≈ 0.961538 ETH");
-    expect(screen.getByText(/reference price you'd expect/)).toHaveTextContent(
-      'At today\'s reference price you\'d expect ≈ 1 ETH. This trade is large enough relative to available liquidity to move the price by 4.00% (its "price impact").',
-    );
+    expect(
+      screen.getByText("You're getting a little less than the current rate — larger trades move the price more."),
+    ).toBeInTheDocument();
+
+    const toggle = screen.getByRole("button", { name: /why did i receive less/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+
+    expect(screen.getByText(/you'd expect ≈ 1 ETH\. This trade receives 0\.961538 ETH instead\./)).toBeInTheDocument();
+    expect(screen.getByText(/this is called price impact\. Here, it moved the price by 4\.00%\./i)).toBeInTheDocument();
+  });
+
+  it("does not show the price-impact explainer for a trade below the meaningful-impact threshold", () => {
+    render(<SwapForm />);
+    fireEvent.change(screen.getByLabelText("From USDC"), { target: { value: "10" } });
+
+    expect(screen.getByText(/You'll receive/)).toBeInTheDocument();
+    expect(screen.queryByText(/why did i receive less/i)).not.toBeInTheDocument();
   });
 
   it("submits a swap and updates balances immediately", () => {
