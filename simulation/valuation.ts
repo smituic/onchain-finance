@@ -19,6 +19,16 @@ export function getAssetValueMicroUsd(state: SimulationState, assetId: AssetId):
  * asset's fixed simulated price. Same BigInt multiply-then-divide pattern
  * as the swap action, for the same overflow/precision reasons.
  */
+/**
+ * Everything the user has, in micro-USD: assets held plus the savings
+ * position. This is the number Home leads with. Moving money between Cash
+ * and savings can't change it — Cash is USDC at exactly $1 — so only
+ * interest and swap price impact ever move this total.
+ */
+export function getTotalBalanceMicroUsd(state: SimulationState): number {
+  return getPortfolioValueMicroUsd(state) + state.savings.balance;
+}
+
 export function getPortfolioValueMicroUsd(state: SimulationState): number {
   const totalMicroUsd = (Object.keys(state.balances) as AssetId[]).reduce((sum, assetId) => {
     const balance = BigInt(state.balances[assetId]);

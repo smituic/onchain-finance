@@ -98,6 +98,7 @@ export function applySwap(state: SimulationState, action: SwapAction): ActionRes
   return {
     ok: true,
     state: {
+      ...state,
       balances: {
         ...state.balances,
         [fromAsset]: fromBalance - amountIn,

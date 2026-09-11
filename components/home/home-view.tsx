@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { ChevronRight } from "lucide-react";
-import { getAssetValueMicroUsd, getPortfolioValueMicroUsd } from "@/simulation";
+import { getAssetValueMicroUsd, getTotalBalanceMicroUsd } from "@/simulation";
 import { useHasSimulationHydrated, useSimulationStore } from "@/lib/stores/simulation-store";
 import { formatAssetAmount, formatUsd } from "@/lib/format";
 import { HOME_ACTION_AREA_IDS, PRODUCT_AREAS_BY_ID } from "@/lib/product-areas";
@@ -16,7 +16,8 @@ export function HomeView() {
 
   const cashMicroUsd = getAssetValueMicroUsd(state, "USDC");
   const cryptoMicroUsd = getAssetValueMicroUsd(state, "ETH");
-  const totalMicroUsd = getPortfolioValueMicroUsd(state);
+  const savingsMicroUsd = state.savings.balance;
+  const totalMicroUsd = getTotalBalanceMicroUsd(state);
 
   const featuredExperiments = EXPLORE_EXPERIMENTS.slice(0, 2);
 
@@ -73,7 +74,13 @@ export function HomeView() {
               value={formatUsd(cashMicroUsd)}
               loading={!hasHydrated}
             />
-            <ValueRow label="Savings" value={formatUsd(0)} hint="Not started yet" muted />
+            <ValueRow
+              label="Savings"
+              value={formatUsd(savingsMicroUsd)}
+              hint={savingsMicroUsd > 0 ? "Earning interest" : "Not started yet"}
+              loading={!hasHydrated}
+              muted={savingsMicroUsd === 0}
+            />
             <ValueRow label="Investments" value={formatUsd(0)} hint="Not started yet" muted />
             <ValueRow
               label="Crypto"

@@ -11,6 +11,31 @@ export type AssetId = "USDC" | "ETH";
 export type SimulationState = {
   balances: Record<AssetId, number>;
   pool: PoolState;
+  savings: SavingsState;
+  /**
+   * Milliseconds of simulated time the user has deliberately skipped
+   * forward with Practice Mode's time control, added to wall-clock time to
+   * get the simulation's "now". Lives at the top level because it's the
+   * whole simulation's clock, not a savings-only concept — borrowing
+   * scenarios will read the same offset.
+   */
+  clockOffsetMs: number;
+};
+
+/**
+ * A simulated savings position. `balance` is the whole position — deposits
+ * plus every bit of interest credited into it — so it's always "what the
+ * user would get back if they withdrew everything right now", which keeps
+ * deposits and withdrawals at arbitrary times coherent.
+ * `interestEarnedTotal` is a separate lifetime counter kept for display: it
+ * only ever grows, so withdrawing money doesn't erase the fact that the
+ * money was earned.
+ */
+export type SavingsState = {
+  balance: number;
+  interestEarnedTotal: number;
+  /** Simulated-clock timestamp (ms) that `balance` is current as of. */
+  lastAccruedAt: number;
 };
 
 /**
@@ -33,8 +58,42 @@ export type SwapAction = {
   amountIn: number;
 };
 
-/** Grows as more mechanics (deposit, borrow, repay, liquidate, ...) are added. */
-export type Action = SwapAction;
+/** Moves Cash into savings. Amount is in micro-units of USDC (= micro-USD). */
+export type DepositToSavingsAction = {
+  type: "deposit-to-savings";
+  amount: number;
+};
+
+/** Moves money out of savings and back into Cash, in micro-USD. */
+export type WithdrawFromSavingsAction = {
+  type: "withdraw-from-savings";
+  amount: number;
+};
+
+/**
+ * Brings the savings position up to date with the current time. Dispatched
+ * at read/lifecycle boundaries (notably after the store rehydrates) so
+ * interest appears without a timer constantly mutating the ledger.
+ */
+export type AccrueSavingsAction = {
+  type: "accrue-savings";
+};
+
+/**
+ * Practice Mode's time control: jumps the simulation's clock forward by one
+ * step so a user can watch interest arrive without waiting a real month.
+ */
+export type AdvancePracticeTimeAction = {
+  type: "advance-practice-time";
+};
+
+/** Grows as more mechanics (borrow, repay, liquidate, ...) are added. */
+export type Action =
+  | SwapAction
+  | DepositToSavingsAction
+  | WithdrawFromSavingsAction
+  | AccrueSavingsAction
+  | AdvancePracticeTimeAction;
 
 export type SimulationErrorCode =
   | "SAME_ASSET"

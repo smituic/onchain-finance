@@ -10,4 +10,8 @@ This is the framework-agnostic simulation/ledger layer described in [ARCHITECTUR
 
 ## Status
 
-Initial state, swap, and a constant-product (x*y=k) liquidity pool are implemented (`pool.ts`, `actions/swap.ts`) — swap execution now depends on trade size relative to pool reserves (price impact), still zero fee. Portfolio valuation (`valuation.ts`) intentionally still marks assets at the static reference prices in `assets.ts`, not the pool's live price — a known simplification, not an oversight. Earn, borrow, and liquidation logic have not been implemented yet.
+Initial state, swap, and a constant-product (x*y=k) liquidity pool are implemented (`pool.ts`, `actions/swap.ts`) — swap execution now depends on trade size relative to pool reserves (price impact), still zero fee. Portfolio valuation (`valuation.ts`) intentionally still marks assets at the static reference prices in `assets.ts`, not the pool's live price — a known simplification, not an oversight.
+
+Savings are implemented (`savings.ts`, `actions/savings.ts`): a single position earning a fixed `SAVINGS_ANNUAL_RATE_BPS` (4.00%/yr), with interest credited into the balance at interaction boundaries rather than by a timer. Time is passed in rather than read here — `applyAction(state, action, nowMs)` — so accrual stays deterministic and testable; `clockOffsetMs` holds the simulated time a user has skipped forward via Practice Mode's time control.
+
+Borrow and liquidation logic have not been implemented yet.

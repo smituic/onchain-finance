@@ -3,6 +3,7 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import {
   applyAction,
   createInitialPoolReserves,
+  createInitialSavingsState,
   createInitialState,
   type Action,
   type ActionResult,
@@ -25,16 +26,28 @@ export type SimulationStore = {
 export const SIMULATION_STORE_NAME = "onchain-finance:simulation";
 
 /** Shape of what `partialize` below persists: just the financial state. */
-type PersistedSimulationState = { state: { balances: SimulationState["balances"]; pool?: SimulationState["pool"] } };
+type PersistedSimulationState = {
+  state: {
+    balances: SimulationState["balances"];
+    pool?: SimulationState["pool"];
+    savings?: SimulationState["savings"];
+    clockOffsetMs?: number;
+  };
+};
 
-export function createSimulationStore() {
+/**
+ * @param now injectable clock. The store is the one place that reads real
+ * time, so the simulation engine stays pure and tests can drive interest
+ * accrual to an exact instant.
+ */
+export function createSimulationStore({ now = () => Date.now() }: { now?: () => number } = {}) {
   const store = create<SimulationStore>()(
     persist(
       (set, get) => ({
-        state: createInitialState(),
+        state: createInitialState(now()),
         hasHydrated: false,
         dispatch: (action) => {
-          const result = applyAction(get().state, action);
+          const result = applyAction(get().state, action, now());
           if (result.ok) set({ state: result.state });
           return result;
         },
@@ -50,22 +63,25 @@ export function createSimulationStore() {
         // `useSimulationStore.persist.rehydrate()` after mount (e.g. in a
         // client-only effect) to load any persisted state.
         skipHydration: true,
-        // Bumped when `state`'s shape changes (here: adding `pool`). A
-        // pre-v1 persisted entry has no pool of its own to restore — it
-        // never existed — so migration keeps the user's existing balances
-        // and seeds a fresh genesis pool, rather than discarding balances.
-        version: 1,
+        // Bumped when `state`'s shape changes. Each step is additive and
+        // preserves what the user already had: v1 added the liquidity pool,
+        // v2 added the savings position and simulated clock. A pre-v2 entry
+        // has no savings history to restore — it never existed — so it
+        // starts an empty position accruing from now, leaving balances,
+        // ETH, and pool reserves untouched.
+        version: 2,
         migrate: (persisted, version) => {
           const typed = persisted as PersistedSimulationState;
+          let migrated = typed.state;
+
           if (version < 1) {
-            return {
-              state: {
-                balances: typed.state.balances,
-                pool: { reserves: createInitialPoolReserves() },
-              },
-            } satisfies PersistedSimulationState;
+            migrated = { ...migrated, pool: { reserves: createInitialPoolReserves() } };
           }
-          return typed;
+          if (version < 2) {
+            migrated = { ...migrated, savings: createInitialSavingsState(now()), clockOffsetMs: 0 };
+          }
+
+          return { state: migrated } satisfies PersistedSimulationState;
         },
       },
     ),
@@ -77,7 +93,13 @@ export function createSimulationStore() {
   // one-shot event) before this component's own effect has subscribed,
   // permanently missing the notification. Writing hasHydrated into the
   // store itself sidesteps that entirely.
-  store.persist.onFinishHydration(() => store.setState({ hasHydrated: true }));
+  store.persist.onFinishHydration(() => {
+    // Settle the interest earned while the app was closed. Doing it here,
+    // at a lifecycle boundary, is what lets savings grow over real time
+    // without a timer permanently mutating the ledger.
+    store.getState().dispatch({ type: "accrue-savings" });
+    store.setState({ hasHydrated: true });
+  });
 
   return store;
 }

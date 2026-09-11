@@ -40,7 +40,7 @@ describe("getPortfolioValueMicroUsd", () => {
     const state = createInitialState();
     expect(state.balances.ETH).toBe(0);
     expect(getPortfolioValueMicroUsd(state)).toBe(
-      getPortfolioValueMicroUsd({ balances: { ...state.balances }, pool: state.pool }),
+      getPortfolioValueMicroUsd({ ...state, balances: { ...state.balances } }),
     );
   });
 

@@ -30,11 +30,11 @@ describe("product routes", () => {
     expect(screen.getByRole("button", { name: "Send money" })).toBeInTheDocument();
   });
 
-  it("renders Save with its primary action and where-yield-comes-from explanation", () => {
+  it("renders Save with its primary action and where-interest-comes-from explanation", () => {
     render(<SavePage />);
     expect(screen.getByRole("heading", { name: "Save" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add money" })).toBeInTheDocument();
-    expect(screen.getByText("Where the growth comes from")).toBeInTheDocument();
+    expect(screen.getByText("Where does the interest come from?")).toBeInTheDocument();
   });
 
   it("renders Invest with its primary action and curated categories", () => {

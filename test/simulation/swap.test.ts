@@ -35,7 +35,7 @@ describe("applyAction (swap)", () => {
   });
 
   it("swaps ETH back to USDC, below the reference price", () => {
-    const state = { balances: { USDC: 0, ETH: toMicroUnits(1) }, pool: createInitialState().pool };
+    const state = { ...createInitialState(), balances: { USDC: 0, ETH: toMicroUnits(1) } };
     const result = applyAction(state, { type: "swap", fromAsset: "ETH", toAsset: "USDC", amountIn: toMicroUnits(1) });
 
     expect(result.ok).toBe(true);
@@ -75,7 +75,7 @@ describe("applyAction (swap)", () => {
     if (!usdcToEth.ok) return;
     expect(usdcToEth.swap!.priceImpactBps).toBe(0);
 
-    const state2 = { balances: { USDC: 0, ETH: toMicroUnits(1) }, pool: createInitialState().pool };
+    const state2 = { ...createInitialState(), balances: { USDC: 0, ETH: toMicroUnits(1) } };
     const ethToUsdc = applyAction(state2, {
       type: "swap",
       fromAsset: "ETH",
@@ -137,6 +137,7 @@ describe("applyAction (swap)", () => {
 
   it("rejects insufficient balance and leaves state untouched", () => {
     const state = createInitialState();
+    const before = structuredClone(state);
     const result = applyAction(state, {
       type: "swap",
       fromAsset: "USDC",
@@ -145,7 +146,7 @@ describe("applyAction (swap)", () => {
     });
 
     expect(result).toEqual({ ok: false, error: expect.any(String), code: "INSUFFICIENT_BALANCE" });
-    expect(state).toEqual(createInitialState());
+    expect(state).toEqual(before);
   });
 
   it("rejects swapping an asset for itself", () => {

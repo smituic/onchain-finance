@@ -49,6 +49,43 @@ describe("HomeView", () => {
     expect(screen.getByTestId("total-balance")).toHaveTextContent("$9,884.61");
   });
 
+  it("moves money between Cash and Savings without changing the total", async () => {
+    const { unmount } = render(<HomeView />);
+    const totalBefore = screen.getByTestId("total-balance").textContent;
+    unmount();
+
+    await act(async () => {
+      useSimulationStore.getState().dispatch({
+        type: "deposit-to-savings",
+        amount: toMicroUnits(1_000),
+      });
+    });
+
+    render(<HomeView />);
+
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$9,000.00");
+    expect(screen.getByTestId("value-row-savings")).toHaveTextContent("$1,000.00");
+    expect(screen.getByTestId("value-row-savings")).toHaveTextContent("Earning interest");
+    // Moving money between your own pockets can't make you richer.
+    expect(screen.getByTestId("total-balance")).toHaveTextContent(totalBefore as string);
+  });
+
+  it("grows the total once savings have earned interest", async () => {
+    await act(async () => {
+      useSimulationStore.getState().dispatch({
+        type: "deposit-to-savings",
+        amount: toMicroUnits(1_000),
+      });
+      useSimulationStore.getState().dispatch({ type: "advance-practice-time" });
+    });
+
+    render(<HomeView />);
+
+    // $10,000 + 4.00% a year on $1,000 for 30 days ($3.287671).
+    expect(screen.getByTestId("total-balance")).toHaveTextContent("$10,003.29");
+    expect(screen.getByTestId("value-row-savings")).toHaveTextContent("$1,003.29");
+  });
+
   it("offers the primary actions", () => {
     render(<HomeView />);
 
