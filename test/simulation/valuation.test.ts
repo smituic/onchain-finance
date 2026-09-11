@@ -1,5 +1,34 @@
 import { describe, expect, it } from "vitest";
-import { applyAction, createInitialState, getPortfolioValueMicroUsd, toMicroUnits } from "@/simulation";
+import {
+  applyAction,
+  createInitialState,
+  getAssetValueMicroUsd,
+  getPortfolioValueMicroUsd,
+  toMicroUnits,
+} from "@/simulation";
+
+describe("getAssetValueMicroUsd", () => {
+  it("values a single asset's balance at its fixed price", () => {
+    const state = createInitialState();
+    expect(getAssetValueMicroUsd(state, "USDC")).toBe(10_000_000_000);
+    expect(getAssetValueMicroUsd(state, "ETH")).toBe(0);
+  });
+
+  it("sums across assets to the portfolio total", () => {
+    const result = applyAction(createInitialState(), {
+      type: "swap",
+      fromAsset: "USDC",
+      toAsset: "ETH",
+      amountIn: toMicroUnits(3_000),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(getAssetValueMicroUsd(result.state, "USDC") + getAssetValueMicroUsd(result.state, "ETH")).toBe(
+      getPortfolioValueMicroUsd(result.state),
+    );
+  });
+});
 
 describe("getPortfolioValueMicroUsd", () => {
   it("values the initial portfolio at exactly $10,000", () => {

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { SimulationStoreHydration } from "@/components/simulation-store-hydration";
+import { AppShell } from "@/components/shell/app-shell";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -12,7 +13,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
     <html lang="en" className="h-full antialiased">
       <body className="min-h-full flex flex-col font-sans">
         <SimulationStoreHydration />
-        {children}
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );

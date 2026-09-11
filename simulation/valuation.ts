@@ -5,6 +5,16 @@ import { DECIMALS } from "./money";
 const SCALE = BigInt(10 ** DECIMALS);
 
 /**
+ * Value of a single asset's balance, in micro-USD, at its fixed simulated
+ * price. Lives here rather than in the presentation layer so no component
+ * has to multiply a balance by a price itself.
+ */
+export function getAssetValueMicroUsd(state: SimulationState, assetId: AssetId): number {
+  const balance = BigInt(state.balances[assetId]);
+  return Number((balance * ASSETS[assetId].priceMicroUsd) / SCALE);
+}
+
+/**
  * Total portfolio value across every asset, in micro-USD, using each
  * asset's fixed simulated price. Same BigInt multiply-then-divide pattern
  * as the swap action, for the same overflow/precision reasons.

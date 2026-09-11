@@ -1,16 +1,17 @@
 "use client";
 
 import { useState } from "react";
-import Link from "next/link";
 import { ArrowDownUp } from "lucide-react";
 import { applyAction, getPoolSpotPriceMicroUsd, type AssetId } from "@/simulation";
 import { useSimulationStore } from "@/lib/stores/simulation-store";
 import { parseAmountToMicroUnits } from "@/lib/parse-amount";
 import { formatAssetAmount, formatUsd } from "@/lib/format";
+import { PRODUCT_AREAS_BY_ID } from "@/lib/product-areas";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
+import { PageHeader } from "@/components/shell/page-header";
 import { PriceImpactNote } from "@/components/swap/price-impact-note";
 
 const OTHER_ASSET: Record<AssetId, AssetId> = { USDC: "ETH", ETH: "USDC" };
@@ -50,16 +51,13 @@ export function SwapForm() {
     }
   }
 
+  const area = PRODUCT_AREAS_BY_ID.swap;
+
   return (
-    <main className="mx-auto flex w-full max-w-sm flex-1 flex-col gap-6 p-6">
-      <Link href="/" className="text-sm text-muted-foreground hover:text-foreground">
-        ← Portfolio
-      </Link>
+    <div className="flex flex-col gap-2">
+      <PageHeader title={area.label} purpose={area.purpose} />
 
       <Card>
-        <CardHeader>
-          <CardTitle>Swap</CardTitle>
-        </CardHeader>
         <CardContent>
           <form
             className="flex flex-col gap-4"
@@ -127,6 +125,6 @@ export function SwapForm() {
           </form>
         </CardContent>
       </Card>
-    </main>
+    </div>
   );
 }

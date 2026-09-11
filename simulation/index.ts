@@ -18,5 +18,5 @@ export { ASSETS } from "./assets";
 export { DECIMALS, fromMicroUnits, toMicroUnits } from "./money";
 export { createInitialState } from "./state";
 export { applyAction } from "./applyAction";
-export { getPortfolioValueMicroUsd } from "./valuation";
+export { getAssetValueMicroUsd, getPortfolioValueMicroUsd } from "./valuation";
 export { createInitialPoolReserves, getPoolSpotPriceMicroUsd } from "./pool";
