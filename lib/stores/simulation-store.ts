@@ -2,6 +2,8 @@ import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import {
   applyAction,
+  createInitialBorrowState,
+  createInitialMarketState,
   createInitialPoolReserves,
   createInitialSavingsState,
   createInitialState,
@@ -32,6 +34,8 @@ type PersistedSimulationState = {
     pool?: SimulationState["pool"];
     savings?: SimulationState["savings"];
     clockOffsetMs?: number;
+    borrow?: SimulationState["borrow"];
+    market?: SimulationState["market"];
   };
 };
 
@@ -65,11 +69,12 @@ export function createSimulationStore({ now = () => Date.now() }: { now?: () => 
         skipHydration: true,
         // Bumped when `state`'s shape changes. Each step is additive and
         // preserves what the user already had: v1 added the liquidity pool,
-        // v2 added the savings position and simulated clock. A pre-v2 entry
-        // has no savings history to restore — it never existed — so it
-        // starts an empty position accruing from now, leaving balances,
-        // ETH, and pool reserves untouched.
-        version: 2,
+        // v2 added the savings position and simulated clock, v3 added the
+        // loan and simulated market prices. An entry from an older version
+        // has no history to restore for the part that didn't exist yet, so
+        // that part starts empty — balances, ETH, pool reserves, savings,
+        // and the practice clock all carry through untouched.
+        version: 3,
         migrate: (persisted, version) => {
           const typed = persisted as PersistedSimulationState;
           let migrated = typed.state;
@@ -79,6 +84,13 @@ export function createSimulationStore({ now = () => Date.now() }: { now?: () => 
           }
           if (version < 2) {
             migrated = { ...migrated, savings: createInitialSavingsState(now()), clockOffsetMs: 0 };
+          }
+          if (version < 3) {
+            migrated = {
+              ...migrated,
+              borrow: createInitialBorrowState(),
+              market: createInitialMarketState(),
+            };
           }
 
           return { state: migrated } satisfies PersistedSimulationState;

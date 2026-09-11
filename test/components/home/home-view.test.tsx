@@ -86,6 +86,66 @@ describe("HomeView", () => {
     expect(screen.getByTestId("value-row-savings")).toHaveTextContent("$1,003.29");
   });
 
+  it("borrowing hands over cash and a debt, leaving net worth unchanged", async () => {
+    await act(async () => {
+      const base = useSimulationStore.getState().state;
+      useSimulationStore.setState({
+        state: { ...base, balances: { ...base.balances, ETH: toMicroUnits(1) } },
+      });
+      useSimulationStore.getState().dispatch({ type: "add-collateral", amount: toMicroUnits(1) });
+    });
+
+    const { unmount } = render(<HomeView />);
+    const beforeBorrowing = screen.getByTestId("total-balance").textContent;
+    unmount();
+
+    await act(async () => {
+      useSimulationStore.getState().dispatch({ type: "borrow-cash", amount: toMicroUnits(1_000) });
+    });
+
+    render(<HomeView />);
+
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$11,000.00");
+    expect(screen.getByTestId("value-row-borrowed")).toHaveTextContent("−$1,000.00");
+    // $10,000 cash + $3,000 of ETH, and borrowing can't change it.
+    expect(screen.getByTestId("total-balance")).toHaveTextContent(beforeBorrowing as string);
+    expect(screen.getByTestId("total-balance")).toHaveTextContent("$13,000.00");
+    expect(screen.getByText("What you're worth")).toBeInTheDocument();
+  });
+
+  it("counts pledged collateral as crypto the user still owns", async () => {
+    await act(async () => {
+      const base = useSimulationStore.getState().state;
+      useSimulationStore.setState({
+        state: { ...base, balances: { ...base.balances, ETH: toMicroUnits(2) } },
+      });
+      useSimulationStore.getState().dispatch({ type: "add-collateral", amount: toMicroUnits(1) });
+    });
+
+    render(<HomeView />);
+
+    expect(screen.getByTestId("value-row-crypto")).toHaveTextContent("$6,000.00");
+    expect(screen.getByTestId("value-row-crypto")).toHaveTextContent("2 ETH");
+    expect(screen.getByTestId("value-row-crypto")).toHaveTextContent("set aside for your loan");
+  });
+
+  it("drops net worth when the simulated ETH price falls", async () => {
+    await act(async () => {
+      const base = useSimulationStore.getState().state;
+      useSimulationStore.setState({
+        state: { ...base, balances: { ...base.balances, ETH: toMicroUnits(1) } },
+      });
+      useSimulationStore
+        .getState()
+        .dispatch({ type: "simulate-eth-price-change", changeBps: -4_000 });
+    });
+
+    render(<HomeView />);
+
+    expect(screen.getByTestId("value-row-crypto")).toHaveTextContent("$1,800.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent("$11,800.00");
+  });
+
   it("offers the primary actions", () => {
     render(<HomeView />);
 

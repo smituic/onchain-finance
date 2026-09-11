@@ -23,11 +23,13 @@ export const EXPLORE_EXPERIMENTS: Experiment[] = [
     id: "eth-drawdown",
     question: "What happens if ETH falls 40%?",
     hook: "Drop the market and see what it does to money borrowed against it.",
+    href: "/borrow",
   },
   {
     id: "lending-yield",
     question: "Where does lending yield come from?",
     hook: "Follow a dollar from your savings to the person borrowing it.",
+    href: "/save",
   },
   {
     id: "thin-liquidity",

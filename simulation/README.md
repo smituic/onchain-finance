@@ -14,4 +14,6 @@ Initial state, swap, and a constant-product (x*y=k) liquidity pool are implement
 
 Savings are implemented (`savings.ts`, `actions/savings.ts`): a single position earning a fixed `SAVINGS_ANNUAL_RATE_BPS` (4.00%/yr), with interest credited into the balance at interaction boundaries rather than by a timer. Time is passed in rather than read here — `applyAction(state, action, nowMs)` — so accrual stays deterministic and testable; `clockOffsetMs` holds the simulated time a user has skipped forward via Practice Mode's time control.
 
-Borrow and liquidation logic have not been implemented yet.
+Borrowing is implemented (`borrow.ts`, `actions/borrow.ts`): one collateralised position — ETH pledged, Cash owed — capped at `MAX_BORROW_LTV_BPS` (50%) and liquidated in full at `LIQUIDATION_THRESHOLD_BPS` (75%). `getBorrowPosition()` derives the whole position (value, capacity, LTV, health, liquidation price) from state rather than storing it. Full liquidation with the surplus returned as Cash is a documented Practice Mode simplification — no partial liquidation, no liquidator bonus, no interest on the debt.
+
+Prices now come from two deliberately separate places: `market.ts` holds the simulated **market/reference price** used for valuation and collateral (and moved by Practice Mode crash scenarios), while `pool.ts`'s spot price remains the **execution price** for swaps. A crash scenario re-prices collateral without trading against the pool or touching its reserves.

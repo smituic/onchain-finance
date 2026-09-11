@@ -1,6 +1,12 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
-import { createInitialPoolReserves, createInitialState, toMicroUnits } from "@/simulation";
+import {
+  createInitialPoolReserves,
+  createInitialSavingsState,
+  createInitialState,
+  getBorrowPosition,
+  toMicroUnits,
+} from "@/simulation";
 import {
   createSimulationStore,
   SIMULATION_STORE_NAME,
@@ -202,6 +208,96 @@ describe("simulation store", () => {
 
       expect(reopened.getState().state.savings.balance).toBe(toMicroUnits(1_040));
       expect(reopened.getState().state.savings.interestEarnedTotal).toBe(toMicroUnits(40));
+    });
+  });
+
+  describe("borrowing", () => {
+    /** A store whose user holds 1 ETH, ready to pledge it. */
+    function storeWithEth() {
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+      store.setState({
+        state: {
+          ...store.getState().state,
+          balances: { ...store.getState().state.balances, ETH: toMicroUnits(1) },
+        },
+      });
+      return store;
+    }
+
+    it("dispatches collateral, borrowing, and repayment, and persists the loan", async () => {
+      const store = storeWithEth();
+
+      expect(store.getState().dispatch({ type: "add-collateral", amount: toMicroUnits(1) }).ok).toBe(
+        true,
+      );
+      expect(store.getState().dispatch({ type: "borrow-cash", amount: toMicroUnits(1_000) }).ok).toBe(
+        true,
+      );
+      expect(store.getState().dispatch({ type: "repay-cash", amount: toMicroUnits(250) }).ok).toBe(
+        true,
+      );
+
+      expect(store.getState().state.borrow).toEqual({
+        collateralEth: toMicroUnits(1),
+        debtMicroUsd: toMicroUnits(750),
+      });
+
+      const restored = createSimulationStore({ now: () => FIXED_NOW });
+      await restored.persist.rehydrate();
+      expect(restored.getState().state.borrow).toEqual({
+        collateralEth: toMicroUnits(1),
+        debtMicroUsd: toMicroUnits(750),
+      });
+    });
+
+    it("dispatches a crash scenario and persists both the price and the liquidation it caused", async () => {
+      const store = storeWithEth();
+      store.getState().dispatch({ type: "add-collateral", amount: toMicroUnits(1) });
+      store.getState().dispatch({ type: "borrow-cash", amount: toMicroUnits(1_500) });
+
+      const result = store.getState().dispatch({
+        type: "simulate-eth-price-change",
+        changeBps: -4_000,
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.liquidation).toBeDefined();
+      expect(store.getState().state.borrow).toEqual({ collateralEth: 0, debtMicroUsd: 0 });
+
+      const restored = createSimulationStore({ now: () => FIXED_NOW });
+      await restored.persist.rehydrate();
+      expect(restored.getState().state.market.pricesMicroUsd.ETH).toBe(toMicroUnits(1_800));
+      expect(restored.getState().state.borrow).toEqual({ collateralEth: 0, debtMicroUsd: 0 });
+    });
+
+    it("migrates a pre-borrow (v2) entry, keeping balances, pool, savings, and the clock", async () => {
+      const balances = { USDC: toMicroUnits(4_000), ETH: toMicroUnits(2) };
+      const pool = { reserves: createInitialPoolReserves() };
+      const savings = { ...createInitialSavingsState(FIXED_NOW), balance: toMicroUnits(500) };
+      localStorage.setItem(
+        SIMULATION_STORE_NAME,
+        JSON.stringify({
+          state: { state: { balances, pool, savings, clockOffsetMs: 12_345 } },
+          version: 2,
+        }),
+      );
+
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+      await store.persist.rehydrate();
+
+      const state = store.getState().state;
+      expect(state.balances).toEqual(balances);
+      expect(state.pool).toEqual(pool);
+      expect(state.clockOffsetMs).toBe(12_345);
+      // The savings balance carries through untouched, apart from the
+      // interest hydration settles for the time the clock offset represents.
+      expect(state.savings.balance).toBe(toMicroUnits(500) + state.savings.interestEarnedTotal);
+      expect(state.savings.balance).toBeGreaterThanOrEqual(toMicroUnits(500));
+      // ...and Borrow starts empty, at the genesis price.
+      expect(state.borrow).toEqual({ collateralEth: 0, debtMicroUsd: 0 });
+      expect(state.market.pricesMicroUsd.ETH).toBe(toMicroUnits(3_000));
+      expect(getBorrowPosition(state).availableToBorrowMicroUsd).toBe(0);
     });
   });
 

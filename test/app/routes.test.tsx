@@ -45,10 +45,14 @@ describe("product routes", () => {
     expect(screen.getByText("Broad market")).toBeInTheDocument();
   });
 
-  it("renders Borrow with its primary action", () => {
+  it("renders Borrow, pointing a user with no ETH at Swap", () => {
     render(<BorrowPage />);
     expect(screen.getByRole("heading", { name: "Borrow" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Borrow money" })).toBeInTheDocument();
+    expect(screen.getByText("You need ETH first")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Get some ETH in Swap" })).toHaveAttribute(
+      "href",
+      "/swap",
+    );
   });
 
   it("renders Explore's experiments as entry points, not lessons", () => {

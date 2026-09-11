@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { ChevronRight } from "lucide-react";
-import { getAssetValueMicroUsd, getTotalBalanceMicroUsd } from "@/simulation";
+import { getAssetValueMicroUsd, getCryptoValueMicroUsd, getNetWorthMicroUsd } from "@/simulation";
 import { useHasSimulationHydrated, useSimulationStore } from "@/lib/stores/simulation-store";
 import { formatAssetAmount, formatUsd } from "@/lib/format";
 import { HOME_ACTION_AREA_IDS, PRODUCT_AREAS_BY_ID } from "@/lib/product-areas";
@@ -15,16 +15,22 @@ export function HomeView() {
   const hasHydrated = useHasSimulationHydrated();
 
   const cashMicroUsd = getAssetValueMicroUsd(state, "USDC");
-  const cryptoMicroUsd = getAssetValueMicroUsd(state, "ETH");
+  const cryptoMicroUsd = getCryptoValueMicroUsd(state);
   const savingsMicroUsd = state.savings.balance;
-  const totalMicroUsd = getTotalBalanceMicroUsd(state);
+  const debtMicroUsd = state.borrow.debtMicroUsd;
+  const totalMicroUsd = getNetWorthMicroUsd(state);
+  const collateralEth = state.borrow.collateralEth;
 
   const featuredExperiments = EXPLORE_EXPERIMENTS.slice(0, 2);
 
   return (
     <div className="flex flex-col gap-8">
       <section className="flex flex-col gap-2 pt-2">
-        <p className="text-sm text-muted-foreground">Total balance</p>
+        {/* "What you're worth" rather than a balance: once money is
+            borrowed, the headline has to net out what's owed. */}
+        <p className="text-sm text-muted-foreground">
+          {debtMicroUsd > 0 ? "What you're worth" : "Total balance"}
+        </p>
         {hasHydrated ? (
           <p
             className="font-heading text-[2.75rem] leading-none font-semibold tracking-tight tabular-nums"
@@ -36,7 +42,9 @@ export function HomeView() {
           <div aria-hidden="true" className="h-11 w-52 animate-pulse rounded-lg bg-muted" />
         )}
         <p className="text-sm text-muted-foreground">
-          Simulated money you can experiment with freely.
+          {debtMicroUsd > 0
+            ? "Everything you hold, minus what you owe."
+            : "Simulated money you can experiment with freely."}
         </p>
       </section>
 
@@ -84,10 +92,23 @@ export function HomeView() {
             <ValueRow label="Investments" value={formatUsd(0)} hint="Not started yet" muted />
             <ValueRow
               label="Crypto"
-              hint={hasHydrated ? formatAssetAmount(state.balances.ETH, "ETH") : undefined}
+              hint={
+                hasHydrated
+                  ? formatAssetAmount(state.balances.ETH + collateralEth, "ETH") +
+                    (collateralEth > 0 ? " · some set aside for your loan" : "")
+                  : undefined
+              }
               value={formatUsd(cryptoMicroUsd)}
               loading={!hasHydrated}
             />
+            {debtMicroUsd > 0 ? (
+              <ValueRow
+                label="Borrowed"
+                value={`−${formatUsd(debtMicroUsd)}`}
+                hint="What you owe"
+                loading={!hasHydrated}
+              />
+            ) : null}
           </CardContent>
         </Card>
       </section>

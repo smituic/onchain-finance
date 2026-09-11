@@ -2,6 +2,8 @@ import type { SimulationState } from "./types";
 import { toMicroUnits } from "./money";
 import { createInitialPoolReserves } from "./pool";
 import { createInitialSavingsState } from "./savings";
+import { createInitialBorrowState } from "./borrow";
+import { createInitialMarketState } from "./market";
 
 /**
  * A new simulated portfolio: ~$10,000 in USDC, nothing else.
@@ -19,6 +21,8 @@ export function createInitialState(nowMs: number = Date.now()): SimulationState 
       reserves: createInitialPoolReserves(),
     },
     savings: createInitialSavingsState(nowMs),
+    borrow: createInitialBorrowState(),
+    market: createInitialMarketState(),
     clockOffsetMs: 0,
   };
 }

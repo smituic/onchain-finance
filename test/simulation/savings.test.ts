@@ -3,7 +3,7 @@ import {
   applyAction,
   calculateInterestMicroUsd,
   createInitialState,
-  getTotalBalanceMicroUsd,
+  getNetWorthMicroUsd,
   PRACTICE_TIME_STEP_MS,
   SAVINGS_ANNUAL_RATE_BPS,
   toMicroUnits,
@@ -34,13 +34,13 @@ function advance(state: SimulationState, at: number) {
 describe("savings deposits", () => {
   it("moves cash into savings without changing what the user is worth", () => {
     const state = createInitialState(T0);
-    const before = getTotalBalanceMicroUsd(state);
+    const before = getNetWorthMicroUsd(state);
 
     const next = deposit(state, 1_000, T0);
 
     expect(next.balances.USDC).toBe(toMicroUnits(9_000));
     expect(next.savings.balance).toBe(toMicroUnits(1_000));
-    expect(getTotalBalanceMicroUsd(next)).toBe(before);
+    expect(getNetWorthMicroUsd(next)).toBe(before);
   });
 
   it("rejects depositing more cash than the user has", () => {
@@ -87,13 +87,13 @@ describe("savings deposits", () => {
 describe("savings withdrawals", () => {
   it("moves money back into cash without changing what the user is worth", () => {
     const saved = deposit(createInitialState(T0), 1_000, T0);
-    const before = getTotalBalanceMicroUsd(saved);
+    const before = getNetWorthMicroUsd(saved);
 
     const next = withdraw(saved, 400, T0);
 
     expect(next.savings.balance).toBe(toMicroUnits(600));
     expect(next.balances.USDC).toBe(toMicroUnits(9_400));
-    expect(getTotalBalanceMicroUsd(next)).toBe(before);
+    expect(getNetWorthMicroUsd(next)).toBe(before);
   });
 
   it("rejects withdrawing more than the savings balance", () => {
@@ -242,12 +242,12 @@ describe("practice-mode time control", () => {
 
   it("increases what the user is worth, because the simulation created earnings", () => {
     const saved = deposit(createInitialState(T0), 1_000, T0);
-    const before = getTotalBalanceMicroUsd(saved);
+    const before = getNetWorthMicroUsd(saved);
 
     const next = advance(saved, T0);
 
-    expect(getTotalBalanceMicroUsd(next)).toBeGreaterThan(before);
-    expect(getTotalBalanceMicroUsd(next)).toBe(before + next.savings.interestEarnedTotal);
+    expect(getNetWorthMicroUsd(next)).toBeGreaterThan(before);
+    expect(getNetWorthMicroUsd(next)).toBe(before + next.savings.interestEarnedTotal);
   });
 
   it("leaves swap state alone", () => {

@@ -6,6 +6,14 @@ import {
   applyDepositToSavings,
   applyWithdrawFromSavings,
 } from "./actions/savings";
+import {
+  applyAddCollateral,
+  applyBorrowCash,
+  applyRemoveCollateral,
+  applyRepayCash,
+  applyResetEthPrice,
+  applySimulateEthPriceChange,
+} from "./actions/borrow";
 
 /**
  * Single entry point into the simulation ledger. Pure: never mutates state.
@@ -31,5 +39,17 @@ export function applyAction(
       return applyAccrueSavings(state, nowMs);
     case "advance-practice-time":
       return applyAdvancePracticeTime(state, nowMs);
+    case "add-collateral":
+      return applyAddCollateral(state, action);
+    case "remove-collateral":
+      return applyRemoveCollateral(state, action);
+    case "borrow-cash":
+      return applyBorrowCash(state, action);
+    case "repay-cash":
+      return applyRepayCash(state, action);
+    case "simulate-eth-price-change":
+      return applySimulateEthPriceChange(state, action);
+    case "reset-eth-price":
+      return applyResetEthPrice(state);
   }
 }
