@@ -12,6 +12,9 @@ export type {
   BorrowCashAction,
   BorrowState,
   BuyInvestmentAction,
+  CompletePaymentRequestAction,
+  CreatePaymentRequestAction,
+  DepositCashAction,
   DepositToSavingsAction,
   InvestmentAssetId,
   InvestmentHoldingState,
@@ -20,19 +23,28 @@ export type {
   InvestState,
   LiquidationReceipt,
   MarketState,
+  PayActivity,
+  PayActivityKind,
+  PayContactId,
+  PaymentRequest,
+  PaymentRequestStatus,
+  PayState,
   PoolState,
+  ReceivePaymentAction,
   RemoveCollateralAction,
   RepayCashAction,
   ResetEthPriceAction,
   ResetInvestmentPricesAction,
   SavingsState,
   SellInvestmentAction,
+  SendPaymentAction,
   SimulateEthPriceChangeAction,
   SimulateInvestmentMarketMoveAction,
   SimulationErrorCode,
   SimulationState,
   SwapAction,
   SwapReceipt,
+  WithdrawCashAction,
   WithdrawFromSavingsAction,
 } from "./types";
 export type { AssetDefinition } from "./assets";
@@ -44,6 +56,7 @@ export type {
   InvestmentRiskLevel,
   InvestPortfolio,
 } from "./investments";
+export type { PayContactDefinition } from "./pay";
 
 export { ASSETS } from "./assets";
 export { DECIMALS, fromMicroUnits, toMicroUnits } from "./money";
@@ -91,3 +104,4 @@ export {
   INVESTMENT_ASSETS,
   INVESTMENT_MARKET_MOVE_BPS,
 } from "./investments";
+export { createInitialPayState, PAY_CONTACT_IDS, PAY_CONTACTS, PRACTICE_HANDLE } from "./pay";

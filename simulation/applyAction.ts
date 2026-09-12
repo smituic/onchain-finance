@@ -20,6 +20,14 @@ import {
   applySellInvestment,
   applySimulateInvestmentMarketMove,
 } from "./actions/invest";
+import {
+  applyCompletePaymentRequest,
+  applyCreatePaymentRequest,
+  applyDepositCash,
+  applyReceivePayment,
+  applySendPayment,
+  applyWithdrawCash,
+} from "./actions/pay";
 
 /**
  * Single entry point into the simulation ledger. Pure: never mutates state.
@@ -65,5 +73,17 @@ export function applyAction(
       return applySimulateInvestmentMarketMove(state, action);
     case "reset-investment-prices":
       return applyResetInvestmentPrices(state);
+    case "send-payment":
+      return applySendPayment(state, action, nowMs);
+    case "receive-payment":
+      return applyReceivePayment(state, action, nowMs);
+    case "create-payment-request":
+      return applyCreatePaymentRequest(state, action, nowMs);
+    case "complete-payment-request":
+      return applyCompletePaymentRequest(state, action, nowMs);
+    case "deposit-cash":
+      return applyDepositCash(state, action, nowMs);
+    case "withdraw-cash":
+      return applyWithdrawCash(state, action, nowMs);
   }
 }

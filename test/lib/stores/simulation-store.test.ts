@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   createInitialInvestmentMarketState,
   createInitialInvestState,
+  createInitialPayState,
   createInitialPoolReserves,
   createInitialSavingsState,
   createInitialState,
@@ -383,6 +384,136 @@ describe("simulation store", () => {
       // ...and Invest starts empty, at genesis prices.
       expect(state.invest).toEqual(createInitialInvestState());
       expect(state.investmentMarket).toEqual(createInitialInvestmentMarketState());
+    });
+  });
+
+  describe("pay", () => {
+    it("dispatches a send, decreasing Cash, and persists the activity", async () => {
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+
+      const result = store.getState().dispatch({
+        type: "send-payment",
+        contactId: "maya",
+        amount: toMicroUnits(50),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(store.getState().state.balances.USDC).toBe(toMicroUnits(10_000) - toMicroUnits(50));
+      expect(store.getState().state.pay.activity).toHaveLength(1);
+
+      const restored = createSimulationStore({ now: () => FIXED_NOW });
+      await restored.persist.rehydrate();
+      expect(restored.getState().state.pay.activity).toEqual(store.getState().state.pay.activity);
+    });
+
+    it("dispatches a receive, increasing Cash", () => {
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+      const result = store.getState().dispatch({
+        type: "receive-payment",
+        contactId: "jordan",
+        amount: toMicroUnits(25),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(store.getState().state.balances.USDC).toBe(toMicroUnits(10_000) + toMicroUnits(25));
+    });
+
+    it("dispatches a deposit and a withdrawal", () => {
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+      store.getState().dispatch({ type: "deposit-cash", amount: toMicroUnits(200) });
+      store.getState().dispatch({ type: "withdraw-cash", amount: toMicroUnits(75) });
+
+      expect(store.getState().state.balances.USDC).toBe(toMicroUnits(10_000) + toMicroUnits(200) - toMicroUnits(75));
+      expect(store.getState().state.pay.activity.map((a) => a.kind)).toEqual(["deposit", "withdraw"]);
+    });
+
+    it("creates a request, moving no Cash, and persists it as pending", async () => {
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+      const result = store.getState().dispatch({
+        type: "create-payment-request",
+        contactId: "alex",
+        amount: toMicroUnits(40),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(store.getState().state.balances.USDC).toBe(toMicroUnits(10_000));
+      expect(store.getState().state.pay.requests).toEqual([
+        expect.objectContaining({ id: "request-1", status: "pending" }),
+      ]);
+
+      const restored = createSimulationStore({ now: () => FIXED_NOW });
+      await restored.persist.rehydrate();
+      expect(restored.getState().state.pay.requests).toEqual(store.getState().state.pay.requests);
+    });
+
+    it("completes a request exactly once, and persists the paid status and counters", async () => {
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+      const created = store.getState().dispatch({
+        type: "create-payment-request",
+        contactId: "alex",
+        amount: toMicroUnits(40),
+      });
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const requestId = created.paymentRequest!.id;
+
+      const paid = store.getState().dispatch({ type: "complete-payment-request", requestId });
+      expect(paid.ok).toBe(true);
+      expect(store.getState().state.balances.USDC).toBe(toMicroUnits(10_000) + toMicroUnits(40));
+
+      const second = store.getState().dispatch({ type: "complete-payment-request", requestId });
+      expect(second.ok).toBe(false);
+      expect(store.getState().state.balances.USDC).toBe(toMicroUnits(10_000) + toMicroUnits(40));
+
+      const restored = createSimulationStore({ now: () => FIXED_NOW });
+      await restored.persist.rehydrate();
+      expect(restored.getState().state.pay.requests[0].status).toBe("paid");
+      expect(restored.getState().state.pay.nextRequestId).toBe(2);
+      expect(restored.getState().state.pay.nextActivityId).toBe(2);
+    });
+
+    it("migrates a pre-pay (v4) entry, preserving every previous field exactly and seeding empty Pay state", async () => {
+      const balances = { USDC: toMicroUnits(4_000), ETH: toMicroUnits(2) };
+      const pool = { reserves: createInitialPoolReserves() };
+      const clockOffsetMs = 12_345;
+      // lastAccruedAt is set so that getSimulatedNow(state, FIXED_NOW) - lastAccruedAt === 0:
+      // rehydration's accrueSavings call then earns no additional interest,
+      // so every savings field below can be asserted exactly rather than
+      // with a >= bound.
+      const savings = {
+        balance: toMicroUnits(500),
+        interestEarnedTotal: toMicroUnits(20),
+        lastAccruedAt: FIXED_NOW + clockOffsetMs,
+      };
+      const borrow = { collateralEth: toMicroUnits(1), debtMicroUsd: toMicroUnits(1_000) };
+      const market = { pricesMicroUsd: { USDC: toMicroUnits(1), ETH: toMicroUnits(2_500) } };
+      const invest = createInitialInvestState();
+      invest.holdings.BTC = { unitsHeld: toMicroUnits(0.01), costBasisMicroUsd: toMicroUnits(600) };
+      const investmentMarket = createInitialInvestmentMarketState();
+
+      localStorage.setItem(
+        SIMULATION_STORE_NAME,
+        JSON.stringify({
+          state: {
+            state: { balances, pool, savings, clockOffsetMs, borrow, market, invest, investmentMarket },
+          },
+          version: 4,
+        }),
+      );
+
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+      await store.persist.rehydrate();
+
+      const state = store.getState().state;
+      expect(state.balances).toEqual(balances);
+      expect(state.pool).toEqual(pool);
+      expect(state.clockOffsetMs).toBe(clockOffsetMs);
+      expect(state.savings).toEqual(savings);
+      expect(state.borrow).toEqual(borrow);
+      expect(state.market).toEqual(market);
+      expect(state.invest).toEqual(invest);
+      expect(state.investmentMarket).toEqual(investmentMarket);
+      expect(state.pay).toEqual(createInitialPayState());
     });
   });
 

@@ -6,6 +6,7 @@ import {
   createInitialInvestmentMarketState,
   createInitialInvestState,
   createInitialMarketState,
+  createInitialPayState,
   createInitialPoolReserves,
   createInitialSavingsState,
   createInitialState,
@@ -40,6 +41,7 @@ type PersistedSimulationState = {
     market?: SimulationState["market"];
     invest?: SimulationState["invest"];
     investmentMarket?: SimulationState["investmentMarket"];
+    pay?: SimulationState["pay"];
   };
 };
 
@@ -75,12 +77,13 @@ export function createSimulationStore({ now = () => Date.now() }: { now?: () => 
         // preserves what the user already had: v1 added the liquidity pool,
         // v2 added the savings position and simulated clock, v3 added the
         // loan and simulated market prices, v4 added the curated Invest
-        // portfolio and its simulated market prices. An entry from an older
+        // portfolio and its simulated market prices, v5 added Pay's requests,
+        // activity, and deterministic ID counters. An entry from an older
         // version has no history to restore for the part that didn't exist
         // yet, so that part starts empty — balances, ETH, pool reserves,
-        // savings, the practice clock, the loan, and market prices all
-        // carry through untouched.
-        version: 4,
+        // savings, the practice clock, the loan, market prices, the Invest
+        // portfolio, and Pay all carry through untouched.
+        version: 5,
         migrate: (persisted, version) => {
           const typed = persisted as PersistedSimulationState;
           let migrated = typed.state;
@@ -104,6 +107,9 @@ export function createSimulationStore({ now = () => Date.now() }: { now?: () => 
               invest: createInitialInvestState(),
               investmentMarket: createInitialInvestmentMarketState(),
             };
+          }
+          if (version < 5) {
+            migrated = { ...migrated, pay: createInitialPayState() };
           }
 
           return { state: migrated } satisfies PersistedSimulationState;

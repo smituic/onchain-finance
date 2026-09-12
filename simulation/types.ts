@@ -24,6 +24,7 @@ export type SimulationState = {
   market: MarketState;
   invest: InvestState;
   investmentMarket: InvestmentMarketState;
+  pay: PayState;
   /**
    * Milliseconds of simulated time the user has deliberately skipped
    * forward with Practice Mode's time control, added to wall-clock time to
@@ -114,6 +115,96 @@ export type InvestState = {
  */
 export type InvestmentMarketState = {
   pricesMicroUsd: Record<InvestmentAssetId, number>;
+};
+
+/**
+ * A fixed, clearly fictional set of Practice contacts Pay's Send/Receive/
+ * Request flows move money between — a display registry, not mutable
+ * financial state. See simulation/pay.ts for the definitions.
+ */
+export type PayContactId = "maya" | "jordan" | "alex";
+
+export type PaymentRequestStatus = "pending" | "paid";
+
+/**
+ * A request for someone else to pay the user. Creating one never moves
+ * money — only `complete-payment-request` does, exactly once, which is why
+ * `status` exists at all.
+ */
+export type PaymentRequest = {
+  id: string;
+  contactId: PayContactId;
+  amountMicroUsd: number;
+  status: PaymentRequestStatus;
+  note?: string;
+  createdAtMs: number;
+  paidAtMs?: number;
+};
+
+export type PayActivityKind = "send" | "receive" | "deposit" | "withdraw";
+
+/**
+ * A completed Pay money movement. Unlike PaymentRequest, every activity
+ * entry represents Cash that has actually moved — a paid request creates one
+ * of these (kind "receive") rather than inventing a separate movement type.
+ */
+export type PayActivity = {
+  id: string;
+  kind: PayActivityKind;
+  amountMicroUsd: number;
+  contactId?: PayContactId;
+  note?: string;
+  occurredAtMs: number;
+};
+
+/** Pay's local state: pending/completed requests, local activity, and deterministic ID counters. */
+export type PayState = {
+  requests: PaymentRequest[];
+  activity: PayActivity[];
+  nextRequestId: number;
+  nextActivityId: number;
+};
+
+/** Sends Cash to a Practice contact, outside the tracked portfolio. */
+export type SendPaymentAction = {
+  type: "send-payment";
+  contactId: PayContactId;
+  amount: number;
+  note?: string;
+};
+
+/** Simulates an incoming payment from a Practice contact. */
+export type ReceivePaymentAction = {
+  type: "receive-payment";
+  contactId: PayContactId;
+  amount: number;
+  note?: string;
+};
+
+/** Creates a pending request for a Practice contact to pay the user. Moves no money. */
+export type CreatePaymentRequestAction = {
+  type: "create-payment-request";
+  contactId: PayContactId;
+  amount: number;
+  note?: string;
+};
+
+/** Simulates a pending request being paid. Can only succeed once per request. */
+export type CompletePaymentRequestAction = {
+  type: "complete-payment-request";
+  requestId: string;
+};
+
+/** Adds simulated Cash from outside the app (Practice Mode's "add money" control). */
+export type DepositCashAction = {
+  type: "deposit-cash";
+  amount: number;
+};
+
+/** Removes simulated Cash from the app. */
+export type WithdrawCashAction = {
+  type: "withdraw-cash";
+  amount: number;
 };
 
 export type SwapAction = {
@@ -255,7 +346,13 @@ export type Action =
   | BuyInvestmentAction
   | SellInvestmentAction
   | SimulateInvestmentMarketMoveAction
-  | ResetInvestmentPricesAction;
+  | ResetInvestmentPricesAction
+  | SendPaymentAction
+  | ReceivePaymentAction
+  | CreatePaymentRequestAction
+  | CompletePaymentRequestAction
+  | DepositCashAction
+  | WithdrawCashAction;
 
 export type SimulationErrorCode =
   | "SAME_ASSET"
@@ -264,7 +361,10 @@ export type SimulationErrorCode =
   | "UNKNOWN_ASSET"
   | "EXCEEDS_BORROW_LIMIT"
   | "EXCEEDS_DEBT"
-  | "WOULD_BE_UNSAFE";
+  | "WOULD_BE_UNSAFE"
+  | "UNKNOWN_CONTACT"
+  | "UNKNOWN_REQUEST"
+  | "REQUEST_ALREADY_PAID";
 
 /**
  * Everything the UI needs to explain a swap's execution without
@@ -326,5 +426,7 @@ export type ActionResult =
       swap?: SwapReceipt;
       liquidation?: LiquidationReceipt;
       investmentTrade?: InvestmentTradeReceipt;
+      payActivity?: PayActivity;
+      paymentRequest?: PaymentRequest;
     }
   | { ok: false; error: string; code: SimulationErrorCode };

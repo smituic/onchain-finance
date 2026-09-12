@@ -42,4 +42,10 @@ export const EXPLORE_EXPERIMENTS: Experiment[] = [
     hook: "Buy a simulated tokenized investment and see what actually changes.",
     href: "/invest",
   },
+  {
+    id: "sending-money",
+    question: "What actually happens when I send money?",
+    hook: "Send a Practice payment without dealing with addresses, gas, or chains.",
+    href: "/pay",
+  },
 ];

@@ -211,6 +211,91 @@ describe("HomeView", () => {
     expect(screen.getByTestId("total-balance")).toHaveTextContent("$11,800.00");
   });
 
+  it("sending a Pay payment decreases Cash and total net worth by exactly the amount", async () => {
+    const { unmount } = render(<HomeView />);
+    const totalBefore = screen.getByTestId("total-balance").textContent;
+    unmount();
+
+    await act(async () => {
+      useSimulationStore.getState().dispatch({ type: "send-payment", contactId: "maya", amount: toMicroUnits(50) });
+    });
+
+    render(<HomeView />);
+
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$9,950.00");
+    expect(totalBefore).toBe("$10,000.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent("$9,950.00");
+  });
+
+  it("receiving and depositing Pay Cash each increase Cash and total net worth by exactly the amount", async () => {
+    await act(async () => {
+      useSimulationStore.getState().dispatch({ type: "receive-payment", contactId: "jordan", amount: toMicroUnits(25) });
+    });
+
+    render(<HomeView />);
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$10,025.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent("$10,025.00");
+  });
+
+  it("depositing Pay Cash increases Cash and total net worth by exactly the amount", async () => {
+    await act(async () => {
+      useSimulationStore.getState().dispatch({ type: "deposit-cash", amount: toMicroUnits(200) });
+    });
+
+    render(<HomeView />);
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$10,200.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent("$10,200.00");
+  });
+
+  it("creating a Pay request leaves Cash and total net worth unchanged", async () => {
+    const { unmount } = render(<HomeView />);
+    const totalBefore = screen.getByTestId("total-balance").textContent;
+    unmount();
+
+    await act(async () => {
+      useSimulationStore.getState().dispatch({
+        type: "create-payment-request",
+        contactId: "alex",
+        amount: toMicroUnits(40),
+      });
+    });
+
+    render(<HomeView />);
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$10,000.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent(totalBefore as string);
+  });
+
+  it("paying a Pay request increases Cash and total net worth exactly once", async () => {
+    let requestId = "";
+    await act(async () => {
+      const result = useSimulationStore.getState().dispatch({
+        type: "create-payment-request",
+        contactId: "alex",
+        amount: toMicroUnits(40),
+      });
+      requestId = result.ok ? result.paymentRequest!.id : "";
+    });
+
+    await act(async () => {
+      useSimulationStore.getState().dispatch({ type: "complete-payment-request", requestId });
+    });
+
+    const { unmount } = render(<HomeView />);
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$10,040.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent("$10,040.00");
+    unmount();
+
+    await act(async () => {
+      const second = useSimulationStore.getState().dispatch({ type: "complete-payment-request", requestId });
+      expect(second.ok).toBe(false);
+    });
+
+    render(<HomeView />);
+    // A second attempt cannot inflate Cash/net worth further.
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$10,040.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent("$10,040.00");
+  });
+
   it("offers the primary actions", () => {
     render(<HomeView />);
 

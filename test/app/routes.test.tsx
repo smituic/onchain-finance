@@ -63,6 +63,7 @@ describe("product routes", () => {
     expect(screen.getByText("Where does lending yield come from?")).toBeInTheDocument();
     expect(screen.getByText("Why can a valuable token still be hard to sell?")).toBeInTheDocument();
     expect(screen.getByText("How can a stock exist on-chain?")).toBeInTheDocument();
+    expect(screen.getByText("What actually happens when I send money?")).toBeInTheDocument();
   });
 
   it("renders Swap inside the shell with its trading behaviour intact", () => {
