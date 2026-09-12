@@ -3,6 +3,8 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import {
   applyAction,
   createInitialBorrowState,
+  createInitialInvestmentMarketState,
+  createInitialInvestState,
   createInitialMarketState,
   createInitialPoolReserves,
   createInitialSavingsState,
@@ -36,6 +38,8 @@ type PersistedSimulationState = {
     clockOffsetMs?: number;
     borrow?: SimulationState["borrow"];
     market?: SimulationState["market"];
+    invest?: SimulationState["invest"];
+    investmentMarket?: SimulationState["investmentMarket"];
   };
 };
 
@@ -70,11 +74,13 @@ export function createSimulationStore({ now = () => Date.now() }: { now?: () => 
         // Bumped when `state`'s shape changes. Each step is additive and
         // preserves what the user already had: v1 added the liquidity pool,
         // v2 added the savings position and simulated clock, v3 added the
-        // loan and simulated market prices. An entry from an older version
-        // has no history to restore for the part that didn't exist yet, so
-        // that part starts empty — balances, ETH, pool reserves, savings,
-        // and the practice clock all carry through untouched.
-        version: 3,
+        // loan and simulated market prices, v4 added the curated Invest
+        // portfolio and its simulated market prices. An entry from an older
+        // version has no history to restore for the part that didn't exist
+        // yet, so that part starts empty — balances, ETH, pool reserves,
+        // savings, the practice clock, the loan, and market prices all
+        // carry through untouched.
+        version: 4,
         migrate: (persisted, version) => {
           const typed = persisted as PersistedSimulationState;
           let migrated = typed.state;
@@ -90,6 +96,13 @@ export function createSimulationStore({ now = () => Date.now() }: { now?: () => 
               ...migrated,
               borrow: createInitialBorrowState(),
               market: createInitialMarketState(),
+            };
+          }
+          if (version < 4) {
+            migrated = {
+              ...migrated,
+              invest: createInitialInvestState(),
+              investmentMarket: createInitialInvestmentMarketState(),
             };
           }
 

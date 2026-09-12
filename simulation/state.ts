@@ -4,6 +4,7 @@ import { createInitialPoolReserves } from "./pool";
 import { createInitialSavingsState } from "./savings";
 import { createInitialBorrowState } from "./borrow";
 import { createInitialMarketState } from "./market";
+import { createInitialInvestState, createInitialInvestmentMarketState } from "./investments";
 
 /**
  * A new simulated portfolio: ~$10,000 in USDC, nothing else.
@@ -23,6 +24,8 @@ export function createInitialState(nowMs: number = Date.now()): SimulationState 
     savings: createInitialSavingsState(nowMs),
     borrow: createInitialBorrowState(),
     market: createInitialMarketState(),
+    invest: createInitialInvestState(),
+    investmentMarket: createInitialInvestmentMarketState(),
     clockOffsetMs: 0,
   };
 }

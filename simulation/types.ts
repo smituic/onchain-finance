@@ -5,6 +5,14 @@
 export type AssetId = "USDC" | "ETH";
 
 /**
+ * The curated set of Practice Mode investments — a distinct namespace from
+ * `AssetId`. These are never spendable/swappable balances and never enter
+ * the swap pool; see simulation/investments.ts for why they're kept
+ * separate rather than folded into `AssetId`.
+ */
+export type InvestmentAssetId = "BTC" | "TBILL" | "BROAD";
+
+/**
  * All balances are integers in fixed-point "micro-units" (see money.ts) —
  * never floats. A balance is always >= 0.
  */
@@ -14,6 +22,8 @@ export type SimulationState = {
   savings: SavingsState;
   borrow: BorrowState;
   market: MarketState;
+  invest: InvestState;
+  investmentMarket: InvestmentMarketState;
   /**
    * Milliseconds of simulated time the user has deliberately skipped
    * forward with Practice Mode's time control, added to wall-clock time to
@@ -76,6 +86,34 @@ export type MarketState = {
  */
 export type PoolState = {
   reserves: Record<AssetId, number>;
+};
+
+/**
+ * A single curated investment position: units held, and the remaining cost
+ * basis behind them. Current value and gain/loss are always derived (see
+ * investments.ts) — never stored — so they can't drift out of sync with the
+ * current investment-market price.
+ */
+export type InvestmentHoldingState = {
+  /** Fixed-point units, using the same DECIMALS precision as everything else. */
+  unitsHeld: number;
+  costBasisMicroUsd: number;
+};
+
+/** The user's whole curated-investment portfolio: one holding per curated asset. */
+export type InvestState = {
+  holdings: Record<InvestmentAssetId, InvestmentHoldingState>;
+};
+
+/**
+ * Simulated market (reference) prices for the curated investment universe —
+ * structurally parallel to `MarketState`, but a distinct namespace: these
+ * assets are never spendable balances and never back the swap pool. See
+ * investments.ts for why they're kept apart from `AssetId`/`MarketState`
+ * rather than merged into them.
+ */
+export type InvestmentMarketState = {
+  pricesMicroUsd: Record<InvestmentAssetId, number>;
 };
 
 export type SwapAction = {
@@ -155,6 +193,52 @@ export type ResetEthPriceAction = {
   type: "reset-eth-price";
 };
 
+/**
+ * Buys a curated investment with Cash. `amount` is the Cash the user wants
+ * to spend, in micro-USD — the same convention as `DepositToSavingsAction`.
+ * The engine converts this to whole fixed-point units at the current price
+ * and settles the *executed* cost (which can be slightly less than
+ * `amount` after flooring to whole units), never the requested amount
+ * itself; see investments.ts.
+ */
+export type BuyInvestmentAction = {
+  type: "buy-investment";
+  assetId: InvestmentAssetId;
+  amount: number;
+};
+
+/**
+ * Sells part or all of a curated investment position. `amount` is how much
+ * value, in micro-USD, the user wants back — the engine converts this to
+ * whole fixed-point units at the current price and credits the *executed*
+ * proceeds of those units, never the requested amount itself. Requesting
+ * (at least) the position's full current value sells everything and zeroes
+ * the position exactly.
+ */
+export type SellInvestmentAction = {
+  type: "sell-investment";
+  assetId: InvestmentAssetId;
+  amount: number;
+};
+
+/**
+ * Practice Mode's investment market control: moves every curated
+ * investment's simulated price by its own deterministic magnitude (see
+ * INVESTMENT_MARKET_MOVE_BPS in investments.ts) — Bitcoin moves the most,
+ * the broad-market fund a moderate amount, Treasuries the least. Touches
+ * only `investmentMarket`; never the swap pool, ETH's market price,
+ * savings, borrowing, or the Practice clock.
+ */
+export type SimulateInvestmentMarketMoveAction = {
+  type: "simulate-investment-market-move";
+  direction: "up" | "down";
+};
+
+/** Puts every curated investment's simulated price back where it started. */
+export type ResetInvestmentPricesAction = {
+  type: "reset-investment-prices";
+};
+
 /** Grows as more mechanics are added. */
 export type Action =
   | SwapAction
@@ -167,7 +251,11 @@ export type Action =
   | BorrowCashAction
   | RepayCashAction
   | SimulateEthPriceChangeAction
-  | ResetEthPriceAction;
+  | ResetEthPriceAction
+  | BuyInvestmentAction
+  | SellInvestmentAction
+  | SimulateInvestmentMarketMoveAction
+  | ResetInvestmentPricesAction;
 
 export type SimulationErrorCode =
   | "SAME_ASSET"
@@ -215,6 +303,28 @@ export type LiquidationReceipt = {
   ethPriceMicroUsd: number;
 };
 
+/**
+ * What a buy or sell of a curated investment actually executed, so the UI
+ * can explain a trade in the user's own numbers without recomputing the
+ * fixed-point math. `amountMicroUsd` is the *executed* cash moved (spent on
+ * a buy, received on a sell) — which can be slightly less than what the
+ * user requested once the request is floored to whole units; see
+ * investments.ts. `realizedGainMicroUsd` is present only for sells.
+ */
+export type InvestmentTradeReceipt = {
+  assetId: InvestmentAssetId;
+  unitsTraded: number;
+  amountMicroUsd: number;
+  priceMicroUsd: number;
+  realizedGainMicroUsd?: number;
+};
+
 export type ActionResult =
-  | { ok: true; state: SimulationState; swap?: SwapReceipt; liquidation?: LiquidationReceipt }
+  | {
+      ok: true;
+      state: SimulationState;
+      swap?: SwapReceipt;
+      liquidation?: LiquidationReceipt;
+      investmentTrade?: InvestmentTradeReceipt;
+    }
   | { ok: false; error: string; code: SimulationErrorCode };

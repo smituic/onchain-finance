@@ -129,6 +129,71 @@ describe("HomeView", () => {
     expect(screen.getByTestId("value-row-crypto")).toHaveTextContent("set aside for your loan");
   });
 
+  it("buying an investment moves Cash into Investments without changing net worth", async () => {
+    const { unmount } = render(<HomeView />);
+    const totalBefore = screen.getByTestId("total-balance").textContent;
+    unmount();
+
+    await act(async () => {
+      useSimulationStore.getState().dispatch({
+        type: "buy-investment",
+        assetId: "BROAD",
+        amount: toMicroUnits(1_000),
+      });
+    });
+
+    render(<HomeView />);
+
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$9,000.00");
+    expect(screen.getByTestId("value-row-investments")).toHaveTextContent("$1,000.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent(totalBefore as string);
+  });
+
+  it("selling an investment at current value moves it back to Cash without changing net worth", async () => {
+    await act(async () => {
+      useSimulationStore.getState().dispatch({
+        type: "buy-investment",
+        assetId: "BROAD",
+        amount: toMicroUnits(1_000),
+      });
+    });
+
+    const { unmount } = render(<HomeView />);
+    const totalBefore = screen.getByTestId("total-balance").textContent;
+    unmount();
+
+    await act(async () => {
+      useSimulationStore.getState().dispatch({
+        type: "sell-investment",
+        assetId: "BROAD",
+        amount: toMicroUnits(1_000),
+      });
+    });
+
+    render(<HomeView />);
+
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$10,000.00");
+    expect(screen.getByTestId("value-row-investments")).toHaveTextContent("$0.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent(totalBefore as string);
+  });
+
+  it("moves net worth when a curated-investment market scenario changes holding value", async () => {
+    await act(async () => {
+      useSimulationStore.getState().dispatch({
+        type: "buy-investment",
+        assetId: "BROAD",
+        amount: toMicroUnits(1_000),
+      });
+      useSimulationStore.getState().dispatch({ type: "simulate-investment-market-move", direction: "up" });
+    });
+
+    render(<HomeView />);
+
+    // BROAD moves 10% per scenario: $1,000 -> $1,100, so net worth rises by $100.
+    expect(screen.getByTestId("value-row-investments")).toHaveTextContent("$1,100.00");
+    expect(screen.getByTestId("total-balance")).toHaveTextContent("$10,100.00");
+  });
+
   it("drops net worth when the simulated ETH price falls", async () => {
     await act(async () => {
       const base = useSimulationStore.getState().state;

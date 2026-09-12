@@ -11,15 +11,24 @@ export type {
   AssetId,
   BorrowCashAction,
   BorrowState,
+  BuyInvestmentAction,
   DepositToSavingsAction,
+  InvestmentAssetId,
+  InvestmentHoldingState,
+  InvestmentMarketState,
+  InvestmentTradeReceipt,
+  InvestState,
   LiquidationReceipt,
   MarketState,
   PoolState,
   RemoveCollateralAction,
   RepayCashAction,
   ResetEthPriceAction,
+  ResetInvestmentPricesAction,
   SavingsState,
+  SellInvestmentAction,
   SimulateEthPriceChangeAction,
+  SimulateInvestmentMarketMoveAction,
   SimulationErrorCode,
   SimulationState,
   SwapAction,
@@ -28,6 +37,13 @@ export type {
 } from "./types";
 export type { AssetDefinition } from "./assets";
 export type { BorrowHealth, BorrowPosition } from "./borrow";
+export type {
+  InvestmentAssetDefinition,
+  InvestmentCategory,
+  InvestmentHolding,
+  InvestmentRiskLevel,
+  InvestPortfolio,
+} from "./investments";
 
 export { ASSETS } from "./assets";
 export { DECIMALS, fromMicroUnits, toMicroUnits } from "./money";
@@ -62,3 +78,16 @@ export {
   getGenesisPriceMicroUsd,
   getPriceMicroUsd,
 } from "./market";
+export {
+  createInitialInvestmentMarketState,
+  createInitialInvestState,
+  getGenesisInvestmentPriceMicroUsd,
+  getInvestmentHolding,
+  getInvestmentHoldings,
+  getInvestmentPortfolioValueMicroUsd,
+  getInvestmentPriceMicroUsd,
+  getInvestPortfolio,
+  INVESTMENT_ASSET_IDS,
+  INVESTMENT_ASSETS,
+  INVESTMENT_MARKET_MOVE_BPS,
+} from "./investments";

@@ -2,6 +2,7 @@ import type { AssetId, SimulationState } from "./types";
 import { DECIMALS } from "./money";
 import { getPriceMicroUsd } from "./market";
 import { getCollateralValueMicroUsd } from "./borrow";
+import { getInvestmentPortfolioValueMicroUsd } from "./investments";
 
 const SCALE = BigInt(10 ** DECIMALS);
 
@@ -46,18 +47,22 @@ export function getCryptoValueMicroUsd(state: SimulationState): number {
 
 /**
  * What the user is actually worth: everything they hold — spendable
- * balances, savings, and pledged collateral — minus what they owe.
+ * balances, savings, curated investments, and pledged collateral — minus
+ * what they owe.
  *
  * Borrowing hands the user Cash and an equal debt, so it can't move this
- * number; neither can moving Cash into savings, nor repaying a loan. Only
- * interest earned, swap price impact, and changes in the market price of
- * what they hold do.
+ * number; neither can moving Cash into savings, nor repaying a loan, nor
+ * buying or selling a curated investment at its current price (both settle
+ * cash and holding value by the exact same executed amount — see
+ * investments.ts). Only interest earned, swap price impact, and changes in
+ * the market price of what they hold do.
  */
 export function getNetWorthMicroUsd(state: SimulationState): number {
   return (
     getPortfolioValueMicroUsd(state) +
     state.savings.balance +
-    getCollateralValueMicroUsd(state) -
+    getCollateralValueMicroUsd(state) +
+    getInvestmentPortfolioValueMicroUsd(state) -
     state.borrow.debtMicroUsd
   );
 }

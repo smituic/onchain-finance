@@ -37,12 +37,12 @@ describe("product routes", () => {
     expect(screen.getByText("Where does the interest come from?")).toBeInTheDocument();
   });
 
-  it("renders Invest with its primary action and curated categories", () => {
+  it("renders Invest with the curated universe and its primary action", () => {
     render(<InvestPage />);
     expect(screen.getByRole("heading", { name: "Invest" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Browse investments" })).toBeInTheDocument();
-    expect(screen.getByText("Crypto")).toBeInTheDocument();
-    expect(screen.getByText("Broad market")).toBeInTheDocument();
+    expect(screen.getByTestId("asset-BTC")).toHaveTextContent("Bitcoin");
+    expect(screen.getByTestId("asset-BROAD")).toHaveTextContent("U.S. Stock Market");
+    expect(screen.getByTestId("asset-TBILL")).toHaveTextContent("Short-Term Treasuries");
   });
 
   it("renders Borrow, pointing a user with no ETH at Swap", () => {
@@ -62,6 +62,7 @@ describe("product routes", () => {
     expect(screen.getByText("What happens if ETH falls 40%?")).toBeInTheDocument();
     expect(screen.getByText("Where does lending yield come from?")).toBeInTheDocument();
     expect(screen.getByText("Why can a valuable token still be hard to sell?")).toBeInTheDocument();
+    expect(screen.getByText("How can a stock exist on-chain?")).toBeInTheDocument();
   });
 
   it("renders Swap inside the shell with its trading behaviour intact", () => {

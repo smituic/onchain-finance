@@ -25,4 +25,18 @@ describe("createInitialState", () => {
     expect(state.pool.reserves.USDC).toBe(75_000_000_000);
     expect(state.pool.reserves.ETH).toBe(25_000_000);
   });
+
+  it("starts with an empty curated-investment portfolio and its genesis prices", () => {
+    const state = createInitialState();
+    expect(state.invest.holdings).toEqual({
+      BTC: { unitsHeld: 0, costBasisMicroUsd: 0 },
+      BROAD: { unitsHeld: 0, costBasisMicroUsd: 0 },
+      TBILL: { unitsHeld: 0, costBasisMicroUsd: 0 },
+    });
+    expect(state.investmentMarket.pricesMicroUsd).toEqual({
+      BTC: 60_000_000_000,
+      BROAD: 500_000_000,
+      TBILL: 100_000_000,
+    });
+  });
 });

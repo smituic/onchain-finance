@@ -14,6 +14,12 @@ import {
   applyResetEthPrice,
   applySimulateEthPriceChange,
 } from "./actions/borrow";
+import {
+  applyBuyInvestment,
+  applyResetInvestmentPrices,
+  applySellInvestment,
+  applySimulateInvestmentMarketMove,
+} from "./actions/invest";
 
 /**
  * Single entry point into the simulation ledger. Pure: never mutates state.
@@ -51,5 +57,13 @@ export function applyAction(
       return applySimulateEthPriceChange(state, action);
     case "reset-eth-price":
       return applyResetEthPrice(state);
+    case "buy-investment":
+      return applyBuyInvestment(state, action);
+    case "sell-investment":
+      return applySellInvestment(state, action);
+    case "simulate-investment-market-move":
+      return applySimulateInvestmentMarketMove(state, action);
+    case "reset-investment-prices":
+      return applyResetInvestmentPrices(state);
   }
 }

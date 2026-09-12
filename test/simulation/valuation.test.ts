@@ -3,6 +3,8 @@ import {
   applyAction,
   createInitialState,
   getAssetValueMicroUsd,
+  getInvestmentHolding,
+  getNetWorthMicroUsd,
   getPortfolioValueMicroUsd,
   toMicroUnits,
 } from "@/simulation";
@@ -58,5 +60,37 @@ describe("getPortfolioValueMicroUsd", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(getPortfolioValueMicroUsd(result.state)).toBeLessThanOrEqual(before);
+  });
+});
+
+describe("getNetWorthMicroUsd", () => {
+  it("includes the curated-investment portfolio in net worth", () => {
+    const state = createInitialState();
+    const result = applyAction(state, { type: "buy-investment", assetId: "BROAD", amount: toMicroUnits(1_000) });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(getNetWorthMicroUsd(result.state)).toBe(getNetWorthMicroUsd(state));
+  });
+
+  it("moves net worth by exactly the value change from a curated-investment market scenario", () => {
+    const state = createInitialState();
+    const bought = applyAction(state, {
+      type: "buy-investment",
+      assetId: "BROAD",
+      amount: toMicroUnits(1_000),
+    });
+    expect(bought.ok).toBe(true);
+    if (!bought.ok) return;
+
+    const valueBefore = getInvestmentHolding(bought.state, "BROAD").currentValueMicroUsd;
+    const moved = applyAction(bought.state, { type: "simulate-investment-market-move", direction: "up" });
+    expect(moved.ok).toBe(true);
+    if (!moved.ok) return;
+
+    const valueAfter = getInvestmentHolding(moved.state, "BROAD").currentValueMicroUsd;
+    expect(getNetWorthMicroUsd(moved.state) - getNetWorthMicroUsd(bought.state)).toBe(
+      valueAfter - valueBefore,
+    );
   });
 });

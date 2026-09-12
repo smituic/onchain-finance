@@ -36,4 +36,10 @@ export const EXPLORE_EXPERIMENTS: Experiment[] = [
     question: "Why can a valuable token still be hard to sell?",
     hook: "Try to sell a big position and see what actually lands in your account.",
   },
+  {
+    id: "tokenization",
+    question: "How can a stock exist on-chain?",
+    hook: "Buy a simulated tokenized investment and see what actually changes.",
+    href: "/invest",
+  },
 ];

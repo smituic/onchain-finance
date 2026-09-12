@@ -1,10 +1,13 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  createInitialInvestmentMarketState,
+  createInitialInvestState,
   createInitialPoolReserves,
   createInitialSavingsState,
   createInitialState,
   getBorrowPosition,
+  getInvestmentPriceMicroUsd,
   toMicroUnits,
 } from "@/simulation";
 import {
@@ -298,6 +301,88 @@ describe("simulation store", () => {
       expect(state.borrow).toEqual({ collateralEth: 0, debtMicroUsd: 0 });
       expect(state.market.pricesMicroUsd.ETH).toBe(toMicroUnits(3_000));
       expect(getBorrowPosition(state).availableToBorrowMicroUsd).toBe(0);
+    });
+  });
+
+  describe("investing", () => {
+    it("dispatches a buy, updating holdings and cash, and persists it", async () => {
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+
+      const result = store.getState().dispatch({
+        type: "buy-investment",
+        assetId: "BTC",
+        amount: toMicroUnits(500),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(store.getState().state.invest.holdings.BTC.unitsHeld).toBe(8_333);
+      expect(store.getState().state.balances.USDC).toBe(toMicroUnits(10_000) - 499_980_000);
+
+      const restored = createSimulationStore({ now: () => FIXED_NOW });
+      await restored.persist.rehydrate();
+      expect(restored.getState().state.invest.holdings.BTC.unitsHeld).toBe(8_333);
+    });
+
+    it("dispatches a sell, returning cash and reducing the position", () => {
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+      store.getState().dispatch({ type: "buy-investment", assetId: "BROAD", amount: toMicroUnits(1_000) });
+
+      const result = store.getState().dispatch({
+        type: "sell-investment",
+        assetId: "BROAD",
+        amount: toMicroUnits(400),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(store.getState().state.invest.holdings.BROAD).toEqual({
+        unitsHeld: toMicroUnits(1.2),
+        costBasisMicroUsd: toMicroUnits(600),
+      });
+    });
+
+    it("dispatches a market scenario, moving every curated investment's price", () => {
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+
+      const result = store.getState().dispatch({ type: "simulate-investment-market-move", direction: "up" });
+
+      expect(result.ok).toBe(true);
+      expect(getInvestmentPriceMicroUsd(store.getState().state, "BTC")).toBe(toMicroUnits(75_000));
+      expect(getInvestmentPriceMicroUsd(store.getState().state, "BROAD")).toBe(toMicroUnits(550));
+      expect(getInvestmentPriceMicroUsd(store.getState().state, "TBILL")).toBe(toMicroUnits(101));
+
+      const resetResult = store.getState().dispatch({ type: "reset-investment-prices" });
+      expect(resetResult.ok).toBe(true);
+      expect(getInvestmentPriceMicroUsd(store.getState().state, "BTC")).toBe(toMicroUnits(60_000));
+    });
+
+    it("migrates a pre-invest (v3) entry, keeping every previous field and seeding an empty portfolio", async () => {
+      const balances = { USDC: toMicroUnits(4_000), ETH: toMicroUnits(2) };
+      const pool = { reserves: createInitialPoolReserves() };
+      const savings = { ...createInitialSavingsState(FIXED_NOW), balance: toMicroUnits(500) };
+      const borrow = { collateralEth: toMicroUnits(1), debtMicroUsd: toMicroUnits(1_000) };
+      const market = { pricesMicroUsd: { USDC: toMicroUnits(1), ETH: toMicroUnits(2_500) } };
+      localStorage.setItem(
+        SIMULATION_STORE_NAME,
+        JSON.stringify({
+          state: { state: { balances, pool, savings, clockOffsetMs: 12_345, borrow, market } },
+          version: 3,
+        }),
+      );
+
+      const store = createSimulationStore({ now: () => FIXED_NOW });
+      await store.persist.rehydrate();
+
+      const state = store.getState().state;
+      expect(state.balances).toEqual(balances);
+      expect(state.pool).toEqual(pool);
+      expect(state.clockOffsetMs).toBe(12_345);
+      expect(state.borrow).toEqual(borrow);
+      expect(state.market).toEqual(market);
+      // Savings carries through untouched apart from interest hydration settles.
+      expect(state.savings.balance).toBeGreaterThanOrEqual(toMicroUnits(500));
+      // ...and Invest starts empty, at genesis prices.
+      expect(state.invest).toEqual(createInitialInvestState());
+      expect(state.investmentMarket).toEqual(createInitialInvestmentMarketState());
     });
   });
 
