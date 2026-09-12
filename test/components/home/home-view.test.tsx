@@ -311,11 +311,16 @@ describe("HomeView", () => {
     }
   });
 
-  it("links into Explore experiments", () => {
+  it("links into Explore experiments, at their real experiment routes", () => {
     render(<HomeView />);
 
     expect(screen.getByRole("link", { name: "All experiments" })).toHaveAttribute("href", "/explore");
-    expect(screen.getByText("Why do large trades move prices?")).toBeInTheDocument();
+    expect(
+      screen.getByText("You own $30,000 of ETH. Can you sell it for $30,000?"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: /You own \$30,000 of ETH/ }),
+    ).toHaveAttribute("href", "/explore/liquidity");
   });
 
   it("shows an honest empty state where activity history will go", () => {

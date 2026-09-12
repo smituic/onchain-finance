@@ -20,36 +20,23 @@ export function ExploreView() {
       </ul>
 
       <p className="text-sm leading-relaxed text-muted-foreground">
-        Each experiment is something you do, not something you read. More are on the way.
+        Each experiment is something you do, not something you read.
       </p>
     </div>
   );
 }
 
 function ExperimentCard({ experiment }: { experiment: Experiment }) {
-  const content = (
-    <>
+  return (
+    <Link
+      href={`/explore/${experiment.id}`}
+      className="flex items-center justify-between gap-4 rounded-xl px-4 py-4 ring-1 ring-foreground/10 transition-colors hover:bg-muted"
+    >
       <span className="flex flex-col gap-1.5">
         <span className="font-heading text-base font-medium">{experiment.question}</span>
         <span className="text-sm text-muted-foreground">{experiment.hook}</span>
       </span>
-      {experiment.href ? (
-        <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-      ) : (
-        <span className="shrink-0 text-xs text-muted-foreground">Soon</span>
-      )}
-    </>
-  );
-
-  const className = "flex items-center justify-between gap-4 rounded-xl px-4 py-4 ring-1 ring-foreground/10";
-
-  if (!experiment.href) {
-    return <div className={className}>{content}</div>;
-  }
-
-  return (
-    <Link href={experiment.href} className={`${className} transition-colors hover:bg-muted`}>
-      {content}
+      <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     </Link>
   );
 }

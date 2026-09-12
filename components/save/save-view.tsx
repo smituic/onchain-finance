@@ -2,7 +2,11 @@
 
 import { useState } from "react";
 import { ChevronDown } from "lucide-react";
-import { getAssetValueMicroUsd, PRACTICE_TIME_STEP_MS, SAVINGS_ANNUAL_RATE_BPS } from "@/simulation";
+import {
+  getAssetValueMicroUsd,
+  getPracticeMonthsElapsed,
+  SAVINGS_ANNUAL_RATE_BPS,
+} from "@/simulation";
 import { useHasSimulationHydrated, useSimulationStore } from "@/lib/stores/simulation-store";
 import { parseAmountToMicroUnits } from "@/lib/parse-amount";
 import { formatRatePercent, formatUsd } from "@/lib/format";
@@ -30,7 +34,7 @@ export function SaveView() {
 
   const cashMicroUsd = getAssetValueMicroUsd(state, "USDC");
   const savings = state.savings;
-  const monthsSkipped = Math.round(state.clockOffsetMs / PRACTICE_TIME_STEP_MS);
+  const monthsSkipped = getPracticeMonthsElapsed(state);
 
   function openTransfer(next: TransferMode) {
     setMode(next);
@@ -221,8 +225,9 @@ function InterestExplainer() {
   return (
     <Note title="Where does the interest come from?">
       <p>
-        Your money doesn&apos;t sit in a vault. It&apos;s made available to people who want to borrow,
-        and they pay to use it. That payment is what shows up as your interest.
+        Practice Mode credits interest at a fixed, simulated rate — right now{" "}
+        {formatRatePercent(SAVINGS_ANNUAL_RATE_BPS)} a year, added to your balance as time passes. Your
+        money here isn&apos;t going anywhere or being lent to anyone.
       </p>
       <Button
         type="button"
@@ -238,10 +243,11 @@ function InterestExplainer() {
       </Button>
       {expanded ? (
         <p id="savings-real-mode-detail" className="mt-2">
-          Here it&apos;s simulated at a fixed rate. With real money, the borrowing and lending happens
-          in open markets rather than inside one bank, so the rate moves with how much people want to
-          borrow. You&apos;d still see the same thing: a balance, a rate, and money you can take out
-          whenever you want.
+          With real money, yield like this can come from somewhere real — often other people paying to
+          borrow the same money you&apos;ve set aside, in open markets where the rate moves with how much
+          people want to borrow. That causal market isn&apos;t modeled in Practice Mode today; the rate
+          here is fixed so it&apos;s easy to predict and check. You&apos;d still see the same shape: a
+          balance, a rate, and money you can take out whenever you want.
         </p>
       ) : null}
     </Note>

@@ -138,7 +138,7 @@ export function HomeView() {
           {featuredExperiments.map((experiment) => (
             <li key={experiment.id}>
               <Link
-                href={experiment.href ?? "/explore"}
+                href={`/explore/${experiment.id}`}
                 className="flex items-center justify-between gap-4 rounded-xl bg-muted/60 px-4 py-3.5 transition-colors hover:bg-muted"
               >
                 <span className="flex flex-col gap-0.5">

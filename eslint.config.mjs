@@ -33,6 +33,27 @@ const eslintConfig = defineConfig([
       ],
     },
   },
+  {
+    // Explore's sandboxes run an isolated, ephemeral SimulationState (see
+    // ARCHITECTURE.md's "Explore sandbox" section) and must never be able
+    // to reach the user's real Practice Mode portfolio. This makes that
+    // isolation a lint failure, not just a review discipline.
+    files: ["components/explore/**/*.{ts,tsx}", "lib/explore/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "@/lib/stores/simulation-store",
+              message:
+                "Explore experiments run in an isolated sandbox and must never dispatch into the user's real Practice Mode store — use lib/explore/use-experiment-simulation instead.",
+            },
+          ],
+        },
+      ],
+    },
+  },
 ]);
 
 export default eslintConfig;

@@ -19,6 +19,17 @@ export function createInitialSavingsState(nowMs: number): SavingsState {
   return { balance: 0, interestEarnedTotal: 0, lastAccruedAt: nowMs };
 }
 
+/**
+ * How many Practice Mode time-steps have been skipped forward, rounded.
+ * Derived from clockOffsetMs — never stored separately, so it can't drift
+ * out of sync with it. "Months" is the product's display label for one
+ * PRACTICE_TIME_STEP_MS step; this is a rounded approximation for display,
+ * not an exact calendar-month count.
+ */
+export function getPracticeMonthsElapsed(state: SimulationState): number {
+  return Math.round(state.clockOffsetMs / PRACTICE_TIME_STEP_MS);
+}
+
 /** The simulation's current time: wall clock plus any time skipped forward. */
 export function getSimulatedNow(state: SimulationState, nowMs: number): number {
   return nowMs + state.clockOffsetMs;

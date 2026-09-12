@@ -58,12 +58,20 @@ describe("product routes", () => {
   it("renders Explore's experiments as entry points, not lessons", () => {
     render(<ExplorePage />);
     expect(screen.getByRole("heading", { name: "Explore" })).toBeInTheDocument();
-    expect(screen.getByText("Why do large trades move prices?")).toBeInTheDocument();
-    expect(screen.getByText("What happens if ETH falls 40%?")).toBeInTheDocument();
-    expect(screen.getByText("Where does lending yield come from?")).toBeInTheDocument();
-    expect(screen.getByText("Why can a valuable token still be hard to sell?")).toBeInTheDocument();
-    expect(screen.getByText("How can a stock exist on-chain?")).toBeInTheDocument();
-    expect(screen.getByText("What actually happens when I send money?")).toBeInTheDocument();
+
+    const expected: [string, string][] = [
+      ["You own $30,000 of ETH. Can you sell it for $30,000?", "/explore/liquidity"],
+      ["What happens if ETH falls?", "/explore/liquidation"],
+      ["What does a 4% annual rate look like over time?", "/explore/yield"],
+      ["Why not put everything in whatever grows fastest?", "/explore/risk"],
+      ["What actually happens when you send money?", "/explore/payments"],
+    ];
+    for (const [question, href] of expected) {
+      expect(screen.getByRole("link", { name: new RegExp(question.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")) })).toHaveAttribute(
+        "href",
+        href,
+      );
+    }
   });
 
   it("renders Swap inside the shell with its trading behaviour intact", () => {

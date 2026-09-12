@@ -4,6 +4,7 @@ import {
   calculateInterestMicroUsd,
   createInitialState,
   getNetWorthMicroUsd,
+  getPracticeMonthsElapsed,
   PRACTICE_TIME_STEP_MS,
   SAVINGS_ANNUAL_RATE_BPS,
   toMicroUnits,
@@ -256,5 +257,20 @@ describe("practice-mode time control", () => {
 
     expect(next.pool).toEqual(saved.pool);
     expect(next.balances.ETH).toBe(saved.balances.ETH);
+  });
+});
+
+describe("getPracticeMonthsElapsed", () => {
+  it("is zero for a fresh state", () => {
+    expect(getPracticeMonthsElapsed(createInitialState(T0))).toBe(0);
+  });
+
+  it("counts each advance-practice-time step as one month, derived from clockOffsetMs", () => {
+    let state = createInitialState(T0);
+    for (let i = 1; i <= 12; i++) {
+      state = advance(state, T0);
+      expect(getPracticeMonthsElapsed(state)).toBe(i);
+      expect(state.clockOffsetMs).toBe(i * PRACTICE_TIME_STEP_MS);
+    }
   });
 });

@@ -73,6 +73,7 @@ export {
   accrueSavings,
   calculateInterestMicroUsd,
   createInitialSavingsState,
+  getPracticeMonthsElapsed,
   getSimulatedNow,
   PRACTICE_TIME_STEP_MS,
   SAVINGS_ANNUAL_RATE_BPS,

@@ -100,19 +100,21 @@ describe("SaveView", () => {
     expect(screen.getByText(/skipped ahead 1 month in Practice Mode/)).toBeInTheDocument();
   });
 
-  it("explains where interest comes from, with the real-money detail a tap away", () => {
+  it("explains where interest comes from honestly, with the real-money detail a tap away", () => {
     render(<SaveView />);
 
     expect(screen.getByText("Where does the interest come from?")).toBeInTheDocument();
-    expect(screen.getByText(/made available to people who want to borrow/)).toBeInTheDocument();
+    // The simulation credits a fixed rate — it does not lend the user's
+    // money to anyone, so the copy must not claim otherwise.
+    expect(screen.getByText(/isn't going anywhere or being lent to anyone/)).toBeInTheDocument();
 
     const toggle = screen.getByRole("button", { name: /what about real money/i });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByText(/in open markets rather than inside one bank/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/that causal market isn't modeled in Practice Mode today/i)).not.toBeInTheDocument();
 
     fireEvent.click(toggle);
 
     expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText(/in open markets rather than inside one bank/)).toBeInTheDocument();
+    expect(screen.getByText(/that causal market isn't modeled in Practice Mode today/i)).toBeInTheDocument();
   });
 });

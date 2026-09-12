@@ -1,51 +1,56 @@
+import type { ExperimentId } from "@/lib/explore/experiment-state";
+import type { ProductAreaId } from "@/lib/product-areas";
+
+/**
+ * Explore's single source of truth: one entry per interactive experiment.
+ * The route is always derived as /explore/<id> (see
+ * app/explore/[experimentId]/page.tsx) — there is no separate href to drift
+ * out of sync with an id, and every entry here is playable inside Explore
+ * itself, never a link-only placeholder.
+ */
 export type Experiment = {
-  id: string;
+  id: ExperimentId;
   /** The question the experiment answers — the entry point's title. */
   question: string;
   /** What the user will actually do, in one line. Not a summary of an answer. */
   hook: string;
-  /**
-   * Set only when the experiment can already be played somewhere in the
-   * product. Swap's price-impact explainer is a working demonstration of
-   * the first one; the rest wait on the experiment engine.
-   */
-  href?: string;
+  /** The full feature area this experiment's mechanics come from, for its "Open full X" link. */
+  areaId: ProductAreaId;
 };
 
 export const EXPLORE_EXPERIMENTS: Experiment[] = [
   {
-    id: "price-impact",
-    question: "Why do large trades move prices?",
-    hook: "Convert $10,000 at once and watch the price move against you.",
-    href: "/swap",
+    id: "liquidity",
+    question: "You own $30,000 of ETH. Can you sell it for $30,000?",
+    hook: "Sell a little, then sell it all, and compare what actually lands in your account.",
+    areaId: "swap",
   },
   {
-    id: "eth-drawdown",
-    question: "What happens if ETH falls 40%?",
-    hook: "Drop the market and see what it does to money borrowed against it.",
-    href: "/borrow",
+    id: "liquidation",
+    question: "What happens if ETH falls?",
+    hook: "You've borrowed against ETH. Drop the price and watch the loan.",
+    areaId: "borrow",
   },
   {
-    id: "lending-yield",
-    question: "Where does lending yield come from?",
-    hook: "Follow a dollar from your savings to the person borrowing it.",
-    href: "/save",
+    id: "yield",
+    question: "What does a 4% annual rate look like over time?",
+    hook: "Put $1,000 in savings and skip ahead, a few months at a time.",
+    areaId: "save",
   },
   {
-    id: "thin-liquidity",
-    question: "Why can a valuable token still be hard to sell?",
-    hook: "Try to sell a big position and see what actually lands in your account.",
+    id: "risk",
+    question: "Why not put everything in whatever grows fastest?",
+    hook: "Buy three different investments, then move the market once.",
+    areaId: "invest",
   },
   {
-    id: "tokenization",
-    question: "How can a stock exist on-chain?",
-    hook: "Buy a simulated tokenized investment and see what actually changes.",
-    href: "/invest",
-  },
-  {
-    id: "sending-money",
-    question: "What actually happens when I send money?",
-    hook: "Send a Practice payment without dealing with addresses, gas, or chains.",
-    href: "/pay",
+    id: "payments",
+    question: "What actually happens when you send money?",
+    hook: "Send $25, then request $25, and see which one actually moves money.",
+    areaId: "pay",
   },
 ];
+
+export const EXPLORE_EXPERIMENTS_BY_ID = Object.fromEntries(
+  EXPLORE_EXPERIMENTS.map((experiment) => [experiment.id, experiment]),
+) as Record<ExperimentId, Experiment>;
