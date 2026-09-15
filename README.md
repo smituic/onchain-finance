@@ -8,7 +8,17 @@ The MVP lets people *learn by doing*: manage a simulated portfolio, swap assets,
 
 ## Project Status
 
-Early stage — documentation only. No application has been built yet.
+**Phase 1 (Practice Mode) is complete.** All seven product areas are built and functional, entirely simulated with fake money:
+
+- **Home** — a unified financial overview: cash, savings, investments, and crypto in one total balance
+- **Pay** — send, receive, request, deposit, and withdraw simulated money
+- **Save** — simulated savings yield, with a Practice time control to watch interest accrue
+- **Invest** — a curated set of simulated investments, with market scenarios to move their prices
+- **Swap** — AMM-based swaps between simulated assets, with real price impact on larger trades
+- **Borrow** — collateralized borrowing against simulated ETH, including simulated liquidation
+- **Explore** — isolated, interactive financial experiments (liquidity, liquidation, yield, risk, payments) that let a user cause a financial outcome themselves rather than read about it
+
+See [ROADMAP.md](ROADMAP.md) for what's next (Phase 2: testnet and Real Mode).
 
 ## Documentation
 
@@ -20,4 +30,4 @@ Early stage — documentation only. No application has been built yet.
 
 ## Contributing
 
-This is currently a solo project in early planning. There is no build or contribution process yet — that will be documented here once the application is scaffolded.
+This is currently a solo project. There is no external contribution process yet.

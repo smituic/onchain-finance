@@ -6,6 +6,8 @@ Three phases, increasing in realism and risk. We do not move to the next phase u
 
 ## Phase 1 — Practice Mode: The Complete Product
 
+**Status: Complete.** All seven areas — Home, Pay, Save, Invest, Swap, Borrow, and Explore — are built and functional in Practice Mode, and the exit criteria below are met. Phase 2 is next.
+
 **Goal:** Deliver the complete consumer product — all seven areas — in Practice Mode. Prove that people can learn on-chain finance concepts by doing them, entirely simulated, with no real funds, wallets, or chain interaction yet.
 
 **In scope:**
