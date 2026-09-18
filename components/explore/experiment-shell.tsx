@@ -42,6 +42,10 @@ export function ExperimentShell({
         <p className="text-sm text-muted-foreground">{experiment.hook}</p>
       </header>
 
+      <p className="text-xs text-muted-foreground">
+        This experiment uses separate Practice money — your main balances won&apos;t change.
+      </p>
+
       {children}
 
       <div className="flex flex-col gap-3 pt-2">

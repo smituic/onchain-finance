@@ -57,4 +57,29 @@ describe("SwapForm", () => {
     expect(screen.getByText("Insufficient balance.")).toBeInTheDocument();
     expect(useSimulationStore.getState().state).toEqual(before);
   });
+
+  it("labels the pool's rate as the Swap rate", () => {
+    render(<SwapForm />);
+    expect(screen.getByText("Swap rate: 1 ETH ≈ $3,000.00")).toBeInTheDocument();
+  });
+
+  it("shows no divergence note when the market price and pool price are at genesis", () => {
+    render(<SwapForm />);
+    expect(screen.queryByText(/elsewhere in Practice/)).not.toBeInTheDocument();
+  });
+
+  it("explains the gap once a Borrow-style market scenario moves ETH's Practice valuation away from the pool", async () => {
+    await act(async () => {
+      useSimulationStore.getState().dispatch({ type: "simulate-eth-price-change", changeBps: -4_000 });
+    });
+
+    render(<SwapForm />);
+
+    // Market price (crashed) vs. pool price (untouched) — the market value
+    // shown must match the engine's market price, not the pool's.
+    expect(
+      screen.getByText("ETH is valued at $1,800.00 elsewhere in Practice. Swap rates come from the trading pool and can differ."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Swap rate: 1 ETH ≈ $3,000.00")).toBeInTheDocument();
+  });
 });

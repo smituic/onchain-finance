@@ -296,9 +296,9 @@ export function BorrowView() {
         <div className="flex flex-col gap-1">
           <p className="text-sm font-medium">What if ETH falls?</p>
           <p className="text-sm text-muted-foreground">
-            Move ETH&apos;s simulated price and watch what it does to your loan. This is a practice
-            scenario — it changes ETH&apos;s price everywhere in the app, and nothing is bought or
-            sold to make it happen.
+            Move ETH&apos;s simulated price and watch what it does to your loan. This is a Practice
+            scenario — it changes what your ETH is worth and how risky your loan is, not Swap&apos;s
+            rate, and nothing is bought or sold to make it happen.
           </p>
         </div>
         <div className="grid gap-2">
@@ -332,6 +332,9 @@ export function BorrowView() {
         <p>
           Setting ETH aside lets you get cash without giving up your ETH — you keep it, and you get it
           back when you repay.
+        </p>
+        <p className="mt-2">
+          Practice loans don&apos;t charge interest. Real borrowing usually does.
         </p>
         <div className="mt-3 flex flex-col gap-3">
           <Expander question="Why can I only borrow part of my ETH's value?">

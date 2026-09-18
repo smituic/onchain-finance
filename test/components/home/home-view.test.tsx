@@ -323,9 +323,59 @@ describe("HomeView", () => {
     ).toHaveAttribute("href", "/explore/liquidity");
   });
 
-  it("shows an honest empty state where activity history will go", () => {
-    render(<HomeView />);
-    expect(screen.getByText("No activity yet")).toBeInTheDocument();
+  describe("Recent payments", () => {
+    it("shows an honest empty state when nothing has been paid yet", () => {
+      render(<HomeView />);
+      expect(screen.getByText("No payments yet")).toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: "See all" })).not.toBeInTheDocument();
+    });
+
+    it("shows recent Pay activity newest-first, with correct signed amounts", async () => {
+      await act(async () => {
+        useSimulationStore.getState().dispatch({
+          type: "send-payment",
+          contactId: "maya",
+          amount: toMicroUnits(25),
+        });
+        useSimulationStore.getState().dispatch({
+          type: "receive-payment",
+          contactId: "jordan",
+          amount: toMicroUnits(40),
+        });
+      });
+
+      render(<HomeView />);
+
+      const entries = screen.getAllByTestId(/^home-activity-/);
+      expect(entries).toHaveLength(2);
+      expect(entries[0]).toHaveTextContent("Received from Jordan Lee");
+      expect(entries[0]).toHaveTextContent("+$40.00");
+      expect(entries[1]).toHaveTextContent("Sent to Maya Chen");
+      expect(entries[1]).toHaveTextContent("−$25.00");
+    });
+
+    it("shows only the 3 most recent payments", async () => {
+      await act(async () => {
+        for (let i = 0; i < 5; i++) {
+          useSimulationStore.getState().dispatch({
+            type: "deposit-cash",
+            amount: toMicroUnits(10),
+          });
+        }
+      });
+
+      render(<HomeView />);
+      expect(screen.getAllByTestId(/^home-activity-/)).toHaveLength(3);
+    });
+
+    it("links to Pay for the full history once there's activity to see", async () => {
+      await act(async () => {
+        useSimulationStore.getState().dispatch({ type: "deposit-cash", amount: toMicroUnits(10) });
+      });
+
+      render(<HomeView />);
+      expect(screen.getByRole("link", { name: "See all" })).toHaveAttribute("href", "/pay");
+    });
   });
 
   it("does not show a balance before the store has hydrated", () => {

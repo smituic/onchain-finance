@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { ArrowDownUp } from "lucide-react";
-import { applyAction, getPoolSpotPriceMicroUsd, type AssetId } from "@/simulation";
+import { applyAction, getPoolSpotPriceMicroUsd, getPriceMicroUsd, type AssetId } from "@/simulation";
 import { useSimulationStore } from "@/lib/stores/simulation-store";
 import { parseAmountToMicroUnits } from "@/lib/parse-amount";
 import { formatAssetAmount, formatUsd } from "@/lib/format";
@@ -13,6 +13,7 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent } from "@/components/ui/card";
 import { PageHeader } from "@/components/shell/page-header";
 import { PriceImpactNote } from "@/components/swap/price-impact-note";
+import { RateDivergenceNote } from "@/components/swap/rate-divergence-note";
 
 const OTHER_ASSET: Record<AssetId, AssetId> = { USDC: "ETH", ETH: "USDC" };
 
@@ -66,7 +67,15 @@ export function SwapForm() {
               trySubmit();
             }}
           >
-            <p className="text-sm text-muted-foreground">1 ETH ≈ {formatUsd(getPoolSpotPriceMicroUsd(state.pool))}</p>
+            <div className="flex flex-col gap-1">
+              <p className="text-sm text-muted-foreground">
+                Swap rate: 1 ETH ≈ {formatUsd(getPoolSpotPriceMicroUsd(state.pool))}
+              </p>
+              <RateDivergenceNote
+                marketPriceMicroUsd={getPriceMicroUsd(state, "ETH")}
+                poolPriceMicroUsd={getPoolSpotPriceMicroUsd(state.pool)}
+              />
+            </div>
 
             <div className="flex flex-col gap-1.5">
               <div className="flex items-center justify-between">

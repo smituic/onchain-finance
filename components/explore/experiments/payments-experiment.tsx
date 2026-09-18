@@ -1,9 +1,10 @@
 "use client";
 
 import { useState } from "react";
-import { getAssetValueMicroUsd, PAY_CONTACTS, toMicroUnits, type PayActivity } from "@/simulation";
+import { getAssetValueMicroUsd, PAY_CONTACTS, toMicroUnits } from "@/simulation";
 import { useExperimentSimulation } from "@/lib/explore/use-experiment-simulation";
 import { formatSignedUsd, formatUsd } from "@/lib/format";
+import { payActivityLabel, signedPayActivityAmount } from "@/lib/pay-activity";
 import { Button } from "@/components/ui/button";
 import { Note } from "@/components/shell/note";
 import { Expander } from "@/components/shell/expander";
@@ -14,26 +15,6 @@ const SEND_AMOUNT = toMicroUnits(25);
 const REQUEST_AMOUNT = toMicroUnits(25);
 const SEND_TO = "maya" as const;
 const REQUEST_FROM = "jordan" as const;
-
-function activityLabel(activity: PayActivity): string {
-  const contactName = activity.contactId ? PAY_CONTACTS[activity.contactId].displayName : null;
-  switch (activity.kind) {
-    case "send":
-      return `Sent to ${contactName}`;
-    case "receive":
-      return `Received from ${contactName}`;
-    case "deposit":
-      return "Added Cash";
-    case "withdraw":
-      return "Withdrew Cash";
-  }
-}
-
-function signedActivityAmount(activity: PayActivity): number {
-  return activity.kind === "send" || activity.kind === "withdraw"
-    ? -activity.amountMicroUsd
-    : activity.amountMicroUsd;
-}
 
 export function PaymentsExperiment() {
   const experiment = EXPLORE_EXPERIMENTS_BY_ID.payments;
@@ -119,9 +100,9 @@ export function PaymentsExperiment() {
                   data-testid={`experiment-activity-${entry.id}`}
                   className="flex items-center justify-between gap-4 rounded-xl bg-muted/60 px-4 py-3.5"
                 >
-                  <span className="text-sm font-medium">{activityLabel(entry)}</span>
+                  <span className="text-sm font-medium">{payActivityLabel(entry)}</span>
                   <span className="shrink-0 text-sm font-medium tabular-nums">
-                    {formatSignedUsd(signedActivityAmount(entry))}
+                    {formatSignedUsd(signedPayActivityAmount(entry))}
                   </span>
                 </li>
               ))}

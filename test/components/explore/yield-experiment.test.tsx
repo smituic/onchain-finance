@@ -7,7 +7,7 @@ describe("YieldExperiment", () => {
     render(<YieldExperiment />);
     expect(screen.getByText("$1,000.00")).toBeInTheDocument();
     expect(screen.getByText("Practice time skipped")).toBeInTheDocument();
-    expect(screen.getByText("0 steps")).toBeInTheDocument();
+    expect(screen.getByText("0 months")).toBeInTheDocument();
   });
 
   it("one month earns the engine's own 4%/yr interest on $1,000", () => {
@@ -32,13 +32,18 @@ describe("YieldExperiment", () => {
 
     // Not 13 months of compounding — exactly the 1-month figure.
     expect(screen.getByText("$1,003.29")).toBeInTheDocument();
-    expect(screen.getByText("1 step")).toBeInTheDocument();
+    expect(screen.getByTestId("value-row-practice-time-skipped")).toHaveTextContent("1 month");
   });
 
   it("does not claim the engine models an exact calendar year or precise APY", () => {
     render(<YieldExperiment />);
     expect(screen.queryByText(/exactly.*calendar year/i)).not.toBeInTheDocument();
-    expect(screen.getByText(/30-day Practice steps/)).toBeInTheDocument();
+    expect(screen.getByText(/Practice months — each one 30 days/)).toBeInTheDocument();
+  });
+
+  it("uses 'months', not 'steps', in its user-facing copy", () => {
+    render(<YieldExperiment />);
+    expect(screen.queryByText(/\bsteps?\b/)).not.toBeInTheDocument();
   });
 
   it("reset restores the $1,000 starting balance", () => {
@@ -47,7 +52,7 @@ describe("YieldExperiment", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reset experiment" }));
 
     expect(screen.getByText("$1,000.00")).toBeInTheDocument();
-    expect(screen.getByText("0 steps")).toBeInTheDocument();
+    expect(screen.getByText("0 months")).toBeInTheDocument();
     expect(screen.queryByText("What changed")).not.toBeInTheDocument();
   });
 

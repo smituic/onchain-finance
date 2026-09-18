@@ -89,20 +89,23 @@ export function YieldExperiment() {
               value={formatUsd(state.savings.interestEarnedTotal)}
               hint="Since the deposit"
             />
-            <ValueRow label="Practice time skipped" value={`${monthsElapsed} ${monthsElapsed === 1 ? "step" : "steps"}`} />
+            <ValueRow
+              label="Practice time skipped"
+              value={`${monthsElapsed} ${monthsElapsed === 1 ? "month" : "months"}`}
+            />
           </CardContent>
         </Card>
 
         <Note title="Is this exactly 4.00% a year?">
           <p>
-            Practice Mode credits interest at a fixed 4% annual rate, but time here moves in 30-day
-            Practice steps rather than tracking exact calendar months or a real year.
+            Practice Mode credits interest at a fixed 4% annual rate, but time here moves in Practice
+            months — each one 30 days — rather than tracking exact calendar months or a real year.
           </p>
           <Expander question="Does interest earn interest here?">
             <p>
-              Each step adds interest on your balance as it stands at that moment — so interest credited
-              in an earlier step earns its own interest in the next one. That&apos;s compounding once per
-              step, not continuously the way a real account might calculate it.
+              Each Practice month adds interest on your balance as it stands at that moment — so
+              interest credited in an earlier month earns its own interest in the next one. That&apos;s
+              compounding once per month, not continuously the way a real account might calculate it.
             </p>
           </Expander>
         </Note>

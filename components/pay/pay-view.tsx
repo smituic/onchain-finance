@@ -6,12 +6,12 @@ import {
   PAY_CONTACT_IDS,
   PAY_CONTACTS,
   PRACTICE_HANDLE,
-  type PayActivity,
   type PayContactId,
 } from "@/simulation";
 import { useHasSimulationHydrated, useSimulationStore } from "@/lib/stores/simulation-store";
 import { parseAmountToMicroUnits } from "@/lib/parse-amount";
 import { formatSignedUsd, formatUsd } from "@/lib/format";
+import { payActivityLabel, signedPayActivityAmount } from "@/lib/pay-activity";
 import { PRODUCT_AREAS_BY_ID } from "@/lib/product-areas";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -40,26 +40,6 @@ function needsContact(mode: PayMode): boolean {
 
 function needsNote(mode: PayMode): boolean {
   return mode === "send" || mode === "request";
-}
-
-function activityLabel(activity: PayActivity): string {
-  const contactName = activity.contactId ? PAY_CONTACTS[activity.contactId].displayName : null;
-  switch (activity.kind) {
-    case "send":
-      return `Sent to ${contactName}`;
-    case "receive":
-      return `Received from ${contactName}`;
-    case "deposit":
-      return "Added Cash";
-    case "withdraw":
-      return "Withdrew Cash";
-  }
-}
-
-function signedActivityAmount(activity: PayActivity): number {
-  return activity.kind === "send" || activity.kind === "withdraw"
-    ? -activity.amountMicroUsd
-    : activity.amountMicroUsd;
 }
 
 export function PayView() {
@@ -274,11 +254,11 @@ export function PayView() {
                 className="flex items-center justify-between gap-4 rounded-xl bg-muted/60 px-4 py-3.5"
               >
                 <span className="flex flex-col gap-0.5">
-                  <span className="text-sm font-medium">{activityLabel(entry)}</span>
+                  <span className="text-sm font-medium">{payActivityLabel(entry)}</span>
                   {entry.note ? <span className="text-xs text-muted-foreground">{entry.note}</span> : null}
                 </span>
                 <span className="shrink-0 text-sm font-medium tabular-nums">
-                  {formatSignedUsd(signedActivityAmount(entry))}
+                  {formatSignedUsd(signedPayActivityAmount(entry))}
                 </span>
               </li>
             ))}

@@ -9,7 +9,8 @@ import {
   getNetWorthMicroUsd,
 } from "@/simulation";
 import { useHasSimulationHydrated, useSimulationStore } from "@/lib/stores/simulation-store";
-import { formatAssetAmount, formatUsd } from "@/lib/format";
+import { formatAssetAmount, formatSignedUsd, formatUsd } from "@/lib/format";
+import { payActivityLabel, signedPayActivityAmount } from "@/lib/pay-activity";
 import { HOME_ACTION_AREA_IDS, PRODUCT_AREAS_BY_ID } from "@/lib/product-areas";
 import { Card, CardContent } from "@/components/ui/card";
 import { ValueRow } from "@/components/shell/value-row";
@@ -28,6 +29,7 @@ export function HomeView() {
   const collateralEth = state.borrow.collateralEth;
 
   const featuredExperiments = EXPLORE_EXPERIMENTS.slice(0, 2);
+  const recentPayActivity = state.pay.activity.slice().reverse().slice(0, 3);
 
   return (
     <div className="flex flex-col gap-8">
@@ -153,15 +155,39 @@ export function HomeView() {
       </section>
 
       <section className="flex flex-col gap-3" aria-labelledby="activity-heading">
-        <h2 id="activity-heading" className="font-heading text-sm font-medium">
-          Recent activity
-        </h2>
-        <div className="flex flex-col items-center gap-1.5 rounded-xl border border-dashed border-border px-6 py-10 text-center">
-          <p className="text-sm font-medium">No activity yet</p>
-          <p className="text-sm text-muted-foreground">
-            Money you move in Practice Mode will show up here.
-          </p>
+        <div className="flex items-baseline justify-between">
+          <h2 id="activity-heading" className="font-heading text-sm font-medium">
+            Recent payments
+          </h2>
+          {recentPayActivity.length > 0 ? (
+            <Link href="/pay" className="text-xs text-muted-foreground hover:text-foreground">
+              See all
+            </Link>
+          ) : null}
         </div>
+        {recentPayActivity.length > 0 ? (
+          <ul className="flex flex-col gap-2">
+            {recentPayActivity.map((entry) => (
+              <li
+                key={entry.id}
+                data-testid={`home-activity-${entry.id}`}
+                className="flex items-center justify-between gap-4 rounded-xl bg-muted/60 px-4 py-3.5"
+              >
+                <span className="text-sm font-medium">{payActivityLabel(entry)}</span>
+                <span className="shrink-0 text-sm font-medium tabular-nums">
+                  {formatSignedUsd(signedPayActivityAmount(entry))}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="flex flex-col items-center gap-1.5 rounded-xl border border-dashed border-border px-6 py-10 text-center">
+            <p className="text-sm font-medium">No payments yet</p>
+            <p className="text-sm text-muted-foreground">
+              Money you send, receive, or move in Pay will show up here.
+            </p>
+          </div>
+        )}
       </section>
     </div>
   );

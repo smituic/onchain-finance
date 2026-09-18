@@ -221,5 +221,21 @@ describe("BorrowView", () => {
       fireEvent.click(screen.getByRole("button", { name: /what happens if eth falls/i }));
       expect(screen.getByText(/is called liquidation/)).toBeInTheDocument();
     });
+
+    it("does not claim a price scenario changes ETH's price everywhere in the app, and doesn't imply debt itself shrinks", () => {
+      render(<BorrowView />);
+
+      expect(screen.queryByText(/everywhere in the app/)).not.toBeInTheDocument();
+      expect(
+        screen.getByText(/changes what your ETH is worth and how risky your loan is, not Swap's rate/),
+      ).toBeInTheDocument();
+    });
+
+    it("discloses that Practice loans don't charge interest", () => {
+      render(<BorrowView />);
+      expect(
+        screen.getByText("Practice loans don't charge interest. Real borrowing usually does."),
+      ).toBeInTheDocument();
+    });
   });
 });
