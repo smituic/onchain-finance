@@ -61,6 +61,6 @@ describe("LiquidationExperiment", () => {
 
   it("links to the full Borrow feature", () => {
     render(<LiquidationExperiment />);
-    expect(screen.getByRole("link", { name: "Open full Borrow" })).toHaveAttribute("href", "/borrow");
+    expect(screen.getByRole("link", { name: "Try it in Borrow" })).toHaveAttribute("href", "/borrow");
   });
 });

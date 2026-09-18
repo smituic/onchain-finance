@@ -60,6 +60,6 @@ describe("PaymentsExperiment", () => {
 
   it("links to the full Pay feature", () => {
     render(<PaymentsExperiment />);
-    expect(screen.getByRole("link", { name: "Open full Pay" })).toHaveAttribute("href", "/pay");
+    expect(screen.getByRole("link", { name: "Try it in Pay" })).toHaveAttribute("href", "/pay");
   });
 });

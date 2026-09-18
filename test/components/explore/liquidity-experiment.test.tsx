@@ -60,6 +60,6 @@ describe("LiquidityExperiment", () => {
 
   it("links to the full Swap feature", () => {
     render(<LiquidityExperiment />);
-    expect(screen.getByRole("link", { name: "Open full Swap" })).toHaveAttribute("href", "/swap");
+    expect(screen.getByRole("link", { name: "Try it in Swap" })).toHaveAttribute("href", "/swap");
   });
 });

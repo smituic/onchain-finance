@@ -61,6 +61,6 @@ describe("RiskExperiment", () => {
 
   it("links to the full Invest feature", () => {
     render(<RiskExperiment />);
-    expect(screen.getByRole("link", { name: "Open full Invest" })).toHaveAttribute("href", "/invest");
+    expect(screen.getByRole("link", { name: "Try it in Invest" })).toHaveAttribute("href", "/invest");
   });
 });

@@ -15,7 +15,7 @@ describe("SwapForm", () => {
 
   it("shows a rate preview and its price-impact explainer for a trade above the threshold", () => {
     render(<SwapForm />);
-    fireEvent.change(screen.getByLabelText("From USDC"), { target: { value: "3000" } });
+    fireEvent.change(screen.getByLabelText("From Cash"), { target: { value: "3000" } });
 
     expect(screen.getByText(/You'll receive/)).toHaveTextContent("You'll receive ≈ 0.961538 ETH");
     expect(
@@ -32,7 +32,7 @@ describe("SwapForm", () => {
 
   it("does not show the price-impact explainer for a trade below the meaningful-impact threshold", () => {
     render(<SwapForm />);
-    fireEvent.change(screen.getByLabelText("From USDC"), { target: { value: "10" } });
+    fireEvent.change(screen.getByLabelText("From Cash"), { target: { value: "10" } });
 
     expect(screen.getByText(/You'll receive/)).toBeInTheDocument();
     expect(screen.queryByText(/why did i receive less/i)).not.toBeInTheDocument();
@@ -40,7 +40,7 @@ describe("SwapForm", () => {
 
   it("submits a swap and updates balances immediately", () => {
     render(<SwapForm />);
-    fireEvent.change(screen.getByLabelText("From USDC"), { target: { value: "3000" } });
+    fireEvent.change(screen.getByLabelText("From Cash"), { target: { value: "3000" } });
     fireEvent.click(screen.getByRole("button", { name: "Swap" }));
 
     expect(useSimulationStore.getState().state.balances.ETH).toBe(961_538);
@@ -52,10 +52,16 @@ describe("SwapForm", () => {
     render(<SwapForm />);
     const before = useSimulationStore.getState().state;
 
-    fireEvent.change(screen.getByLabelText("From USDC"), { target: { value: "50000" } });
+    fireEvent.change(screen.getByLabelText("From Cash"), { target: { value: "50000" } });
 
-    expect(screen.getByText("Insufficient balance.")).toBeInTheDocument();
+    expect(screen.getByText("You don't have enough Cash for that swap.")).toBeInTheDocument();
     expect(useSimulationStore.getState().state).toEqual(before);
+  });
+
+  it("explains what Cash is underneath", () => {
+    render(<SwapForm />);
+    expect(screen.getByText("What is Cash, underneath?")).toBeInTheDocument();
+    expect(screen.getByText(/simulated asset behind it is called USDC/)).toBeInTheDocument();
   });
 
   it("labels the pool's rate as the Swap rate", () => {

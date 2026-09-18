@@ -96,12 +96,12 @@ describe("PayView", () => {
     expect(screen.getByTestId("pay-cash-headline")).toHaveTextContent("$10,000.00");
     expect(screen.getByText("$40.00 from Alex Rivera")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Simulate paid" }));
+    fireEvent.click(screen.getByRole("button", { name: "Simulate Alex Rivera paying" }));
 
     expect(screen.getByTestId("pay-cash-headline")).toHaveTextContent("$10,040.00");
     expect(screen.getByText("Received from Alex Rivera")).toBeInTheDocument();
     expect(screen.queryByText("$40.00 from Alex Rivera")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Simulate paid" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Simulate Alex Rivera paying" })).not.toBeInTheDocument();
 
     const requestId = useSimulationStore.getState().state.pay.requests[0].id;
     const second = useSimulationStore.getState().dispatch({ type: "complete-payment-request", requestId });

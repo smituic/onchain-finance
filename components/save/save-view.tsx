@@ -73,7 +73,7 @@ export function SaveView() {
     setReceipt(
       mode === "deposit"
         ? `Moved ${formatUsd(amount)} into savings.`
-        : `Moved ${formatUsd(amount)} back to cash.`,
+        : `Moved ${formatUsd(amount)} back to Cash.`,
     );
     closeTransfer();
   }
@@ -88,7 +88,7 @@ export function SaveView() {
     setReceipt(
       earned > 0
         ? `A month went by — you earned ${formatUsd(earned)} in interest.`
-        : "A month went by. Add money to savings to start earning interest.",
+        : "A month went by. Move money to savings to start earning interest.",
     );
   }
 
@@ -125,11 +125,11 @@ export function SaveView() {
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between">
               <Label htmlFor="savings-amount">
-                {mode === "deposit" ? "Add to savings" : "Withdraw from savings"}
+                {mode === "deposit" ? "Move to savings" : "Move to Cash"}
               </Label>
               <span className="text-xs text-muted-foreground">
                 {mode === "deposit"
-                  ? `${formatUsd(cashMicroUsd)} in cash`
+                  ? `${formatUsd(cashMicroUsd)} in Cash`
                   : `${formatUsd(savings.balance)} in savings`}
               </span>
             </div>
@@ -151,7 +151,7 @@ export function SaveView() {
 
           <div className="flex flex-col gap-2">
             <Button type="submit" size="lg" className="h-12 w-full">
-              {mode === "deposit" ? "Add money" : "Withdraw"}
+              {mode === "deposit" ? "Move to savings" : "Move to Cash"}
             </Button>
             <Button type="button" variant="ghost" className="h-11 w-full" onClick={closeTransfer}>
               Cancel
@@ -161,7 +161,7 @@ export function SaveView() {
       ) : (
         <section className="flex flex-col gap-2">
           <Button size="lg" className="h-12 w-full" onClick={() => openTransfer("deposit")}>
-            Add money
+            Move to savings
           </Button>
           <Button
             variant="outline"
@@ -169,7 +169,7 @@ export function SaveView() {
             disabled={savings.balance <= 0}
             onClick={() => openTransfer("withdraw")}
           >
-            Withdraw
+            Move to Cash
           </Button>
         </section>
       )}
@@ -187,9 +187,9 @@ export function SaveView() {
             value={`${formatRatePercent(SAVINGS_ANNUAL_RATE_BPS)} a year`}
           />
           <ValueRow
-            label="Available to add"
+            label="Available to move"
             value={formatUsd(cashMicroUsd)}
-            hint="Your cash"
+            hint="Your Cash"
             loading={!hasHydrated}
           />
         </CardContent>

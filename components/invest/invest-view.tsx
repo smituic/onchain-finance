@@ -97,7 +97,7 @@ export function InvestView() {
     const executedMicroUsd = result.investmentTrade?.amountMicroUsd ?? amount;
     setReceipt(
       tradeMode === "buy"
-        ? `Invested ${formatUsd(executedMicroUsd)} in ${name}.`
+        ? `Bought ${formatUsd(executedMicroUsd)} of ${name}.`
         : `Sold ${formatUsd(executedMicroUsd)} of ${name}.`,
     );
     closeTrade();
@@ -381,7 +381,7 @@ function InvestmentDetail({
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between">
               <Label htmlFor="invest-amount">
-                {tradeMode === "buy" ? `Invest in ${definition.name}` : `Sell ${definition.name}`}
+                {tradeMode === "buy" ? `Buy ${definition.name}` : `Sell ${definition.name}`}
               </Label>
               <span className="text-xs text-muted-foreground">
                 {tradeMode === "buy" ? `${formatUsd(cashMicroUsd)} in cash` : `${formatUsd(holding.currentValueMicroUsd)} available`}
@@ -400,7 +400,7 @@ function InvestmentDetail({
 
           <div className="flex flex-col gap-2">
             <Button type="submit" size="lg" className="h-12 w-full">
-              {tradeMode === "buy" ? "Invest" : "Sell"}
+              {tradeMode === "buy" ? "Buy" : "Sell"}
             </Button>
             {tradeMode === "sell" ? (
               <Button type="button" variant="outline" className="h-11 w-full" onClick={onSellAll}>
@@ -415,7 +415,7 @@ function InvestmentDetail({
       ) : (
         <section className="flex flex-col gap-2">
           <Button size="lg" className="h-12 w-full" disabled={cashMicroUsd <= 0} onClick={() => onOpenTrade("buy")}>
-            Invest
+            Buy
           </Button>
           {isOwned ? (
             <Button variant="outline" className="h-11 w-full" onClick={() => onOpenTrade("sell")}>

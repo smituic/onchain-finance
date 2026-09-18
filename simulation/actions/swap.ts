@@ -37,7 +37,7 @@ export function applySwap(state: SimulationState, action: SwapAction): ActionRes
   if (!Number.isInteger(amountIn) || amountIn <= 0) {
     return {
       ok: false,
-      error: "Swap amount must be a positive whole number of micro-units.",
+      error: "Enter an amount greater than zero.",
       code: "INVALID_AMOUNT",
     };
   }

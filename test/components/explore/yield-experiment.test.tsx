@@ -58,6 +58,6 @@ describe("YieldExperiment", () => {
 
   it("links to the full Save feature", () => {
     render(<YieldExperiment />);
-    expect(screen.getByRole("link", { name: "Open full Save" })).toHaveAttribute("href", "/save");
+    expect(screen.getByRole("link", { name: "Try it in Save" })).toHaveAttribute("href", "/save");
   });
 });

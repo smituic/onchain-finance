@@ -233,7 +233,7 @@ export function PayView() {
                   className="h-9 shrink-0"
                   onClick={() => completeRequest(request.id)}
                 >
-                  Simulate paid
+                  Simulate {PAY_CONTACTS[request.contactId].displayName} paying
                 </Button>
               </li>
             ))}

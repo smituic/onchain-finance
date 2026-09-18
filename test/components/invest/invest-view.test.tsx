@@ -17,9 +17,9 @@ function selectAsset(testId: string) {
 }
 
 function buy(amount: string) {
-  fireEvent.click(screen.getByRole("button", { name: "Invest" }));
-  fireEvent.change(screen.getByLabelText(/^Invest in /), { target: { value: amount } });
-  fireEvent.click(screen.getByRole("button", { name: "Invest" }));
+  fireEvent.click(screen.getByRole("button", { name: "Buy" }));
+  fireEvent.change(screen.getByLabelText(/^Buy /), { target: { value: amount } });
+  fireEvent.click(screen.getByRole("button", { name: "Buy" }));
 }
 
 function sell(amount: string) {
@@ -52,7 +52,7 @@ describe("InvestView", () => {
     expect(screen.getByRole("heading", { name: "Bitcoin" })).toBeInTheDocument();
     expect(screen.getByTestId("value-row-price")).toHaveTextContent("$60,000.00");
     expect(screen.getByText(/Higher risk/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Invest" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Buy" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Sell" })).not.toBeInTheDocument();
   });
 
@@ -61,7 +61,7 @@ describe("InvestView", () => {
     selectAsset("asset-BTC");
     buy("500");
 
-    expect(screen.getByRole("status")).toHaveTextContent("Invested $499.98 in Bitcoin.");
+    expect(screen.getByRole("status")).toHaveTextContent("Bought $499.98 of Bitcoin.");
     expect(useSimulationStore.getState().state.invest.holdings.BTC.unitsHeld).toBe(8_333);
     expect(useSimulationStore.getState().state.balances.USDC).toBe(toMicroUnits(10_000) - 499_980_000);
     expect(screen.getByTestId("value-row-you-own")).toHaveTextContent("$499.98");
@@ -79,9 +79,9 @@ describe("InvestView", () => {
   it("rejects a zero or unparseable amount", () => {
     render(<InvestView />);
     selectAsset("asset-BTC");
-    fireEvent.click(screen.getByRole("button", { name: "Invest" }));
-    fireEvent.change(screen.getByLabelText(/^Invest in /), { target: { value: "0" } });
-    fireEvent.click(screen.getByRole("button", { name: "Invest" }));
+    fireEvent.click(screen.getByRole("button", { name: "Buy" }));
+    fireEvent.change(screen.getByLabelText(/^Buy /), { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: "Buy" }));
 
     expect(screen.getByText("Enter an amount greater than zero.")).toBeInTheDocument();
   });

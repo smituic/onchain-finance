@@ -12,10 +12,10 @@ async function resetStore() {
   });
 }
 
-function addMoney(amount: string) {
-  fireEvent.click(screen.getByRole("button", { name: "Add money" }));
-  fireEvent.change(screen.getByLabelText("Add to savings"), { target: { value: amount } });
-  fireEvent.click(screen.getByRole("button", { name: "Add money" }));
+function moveToSavings(amount: string) {
+  fireEvent.click(screen.getByRole("button", { name: "Move to savings" }));
+  fireEvent.change(screen.getByLabelText("Move to savings"), { target: { value: amount } });
+  fireEvent.click(screen.getByRole("button", { name: "Move to savings" }));
 }
 
 describe("SaveView", () => {
@@ -31,7 +31,7 @@ describe("SaveView", () => {
 
   it("adds money, moving it out of cash and into savings", () => {
     render(<SaveView />);
-    addMoney("1000");
+    moveToSavings("1000");
 
     expect(screen.getByTestId("savings-balance")).toHaveTextContent("$1,000.00");
     expect(useSimulationStore.getState().state.savings.balance).toBe(toMicroUnits(1_000));
@@ -43,7 +43,7 @@ describe("SaveView", () => {
     render(<SaveView />);
     const before = useSimulationStore.getState().state;
 
-    addMoney("50000");
+    moveToSavings("50000");
 
     expect(screen.getByText("You don't have that much cash.")).toBeInTheDocument();
     expect(useSimulationStore.getState().state).toEqual(before);
@@ -52,9 +52,9 @@ describe("SaveView", () => {
   it("rejects a zero or unparseable amount", () => {
     render(<SaveView />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Add money" }));
-    fireEvent.change(screen.getByLabelText("Add to savings"), { target: { value: "0" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add money" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move to savings" }));
+    fireEvent.change(screen.getByLabelText("Move to savings"), { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: "Move to savings" }));
 
     expect(screen.getByText("Enter an amount greater than zero.")).toBeInTheDocument();
     expect(useSimulationStore.getState().state.savings.balance).toBe(0);
@@ -62,25 +62,25 @@ describe("SaveView", () => {
 
   it("withdraws money back into cash", () => {
     render(<SaveView />);
-    addMoney("1000");
+    moveToSavings("1000");
 
-    fireEvent.click(screen.getByRole("button", { name: "Withdraw" }));
-    fireEvent.change(screen.getByLabelText("Withdraw from savings"), { target: { value: "400" } });
-    fireEvent.click(screen.getByRole("button", { name: "Withdraw" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move to Cash" }));
+    fireEvent.change(screen.getByLabelText("Move to Cash"), { target: { value: "400" } });
+    fireEvent.click(screen.getByRole("button", { name: "Move to Cash" }));
 
     expect(screen.getByTestId("savings-balance")).toHaveTextContent("$600.00");
     expect(useSimulationStore.getState().state.balances.USDC).toBe(toMicroUnits(9_400));
-    expect(screen.getByRole("status")).toHaveTextContent("Moved $400.00 back to cash.");
+    expect(screen.getByRole("status")).toHaveTextContent("Moved $400.00 back to Cash.");
   });
 
   it("cannot withdraw from an empty position", () => {
     render(<SaveView />);
-    expect(screen.getByRole("button", { name: "Withdraw" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Move to Cash" })).toBeDisabled();
   });
 
   it("earns visible interest when the user skips a month ahead", () => {
     render(<SaveView />);
-    addMoney("1000");
+    moveToSavings("1000");
 
     expect(screen.getByTestId("value-row-interest-earned")).toHaveTextContent("$0.00");
 
@@ -94,7 +94,7 @@ describe("SaveView", () => {
 
   it("is explicit that skipping ahead simulates time", () => {
     render(<SaveView />);
-    addMoney("1000");
+    moveToSavings("1000");
     fireEvent.click(screen.getByRole("button", { name: "See one month later" }));
 
     expect(screen.getByText(/skipped ahead 1 month in Practice Mode/)).toBeInTheDocument();

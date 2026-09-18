@@ -22,7 +22,7 @@ describe("HomeView", () => {
     render(<HomeView />);
 
     expect(screen.getByTestId("value-row-cash")).toHaveTextContent("$10,000.00");
-    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("10,000 USDC");
+    expect(screen.getByTestId("value-row-cash")).toHaveTextContent("10,000 Cash");
     expect(screen.getByTestId("value-row-crypto")).toHaveTextContent("$0.00");
     expect(screen.getByTestId("value-row-crypto")).toHaveTextContent("0 ETH");
 

@@ -58,7 +58,7 @@ export function ExperimentShell({
           href={area.href}
           className="text-center text-sm text-muted-foreground underline underline-offset-4 hover:text-foreground"
         >
-          Open full {area.label}
+          Try it in {area.label}
         </Link>
       </div>
     </div>

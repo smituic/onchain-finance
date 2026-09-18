@@ -5,13 +5,14 @@ import { ArrowDownUp } from "lucide-react";
 import { applyAction, getPoolSpotPriceMicroUsd, getPriceMicroUsd, type AssetId } from "@/simulation";
 import { useSimulationStore } from "@/lib/stores/simulation-store";
 import { parseAmountToMicroUnits } from "@/lib/parse-amount";
-import { formatAssetAmount, formatUsd } from "@/lib/format";
+import { displayAssetSymbol, formatAssetAmount, formatUsd } from "@/lib/format";
 import { PRODUCT_AREAS_BY_ID } from "@/lib/product-areas";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent } from "@/components/ui/card";
 import { PageHeader } from "@/components/shell/page-header";
+import { Note } from "@/components/shell/note";
 import { PriceImpactNote } from "@/components/swap/price-impact-note";
 import { RateDivergenceNote } from "@/components/swap/rate-divergence-note";
 
@@ -33,8 +34,15 @@ export function SwapForm() {
     ? applyAction(state, { type: "swap", fromAsset, toAsset, amountIn: amountInMicroUnits })
     : null;
 
-  const parseError = amountInput.trim() !== "" && amountInMicroUnits === null ? "Enter a valid amount." : null;
-  const errorMessage = parseError ?? (preview && !preview.ok ? preview.error : null);
+  const parseError =
+    amountInput.trim() !== "" && amountInMicroUnits === null ? "Enter an amount greater than zero." : null;
+  const errorMessage =
+    parseError ??
+    (preview && !preview.ok
+      ? preview.code === "INSUFFICIENT_BALANCE"
+        ? `You don't have enough ${displayAssetSymbol(fromAsset)} for that swap.`
+        : preview.error
+      : null);
   const receipt = preview?.ok ? preview.swap : undefined;
 
   function handleFlip() {
@@ -79,7 +87,7 @@ export function SwapForm() {
 
             <div className="flex flex-col gap-1.5">
               <div className="flex items-center justify-between">
-                <Label htmlFor="amount">From {fromAsset}</Label>
+                <Label htmlFor="amount">From {displayAssetSymbol(fromAsset)}</Label>
                 <span className="text-xs text-muted-foreground">
                   Balance: {formatAssetAmount(state.balances[fromAsset], fromAsset)}
                 </span>
@@ -109,7 +117,7 @@ export function SwapForm() {
             </Button>
 
             <div className="flex items-center justify-between text-sm text-muted-foreground">
-              <span>To {toAsset}</span>
+              <span>To {displayAssetSymbol(toAsset)}</span>
               <span>Balance: {formatAssetAmount(state.balances[toAsset], toAsset)}</span>
             </div>
 
@@ -134,6 +142,14 @@ export function SwapForm() {
           </form>
         </CardContent>
       </Card>
+
+      <Note title="What is Cash, underneath?">
+        <p>
+          In this product, Cash represents a digital dollar. The simulated asset behind it is called USDC — a
+          stablecoin, designed to track the value of one US dollar. Practice Mode uses simulated money only, so
+          nothing here touches real currency.
+        </p>
+      </Note>
     </div>
   );
 }

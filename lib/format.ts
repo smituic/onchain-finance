@@ -1,4 +1,4 @@
-import { ASSETS, fromMicroUnits, INVESTMENT_ASSETS, type AssetId, type InvestmentAssetId } from "@/simulation";
+import { fromMicroUnits, INVESTMENT_ASSETS, type AssetId, type InvestmentAssetId } from "@/simulation";
 
 const usdFormatter = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
@@ -7,10 +7,20 @@ export function formatUsd(amountMicroUsd: number): string {
   return usdFormatter.format(fromMicroUnits(amountMicroUsd));
 }
 
+const DISPLAY_ASSET_SYMBOL: Record<AssetId, string> = { USDC: "Cash", ETH: "ETH" };
+
+/**
+ * Consumer-facing label for an asset — "Cash" for USDC, "ETH" as-is. Domain
+ * truth (AssetId, ASSETS[...].symbol) stays "USDC"; this is presentation only.
+ */
+export function displayAssetSymbol(assetId: AssetId): string {
+  return DISPLAY_ASSET_SYMBOL[assetId];
+}
+
 /** Formats an asset's integer micro-units as a display amount, e.g. "1.5 ETH". */
 export function formatAssetAmount(amountMicroUnits: number, assetId: AssetId): string {
   const amount = fromMicroUnits(amountMicroUnits).toLocaleString("en-US", { maximumFractionDigits: 6 });
-  return `${amount} ${ASSETS[assetId].symbol}`;
+  return `${amount} ${displayAssetSymbol(assetId)}`;
 }
 
 /** Formats a curated investment's integer micro-units as a display amount, e.g. "0.008333 BTC". */

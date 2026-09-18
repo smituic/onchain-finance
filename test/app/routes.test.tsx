@@ -33,7 +33,7 @@ describe("product routes", () => {
   it("renders Save with its primary action and where-interest-comes-from explanation", () => {
     render(<SavePage />);
     expect(screen.getByRole("heading", { name: "Save" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add money" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Move to savings" })).toBeInTheDocument();
     expect(screen.getByText("Where does the interest come from?")).toBeInTheDocument();
   });
 
@@ -78,7 +78,7 @@ describe("product routes", () => {
     render(<SwapPage />);
     expect(screen.getByRole("heading", { name: "Swap" })).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText("From USDC"), { target: { value: "3000" } });
+    fireEvent.change(screen.getByLabelText("From Cash"), { target: { value: "3000" } });
     expect(screen.getByText(/You'll receive/)).toHaveTextContent("You'll receive ≈ 0.961538 ETH");
 
     fireEvent.click(screen.getByRole("button", { name: "Swap" }));
