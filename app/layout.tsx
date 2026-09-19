@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { SimulationStoreHydration } from "@/components/simulation-store-hydration";
+import { StoreHydration } from "@/components/store-hydration";
 import { AppShell } from "@/components/shell/app-shell";
 import "./globals.css";
 
@@ -15,7 +15,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html lang="en" className="dark h-full antialiased">
       <body className="min-h-full flex flex-col font-sans">
-        <SimulationStoreHydration />
+        <StoreHydration />
         <AppShell>{children}</AppShell>
       </body>
     </html>

@@ -1,12 +1,15 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import { AppSidebarNav, AppTabBarNav } from "@/components/shell/app-nav";
-import { PracticeModeBadge } from "@/components/shell/practice-mode-badge";
+import { ModeDescription } from "@/components/shell/mode-description";
+import { ModeSwitch } from "@/components/shell/mode-switch";
 
 /**
  * The frame every screen sits in: a sidebar on desktop, a tab bar on mobile,
  * and one column of content sized for a phone at any width — larger screens
- * get more room around the product, not a wider dashboard.
+ * get more room around the product, not a wider dashboard. The header
+ * carries the Practice / Real mode control (see ModeSwitch); which mode a
+ * page renders is decided by the page itself via ByMode.
  */
 export function AppShell({ children }: { children: ReactNode }) {
   return (
@@ -18,9 +21,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </Link>
           <AppSidebarNav />
         </div>
-        <p className="px-3 text-xs leading-relaxed text-muted-foreground">
-          You&apos;re in Practice Mode. Every balance here is simulated — nothing is real money.
-        </p>
+        <ModeDescription className="px-3 text-xs leading-relaxed text-muted-foreground" />
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -28,7 +29,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Link href="/" className="font-heading text-base font-semibold tracking-tight md:hidden">
             onchain
           </Link>
-          <PracticeModeBadge />
+          <ModeSwitch />
         </header>
 
         <main className="mx-auto w-full max-w-xl flex-1 px-5 pb-28 md:px-8 md:pb-16">{children}</main>

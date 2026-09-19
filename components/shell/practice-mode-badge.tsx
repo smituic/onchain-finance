@@ -1,8 +1,8 @@
 /**
- * The one consistent Practice Mode treatment, shown in the app header on
- * every screen. Deliberately a quiet pill rather than a warning banner:
- * simulated money is the normal state of the product today, not an error.
- * When Real Mode exists, the mode switch belongs in this slot.
+ * The quiet Practice Mode pill shown in the app header when Real Mode is
+ * not enabled for this build (see ModeSwitch). Deliberately a pill rather
+ * than a warning banner: simulated money is the normal state of the
+ * product, not an error.
  */
 export function PracticeModeBadge() {
   return (

@@ -8,13 +8,17 @@ import SwapPage from "@/app/swap/page";
 import BorrowPage from "@/app/borrow/page";
 import ExplorePage from "@/app/explore/page";
 import { useSimulationStore } from "@/lib/stores/simulation-store";
+import { useModeStore } from "@/lib/stores/mode-store";
 import { createInitialState } from "@/simulation";
 
 describe("product routes", () => {
   beforeEach(async () => {
     localStorage.clear();
     useSimulationStore.setState({ state: createInitialState() });
+    // Practice, as a build without Real Mode configured would be.
+    useModeStore.setState({ mode: "practice", realModeEnabled: false, hasAcknowledgedRealIntro: false, hasHydrated: false });
     await act(async () => {
+      await useModeStore.persist.rehydrate();
       await useSimulationStore.persist.rehydrate();
     });
   });
@@ -83,5 +87,71 @@ describe("product routes", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Swap" }));
     expect(useSimulationStore.getState().state.balances.ETH).toBe(961_538);
+  });
+
+  describe("in Real Mode", () => {
+    beforeEach(() => {
+      useModeStore.setState({ mode: "real", realModeEnabled: true, hasAcknowledgedRealIntro: true, hasHydrated: true });
+    });
+
+    it("renders the Real Home placeholder, with no Practice balances and nothing invented", () => {
+      render(<HomePage />);
+
+      expect(screen.getByTestId("real-home")).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Your real account isn't set up yet" })).toBeInTheDocument();
+      expect(screen.getByText(/test network/)).toBeInTheDocument();
+      expect(screen.queryByText("Total balance")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("total-balance")).not.toBeInTheDocument();
+      expect(screen.queryByText(/\$10,000\.00/)).not.toBeInTheDocument();
+    });
+
+    it("renders the Real Pay placeholder without Practice contacts, balance, or activity", () => {
+      render(<PayPage />);
+
+      expect(screen.getByTestId("real-pay")).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Real Pay is next" })).toBeInTheDocument();
+      expect(screen.getByText("Testnet only")).toBeInTheDocument();
+      expect(screen.queryByTestId("pay-cash-headline")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Send money" })).not.toBeInTheDocument();
+      expect(screen.queryByText("Maya Chen")).not.toBeInTheDocument();
+    });
+
+    it.each([
+      ["Save", SavePage, "Move to savings"],
+      ["Invest", InvestPage, "Buy"],
+      ["Swap", SwapPage, "Swap"],
+      ["Borrow", BorrowPage, "Get some ETH in Swap"],
+    ] as const)("renders %s as Practice-only, without its Practice controls", (label, Page, practiceControl) => {
+      render(<Page />);
+
+      expect(screen.getByRole("heading", { name: label })).toBeInTheDocument();
+      expect(screen.getByText(`${label} is Practice-only for now.`)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Try it in Practice" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: practiceControl })).not.toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: practiceControl })).not.toBeInTheDocument();
+    });
+
+    it("'Try it in Practice' leaves the user on the same area, now in Practice", () => {
+      render(<SavePage />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Try it in Practice" }));
+
+      expect(useModeStore.getState().mode).toBe("practice");
+      expect(screen.getByRole("button", { name: "Move to savings" })).toBeInTheDocument();
+      expect(screen.queryByText("Save is Practice-only for now.")).not.toBeInTheDocument();
+    });
+
+    it("keeps Explore as the same Practice sandbox and says so", () => {
+      render(<ExplorePage />);
+
+      expect(screen.getByRole("heading", { name: "Explore" })).toBeInTheDocument();
+      expect(screen.getByText(/Explore always uses its own separate Practice money/)).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: /What happens if ETH falls\?/ })).toBeInTheDocument();
+    });
+  });
+
+  it("does not mention Real Mode on Explore while in Practice", () => {
+    render(<ExplorePage />);
+    expect(screen.queryByText(/Explore always uses its own separate Practice money/)).not.toBeInTheDocument();
   });
 });

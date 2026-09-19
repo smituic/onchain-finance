@@ -1,4 +1,6 @@
 import type { Metadata } from "next";
+import { ByMode } from "@/components/shell/by-mode";
+import { PracticeOnly } from "@/components/shell/practice-only";
 import { SwapForm } from "@/components/swap/swap-form";
 
 export const metadata: Metadata = {
@@ -6,5 +8,5 @@ export const metadata: Metadata = {
 };
 
 export default function SwapPage() {
-  return <SwapForm />;
+  return <ByMode practice={<SwapForm />} real={<PracticeOnly areaId="swap" />} />;
 }

@@ -20,7 +20,34 @@ The MVP lets people *learn by doing*: manage a simulated portfolio, swap assets,
 
 Two rounds of post-completion product-quality cleanup are also done: Batch A (Home recent payments, clearer Swap-rate explanation, Borrow interest disclosure, Explore sandbox clarity) and Batch B (consistent consumer vocabulary — Cash instead of USDC, Buy/Sell in Invest, clearer Save/Pay wording, friendlier Swap errors).
 
-See [ROADMAP.md](ROADMAP.md) for what's next (Phase 2: testnet and Real Mode).
+**Phase 2 (Real Mode on a testnet) is active**, starting with Pay — a deliberate change from the earlier plan, recorded in [ROADMAP.md](ROADMAP.md). So far:
+
+- **Practice/Real boundary (done).** A Practice / Real switch in the header, a one-time introduction on first entry, and a per-page boundary that renders each area's Practice or Real presentation. Areas with no Real implementation yet (Save, Invest, Swap, Borrow) say so and offer "Try it in Practice". Explore stays the same isolated Practice sandbox in both modes.
+- **Real account foundation (next).** Real Home and Real Pay are currently honest placeholders: no account, balance, or transactions are shown because none exist yet.
+
+Real Mode is **testnet-only** for all of Phase 2 — no mainnet, no real-value funds. Practice Mode is untouched: the simulation engine and its persistence are unchanged, and tests assert Real Mode never mutates Practice state.
+
+### Enabling Real Mode locally
+
+Real Mode is behind a build-time flag and is off by default, so an unconfigured build is the Phase 1 Practice-only app. To see the switch:
+
+```bash
+# .env.local (git-ignored)
+NEXT_PUBLIC_REAL_MODE_ENABLED=true
+```
+
+The flag is authoritative: a browser that remembers Real Mode from an earlier build falls back to Practice when a later build has the flag off.
+
+## Development
+
+```bash
+pnpm install
+pnpm dev          # http://localhost:3000
+pnpm test         # Vitest (unit + React Testing Library)
+pnpm lint
+pnpm exec tsc --noEmit
+pnpm build
+```
 
 ## Documentation
 

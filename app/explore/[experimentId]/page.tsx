@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { EXPLORE_EXPERIMENTS, EXPLORE_EXPERIMENTS_BY_ID } from "@/components/explore/experiments";
 import { ExperimentView } from "@/components/explore/experiment-view";
+import { ExploreModeNotice } from "@/components/explore/explore-mode-notice";
 import type { ExperimentId } from "@/lib/explore/experiment-state";
 
 export function generateStaticParams() {
@@ -29,5 +30,11 @@ export default async function ExperimentPage({ params }: PageProps<"/explore/[ex
   const experiment = findExperiment(experimentId);
   if (!experiment) notFound();
 
-  return <ExperimentView experimentId={experiment.id} />;
+  // Not wrapped in ByMode: experiments always run on separate Practice money.
+  return (
+    <div className="flex flex-col gap-6">
+      <ExploreModeNotice />
+      <ExperimentView experimentId={experiment.id} />
+    </div>
+  );
 }
