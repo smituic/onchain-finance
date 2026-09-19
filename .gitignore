@@ -32,6 +32,7 @@ Thumbs.db
 # Misc
 .cache/
 coverage/
+.pnpm-store/
 
 # TypeScript / Next.js
 *.tsbuildinfo

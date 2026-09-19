@@ -10,16 +10,39 @@ import nextTs from "eslint-config-next/typescript";
  * pieces here — rather than relying on blocks layering.
  */
 
-// Blockchain SDKs (Phase 2). None are installed yet; the fence exists ahead
-// of them so Real Mode's account/chain code can only land inside lib/real/**
-// and the server-side route handlers under app/api/real/**. Components,
-// pages, and stores talk to lib/real's interface, never to a chain SDK.
-const CHAIN_SDK_PACKAGES = ["viem", "@base-org/account", "wagmi", "@wagmi/core", "ethers", "web3"];
+// Blockchain/wallet SDKs (Phase 2). The fence exists so Real Mode's
+// account/chain code can only land inside lib/real/** and the server-side
+// route handlers under app/api/real/**. Components, pages, and stores talk to
+// lib/real's interface, never to a chain SDK. `viem` and `@privy-io/*` are
+// installed on the poc/privy-real-account branch for a DISPOSABLE
+// proof-of-concept that lives only under lib/poc/** and app/dev/** (exempted
+// below, and nothing else may import from those directories).
+const CHAIN_SDK_PACKAGES = [
+  "viem",
+  "@privy-io/react-auth",
+  "@privy-io/js-sdk-core",
+  "@base-org/account",
+  "wagmi",
+  "@wagmi/core",
+  "ethers",
+  "web3",
+];
 const CHAIN_SDK_MESSAGE =
   "Blockchain SDKs may only be imported inside lib/real/** (and app/api/real/** route handlers). Everything else goes through lib/real's interface — see ARCHITECTURE.md.";
 const noChainSdk = {
   paths: CHAIN_SDK_PACKAGES.map((name) => ({ name, message: CHAIN_SDK_MESSAGE })),
   patterns: [{ group: CHAIN_SDK_PACKAGES.map((name) => `${name}/*`), message: CHAIN_SDK_MESSAGE }],
+};
+
+// Nothing in the product may depend on the disposable PoC.
+const noPocImports = {
+  patterns: [
+    {
+      group: ["@/lib/poc", "@/lib/poc/*", "@/app/dev/*"],
+      message:
+        "lib/poc/** and app/dev/** are a disposable proof-of-concept and must not be imported by product code.",
+    },
+  ],
 };
 
 // Framework-agnostic layers: no React, Next.js, or Zustand.
@@ -60,7 +83,16 @@ const eslintConfig = defineConfig([
   {
     // Everything in the app that isn't one of the special layers below.
     files: ["app/**/*.{ts,tsx}", "components/**/*.{ts,tsx}", "lib/**/*.{ts,tsx}"],
-    ignores: ["app/api/real/**", "lib/real/**", "components/explore/**", "lib/explore/**"],
+    ignores: ["app/api/real/**", "lib/real/**", "components/explore/**", "lib/explore/**", "lib/poc/**", "app/dev/**"],
+    rules: { "no-restricted-imports": restrictImports(noChainSdk, noPocImports) },
+  },
+  {
+    // The disposable Privy PoC (poc/privy-real-account branch). The vendor SDK
+    // may be imported by exactly two files — the React bridge and the viem
+    // chain reader — so the rest of the PoC proves it can consume a
+    // vendor-neutral facade, which is the architectural question under test.
+    files: ["lib/poc/**/*.{ts,tsx}", "app/dev/**/*.{ts,tsx}"],
+    ignores: ["lib/poc/privy/privy-bridge.tsx", "lib/poc/privy/chain.ts"],
     rules: { "no-restricted-imports": restrictImports(noChainSdk) },
   },
   {

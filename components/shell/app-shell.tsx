@@ -1,5 +1,8 @@
+"use client";
+
 import type { ReactNode } from "react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { AppSidebarNav, AppTabBarNav } from "@/components/shell/app-nav";
 import { ModeDescription } from "@/components/shell/mode-description";
 import { ModeSwitch } from "@/components/shell/mode-switch";
@@ -10,8 +13,16 @@ import { ModeSwitch } from "@/components/shell/mode-switch";
  * get more room around the product, not a wider dashboard. The header
  * carries the Practice / Real mode control (see ModeSwitch); which mode a
  * page renders is decided by the page itself via ByMode.
+ *
+ * `/dev/*` is a disposable PoC exemption: no product nav, no ModeSwitch, no
+ * constrained `<main>`. Remove this branch when the Privy PoC is discarded.
  */
 export function AppShell({ children }: { children: ReactNode }) {
+  const pathname = usePathname();
+  if (pathname.startsWith("/dev/")) {
+    return <div className="min-h-full flex-1">{children}</div>;
+  }
+
   return (
     <div className="flex min-h-full flex-1 flex-col md:flex-row">
       <aside className="sticky top-0 hidden h-dvh w-60 shrink-0 flex-col justify-between border-r border-border px-4 py-6 md:flex">

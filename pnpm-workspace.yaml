@@ -1,3 +1,23 @@
 allowBuilds:
+  # Transitive native/optional build scripts pulled in by @privy-io/react-auth
+  # (WalletConnect/AppKit and ws performance addons). None are needed: the
+  # packages fall back to pure-JS implementations, so keep builds disabled.
+  '@reown/appkit': false
+  bufferutil: false
+  keccak: false
   sharp: false
   unrs-resolver: false
+  utf-8-validate: false
+# Written by pnpm when adding @privy-io/react-auth@3.44.0: these releases were
+# newer than pnpm's minimum-release-age gate at install time.
+minimumReleaseAgeExclude:
+  - '@privy-io/api-base@1.11.0'
+  - '@privy-io/are-addresses-equal@0.0.13'
+  - '@privy-io/chains@0.6.1'
+  - '@privy-io/encoding@0.2.3'
+  - '@privy-io/ethereum@0.2.4'
+  - '@privy-io/js-sdk-core@0.76.1'
+  - '@privy-io/popup@0.0.6'
+  - '@privy-io/react-auth@3.44.0'
+  - '@privy-io/routes@0.4.1'
+  - '@privy-io/std@0.0.1'
