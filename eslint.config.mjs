@@ -10,11 +10,23 @@ import nextTs from "eslint-config-next/typescript";
  * pieces here — rather than relying on blocks layering.
  */
 
-// Blockchain SDKs (Phase 2). None are installed yet; the fence exists ahead
-// of them so Real Mode's account/chain code can only land inside lib/real/**
-// and the server-side route handlers under app/api/real/**. Components,
-// pages, and stores talk to lib/real's interface, never to a chain SDK.
-const CHAIN_SDK_PACKAGES = ["viem", "@base-org/account", "wagmi", "@wagmi/core", "ethers", "web3"];
+// Blockchain SDKs (Phase 2). The fence exists so Real Mode's account/chain
+// code can only land inside lib/real/** and the server-side route handlers
+// under app/api/real/**. Components, pages, and stores talk to lib/real's
+// interface, never to a chain SDK. (viem and @coinbase/cdp-core are installed
+// for the disposable CDP PoC under lib/poc/** — see the carve-out below —
+// nothing else may import them yet.)
+const CHAIN_SDK_PACKAGES = [
+  "viem",
+  "@coinbase/cdp-core",
+  "@coinbase/cdp-hooks",
+  "@coinbase/cdp-react",
+  "@base-org/account",
+  "wagmi",
+  "@wagmi/core",
+  "ethers",
+  "web3",
+];
 const CHAIN_SDK_MESSAGE =
   "Blockchain SDKs may only be imported inside lib/real/** (and app/api/real/** route handlers). Everything else goes through lib/real's interface — see ARCHITECTURE.md.";
 const noChainSdk = {
@@ -60,7 +72,13 @@ const eslintConfig = defineConfig([
   {
     // Everything in the app that isn't one of the special layers below.
     files: ["app/**/*.{ts,tsx}", "components/**/*.{ts,tsx}", "lib/**/*.{ts,tsx}"],
-    ignores: ["app/api/real/**", "lib/real/**", "components/explore/**", "lib/explore/**"],
+    // lib/poc/** is the disposable CDP proof-of-concept (branch
+    // poc/cdp-real-account). It is the only non-lib/real place allowed to
+    // import a chain SDK, and only until the PoC is deleted or its verified
+    // parts move into lib/real/**. app/dev/cdp-poc/** is NOT exempt: the
+    // diagnostic page goes through lib/poc/cdp's interface, same as
+    // production pages will go through lib/real's.
+    ignores: ["app/api/real/**", "lib/real/**", "lib/poc/**", "components/explore/**", "lib/explore/**"],
     rules: { "no-restricted-imports": restrictImports(noChainSdk) },
   },
   {
