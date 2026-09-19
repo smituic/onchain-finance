@@ -18,6 +18,8 @@ The MVP lets people *learn by doing*: manage a simulated portfolio, swap assets,
 - **Borrow** — collateralized borrowing against simulated ETH, including simulated liquidation
 - **Explore** — isolated, interactive financial experiments (liquidity, liquidation, yield, risk, payments) that let a user cause a financial outcome themselves rather than read about it
 
+Two rounds of post-completion product-quality cleanup are also done: Batch A (Home recent payments, clearer Swap-rate explanation, Borrow interest disclosure, Explore sandbox clarity) and Batch B (consistent consumer vocabulary — Cash instead of USDC, Buy/Sell in Invest, clearer Save/Pay wording, friendlier Swap errors).
+
 See [ROADMAP.md](ROADMAP.md) for what's next (Phase 2: testnet and Real Mode).
 
 ## Documentation

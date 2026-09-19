@@ -8,6 +8,8 @@ Three phases, increasing in realism and risk. We do not move to the next phase u
 
 **Status: Complete.** All seven areas — Home, Pay, Save, Invest, Swap, Borrow, and Explore — are built and functional in Practice Mode, and the exit criteria below are met. Phase 2 is next.
 
+Two rounds of post-completion product-quality polish followed: Batch A (Home recent payments, clearer ETH market-vs-Swap-rate explanation, Borrow interest disclosure, Explore sandbox clarity) and Batch B (consistent consumer vocabulary — Cash instead of USDC, Buy/Sell in Invest, "Move to savings"/"Move to Cash" in Save, contact-specific Pay request wording, "Try it in X" in Explore, friendlier Swap errors).
+
 **Goal:** Deliver the complete consumer product — all seven areas — in Practice Mode. Prove that people can learn on-chain finance concepts by doing them, entirely simulated, with no real funds, wallets, or chain interaction yet.
 
 **In scope:**
