@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 import { useSimulationStore } from "@/lib/stores/simulation-store";
 import { useModeStore } from "@/lib/stores/mode-store";
+import { useRealAccountStore } from "@/lib/stores/real-account-store";
 
 /**
  * Mounted once in the root layout. Triggers every persisted store's
@@ -14,6 +15,7 @@ export function StoreHydration() {
   useEffect(() => {
     void useModeStore.persist.rehydrate();
     void useSimulationStore.persist.rehydrate();
+    void useRealAccountStore.persist.rehydrate();
   }, []);
 
   return null;
