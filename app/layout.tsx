@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { StoreHydration } from "@/components/store-hydration";
-import { AppShell } from "@/components/shell/app-shell";
+import { AppFrame } from "@/components/shell/app-frame";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -16,7 +16,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
     <html lang="en" className="dark h-full antialiased">
       <body className="min-h-full flex flex-col font-sans">
         <StoreHydration />
-        <AppShell>{children}</AppShell>
+        <AppFrame>{children}</AppFrame>
       </body>
     </html>
   );

@@ -14,7 +14,24 @@ import nextTs from "eslint-config-next/typescript";
 // of them so Real Mode's account/chain code can only land inside lib/real/**
 // and the server-side route handlers under app/api/real/**. Components,
 // pages, and stores talk to lib/real's interface, never to a chain SDK.
-const CHAIN_SDK_PACKAGES = ["viem", "@base-org/account", "wagmi", "@wagmi/core", "ethers", "web3"];
+const CHAIN_SDK_PACKAGES = [
+  "viem",
+  "@base-org/account",
+  "wagmi",
+  "@wagmi/core",
+  "ethers",
+  "web3",
+  "permissionless",
+  "ox",
+  "@turnkey/http",
+  "@turnkey/webauthn-stamper",
+  "@turnkey/viem",
+  "@turnkey/api-key-stamper",
+  "@turnkey/sdk-browser",
+  "@turnkey/sdk-server",
+  "@turnkey/core",
+  "@turnkey/indexed-db-stamper",
+];
 const CHAIN_SDK_MESSAGE =
   "Blockchain SDKs may only be imported inside lib/real/** (and app/api/real/** route handlers). Everything else goes through lib/real's interface — see ARCHITECTURE.md.";
 const noChainSdk = {
@@ -60,7 +77,14 @@ const eslintConfig = defineConfig([
   {
     // Everything in the app that isn't one of the special layers below.
     files: ["app/**/*.{ts,tsx}", "components/**/*.{ts,tsx}", "lib/**/*.{ts,tsx}"],
-    ignores: ["app/api/real/**", "lib/real/**", "components/explore/**", "lib/explore/**"],
+    ignores: [
+      "app/api/real/**",
+      "lib/real/**",
+      "app/api/dev/turnkey-poc/**",
+      "lib/poc/turnkey/**",
+      "components/explore/**",
+      "lib/explore/**",
+    ],
     rules: { "no-restricted-imports": restrictImports(noChainSdk) },
   },
   {
@@ -78,6 +102,30 @@ const eslintConfig = defineConfig([
           },
         ],
       }),
+    },
+  },
+  {
+    // Isolated Turnkey PoC. May use chain SDKs, but never Practice state or
+    // production stores. Not the future lib/real adapter.
+    files: ["lib/poc/turnkey/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "@/simulation",
+              message: "The Turnkey PoC must not touch the Practice simulation.",
+            },
+          ],
+          patterns: [
+            {
+              group: ["@/simulation/*", "@/lib/stores/*", "@/components/real/*"],
+              message: "The Turnkey PoC must stay isolated from Practice state and production Real UI.",
+            },
+          ],
+        },
+      ],
     },
   },
   {
