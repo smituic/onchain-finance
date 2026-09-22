@@ -73,6 +73,76 @@ describe("lib/real/** boundary — no Turnkey session-login authority anywhere",
   });
 });
 
+describe("Pimlico access — no generic proxy, key stays server-only", () => {
+  it("PIMLICO_API_KEY / pimlicoApiKey is referenced only under lib/real/server/** and the payment route handlers that pass it through", () => {
+    const projectRoot = process.cwd();
+    const scanDirs = ["app", "components", "lib"].map((dir) => path.join(projectRoot, dir));
+    const offenders: string[] = [];
+    for (const dir of scanDirs) {
+      const files = listFilesRecursive(dir).filter((f) => f.endsWith(".ts") || f.endsWith(".tsx"));
+      for (const file of files) {
+        if (file.includes(`${path.sep}lib${path.sep}real${path.sep}server${path.sep}`)) continue;
+        if (file.includes(`${path.sep}app${path.sep}api${path.sep}real${path.sep}payments${path.sep}`)) continue;
+        const source = readFileSync(file, "utf8");
+        if (/PIMLICO_API_KEY|pimlicoApiKey/.test(source)) offenders.push(path.relative(projectRoot, file));
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("only lib/real/server/pimlico.ts ever builds a Pimlico URL", () => {
+    const projectRoot = process.cwd();
+    const files = [
+      ...listFilesRecursive(path.join(projectRoot, "app")),
+      ...listFilesRecursive(path.join(projectRoot, "lib")),
+      ...listFilesRecursive(path.join(projectRoot, "components")),
+    ].filter((f) => f.endsWith(".ts") || f.endsWith(".tsx"));
+
+    const offenders = files.filter((file) => {
+      if (file.endsWith(`${path.sep}lib${path.sep}real${path.sep}server${path.sep}pimlico.ts`)) return false;
+      return /api\.pimlico\.io/.test(readFileSync(file, "utf8"));
+    });
+    expect(offenders).toEqual([]);
+  });
+
+  it("no payments route imports lib/real/server/pimlico.ts directly, or forwards a client-supplied JSON-RPC method/params — every route goes through the purpose-built server/payments.ts resolvers", () => {
+    const routesDir = path.resolve(process.cwd(), "app/api/real/payments");
+    const files = listFilesRecursive(routesDir).filter((f) => f.endsWith(".ts"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const file of files) {
+      const source = readFileSync(file, "utf8");
+      expect(source).not.toMatch(/from\s+["']@\/lib\/real\/server\/pimlico["']/);
+      expect(source).toMatch(/from\s+["']@\/lib\/real\/server\/payments["']/);
+    }
+  });
+});
+
+describe("Payment records never hold signing material", () => {
+  it("schema.sql's payment_attempts table has no signature column", () => {
+    const source = readFileSync(path.resolve(process.cwd(), "lib/real/server/schema.sql"), "utf8");
+    const tableStart = source.indexOf("CREATE TABLE IF NOT EXISTS payment_attempts");
+    const tableEnd = source.indexOf(");", tableStart);
+    expect(tableStart).toBeGreaterThan(-1);
+    const tableBody = source.slice(tableStart, tableEnd);
+    expect(tableBody).not.toMatch(/\bsignature\b/i);
+  });
+
+  it("the PaymentAttempt type and its Neon/in-memory adapters never persist a signature field", () => {
+    for (const file of ["lib/real/server/payment-attempts.ts", "lib/real/server/neon-store.ts"]) {
+      const source = readFileSync(path.resolve(process.cwd(), file), "utf8");
+      expect(source).not.toMatch(/\bsignature\s*:/i);
+      expect(source).not.toMatch(/\bsignature\s+TEXT/i);
+    }
+  });
+
+  it("the real-payment-store client store is entirely unpersisted — no zustand persist middleware, no localStorage", () => {
+    const source = readFileSync(path.resolve(process.cwd(), "lib/stores/real-payment-store.ts"), "utf8");
+    expect(source).not.toMatch(/zustand\/middleware/);
+    expect(source).not.toMatch(/\bpersist\(/);
+    expect(source).not.toMatch(/localStorage/);
+  });
+});
+
 describe("real-account-store.ts localStorage — public account metadata only", () => {
   beforeEach(() => {
     localStorage.clear();

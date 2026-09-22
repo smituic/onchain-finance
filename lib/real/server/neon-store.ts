@@ -2,6 +2,7 @@ import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import type { ChallengePurpose, ChallengeStore, StoredChallenge } from "./challenge-store";
 import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
 import type { ExternalProvisioningOutcome, RegistrationAttempt, RegistrationAttemptState, RegistrationAttemptStore } from "./registration-attempts";
+import type { PaymentAttempt, PaymentAttemptState, PaymentAttemptStore, ReserveResult } from "./payment-attempts";
 
 /**
  * SERVER-ONLY durable adapters for the three vendor-neutral interfaces
@@ -81,6 +82,37 @@ function toPasskey(row: Row): RealPasskeyRecord {
     credentialBackedUp: (row.credential_backed_up as boolean | null) ?? null,
     status: row.status as RealPasskeyRecord["status"],
     createdAt: new Date(row.created_at as string).toISOString(),
+  };
+}
+
+function toPaymentAttempt(row: Row): PaymentAttempt {
+  return {
+    id: row.id as string,
+    appUserId: row.app_user_id as string,
+    safeAddress: row.safe_address as string,
+    recipient: row.recipient as string,
+    amountBaseUnits: row.amount_base_units as string,
+    chainId: Number(row.chain_id),
+    tokenAddress: row.token_address as string,
+    state: row.state as PaymentAttemptState,
+    nonce: (row.nonce as string | null) ?? null,
+    callData: (row.call_data as string | null) ?? null,
+    factory: (row.factory as string | null) ?? null,
+    factoryData: (row.factory_data as string | null) ?? null,
+    callGasLimit: (row.call_gas_limit as string | null) ?? null,
+    verificationGasLimit: (row.verification_gas_limit as string | null) ?? null,
+    preVerificationGas: (row.pre_verification_gas as string | null) ?? null,
+    maxFeePerGas: (row.max_fee_per_gas as string | null) ?? null,
+    maxPriorityFeePerGas: (row.max_priority_fee_per_gas as string | null) ?? null,
+    paymaster: (row.paymaster as string | null) ?? null,
+    paymasterData: (row.paymaster_data as string | null) ?? null,
+    paymasterVerificationGasLimit: (row.paymaster_verification_gas_limit as string | null) ?? null,
+    paymasterPostOpGasLimit: (row.paymaster_post_op_gas_limit as string | null) ?? null,
+    expectedUserOperationHash: (row.expected_user_operation_hash as string | null) ?? null,
+    transactionHash: (row.transaction_hash as string | null) ?? null,
+    failureReason: (row.failure_reason as string | null) ?? null,
+    createdAt: new Date(row.created_at as string).toISOString(),
+    updatedAt: new Date(row.updated_at as string).toISOString(),
   };
 }
 
@@ -279,18 +311,146 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
   };
 }
 
+/**
+ * Batch 2d: durable Real Pay attempts. `reserve()` is a SINGLE SQL statement
+ * (a CTE) — never a separate count-then-insert pair — so the per-account
+ * rate limit and the one-non-terminal-attempt-per-account invariant are both
+ * enforced atomically at the database level, safe under concurrent requests
+ * and across multiple serverless instances:
+ *
+ *  1. `pg_advisory_xact_lock(hashtext(app_user_id))` — the TRANSACTION-scoped
+ *     variant, not the session-scoped `pg_advisory_lock` — serializes
+ *     concurrent reserve() calls for the SAME account only (different
+ *     accounts never contend) and releases automatically when this single
+ *     statement's implicit transaction ends. This matters specifically
+ *     because Neon's HTTP query function opens a fresh connection per call
+ *     (there is no persistent session to scope a session-level lock to, and
+ *     a session-scoped lock could leak indefinitely on a driver that never
+ *     reuses connections); a transaction-scoped lock has no such failure
+ *     mode — it cannot outlive the statement that took it.
+ *  2. `_lock` is marked `MATERIALIZED` and its result is cross-joined into
+ *     `_counts`'s FROM clause — not just referenced in passing. Both of
+ *     these are deliberate: MATERIALIZED forces Postgres to actually
+ *     execute (and not inline-optimize-away) this CTE regardless of planner
+ *     version, and the cross join means `_counts` cannot be computed
+ *     without `_lock` having already produced its one row — i.e. the lock
+ *     is provably acquired before the quota counts are read, not just
+ *     "hopefully" ordered by CTE position.
+ *  3. The hourly/daily/active counts are read inside that lock, so a second
+ *     concurrent call for the same account can't read a stale count.
+ *  4. The INSERT only happens `WHERE hourly < 10 AND daily < 30 AND active = 0`.
+ *
+ * The partial unique index (payment_attempts_one_active_per_account, see
+ * schema.sql) is the independent, final backstop for the one-active-
+ * attempt-per-account invariant — even if the lock/count logic here were
+ * ever bypassed or buggy, Postgres itself refuses a second non-terminal row
+ * for the same account, surfaced here as a 23505 unique-violation mapped to
+ * the same "payment_in_progress" result.
+ */
+export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, false>): PaymentAttemptStore {
+  return {
+    async reserve(input): Promise<ReserveResult> {
+      try {
+        const rows = (await sql`
+          WITH _lock AS MATERIALIZED (
+            SELECT pg_advisory_xact_lock(hashtext(${input.appUserId})::bigint)
+          ), _counts AS (
+            SELECT
+              count(*) FILTER (WHERE created_at > now() - interval '1 hour') AS hourly,
+              count(*) FILTER (WHERE created_at > now() - interval '1 day') AS daily,
+              count(*) FILTER (WHERE state NOT IN ('confirmed', 'failed', 'cancelled')) AS active
+            FROM payment_attempts, _lock
+            WHERE app_user_id = ${input.appUserId}
+          )
+          INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state)
+          SELECT ${input.appUserId}, ${input.safeAddress}, ${input.recipient}, ${input.amountBaseUnits}, ${input.chainId}, ${input.tokenAddress}, 'prepared'
+          FROM _counts
+          WHERE hourly < 10 AND daily < 30 AND active = 0
+          RETURNING *
+        `) as Row[];
+
+        if (rows.length === 0) {
+          // The statement ran but its WHERE matched nothing — need one more
+          // read to tell "quota" apart from "already has one in flight" for
+          // an accurate result (the write itself already refused either
+          // way, so this read is informational, not a second decision).
+          const counts = (await sql`
+            SELECT
+              count(*) FILTER (WHERE created_at > now() - interval '1 hour') AS hourly,
+              count(*) FILTER (WHERE created_at > now() - interval '1 day') AS daily,
+              count(*) FILTER (WHERE state NOT IN ('confirmed', 'failed', 'cancelled')) AS active
+            FROM payment_attempts WHERE app_user_id = ${input.appUserId}
+          `) as Row[];
+          const active = Number(counts[0]?.active ?? 0);
+          if (active > 0) return { ok: false, reason: "payment_in_progress" };
+          return { ok: false, reason: "quota_exceeded" };
+        }
+
+        return { ok: true, attempt: toPaymentAttempt(rows[0]!) };
+      } catch (error) {
+        if (isUniqueViolation(error, "payment_attempts_one_active_per_account")) {
+          return { ok: false, reason: "payment_in_progress" };
+        }
+        throw error;
+      }
+    },
+
+    async findById(id) {
+      const rows = (await sql`SELECT * FROM payment_attempts WHERE id = ${id}`) as Row[];
+      return rows[0] ? toPaymentAttempt(rows[0]) : null;
+    },
+
+    async findLatestByAppUserId(appUserId) {
+      const rows = (await sql`
+        SELECT * FROM payment_attempts WHERE app_user_id = ${appUserId} ORDER BY created_at DESC LIMIT 1
+      `) as Row[];
+      return rows[0] ? toPaymentAttempt(rows[0]) : null;
+    },
+
+    async transition({ id, from, to, patch }) {
+      const rows = (await sql`
+        UPDATE payment_attempts
+        SET
+          state = ${to},
+          nonce = COALESCE(${patch?.nonce ?? null}, nonce),
+          call_data = COALESCE(${patch?.callData ?? null}, call_data),
+          factory = COALESCE(${patch?.factory ?? null}, factory),
+          factory_data = COALESCE(${patch?.factoryData ?? null}, factory_data),
+          call_gas_limit = COALESCE(${patch?.callGasLimit ?? null}, call_gas_limit),
+          verification_gas_limit = COALESCE(${patch?.verificationGasLimit ?? null}, verification_gas_limit),
+          pre_verification_gas = COALESCE(${patch?.preVerificationGas ?? null}, pre_verification_gas),
+          max_fee_per_gas = COALESCE(${patch?.maxFeePerGas ?? null}, max_fee_per_gas),
+          max_priority_fee_per_gas = COALESCE(${patch?.maxPriorityFeePerGas ?? null}, max_priority_fee_per_gas),
+          paymaster = COALESCE(${patch?.paymaster ?? null}, paymaster),
+          paymaster_data = COALESCE(${patch?.paymasterData ?? null}, paymaster_data),
+          paymaster_verification_gas_limit = COALESCE(${patch?.paymasterVerificationGasLimit ?? null}, paymaster_verification_gas_limit),
+          paymaster_post_op_gas_limit = COALESCE(${patch?.paymasterPostOpGasLimit ?? null}, paymaster_post_op_gas_limit),
+          expected_user_operation_hash = COALESCE(${patch?.expectedUserOperationHash ?? null}, expected_user_operation_hash),
+          transaction_hash = COALESCE(${patch?.transactionHash ?? null}, transaction_hash),
+          failure_reason = COALESCE(${patch?.failureReason ?? null}, failure_reason),
+          updated_at = now()
+        WHERE id = ${id} AND state = ${from}
+        RETURNING *
+      `) as Row[];
+      return rows[0] ? toPaymentAttempt(rows[0]) : null;
+    },
+  };
+}
+
 export type NeonDurableStores = {
   challengeStore: ChallengeStore;
   registry: RealAccountRegistry;
   attempts: RegistrationAttemptStore;
+  payments: PaymentAttemptStore;
 };
 
-/** One connection (Neon's HTTP query function is stateless/per-request-safe), three adapters. */
+/** One connection (Neon's HTTP query function is stateless/per-request-safe), four adapters. */
 export function createNeonDurableStores(databaseUrl: string): NeonDurableStores {
   const sql = neon(databaseUrl);
   return {
     challengeStore: createNeonChallengeStore(sql),
     registry: createNeonRealAccountRegistry(sql),
     attempts: createNeonRegistrationAttemptStore(sql),
+    payments: createNeonPaymentAttemptStore(sql),
   };
 }

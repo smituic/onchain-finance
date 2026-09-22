@@ -7,13 +7,13 @@ import { PageHeader } from "@/components/shell/page-header";
 import { Note } from "@/components/shell/note";
 import { AccountSetup } from "@/components/real/account-setup";
 import { CashBalance } from "@/components/real/cash-balance";
+import { RealPayForm } from "@/components/real/real-pay-form";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 
 /**
  * Real Mode's Pay. Pay is where Real Mode starts, so this is where account
- * setup lives; once an account exists, its real Cash balance is shown here
- * too (CashBalance) so there's an honest answer to "what could I send" —
- * sending itself, the form and transaction flow, is still Batch 2d.
+ * setup lives; once an account exists, its real Cash balance (CashBalance)
+ * and the send flow (RealPayForm, Batch 2d) are shown here.
  */
 export function RealPayView() {
   const area = PRODUCT_AREAS_BY_ID.pay;
@@ -27,16 +27,18 @@ export function RealPayView() {
       <section className="flex flex-col gap-2">
         <p className="text-sm text-muted-foreground">Real Mode</p>
         <h2 className="font-heading text-xl font-semibold tracking-tight">
-          {account ? "Sending Cash is next" : "Real Pay is next"}
+          {account ? "Send Cash" : "Real Pay is next"}
         </h2>
         <p className="text-sm text-muted-foreground">
           {account
-            ? "Your account is connected. Sending Cash, each payment's status, and history follow from here."
-            : "The next step is connecting a real account and showing its real test-network Cash balance. Sending Cash, each payment's status, and history follow from there."}
+            ? "Send test Cash to another Base Sepolia address. Each payment needs a fresh passkey approval."
+            : "The next step is connecting a real account and showing its real test-network Cash balance."}
         </p>
       </section>
 
       <CashBalance />
+
+      {account ? <RealPayForm /> : null}
 
       <AccountSetup />
 

@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import HomePage from "@/app/page";
 import PayPage from "@/app/pay/page";
 import SavePage from "@/app/save/page";
@@ -10,6 +10,7 @@ import ExplorePage from "@/app/explore/page";
 import { ModeSwitch } from "@/components/shell/mode-switch";
 import { SIMULATION_STORE_NAME, useSimulationStore } from "@/lib/stores/simulation-store";
 import { useModeStore } from "@/lib/stores/mode-store";
+import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import { createInitialState, toMicroUnits, type SimulationState } from "@/simulation";
 
 /**
@@ -96,5 +97,32 @@ describe("Real Mode never touches Practice financial state", () => {
     expect(screen.getByTestId("value-row-savings")).toHaveTextContent("$2,000.00");
     expect(screen.getByTestId("value-row-borrowed")).toHaveTextContent("−$1,000.00");
     expectPracticeUntouched();
+  });
+
+  it("Pay in Real Mode with a signed-in account and the send form on screen, with every control pressed", async () => {
+    const ACCOUNT = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+        if (url.endsWith("/api/real/payments/latest")) return ok({ attempt: null });
+        if (url.endsWith("/api/real/account/balance")) return ok({ token: "USDC", decimals: 6, balanceBaseUnits: "20000000" });
+        if (url.endsWith("/api/real/session")) return ok({ authenticated: false });
+        return ok({});
+      }),
+    );
+
+    render(<PayPage />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+
+    for (const button of screen.queryAllByRole("button")) {
+      fireEvent.click(button);
+    }
+
+    expectPracticeUntouched();
+    useRealAccountStore.setState({ account: null, status: "idle", error: null, hasHydrated: true });
+    vi.unstubAllGlobals();
   });
 });

@@ -16,6 +16,7 @@ export type RealServerConfig = {
   /** One or more allowed WebAuthn origins (exact scheme+host+port), e.g. "http://localhost:3000". */
   expectedOrigins: string[];
   rpcUrl: string;
+  pimlicoApiKey: string;
 };
 
 export function readRealServerConfig(
@@ -27,6 +28,7 @@ export function readRealServerConfig(
   const sessionSecret = env.REAL_SESSION_SECRET?.trim();
   const rpId = env.NEXT_PUBLIC_REAL_RP_ID?.trim();
   const originsRaw = env.NEXT_PUBLIC_REAL_ORIGIN?.trim();
+  const pimlicoApiKey = env.PIMLICO_API_KEY?.trim();
 
   const missing: string[] = [];
   if (!turnkeyParentOrganizationId) missing.push("TURNKEY_PARENT_ORGANIZATION_ID");
@@ -35,6 +37,7 @@ export function readRealServerConfig(
   if (!sessionSecret) missing.push("REAL_SESSION_SECRET");
   if (!rpId) missing.push("NEXT_PUBLIC_REAL_RP_ID");
   if (!originsRaw) missing.push("NEXT_PUBLIC_REAL_ORIGIN");
+  if (!pimlicoApiKey) missing.push("PIMLICO_API_KEY");
   if (missing.length > 0) {
     return { error: `Missing server configuration: ${missing.join(", ")}.` };
   }
@@ -49,6 +52,7 @@ export function readRealServerConfig(
     rpName: env.NEXT_PUBLIC_REAL_RP_NAME?.trim() || "onchain-finance",
     expectedOrigins: originsRaw!.split(",").map((origin) => origin.trim()).filter(Boolean),
     rpcUrl: env.BASE_SEPOLIA_RPC_URL?.trim() || env.NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL?.trim() || "https://sepolia.base.org",
+    pimlicoApiKey: pimlicoApiKey!,
   };
 }
 

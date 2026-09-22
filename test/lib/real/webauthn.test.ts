@@ -15,6 +15,7 @@ const config: RealServerConfig = {
   rpName: "Test",
   expectedOrigins: [ORIGIN],
   rpcUrl: "https://sepolia.base.org",
+  pimlicoApiKey: "pim_test_key",
 };
 
 describe("webauthn registration verification (real crypto fixtures)", () => {

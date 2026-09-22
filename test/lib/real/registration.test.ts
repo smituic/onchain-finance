@@ -41,6 +41,7 @@ const config: RealServerConfig = {
   rpName: "Test",
   expectedOrigins: [ORIGIN],
   rpcUrl: "https://sepolia.base.org",
+  pimlicoApiKey: "pim_test_key",
 };
 
 const DUMMY_BYTES_RETURN = encodeAbiParameters([{ type: "bytes" }], ["0x600a600c600039600a6000f3" as Hex]);

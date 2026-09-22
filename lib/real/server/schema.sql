@@ -83,3 +83,53 @@ CREATE TABLE IF NOT EXISTS real_passkeys (
   created_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS real_passkeys_app_user_id_idx ON real_passkeys (app_user_id);
+
+-- Batch 2d: durable Real Pay attempts. No signing material is ever written
+-- here — the UserOperation signature is used only in-process during
+-- /api/real/payments/submit and discarded; expected_user_operation_hash is
+-- the durable reconciliation key, computed and persisted BEFORE
+-- eth_sendUserOperation is ever called (see lib/real/payments/hash.ts), so a
+-- lost send response still leaves a way to look the operation up.
+--
+-- State machine: prepared -> awaiting_authorization -> signed -> submitting
+-- -> submitted -> confirmed, with failed/cancelled/unknown as alternates.
+-- "submitting" is written BEFORE eth_sendUserOperation is ever dispatched
+-- (lib/real/server/payments.ts's resolveSubmitPayment) specifically so a
+-- crash between "signature verified" and "dispatch result recorded" leaves
+-- a durable row that reconciliation (never a resend) can resolve —
+-- resolvePaymentStatus treats "submitting" exactly like "unknown".
+CREATE TABLE IF NOT EXISTS payment_attempts (
+  id                                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  app_user_id                          TEXT NOT NULL REFERENCES real_accounts (app_user_id),
+  safe_address                         TEXT NOT NULL,
+  recipient                            TEXT NOT NULL,
+  amount_base_units                    TEXT NOT NULL,
+  chain_id                             INT NOT NULL,
+  token_address                        TEXT NOT NULL,
+  state                                TEXT NOT NULL CHECK (state IN ('prepared', 'awaiting_authorization', 'signed', 'submitting', 'submitted', 'confirmed', 'failed', 'cancelled', 'unknown')),
+  nonce                                TEXT,
+  call_data                            TEXT,
+  factory                              TEXT,
+  factory_data                         TEXT,
+  call_gas_limit                       TEXT,
+  verification_gas_limit               TEXT,
+  pre_verification_gas                 TEXT,
+  max_fee_per_gas                      TEXT,
+  max_priority_fee_per_gas             TEXT,
+  paymaster                            TEXT,
+  paymaster_data                       TEXT,
+  paymaster_verification_gas_limit     TEXT,
+  paymaster_post_op_gas_limit          TEXT,
+  expected_user_operation_hash         TEXT,
+  transaction_hash                     TEXT,
+  failure_reason                       TEXT,
+  created_at                           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS payment_attempts_app_user_created_idx ON payment_attempts (app_user_id, created_at DESC);
+
+-- At most one non-terminal attempt per account, enforced by Postgres itself
+-- (not application code) — see lib/real/server/neon-store.ts's reserve().
+CREATE UNIQUE INDEX IF NOT EXISTS payment_attempts_one_active_per_account
+  ON payment_attempts (app_user_id)
+  WHERE state NOT IN ('confirmed', 'failed', 'cancelled');

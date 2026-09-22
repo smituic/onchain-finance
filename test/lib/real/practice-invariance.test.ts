@@ -9,6 +9,7 @@ vi.mock("@simplewebauthn/browser", () => ({
 
 const { useRealAccountStore } = await import("@/lib/stores/real-account-store");
 const { useRealBalanceStore } = await import("@/lib/stores/real-balance-store");
+const { useRealPaymentStore } = await import("@/lib/stores/real-payment-store");
 
 /** A deliberately non-default Practice portfolio, matching the pattern already established for Explore's isolation tests (experiment-isolation.test.tsx). */
 function buildNonDefaultMainState(): SimulationState {
@@ -84,6 +85,47 @@ describe("Real balance store — Practice invariance", () => {
     );
 
     await useRealBalanceStore.getState().fetchBalance();
+
+    expect(useSimulationStore.getState().state).toBe(mainState);
+    expect(useSimulationStore.getState().state).toEqual(mainState);
+
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("Real payment store — Practice invariance", () => {
+  beforeEach(() => {
+    useRealPaymentStore.setState({
+      status: "idle",
+      recipientInput: "",
+      amountInput: "",
+      attempt: null,
+      subOrganizationId: null,
+      isAuthorizing: false,
+      error: null,
+    });
+  });
+
+  it("init, review, checkStatus, cancel, and reset never touch the Practice simulation store, even by reference", async () => {
+    const mainState = buildNonDefaultMainState();
+    useSimulationStore.setState({ state: mainState, hasHydrated: true });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+        if (url.endsWith("/api/real/payments/latest")) return ok({ attempt: null });
+        if (url.includes("/cancel")) return ok({ attempt: null });
+        throw new Error(`Unexpected network call to ${url}`);
+      }),
+    );
+
+    await useRealPaymentStore.getState().init();
+    useRealPaymentStore.getState().review(); // no recipient/amount set — resolves as a local validation error, no network
+    await useRealPaymentStore.getState().checkStatus(); // no attempt — no-op
+    await useRealPaymentStore.getState().cancel();
+    useRealPaymentStore.getState().reset();
 
     expect(useSimulationStore.getState().state).toBe(mainState);
     expect(useSimulationStore.getState().state).toEqual(mainState);

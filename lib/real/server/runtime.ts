@@ -1,6 +1,7 @@
 import { createInMemoryChallengeStore, type ChallengeStore } from "./challenge-store";
 import { createInMemoryRealAccountRegistry, type RealAccountRegistry } from "./registry";
 import { createInMemoryRegistrationAttemptStore, type RegistrationAttemptStore } from "./registration-attempts";
+import { createInMemoryPaymentAttemptStore, type PaymentAttemptStore } from "./payment-attempts";
 import { createNeonDurableStores } from "./neon-store";
 
 /**
@@ -19,9 +20,10 @@ import { createNeonDurableStores } from "./neon-store";
 let registry: RealAccountRegistry | null = null;
 let challengeStore: ChallengeStore | null = null;
 let attemptStore: RegistrationAttemptStore | null = null;
+let paymentAttemptStore: PaymentAttemptStore | null = null;
 
 function ensureStoresInitialized(): void {
-  if (registry && challengeStore && attemptStore) return;
+  if (registry && challengeStore && attemptStore && paymentAttemptStore) return;
 
   const databaseUrl = process.env.DATABASE_URL?.trim();
   if (databaseUrl) {
@@ -29,12 +31,14 @@ function ensureStoresInitialized(): void {
     registry = durable.registry;
     challengeStore = durable.challengeStore;
     attemptStore = durable.attempts;
+    paymentAttemptStore = durable.payments;
     return;
   }
 
   registry = createInMemoryRealAccountRegistry();
   challengeStore = createInMemoryChallengeStore();
   attemptStore = createInMemoryRegistrationAttemptStore();
+  paymentAttemptStore = createInMemoryPaymentAttemptStore();
 }
 
 export function getRealAccountRegistry(): RealAccountRegistry {
@@ -50,4 +54,9 @@ export function getChallengeStore(): ChallengeStore {
 export function getRegistrationAttemptStore(): RegistrationAttemptStore {
   ensureStoresInitialized();
   return attemptStore!;
+}
+
+export function getPaymentAttemptStore(): PaymentAttemptStore {
+  ensureStoresInitialized();
+  return paymentAttemptStore!;
 }

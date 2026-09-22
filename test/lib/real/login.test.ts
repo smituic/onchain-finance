@@ -43,6 +43,7 @@ const config: RealServerConfig = {
   rpName: "Test",
   expectedOrigins: [ORIGIN],
   rpcUrl: "https://sepolia.base.org",
+  pimlicoApiKey: "pim_test_key",
 };
 
 const USER_HANDLE = "user-handle-1";

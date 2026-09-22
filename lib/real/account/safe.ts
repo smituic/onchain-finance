@@ -1,5 +1,6 @@
 import { toSafeSmartAccount } from "permissionless/accounts";
-import { type LocalAccount } from "viem";
+import { toAccount } from "viem/accounts";
+import { type Address, type LocalAccount } from "viem";
 import { entryPoint07Address } from "viem/account-abstraction";
 import { REAL_SAFE } from "../constants";
 
@@ -34,5 +35,32 @@ export async function createRealSafeAccount(input: { owner: LocalAccount; public
     safeProxyFactoryAddress: REAL_SAFE.proxyFactoryAddress,
     safeSingletonAddress: REAL_SAFE.singletonAddress,
     useMultiSendForSetup: REAL_SAFE.useMultiSendForSetup,
+  });
+}
+
+function unsupportedReadOnly(method: string): () => Promise<never> {
+  return async () => {
+    throw new Error(`${method}() is not supported by this read-only owner account — it exists only so the server can call prepareUserOperation without ever holding signing authority.`);
+  };
+}
+
+/**
+ * A read-only stand-in for the Safe's owner, used ONLY for server-side
+ * prepareUserOperation (deriving nonce/factory/factoryData/gas/paymaster
+ * fields) — never for signing. Every signing method throws, so if this is
+ * ever mis-wired into a submit path it fails loudly instead of silently
+ * forging (or attempting to forge) a signature. The server never holds the
+ * owner's private key material at all; real signing happens client-side via
+ * signing/verified-account.ts's createVerifiedTurnkeyOwnerAccount, driven by
+ * a fresh WebAuthn ceremony.
+ */
+export function createReadOnlyOwnerAccount(ownerAddress: Address): LocalAccount {
+  return toAccount({
+    address: ownerAddress,
+    sign: unsupportedReadOnly("sign"),
+    signMessage: unsupportedReadOnly("signMessage"),
+    signTransaction: unsupportedReadOnly("signTransaction"),
+    signTypedData: unsupportedReadOnly("signTypedData"),
+    signAuthorization: unsupportedReadOnly("signAuthorization"),
   });
 }

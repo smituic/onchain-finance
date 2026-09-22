@@ -32,6 +32,7 @@ const config: RealServerConfig = {
   rpName: "Test",
   expectedOrigins: ["http://localhost:3000"],
   rpcUrl: "https://sepolia.base.org",
+  pimlicoApiKey: "pim_test_key",
 };
 
 function completedActivity(result: unknown) {

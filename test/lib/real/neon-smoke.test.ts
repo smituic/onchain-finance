@@ -13,7 +13,10 @@ import { afterAll, describe, expect, it } from "vitest";
  * constraints are enforced, challenge consume is atomic under real
  * concurrent HTTP requests (not just JS's single-threaded run-to-completion
  * semantics), and a full registration state-machine walk finalizes
- * correctly.
+ * correctly. A second describe block below extends this to Batch 2d's
+ * payment_attempts atomic reservation/quota logic — same reasoning: the
+ * transaction-scoped advisory lock and the partial unique index need to be
+ * proven against real Postgres concurrency, not just JS's.
  *
  * Run manually, after applying lib/real/server/schema.sql to a Neon
  * database, with:
@@ -249,5 +252,208 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
       expect(serialized).not.toContain(forbidden);
     }
     expect(Object.keys(row)).not.toContain("private_key");
+  });
+});
+
+/**
+ * Batch 2d: the atomic reservation/quota/single-non-terminal-attempt logic
+ * is security- and sponsorship-critical, so it is proven here against a
+ * real Neon database — not just the in-process concurrency proofs in
+ * test/lib/real/payment-attempts-reserve.test.ts (which prove the
+ * *contract*, but cannot prove real Postgres actually enforces it under
+ * genuine concurrent HTTP requests the way this file's other describe
+ * block already does for challenge consumption).
+ *
+ * Requires `payment_attempts` (Batch 2d's schema.sql addition) to already
+ * be applied. Run manually with:
+ *
+ *   DATABASE_URL="postgres://..." pnpm test:neon-smoke
+ */
+describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (live database) — Batch 2d", () => {
+  const databaseUrl = process.env.DATABASE_URL;
+  const runId = randomUUID().slice(0, 8);
+  const appUserId = (suffix: string) => `smoke-pay-${runId}-user-${suffix}`;
+  const SAFE_ADDRESS = "0xd9a4c22fb34dc74317edc8006140d66c8fa03266";
+  const RECIPIENT = "0x2222222222222222222222222222222222222222";
+  const TOKEN_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+  const CHAIN_ID = 84532;
+
+  const cleanupAppUserIds = new Set<string>();
+
+  afterAll(async () => {
+    if (!databaseUrl) return;
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl);
+    for (const id of cleanupAppUserIds) {
+      await sql`DELETE FROM payment_attempts WHERE app_user_id = ${id}`;
+      await sql`DELETE FROM real_accounts WHERE app_user_id = ${id}`;
+    }
+  });
+
+  async function seedRealAccount(userId: string) {
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    await sql`
+      INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
+      VALUES (${userId}, 'smoke-sub-org', 'smoke-turnkey-user', 'smoke-wallet', 'smoke-wallet-account', '0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF', ${SAFE_ADDRESS}, 1)
+    `;
+  }
+
+  function reserveInput(userId: string) {
+    return { appUserId: userId, safeAddress: SAFE_ADDRESS, recipient: RECIPIENT, amountBaseUnits: "1000000", chainId: CHAIN_ID, tokenAddress: TOKEN_ADDRESS };
+  }
+
+  it("A: the payment_attempts table exists", async () => {
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const rows = (await sql`SELECT to_regclass('payment_attempts') AS exists`) as { exists: string | null }[];
+    expect(rows[0]?.exists, "table payment_attempts is missing — apply the Batch 2d schema addition first").toBe("payment_attempts");
+  });
+
+  it("B/F: several concurrent reserve() calls for the same account — exactly one succeeds under real concurrent HTTP requests, atomically", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("concurrency");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+
+    const results = await Promise.all(Array.from({ length: 5 }, () => store.reserve(reserveInput(userId))));
+    const succeeded = results.filter((result) => result.ok);
+    const inProgress = results.filter((result) => !result.ok && result.reason === "payment_in_progress");
+    expect(succeeded).toHaveLength(1);
+    expect(inProgress).toHaveLength(4);
+  }, 30_000);
+
+  it("C: the partial unique index itself — independent of reserve()'s advisory lock — prevents two active attempts for one account", async () => {
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const userId = appUserId("unique-index");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+
+    // Raw concurrent inserts, deliberately bypassing reserve()'s advisory
+    // lock entirely — this proves the UNIQUE INDEX is an independent
+    // backstop, not merely a restatement of the lock's own guarantee.
+    const insertOne = () => sql`
+      INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state)
+      VALUES (${userId}, ${SAFE_ADDRESS}, ${RECIPIENT}, '1000000', ${CHAIN_ID}, ${TOKEN_ADDRESS}, 'prepared')
+      RETURNING id
+    `;
+
+    const results = await Promise.allSettled([insertOne(), insertOne()]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(String(rejected[0]!.reason)).toMatch(/payment_attempts_one_active_per_account|duplicate key/i);
+  });
+
+  it("D: a cancelled (terminal) attempt frees the slot for a later reservation", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("terminal");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+
+    const first = await store.reserve(reserveInput(userId));
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    const blocked = await store.reserve(reserveInput(userId));
+    expect(blocked).toEqual({ ok: false, reason: "payment_in_progress" });
+
+    const cancelled = await store.transition({ id: first.attempt.id, from: "prepared", to: "cancelled" });
+    expect(cancelled?.state).toBe("cancelled");
+
+    const second = await store.reserve(reserveInput(userId));
+    expect(second.ok).toBe(true);
+  });
+
+  it("E: the hourly quota (10/hour) is enforced by the real database, not merely in-process logic", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("quota");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+
+    for (let i = 0; i < 10; i += 1) {
+      const reserved = await store.reserve(reserveInput(userId));
+      expect(reserved.ok).toBe(true);
+      if (!reserved.ok) return;
+      await store.transition({ id: reserved.attempt.id, from: "prepared", to: "cancelled" });
+    }
+
+    const eleventh = await store.reserve(reserveInput(userId));
+    expect(eleventh).toEqual({ ok: false, reason: "quota_exceeded" });
+  }, 60_000);
+
+  it("G/H: CAS state transitions and expected_user_operation_hash persistence work against the real database", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("cas");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+
+    const reserved = await store.reserve(reserveInput(userId));
+    expect(reserved.ok).toBe(true);
+    if (!reserved.ok) return;
+
+    // A CAS from the wrong state is rejected (null), never silently applied.
+    expect(await store.transition({ id: reserved.attempt.id, from: "signed", to: "submitting" })).toBeNull();
+
+    const awaiting = await store.transition({
+      id: reserved.attempt.id,
+      from: "prepared",
+      to: "awaiting_authorization",
+      patch: { expectedUserOperationHash: "0xsmokehash" },
+    });
+    expect(awaiting?.state).toBe("awaiting_authorization");
+    expect(awaiting?.expectedUserOperationHash).toBe("0xsmokehash");
+
+    // Persisted, re-readable — not just returned in the same round trip.
+    const reread = await store.findById(reserved.attempt.id);
+    expect(reread?.expectedUserOperationHash).toBe("0xsmokehash");
+
+    // A duplicate concurrent CAS out of the same state — only one may win.
+    const [a, b] = await Promise.all([
+      store.transition({ id: reserved.attempt.id, from: "awaiting_authorization", to: "signed" }),
+      store.transition({ id: reserved.attempt.id, from: "awaiting_authorization", to: "signed" }),
+    ]);
+    expect([a, b].filter((result) => result !== null)).toHaveLength(1);
+
+    const submitting = await store.transition({ id: reserved.attempt.id, from: "signed", to: "submitting" });
+    expect(submitting?.state).toBe("submitting");
+    const confirmed = await store.transition({ id: reserved.attempt.id, from: "submitting", to: "confirmed", patch: { transactionHash: "0xsmoketx" } });
+    expect(confirmed?.state).toBe("confirmed");
+    expect(confirmed?.transactionHash).toBe("0xsmoketx");
+  });
+
+  it("I: the database row never contains signing/private material — direct read, not just the mapped type", async () => {
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const userId = appUserId("no-secrets");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+
+    const rows = (await sql`
+      INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state, expected_user_operation_hash)
+      VALUES (${userId}, ${SAFE_ADDRESS}, ${RECIPIENT}, '1000000', ${CHAIN_ID}, ${TOKEN_ADDRESS}, 'awaiting_authorization', '0xsmokehash')
+      RETURNING *
+    `) as Record<string, unknown>[];
+    const row = rows[0]!;
+
+    expect(Object.keys(row)).not.toContain("signature");
+    const serialized = JSON.stringify(row).toLowerCase();
+    for (const forbidden of ["signature", "privatekey", "private_key", "seedphrase", "stamper", "signingkey"]) {
+      expect(serialized).not.toContain(forbidden);
+    }
   });
 });
