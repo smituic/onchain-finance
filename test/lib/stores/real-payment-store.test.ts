@@ -66,3 +66,95 @@ describe("real-payment-store — init() resets prior-account state before fetchi
     vi.unstubAllGlobals();
   });
 });
+
+/**
+ * Pre-2f hardening: a generation token closes the gap "reset before init"
+ * alone leaves open — a request started under one account/generation can
+ * still resolve AFTER a newer reset()/init() has already run. See
+ * real-payment-store.ts's `generation` closure variable.
+ */
+describe("real-payment-store — stale async response race (pre-2f hardening)", () => {
+  it("a stale init() response arriving after reset() is a no-op, never resurrects a cleared attempt", async () => {
+    let resolveFetch: (value: Response) => void = () => {};
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => (resolveFetch = resolve))));
+    const store = createRealPaymentStore();
+
+    const pending = store.getState().init();
+    // Simulates an account switch/logout racing ahead of the in-flight
+    // /latest fetch — reset() is the standalone action real-pay-form.tsx's
+    // effect calls on logout.
+    store.getState().reset();
+    expect(store.getState().attempt).toBeNull();
+    expect(store.getState().status).toBe("editing");
+
+    resolveFetch(
+      jsonResponse(200, {
+        attempt: {
+          id: "stale-attempt",
+          state: "awaiting_authorization",
+          recipient: "0x1111111111111111111111111111111111111111",
+          amountBaseUnits: "1000000",
+          transactionHash: null,
+          failureReason: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          prepared: null,
+        },
+        subOrganizationId: "sub-org-stale",
+      }),
+    );
+    await pending;
+
+    expect(store.getState().attempt).toBeNull();
+    expect(store.getState().status).toBe("editing");
+    vi.unstubAllGlobals();
+  });
+
+  it("latest-request-wins: an older init() response resolving after a newer init() cannot overwrite it", async () => {
+    let resolveA: (value: Response) => void = () => {};
+    let resolveB: (value: Response) => void = () => {};
+    let callCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        callCount += 1;
+        if (callCount === 1) return new Promise<Response>((resolve) => (resolveA = resolve));
+        return new Promise<Response>((resolve) => (resolveB = resolve));
+      }),
+    );
+    const store = createRealPaymentStore();
+
+    // Simulates a fast account switch that re-triggers init() before the
+    // first call's fetch has resolved.
+    const pendingA = store.getState().init();
+    const pendingB = store.getState().init();
+
+    resolveB(jsonResponse(200, { attempt: null }));
+    await pendingB;
+    expect(store.getState().attempt).toBeNull();
+    expect(store.getState().status).toBe("editing");
+
+    // A — the OLDER request — resolves last and must not overwrite B's result.
+    resolveA(
+      jsonResponse(200, {
+        attempt: {
+          id: "attempt-a-stale",
+          state: "awaiting_authorization",
+          recipient: "0x1111111111111111111111111111111111111111",
+          amountBaseUnits: "1000000",
+          transactionHash: null,
+          failureReason: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          prepared: null,
+        },
+        subOrganizationId: "sub-org-a",
+      }),
+    );
+    await pendingA;
+
+    expect(store.getState().attempt).toBeNull();
+    expect(store.getState().status).toBe("editing");
+    vi.unstubAllGlobals();
+  });
+});

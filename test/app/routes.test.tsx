@@ -109,7 +109,7 @@ describe("product routes", () => {
       render(<PayPage />);
 
       expect(screen.getByTestId("real-pay")).toBeInTheDocument();
-      expect(screen.getByRole("heading", { name: "Real Pay is next" })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Set up your account to send Cash" })).toBeInTheDocument();
       expect(screen.getByText("Testnet only")).toBeInTheDocument();
       expect(screen.queryByTestId("pay-cash-headline")).not.toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Send money" })).not.toBeInTheDocument();

@@ -82,3 +82,42 @@ describe("real-payment-history-store — malformed response handling", () => {
     vi.unstubAllGlobals();
   });
 });
+
+/**
+ * Pre-2f hardening: see real-payment-history-store.ts's `generation` closure
+ * variable — a stale fetchHistory() response must never overwrite state a
+ * newer reset() (account switch/logout) already cleared.
+ */
+describe("real-payment-history-store — stale async response race (pre-2f hardening)", () => {
+  it("a stale fetchHistory() response arriving after reset() is a no-op, never resurrects cleared entries", async () => {
+    let resolveFetch: (value: Response) => void = () => {};
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => (resolveFetch = resolve))));
+    const store = createRealPaymentHistoryStore();
+
+    const pending = store.getState().fetchHistory();
+    store.getState().reset();
+    expect(store.getState().entries).toEqual([]);
+    expect(store.getState().status).toBe("idle");
+
+    resolveFetch(
+      jsonResponse(200, {
+        entries: [
+          {
+            id: "stale-entry",
+            recipient: "0x1111111111111111111111111111111111111111",
+            amountBaseUnits: "1000000",
+            state: "confirmed",
+            transactionHash: "0xabc",
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+        ],
+      }),
+    );
+    await pending;
+
+    expect(store.getState().entries).toEqual([]);
+    expect(store.getState().status).toBe("idle");
+    vi.unstubAllGlobals();
+  });
+});

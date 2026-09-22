@@ -12,6 +12,15 @@ import { runProvisioningPipeline, type OnboardingOutcome } from "./onboarding";
 
 const LOGIN_CHALLENGE_TTL_MS = 1000 * 60 * 5;
 
+/**
+ * Pre-2f hardening: never forward @simplewebauthn/server's own error.message
+ * for a failed verifyLogin() call — not necessarily secret-bearing here, but
+ * every other rejection reason in this file is already a fixed string we
+ * wrote ourselves, and a caught library error is the one place that
+ * convention was broken. Mirrors server/payments.ts's SAFE_* constants.
+ */
+const SAFE_LOGIN_VERIFICATION_FAILED = "Login could not be verified.";
+
 export async function beginLogin(input: {
   config: RealServerConfig;
   challengeStore: ChallengeStore;
@@ -80,15 +89,16 @@ export async function completeLogin(input: {
           transports: passkey.transports ?? undefined,
         },
       });
-    } catch (error) {
+    } catch {
       // @simplewebauthn/server itself throws here for a counter regression
       // (see verifyAuthenticationResponse.js: only when either side's
       // counter is nonzero — both-zero authenticators are exempt, matching
       // real platform-authenticator behavior rather than an invented
-      // stricter rule).
-      return { outcome: "rejected", reason: error instanceof Error ? error.message : "Login verification failed." };
+      // stricter rule). Never forward the library's own error.message — see
+      // SAFE_LOGIN_VERIFICATION_FAILED above.
+      return { outcome: "rejected", reason: SAFE_LOGIN_VERIFICATION_FAILED };
     }
-    if (!verified.verified) return { outcome: "rejected", reason: "Login could not be verified." };
+    if (!verified.verified) return { outcome: "rejected", reason: SAFE_LOGIN_VERIFICATION_FAILED };
     if (!verified.authenticationInfo.userVerified) return { outcome: "rejected", reason: "User verification was not performed." };
 
     await input.registry.updateAuthenticatorCounter({ credentialId: passkey.credentialId, counter: verified.authenticationInfo.newCounter });
@@ -126,10 +136,12 @@ export async function completeLogin(input: {
         transports: attempt.transports ?? undefined,
       },
     });
-  } catch (error) {
-    return { outcome: "rejected", reason: error instanceof Error ? error.message : "Login verification failed." };
+  } catch {
+    // Never forward @simplewebauthn/server's own error.message — see
+    // SAFE_LOGIN_VERIFICATION_FAILED above.
+    return { outcome: "rejected", reason: SAFE_LOGIN_VERIFICATION_FAILED };
   }
-  if (!verified.verified) return { outcome: "rejected", reason: "Login could not be verified." };
+  if (!verified.verified) return { outcome: "rejected", reason: SAFE_LOGIN_VERIFICATION_FAILED };
   if (!verified.authenticationInfo.userVerified) return { outcome: "rejected", reason: "User verification was not performed." };
 
   // Possession proven independently of Turnkey. Persist the counter

@@ -183,6 +183,14 @@ async function authorizeAndSubmit(set: (partial: Partial<RealPaymentStore>) => v
 }
 
 export function createRealPaymentStore() {
+  // Pre-2f hardening: same generation-token guard as real-balance-store.ts —
+  // see its comment for why. Scoped to init()'s /latest fetch specifically
+  // (the one that runs on mount/account-switch, per real-pay-form.tsx's
+  // effect) — confirmAndSend/resumeAuthorization/checkStatus/cancel are
+  // user-initiated actions within a single account session, not subject to
+  // the same cross-account race.
+  let generation = 0;
+
   return create<RealPaymentStore>()((set, get) => ({
     status: "idle",
     recipientInput: "",
@@ -193,6 +201,7 @@ export function createRealPaymentStore() {
     error: null,
 
     init: async () => {
+      const myGeneration = ++generation;
       // Pre-2f hardening: clear any prior account's recipient/amount/
       // attempt/error as the FIRST synchronous action, before the fetch —
       // so "reset before init" holds regardless of which caller invokes
@@ -203,21 +212,23 @@ export function createRealPaymentStore() {
       try {
         const response = await fetch("/api/real/payments/latest");
         if (response.status === 401) {
-          set({ status: "editing", attempt: null, subOrganizationId: null });
+          if (myGeneration === generation) set({ status: "editing", attempt: null, subOrganizationId: null });
           return;
         }
         const json = (await response.json()) as { attempt: RealPaymentAttempt | null; subOrganizationId?: string | null; error?: string };
         if (!response.ok || !json.attempt) {
-          set({ status: "editing", attempt: null, subOrganizationId: null });
+          if (myGeneration === generation) set({ status: "editing", attempt: null, subOrganizationId: null });
           return;
         }
-        set({
-          status: mapAttemptStateToStatus(json.attempt.state),
-          attempt: json.attempt,
-          subOrganizationId: json.subOrganizationId ?? null,
-        });
+        if (myGeneration === generation) {
+          set({
+            status: mapAttemptStateToStatus(json.attempt.state),
+            attempt: json.attempt,
+            subOrganizationId: json.subOrganizationId ?? null,
+          });
+        }
       } catch {
-        set({ status: "editing" });
+        if (myGeneration === generation) set({ status: "editing" });
       }
     },
 
@@ -307,7 +318,10 @@ export function createRealPaymentStore() {
       }
     },
 
-    reset: () => set({ status: "editing", attempt: null, subOrganizationId: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null }),
+    reset: () => {
+      generation++;
+      set({ status: "editing", attempt: null, subOrganizationId: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
+    },
   }));
 }
 

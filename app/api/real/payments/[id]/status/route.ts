@@ -6,11 +6,14 @@ import { getPaymentAttemptStore, getRealAccountRegistry } from "@/lib/real/serve
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
 
 /**
- * Reconciles a submitted/unknown attempt against the bundler by its
- * precomputed expected_user_operation_hash — see
- * lib/real/server/payments.ts's resolvePaymentStatus. Read-only from the
- * client's perspective (it never signs or resubmits); the only mutation is
- * moving the durable attempt to confirmed/failed on an unambiguous receipt.
+ * Reconciles a submitting/submitted/unknown attempt against the bundler by
+ * its precomputed expected_user_operation_hash — see
+ * lib/real/server/payments.ts's resolvePaymentStatus and its
+ * RECONCILABLE_STATES (submitting is included deliberately: it's written
+ * durably before eth_sendUserOperation is ever dispatched). Read-only from
+ * the client's perspective (it never signs or resubmits); the only mutation
+ * is moving the durable attempt to confirmed/failed on an unambiguous
+ * receipt.
  */
 export async function GET(_request: NextRequest, ctx: RouteContext<"/api/real/payments/[id]/status">) {
   if (!isRealModeEnabled()) return disabledResponse();

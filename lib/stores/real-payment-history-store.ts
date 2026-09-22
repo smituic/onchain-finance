@@ -33,17 +33,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function createRealPaymentHistoryStore() {
+  // Pre-2f hardening: same generation-token guard as real-balance-store.ts —
+  // see its comment for why. A late-arriving fetchHistory() response from a
+  // superseded account/reset must never overwrite fresher state.
+  let generation = 0;
+
   return create<RealPaymentHistoryStore>()((set) => ({
     entries: [],
     status: "idle",
     error: null,
 
     fetchHistory: async () => {
+      const myGeneration = ++generation;
       set({ status: "loading", error: null });
       try {
         const response = await fetch("/api/real/payments/history?limit=10");
         if (response.status === 401) {
-          set({ status: "unauthenticated", entries: [], error: null });
+          if (myGeneration === generation) set({ status: "unauthenticated", entries: [], error: null });
           return;
         }
         // The body is untrusted shape until proven otherwise — never assert
@@ -54,7 +60,7 @@ export function createRealPaymentHistoryStore() {
 
         if (!response.ok) {
           const message = isRecord(body) && typeof body.error === "string" ? body.error : `Could not load your recent payments (${response.status}).`;
-          set({ status: "error", error: message });
+          if (myGeneration === generation) set({ status: "error", error: message });
           return;
         }
 
@@ -62,17 +68,20 @@ export function createRealPaymentHistoryStore() {
         // empty — coercing it to [] would render a false "no payments yet"
         // for what might actually be a server bug hiding real history.
         if (!isRecord(body) || !Array.isArray(body.entries)) {
-          set({ status: "error", error: "Received an unexpected response while loading your recent payments." });
+          if (myGeneration === generation) set({ status: "error", error: "Received an unexpected response while loading your recent payments." });
           return;
         }
 
-        set({ entries: body.entries as PaymentHistoryEntry[], status: "ready", error: null });
+        if (myGeneration === generation) set({ entries: body.entries as PaymentHistoryEntry[], status: "ready", error: null });
       } catch (error) {
-        set({ status: "error", error: error instanceof Error ? error.message : "Could not load your recent payments." });
+        if (myGeneration === generation) set({ status: "error", error: error instanceof Error ? error.message : "Could not load your recent payments." });
       }
     },
 
-    reset: () => set({ entries: [], status: "idle", error: null }),
+    reset: () => {
+      generation++;
+      set({ entries: [], status: "idle", error: null });
+    },
   }));
 }
 

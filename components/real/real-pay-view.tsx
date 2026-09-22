@@ -28,12 +28,12 @@ export function RealPayView() {
       <section className="flex flex-col gap-2">
         <p className="text-sm text-muted-foreground">Real Mode</p>
         <h2 className="font-heading text-xl font-semibold tracking-tight">
-          {account ? "Send Cash" : "Real Pay is next"}
+          {account ? "Send Cash" : "Set up your account to send Cash"}
         </h2>
         <p className="text-sm text-muted-foreground">
           {account
             ? "Send test Cash to another Base Sepolia address. Each payment needs a fresh passkey approval."
-            : "The next step is connecting a real account and showing its real test-network Cash balance."}
+            : "Connect a real account to send Cash and see your real test-network balance."}
         </p>
       </section>
 

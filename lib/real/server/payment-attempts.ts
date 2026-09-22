@@ -25,8 +25,17 @@ import { randomUUID } from "node:crypto";
  * (advisory-lock + quota count + conditional insert) plus a partial unique
  * index as a database-level backstop; the in-memory adapter here enforces
  * the identical contract synchronously (no `await` between reading current
- * state and committing a new attempt), so both are race-safe for the same
- * reason registration-attempts.ts's in-memory adapter is.
+ * state and committing a new attempt, same technique registration-attempts.ts's
+ * in-memory adapter uses), so it is fully race-safe.
+ *
+ * The Neon adapter is not symmetrically race-safe in every respect: per its
+ * own "PRE-2F CORRECTED CLAIM" (neon-store.ts), the advisory lock does not
+ * refresh its statement's read-committed snapshot, so the hourly/daily quota
+ * counts there are only serially enforced and best-effort precise. What IS a
+ * hard invariant on both adapters is "at most one active attempt per
+ * account" — on Neon backed by the partial unique index (a database
+ * constraint independent of any snapshot), and here by this store's
+ * synchronous, single-threaded reserve().
  */
 export type PaymentAttemptState = "prepared" | "awaiting_authorization" | "signed" | "submitting" | "submitted" | "confirmed" | "failed" | "cancelled" | "unknown";
 
@@ -223,12 +232,13 @@ export function createInMemoryPaymentAttemptStore(): PaymentAttemptStore {
       // sort so that attempts tied on millisecond-resolution createdAt
       // resolve most-recently-inserted-first — same tie-break convention as
       // findLatestByAppUserId above. This is deliberately NOT the same
-      // tie-break the Neon adapter uses (created_at DESC, id DESC): this
-      // store's ids are sequential strings, so "most recently inserted"
-      // already is the meaningful, deterministic order here; Neon's ids are
-      // random UUIDs, where an id-based tie-break can only be a fixed,
-      // repeatable order, not a recency signal. Both are deterministic —
-      // they just can't agree value-for-value given the different id schemes.
+      // tie-break the Neon adapter uses (created_at DESC, id DESC): both
+      // stores' ids are random UUIDs (reserve() above uses randomUUID(),
+      // same as Neon's gen_random_uuid()), so an id-based tie-break would
+      // only be a fixed, repeatable order here too, never a recency signal —
+      // this store's actual recency signal is Map insertion order, which
+      // Neon has no equivalent of. Both are deterministic — they just can't
+      // agree value-for-value given the different tie-break mechanisms.
       return forAccount(appUserId)
         .slice()
         .reverse()

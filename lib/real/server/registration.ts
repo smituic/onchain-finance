@@ -12,6 +12,14 @@ import { runProvisioningPipeline, type OnboardingOutcome } from "./onboarding";
 
 const REGISTRATION_CHALLENGE_TTL_MS = 1000 * 60 * 5;
 
+/**
+ * Pre-2f hardening: never forward @simplewebauthn/server's own error.message
+ * for a failed verifyRegistration() call — not necessarily secret-bearing
+ * here, but every other rejection reason in this file is already a fixed
+ * string we wrote ourselves. Mirrors server/payments.ts's SAFE_* constants.
+ */
+const SAFE_REGISTRATION_VERIFICATION_FAILED = "Registration could not be verified.";
+
 type RegistrationContext = { appUserId: string; userHandle: string };
 
 export async function beginRegistration(input: {
@@ -87,10 +95,12 @@ export async function completeRegistration(input: {
   let verified;
   try {
     verified = await verifyRegistration({ config: input.config, response: input.response, expectedChallenge: stored.challenge });
-  } catch (error) {
-    return { outcome: "rejected", reason: error instanceof Error ? error.message : "Registration verification failed." };
+  } catch {
+    // Never forward @simplewebauthn/server's own error.message — see
+    // SAFE_REGISTRATION_VERIFICATION_FAILED above.
+    return { outcome: "rejected", reason: SAFE_REGISTRATION_VERIFICATION_FAILED };
   }
-  if (!verified.verified) return { outcome: "rejected", reason: "Registration could not be verified." };
+  if (!verified.verified) return { outcome: "rejected", reason: SAFE_REGISTRATION_VERIFICATION_FAILED };
   if (!verified.registrationInfo.userVerified) return { outcome: "rejected", reason: "User verification was not performed." };
 
   // Durable pre-commit — before Turnkey is ever called. If the process

@@ -229,6 +229,38 @@ describe("resolveSubmitPayment", () => {
     expect(reserved.ok).toBe(true);
   });
 
+  it("pre-2f hardening: a persisted expectedUserOperationHash that no longer matches the recomputed hash is rejected before dispatch, never resent", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const { registry, paymentStore, attemptId, signature, cookieValue } = await setup();
+    // Leave the prepared fields and signature untouched — tamper ONLY the
+    // persisted expectedUserOperationHash, via the same same-state
+    // transition() patch technique as the row-corruption test above. This
+    // isolates verifyPreparedPaymentSignature's dedicated recomputed-hash
+    // mismatch branch (submit.ts:50-58) from the SafeOp preflight: a
+    // tampered nonce would change the signed operation itself and could be
+    // rejected by the preflight before ever reaching the hash comparison,
+    // which would prove nothing about the intended branch.
+    await paymentStore.transition({
+      id: attemptId,
+      from: "awaiting_authorization",
+      to: "awaiting_authorization",
+      patch: { expectedUserOperationHash: `0x${"ab".repeat(32)}` },
+    });
+
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", attemptId, signature });
+
+    expect(outcome.outcome).toBe("failed");
+    // Nothing was ever dispatched — the mismatch is caught purely locally,
+    // before eth_sendUserOperation is ever called.
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+    const persisted = await paymentStore.findById(attemptId);
+    expect(persisted?.state).toBe("failed");
+    expect(persisted?.failureReason).toBeTruthy();
+    // The fixed, safe failure reason — never submit.ts's own internal
+    // "recomputed hash does not match..." text.
+    expect(persisted?.failureReason).not.toMatch(/recomputed|persisted expected hash/i);
+  });
+
   it("a signature from the wrong signer is rejected by the independent preflight — never reaches the bundler", async () => {
     // createVerifiedTurnkeyOwnerAccount's own self-check (check A) already
     // refuses to ever RETURN a wrong-signer signature, so a genuine

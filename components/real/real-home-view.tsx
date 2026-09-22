@@ -29,7 +29,7 @@ export function RealHomeView() {
         </h1>
         <p className="text-sm text-muted-foreground">
           {account
-            ? "Connected with a passkey — no seed phrase or extension. Sending Cash comes next."
+            ? "Connected with a passkey — no seed phrase or extension."
             : "Connecting a real, blockchain-backed account is the next step. Until then there's no balance or activity to show here."}
         </p>
       </section>

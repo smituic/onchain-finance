@@ -6,10 +6,13 @@ import { getPaymentAttemptStore, getRealAccountRegistry } from "@/lib/real/serve
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
 
 /**
- * Lets the user abandon a payment that is still awaiting_authorization
- * (e.g. after cancelling the passkey prompt) so it doesn't permanently
- * occupy the account's one-active-attempt slot. Refused for any other
- * state — once a signature may exist, cancelling is not offered.
+ * Lets the user abandon a payment in any provably pre-dispatch state —
+ * prepared, awaiting_authorization, or signed (e.g. after cancelling the
+ * passkey prompt, or a crash that left a signed row stranded) — so it
+ * doesn't permanently occupy the account's one-active-attempt slot. Never
+ * submitting/submitted/unknown: once dispatch may have happened, cancelling
+ * is not offered, only reconciliation (see the status route). See
+ * lib/real/server/payments.ts's CANCELLABLE_STATES for the authoritative set.
  */
 export async function POST(_request: NextRequest, ctx: RouteContext<"/api/real/payments/[id]/cancel">) {
   if (!isRealModeEnabled()) return disabledResponse();

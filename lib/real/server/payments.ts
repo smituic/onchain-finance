@@ -293,6 +293,11 @@ function isWellFormedHexSignature(value: string): boolean {
  * owner — nothing about the HttpOnly cookie itself produces or approves a
  * signature.
  *
+ * Ordering, in one line: structural hex-format validation
+ * (isWellFormedHexSignature, above) happens before transition 1 below
+ * (awaiting_authorization -> signed); cryptographic signature verification
+ * happens after transition 1 and before transition 2 (signed -> submitting).
+ *
  * Two separate CAS transitions guard this function, not one:
  *
  *  1. awaiting_authorization -> signed, before the signature is even

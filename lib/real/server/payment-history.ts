@@ -21,9 +21,10 @@ import type { PaymentAttempt, PaymentAttemptState, PaymentAttemptStore } from ".
  * Deliberately thinner than server/payments.ts's PublicPaymentAttempt, which
  * carries `prepared: WirePreparedFields | null` (nonce/calldata/gas/
  * paymaster — needed only to sign, never to display history). failureReason
- * is excluded too: it can carry raw bundler/infra error text, and history
- * only ever needs the mapped status label (lib/real/display/payment-status.ts),
- * never the internal reason.
+ * is excluded too: it remains an internal field (now always one of a small
+ * set of fixed, safe strings — see server/payments.ts's SAFE_* constants),
+ * and history only ever needs the mapped status label
+ * (lib/real/display/payment-status.ts), never the internal reason.
  */
 export type PaymentHistoryEntry = {
   id: string;
