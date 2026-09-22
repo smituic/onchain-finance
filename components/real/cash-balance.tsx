@@ -22,11 +22,13 @@ export function CashBalance() {
   const reset = useRealBalanceStore((s) => s.reset);
 
   useEffect(() => {
-    if (account) {
-      void fetchBalance();
-    } else {
-      reset();
-    }
+    // Pre-2f hardening: reset unconditionally first — a truthy-to-truthy
+    // switch to a DIFFERENT safeAddress used to skip straight to
+    // fetchBalance() (status stays "ready" with the PRIOR account's
+    // balance until the new fetch resolves); resetting first closes that
+    // window instead of relying on fetchBalance's own "loading" flip.
+    reset();
+    if (account) void fetchBalance();
     // Re-fetch only when the signed-in Safe address itself changes (sign
     // in/out/restore) — not on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps

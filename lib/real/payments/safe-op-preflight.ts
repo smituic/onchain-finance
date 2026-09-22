@@ -217,7 +217,10 @@ export async function verifySafeOpSignature(input: {
   let recoveredAddress: Address;
   try {
     recoveredAddress = await recoverTypedDataAddress({ ...typedData, signature: split.ownerSignature });
-  } catch (error) {
+  } catch {
+    // Fixed, safe reason — never the raw decode error text. Local/offline
+    // (no upstream secret risk here), but still kept off the public/
+    // durable contract per the project's fixed-message policy.
     return {
       ok: false,
       recoveredAddress: null,
@@ -227,7 +230,7 @@ export async function verifySafeOpSignature(input: {
       signatureByteLength: split.byteLength,
       vByte: split.vByte,
       reconstructedDigest,
-      reason: `Signature recovery threw: ${error instanceof Error ? error.message : "unknown error"}`,
+      reason: "Signature could not be recovered from the provided bytes.",
     };
   }
 

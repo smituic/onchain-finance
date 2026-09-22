@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import { useRealBalanceStore } from "@/lib/stores/real-balance-store";
@@ -208,5 +208,48 @@ describe("RealPayForm", () => {
 
     await waitFor(() => expect(screen.getByTestId("real-pay-authorizing")).toBeInTheDocument());
     expect(prepareCallCount).toBe(1);
+  });
+
+  it("pre-2f hardening: A -> logout -> B clears the recipient/amount fields before B's own data loads", async () => {
+    const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
+      return null;
+    });
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText("Recipient"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    expect(screen.getByLabelText("Recipient")).toHaveValue(RECIPIENT);
+
+    act(() => {
+      useRealAccountStore.setState({ account: null, status: "signed-out" });
+    });
+    act(() => {
+      useRealAccountStore.setState({ account: ACCOUNT_B, status: "ready" });
+    });
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(screen.getByLabelText("Recipient")).toHaveValue("");
+    expect(screen.getByLabelText("Amount")).toHaveValue("");
+  });
+
+  it("pre-2f hardening: a restored 'signed' attempt shows the stranded (cancel-only) state, never Continue/resend", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, { attempt: attemptFixture({ state: "signed" }), subOrganizationId: null });
+      }
+      return null;
+    });
+
+    render(<RealPayForm />);
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Continue" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel payment" })).toBeInTheDocument();
   });
 });

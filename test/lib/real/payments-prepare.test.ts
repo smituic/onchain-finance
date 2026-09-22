@@ -217,11 +217,72 @@ describe("resolvePreparePayment", () => {
     expect(outcome.outcome).toBe("prepare_failed");
     const latest = await paymentStore.findLatestByAppUserId("app-user-1");
     expect(latest?.state).toBe("failed");
-    expect(latest?.failureReason).toMatch(/Pimlico is unreachable/);
 
     // The slot is freed — a new attempt can be reserved.
     const secondAttempt = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
     expect(secondAttempt.outcome).toBe("ready");
+  });
+
+  it("pre-2f hardening: never persists or returns a raw upstream Pimlico error — even one carrying the API key/URL", async () => {
+    const secretBearingMessage =
+      "HTTP request failed. URL: https://api.pimlico.io/v2/84532/rpc?apikey=SECRET_TEST_KEY Details: rate limited Version: viem@2.0.0";
+    prepareCashTransferUserOperationMock.mockRejectedValueOnce(new Error(secretBearingMessage));
+    const registry = await seedAccount();
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const paymentStore = createInMemoryPaymentAttemptStore();
+
+    const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
+
+    expect(outcome.outcome).toBe("prepare_failed");
+    if (outcome.outcome !== "prepare_failed") return;
+    for (const forbidden of ["apikey=", "SECRET_TEST_KEY", "pimlico.io", "viem@"]) {
+      expect(outcome.reason).not.toContain(forbidden);
+    }
+
+    const latest = await paymentStore.findLatestByAppUserId("app-user-1");
+    expect(latest?.failureReason).toBe(outcome.reason);
+    for (const forbidden of ["apikey=", "SECRET_TEST_KEY", "pimlico.io", "viem@"]) {
+      expect(latest?.failureReason).not.toContain(forbidden);
+    }
+  });
+
+  it("pre-2f hardening: never persists or returns a raw upstream balance-check error — even one carrying the RPC URL", async () => {
+    const secretBearingMessage = "HTTP request failed. URL: https://base-sepolia.g.alchemy.com/v2/SECRET_ALCHEMY_KEY Version: viem@2.0.0";
+    const registry = await seedAccount();
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const throwingPublicClient = {
+      chain: baseSepolia,
+      getChainId: async () => {
+        throw new Error(secretBearingMessage);
+      },
+    } as unknown as Parameters<typeof resolvePreparePayment>[0]["publicClient"];
+
+    const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, publicClient: throwingPublicClient }));
+
+    expect(outcome.outcome).toBe("balance_check_failed");
+    if (outcome.outcome !== "balance_check_failed") return;
+    for (const forbidden of ["SECRET_ALCHEMY_KEY", "alchemy.com", "viem@"]) {
+      expect(outcome.reason).not.toContain(forbidden);
+    }
+  });
+
+  it("pre-2f hardening: fails closed (prepare_failed) if prepareCashTransferUserOperation's derived sender ever diverges from the account's registered safeAddress", async () => {
+    prepareCashTransferUserOperationMock.mockResolvedValueOnce({
+      ...preparedFields,
+      sender: "0x9999999999999999999999999999999999999999",
+    } as unknown as typeof preparedFields);
+    const registry = await seedAccount();
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const paymentStore = createInMemoryPaymentAttemptStore();
+
+    const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
+
+    expect(outcome.outcome).toBe("prepare_failed");
+    const latest = await paymentStore.findLatestByAppUserId("app-user-1");
+    expect(latest?.state).toBe("failed");
+    // Never reached awaiting_authorization — the mismatch was caught before
+    // the user would ever be asked to sign.
+    expect(latest?.nonce).toBeNull();
   });
 
   it("computes and persists the expected UserOperation hash BEFORE ever calling the bundler — durable even if the send response is later lost", async () => {

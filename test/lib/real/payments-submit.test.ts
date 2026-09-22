@@ -43,7 +43,7 @@ vi.mock("@/lib/real/server/pimlico", () => ({
   fetchUserOperationReceipt: (...args: unknown[]) => fetchUserOperationReceiptMock(...(args as [never])),
 }));
 
-const { resolveSubmitPayment, resolvePaymentStatus } = await import("@/lib/real/server/payments");
+const { resolveSubmitPayment, resolvePaymentStatus, resolveCancelPayment } = await import("@/lib/real/server/payments");
 const { createVerifiedTurnkeyOwnerAccount } = await import("@/lib/real/signing/verified-account");
 const { createRealSafeAccount } = await import("@/lib/real/account/safe");
 const { computeExpectedUserOperationHash } = await import("@/lib/real/payments/hash");
@@ -150,7 +150,7 @@ describe("resolveSubmitPayment", () => {
     expect(sendPreparedUserOperationMock).toHaveBeenCalledTimes(1);
   });
 
-  it("a valid app session with no signature (or a garbage one) is refused before ever reaching the bundler — a session alone never authorizes a payment", async () => {
+  it("a valid app session with a non-hex garbage signature is refused before ever reaching the bundler — a session alone never authorizes a payment", async () => {
     sendPreparedUserOperationMock.mockReset();
     const { registry, paymentStore, attemptId, cookieValue } = await setup();
 
@@ -164,8 +164,69 @@ describe("resolveSubmitPayment", () => {
       signature: "0xnotarealsignature",
     });
 
+    // Pre-2f hardening: "0xnotarealsignature" isn't valid hex (n/o/t/r/s/i/g/u
+    // aren't hex digits) — refused by the pre-CAS hex-format check before
+    // the row is ever touched, not the post-CAS "failed" path.
+    expect(outcome.outcome).toBe("invalid_signature");
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+    const persisted = await paymentStore.findById(attemptId);
+    expect(persisted?.state).toBe("awaiting_authorization");
+  });
+
+  it("pre-2f hardening: a length-valid but non-hex signature is refused the same way, before the row is ever claimed", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const { registry, paymentStore, attemptId, signature, cookieValue } = await setup();
+    // Same total length as a real signature, but with one character
+    // replaced by a non-hex digit.
+    const malformed = `${signature.slice(0, 10)}z${signature.slice(11)}`;
+
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", attemptId, signature: malformed });
+
+    expect(outcome.outcome).toBe("invalid_signature");
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+    const persisted = await paymentStore.findById(attemptId);
+    expect(persisted?.state).toBe("awaiting_authorization");
+  });
+
+  it("pre-2f hardening: a malformed (non-UUID) attemptId is refused as not_found, never reaching the store", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const { registry, paymentStore, signature, cookieValue } = await setup();
+    const findByIdSpy = vi.spyOn(paymentStore, "findById");
+
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", attemptId: "not-a-uuid", signature });
+
+    expect(outcome.outcome).toBe("not_found");
+    expect(findByIdSpy).not.toHaveBeenCalled();
+  });
+
+  it("pre-2f hardening: a throw between the signed and submitting CASes (e.g. a corrupted stored row) becomes a terminal failed, never a stranded 'signed' row — and the account can reserve again afterward", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const { registry, paymentStore, attemptId, signature, cookieValue } = await setup();
+    // Corrupt the stored nonce so toPreparedFields' BigInt() parse throws —
+    // a same-state transition() call is a patch-only write (from === to
+    // === current state), simulating row corruption without going through
+    // any real code path that could introduce it.
+    await paymentStore.transition({ id: attemptId, from: "awaiting_authorization", to: "awaiting_authorization", patch: { nonce: "not-a-number" } });
+
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", attemptId, signature });
+
     expect(outcome.outcome).toBe("failed");
     expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+    const persisted = await paymentStore.findById(attemptId);
+    expect(persisted?.state).toBe("failed");
+    expect(persisted?.failureReason).toBeTruthy();
+    expect(persisted?.failureReason).not.toMatch(/BigInt|SyntaxError|not-a-number/);
+
+    // Terminal and freed — the account isn't stranded.
+    const reserved = await paymentStore.reserve({
+      appUserId: "app-user-1",
+      safeAddress: persisted!.safeAddress,
+      recipient: "0x2222222222222222222222222222222222222222",
+      amountBaseUnits: "1000000",
+      chainId: baseSepolia.id,
+      tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    });
+    expect(reserved.ok).toBe(true);
   });
 
   it("a signature from the wrong signer is rejected by the independent preflight — never reaches the bundler", async () => {
@@ -358,5 +419,68 @@ describe("resolveSubmitPayment", () => {
     expect(outcome.outcome).toBe("unknown");
     const persisted = await paymentStore.findById(attemptId);
     expect(persisted?.state).toBe("unknown");
+  });
+});
+
+/**
+ * Pre-2f hardening: resolveCancelPayment now accepts "signed" (previously
+ * only "awaiting_authorization"), specifically to be the last line of
+ * defense against a stranded pre-dispatch attempt. These two tests prove
+ * the resulting cancel-vs-submit race resolves correctly in BOTH
+ * directions, using real resolveSubmitPayment/resolveCancelPayment code —
+ * not a reimplementation — with a spy on paymentStore.transition as the
+ * deterministic injection point (JS's single-threaded run-to-completion
+ * semantics make "the call that invokes transition() first wins the CAS"
+ * exact, the same technique test/lib/real/payment-attempts.test.ts's own
+ * concurrent-CAS tests already rely on).
+ */
+describe("cancel-vs-submit races (pre-2f hardening)", () => {
+  it("cancel winning the signed->cancelled CAS first makes submit's own signed->submitting CAS fail — the bundler is never called", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const { registry, paymentStore, attemptId, signature, cookieValue } = await setup();
+
+    const originalTransition = paymentStore.transition.bind(paymentStore);
+    const transitionSpy = vi.spyOn(paymentStore, "transition").mockImplementation(async (args) => {
+      const result = await originalTransition(args);
+      if (args.from === "awaiting_authorization" && args.to === "signed" && result) {
+        // Simulate a concurrent cancel request arriving the instant submit's
+        // own first CAS lands (the row is genuinely "signed" right now).
+        const cancelOutcome = await resolveCancelPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, attemptId });
+        expect(cancelOutcome.outcome).toBe("cancelled");
+      }
+      return result;
+    });
+
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", attemptId, signature });
+
+    expect(outcome.outcome).toBe("wrong_state");
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+    const persisted = await paymentStore.findById(attemptId);
+    expect(persisted?.state).toBe("cancelled");
+    transitionSpy.mockRestore();
+  });
+
+  it("submit winning the signed->submitting CAS first makes a concurrent cancel fail (wrong_state), and dispatch proceeds normally", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const { registry, paymentStore, attemptId, signature, cookieValue, expectedUserOperationHash } = await setup();
+    sendPreparedUserOperationMock.mockResolvedValueOnce(expectedUserOperationHash);
+
+    const originalTransition = paymentStore.transition.bind(paymentStore);
+    const transitionSpy = vi.spyOn(paymentStore, "transition").mockImplementation(async (args) => {
+      const result = await originalTransition(args);
+      if (args.from === "signed" && args.to === "submitting" && result) {
+        // Simulate a concurrent cancel request arriving the instant submit's
+        // own second CAS lands (the row is "submitting" now).
+        const cancelOutcome = await resolveCancelPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, attemptId });
+        expect(cancelOutcome.outcome).toBe("wrong_state");
+      }
+      return result;
+    });
+
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", attemptId, signature });
+
+    expect(outcome.outcome).toBe("submitted");
+    expect(sendPreparedUserOperationMock).toHaveBeenCalledTimes(1);
+    transitionSpy.mockRestore();
   });
 });

@@ -1,4 +1,4 @@
-import { asErrorMessage, disabledResponse, isRealModeEnabled, jsonError, requireRealServerConfig } from "@/lib/real/server/http";
+import { disabledResponse, isRealModeEnabled, jsonInternalError, requireRealServerConfig } from "@/lib/real/server/http";
 import { beginLogin } from "@/lib/real/server/login";
 import { getChallengeStore } from "@/lib/real/server/runtime";
 
@@ -8,7 +8,7 @@ export async function POST() {
     const config = requireRealServerConfig();
     const { optionsJSON } = await beginLogin({ config, challengeStore: getChallengeStore() });
     return Response.json({ optionsJSON });
-  } catch (error) {
-    return jsonError(asErrorMessage(error), 500);
+  } catch {
+    return jsonInternalError();
   }
 }

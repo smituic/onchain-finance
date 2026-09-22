@@ -69,11 +69,11 @@ export function RealPaymentHistory() {
   const reset = useRealPaymentHistoryStore((s) => s.reset);
 
   useEffect(() => {
-    if (account) {
-      void fetchHistory();
-    } else {
-      reset();
-    }
+    // Pre-2f hardening: reset unconditionally first — see cash-balance.tsx's
+    // identical fix for why a truthy-to-truthy address switch needs this
+    // too, not just the truthy-to-falsy (logout) case.
+    reset();
+    if (account) void fetchHistory();
     // Re-fetch only when the signed-in Safe address itself changes — not on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account?.safeAddress]);

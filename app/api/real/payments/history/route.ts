@@ -1,6 +1,6 @@
 import { cookies } from "next/headers";
 import type { NextRequest } from "next/server";
-import { asErrorMessage, disabledResponse, isRealModeEnabled, jsonError, requireRealServerConfig } from "@/lib/real/server/http";
+import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, requireRealServerConfig } from "@/lib/real/server/http";
 import { resolvePaymentHistory } from "@/lib/real/server/payment-history";
 import { getPaymentAttemptStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
@@ -28,7 +28,7 @@ export async function GET(request: NextRequest) {
 
     if (outcome.outcome === "unauthenticated") return jsonError("Not authenticated.", 401);
     return Response.json({ entries: outcome.entries });
-  } catch (error) {
-    return jsonError(asErrorMessage(error), 500);
+  } catch {
+    return jsonInternalError();
   }
 }

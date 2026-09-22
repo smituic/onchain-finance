@@ -135,8 +135,28 @@ describe("resolveAuthenticatedCashBalance", () => {
 
     const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
     expect(result.outcome).toBe("read_failed");
+  });
+
+  it("pre-2f hardening: never returns a raw upstream RPC error — even one carrying the provider URL/API key", async () => {
+    const registry = await seedAccount();
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const secretBearingMessage = "HTTP request failed. URL: https://base-sepolia.g.alchemy.com/v2/SECRET_ALCHEMY_KEY Version: viem@2.0.0";
+    const publicClient = createPublicClient({
+      chain: baseSepolia,
+      transport: custom({
+        request: async ({ method }: { method: string }) => {
+          if (method === "eth_chainId") return `0x${baseSepolia.id.toString(16)}`;
+          throw new Error(secretBearingMessage);
+        },
+      }),
+    });
+
+    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
+    expect(result.outcome).toBe("read_failed");
     if (result.outcome !== "read_failed") return;
-    expect(result.reason).toMatch(/RPC unreachable/);
+    for (const forbidden of ["SECRET_ALCHEMY_KEY", "alchemy.com", "viem@"]) {
+      expect(result.reason).not.toContain(forbidden);
+    }
   });
 
   it("a wrong-chain RPC is reported as a read failure, never a balance", async () => {

@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CashBalance } from "@/components/real/cash-balance";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
@@ -78,5 +78,29 @@ describe("CashBalance", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("pre-2f hardening: switching to a different account's address never leaves the prior account's balance on screen", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    stubFetchOnce({ status: 200, body: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" } });
+    render(<CashBalance />);
+    await waitFor(() => expect(screen.getByText("$20.00")).toBeInTheDocument());
+
+    const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+    let resolveSecondFetch: (value: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => (resolveSecondFetch = resolve))),
+    );
+
+    act(() => {
+      useRealAccountStore.setState({ account: ACCOUNT_B, status: "ready" });
+    });
+
+    // Before the new account's fetch has resolved, A's balance must already be gone.
+    expect(screen.queryByText("$20.00")).not.toBeInTheDocument();
+
+    resolveSecondFetch(new Response(JSON.stringify({ token: "USDC", decimals: 6, balanceBaseUnits: "5000000" }), { status: 200, headers: { "content-type": "application/json" } }));
+    await waitFor(() => expect(screen.getByText("$5.00")).toBeInTheDocument());
   });
 });

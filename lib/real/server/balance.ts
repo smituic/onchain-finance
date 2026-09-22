@@ -5,6 +5,9 @@ import type { RealPublicClient } from "../chain/client";
 import { readAuthenticatedRealAccount } from "./auth";
 import type { RealAccountRegistry } from "./registry";
 
+/** Fixed, safe message — never the raw upstream RPC error (see the catch below). */
+const SAFE_BALANCE_READ_FAILED = "Could not read your balance right now. Try again in a moment.";
+
 export type BalanceOutcome =
   | { outcome: "ready"; balance: CashBalance }
   | { outcome: "unauthenticated" }
@@ -38,9 +41,12 @@ export async function resolveAuthenticatedCashBalance(input: {
   try {
     const balance = await readCashBalance({ publicClient: input.publicClient, safeAddress: safeAddress as Address });
     return { outcome: "ready", balance };
-  } catch (error) {
+  } catch {
     // An RPC/validation failure is never converted into a balance — the
-    // caller must show an explicit error state, never a false "$0.00".
-    return { outcome: "read_failed", reason: error instanceof Error ? error.message : "Could not read your balance." };
+    // caller must show an explicit error state, never a false "$0.00". The
+    // reason is a fixed, safe message, never the raw error: a viem
+    // HttpRequestError/RpcRequestError's .message can embed the RPC
+    // request URL (and any API key in it).
+    return { outcome: "read_failed", reason: SAFE_BALANCE_READ_FAILED };
   }
 }

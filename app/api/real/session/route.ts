@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { asErrorMessage, disabledResponse, isRealModeEnabled, jsonError, requireRealServerConfig } from "@/lib/real/server/http";
+import { disabledResponse, isRealModeEnabled, jsonInternalError, requireRealServerConfig } from "@/lib/real/server/http";
 import { readAuthenticatedRealAccount } from "@/lib/real/server/auth";
 import { getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
@@ -21,14 +21,18 @@ export async function GET() {
       ownerAddress: authenticated.account.ownerAddress,
       safeAddress: authenticated.account.safeAddress,
     });
-  } catch (error) {
-    return jsonError(asErrorMessage(error), 500);
+  } catch {
+    return jsonInternalError();
   }
 }
 
 export async function DELETE() {
   if (!isRealModeEnabled()) return disabledResponse();
-  const store = await cookies();
-  store.delete(REAL_SESSION_COOKIE_NAME);
-  return Response.json({ authenticated: false });
+  try {
+    const store = await cookies();
+    store.delete(REAL_SESSION_COOKIE_NAME);
+    return Response.json({ authenticated: false });
+  } catch {
+    return jsonInternalError();
+  }
 }

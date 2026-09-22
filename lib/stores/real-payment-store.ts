@@ -49,7 +49,16 @@ export type RealPaymentStatus =
   | "submitted"
   | "confirmed"
   | "failed"
-  | "unknown";
+  | "unknown"
+  /**
+   * Pre-2f hardening: a reload-restored attempt that is provably
+   * pre-dispatch (prepared/signed) but not the normal "waiting for a first
+   * signature" case (that's "awaiting_authorization"). Never reachable via
+   * a fresh confirmAndSend/resumeAuthorization flow — only via init()
+   * restoring an attempt a crash left mid-flight. The only action offered
+   * is cancel; no resend/retry.
+   */
+  | "stranded";
 
 export type RealPaymentStore = {
   status: RealPaymentStatus;
@@ -92,10 +101,14 @@ function mapAttemptStateToStatus(state: RealPaymentAttemptState): RealPaymentSta
     case "awaiting_authorization":
       return "awaiting_authorization";
     case "signed":
-      // Transient (within one /submit request only — the server
-      // immediately CAS-transitions to "submitting" before ever
-      // dispatching) — essentially never durably observed via a reload.
-      return "submitting";
+      // Pre-2f hardening: a "signed" row is now durably observable via
+      // reload — resolveSubmitPayment's try/catch (server/payments.ts)
+      // resolves almost every failure in this window to "failed", but a
+      // process crash inside that exact window can still leave one at
+      // "signed". Provably pre-dispatch (nothing was ever sent), so this
+      // maps to "stranded" (cancel-only), never "submitting"/"unknown"
+      // (which would wrongly imply it might already be in flight).
+      return "stranded";
     case "submitting":
       // Durably reachable: the server persists this BEFORE calling the
       // bundler, specifically so a crash here survives as reconcile-only.
@@ -117,9 +130,9 @@ function mapAttemptStateToStatus(state: RealPaymentAttemptState): RealPaymentSta
       // Never durably returned by resolvePreparePayment in normal
       // operation (it always moves the row to awaiting_authorization or
       // failed before responding) — only reachable via a crash in the
-      // narrow window between reserve() and that transition. Treated as
-      // unresolved rather than guessed at.
-      return "unknown";
+      // narrow window between reserve() and that transition. Provably
+      // pre-dispatch, same as "signed" above — cancel-only, not "unknown".
+      return "stranded";
   }
 }
 
@@ -180,6 +193,13 @@ export function createRealPaymentStore() {
     error: null,
 
     init: async () => {
+      // Pre-2f hardening: clear any prior account's recipient/amount/
+      // attempt/error as the FIRST synchronous action, before the fetch —
+      // so "reset before init" holds regardless of which caller invokes
+      // this (see components/real/real-pay-form.tsx's account-change
+      // effect). Without this, a stale recipient/amount typed under one
+      // account could survive into a different signed-in account.
+      set({ status: "idle", recipientInput: "", amountInput: "", attempt: null, subOrganizationId: null, isAuthorizing: false, error: null });
       try {
         const response = await fetch("/api/real/payments/latest");
         if (response.status === 401) {

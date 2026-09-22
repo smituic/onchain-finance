@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { asErrorMessage, disabledResponse, isRealModeEnabled, jsonError, requireRealServerConfig } from "@/lib/real/server/http";
+import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readJsonBody, requireRealServerConfig } from "@/lib/real/server/http";
 import { resolveSubmitPayment } from "@/lib/real/server/payments";
 import { getPaymentAttemptStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
@@ -18,7 +18,9 @@ export async function POST(request: Request) {
   if (!isRealModeEnabled()) return disabledResponse();
   try {
     const config = requireRealServerConfig();
-    const body = (await request.json()) as { attemptId?: unknown; signature?: unknown };
+    const rawBody = await readJsonBody(request);
+    if (rawBody === null) return jsonError("Invalid request body.", 400);
+    const body = rawBody as { attemptId?: unknown; signature?: unknown };
     const store = await cookies();
 
     const outcome = await resolveSubmitPayment({
@@ -36,6 +38,8 @@ export async function POST(request: Request) {
         return jsonError("Not authenticated.", 401);
       case "not_found":
         return jsonError("Payment not found.", 404);
+      case "invalid_signature":
+        return jsonError("This payment's signature could not be verified.", 400);
       case "wrong_state":
         return jsonError(`This payment is no longer awaiting authorization (state: ${outcome.state}).`, 409);
       case "submitted":
@@ -43,7 +47,7 @@ export async function POST(request: Request) {
       case "unknown":
         return Response.json({ attempt: outcome.attempt });
     }
-  } catch (error) {
-    return jsonError(asErrorMessage(error), 500);
+  } catch {
+    return jsonInternalError();
   }
 }

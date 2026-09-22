@@ -62,14 +62,6 @@ function errorName(error: unknown): string {
   return error && typeof error === "object" && "name" in error ? String((error as { name: unknown }).name) : "";
 }
 
-function safeShortMessage(error: unknown): string {
-  if (error && typeof error === "object" && "shortMessage" in error) {
-    const short = (error as { shortMessage: unknown }).shortMessage;
-    if (typeof short === "string" && short.trim() !== "") return short.trim();
-  }
-  return error instanceof Error ? error.message : "Unknown error.";
-}
-
 type CauseChain = { bundlerRejectionName: string | null; sawRpcRejection: boolean };
 
 /** Walks error.cause (viem's BaseError and native Error both use the standard cause chain). Depth-limited defensively. */
@@ -87,16 +79,26 @@ function walkCauseChain(error: unknown, depth = 0): CauseChain {
   return { bundlerRejectionName, sawRpcRejection };
 }
 
+/**
+ * Pre-2f hardening: `detail` is now always one of two fixed, safe strings —
+ * never derived from the thrown error's `.message`/`.shortMessage`. Even
+ * `.shortMessage` (viem's short summary, which never embeds a request URL)
+ * isn't relied on here, per the project's fixed-message policy: this is a
+ * deliberate simplification that drops per-category detail (e.g.
+ * "insufficient prefund" vs "nonce too low") in exchange for a message
+ * that can never carry upstream text into a durable failure_reason or an
+ * HTTP response. `stage` classification itself (which recognized bundler
+ * rejection matched, if any) is unaffected — only what gets surfaced is.
+ */
 export function classifySendError(error: unknown): SendErrorClassification {
-  const detailMessage = safeShortMessage(error);
   const chain = walkCauseChain(error);
 
   if (chain.bundlerRejectionName && chain.sawRpcRejection) {
-    return { stage: "failed", detail: `The bundler rejected the payment before executing it: ${detailMessage}` };
+    return { stage: "failed", detail: "The bundler rejected this payment before executing it." };
   }
 
   return {
     stage: "unknown",
-    detail: `No definitive result was received after the operation was signed and dispatched: ${detailMessage}. The payment may still complete — reconcile before trying again.`,
+    detail: "No definitive result was received after the operation was signed and dispatched. The payment may still complete — check its status before trying again.",
   };
 }

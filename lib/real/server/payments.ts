@@ -1,5 +1,5 @@
 import type { Address, Hash, Hex } from "viem";
-import { normalizeAddress, validateAddressCasePreserving } from "../identifiers";
+import { addressesEqual, isValidUuid, normalizeAddress, validateAddressCasePreserving } from "../identifiers";
 import { readCashBalance } from "../chain/balance";
 import type { RealPublicClient } from "../chain/client";
 import { readAuthenticatedRealAccount } from "./auth";
@@ -12,6 +12,19 @@ import { classifyReceipt } from "../payments/reconcile";
 import { fetchUserOperationReceipt, prepareCashTransferUserOperation, sendPreparedUserOperation } from "./pimlico";
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "../constants";
 import type { PaymentAttempt, PaymentAttemptPatch, PaymentAttemptState, PaymentAttemptStore } from "./payment-attempts";
+
+/**
+ * Pre-2f hardening: fixed, safe messages for every failure path in this
+ * file — never `error.message`/`error.shortMessage` from an upstream call.
+ * viem's HttpRequestError/RpcRequestError embeds the request URL (and, for
+ * Pimlico, its API key query param) in `.message`; raw upstream text must
+ * never be persisted to `failure_reason` or returned in a response.
+ */
+const SAFE_BALANCE_CHECK_FAILED = "Could not check your balance right now. Try again in a moment.";
+const SAFE_PREPARE_FAILED = "Could not prepare this payment right now. Try again in a moment.";
+const SAFE_SENDER_MISMATCH = "Could not prepare this payment — your account isn't set up correctly.";
+const SAFE_SIGNATURE_INVALID = "This payment's signature could not be verified.";
+const SAFE_INTERNAL_ERROR = "Something went wrong while sending this payment. It was not sent.";
 
 /**
  * The wire/public shape of a prepared UserOperation's fields — everything a
@@ -185,8 +198,10 @@ export async function resolvePreparePayment(input: {
   try {
     const balance = await readCashBalance({ publicClient: input.publicClient, safeAddress: safeAddress as Address });
     balanceBaseUnits = balance.balanceBaseUnits;
-  } catch (error) {
-    return { outcome: "balance_check_failed", reason: error instanceof Error ? error.message : "Could not read your balance." };
+  } catch {
+    // Never the raw upstream error — a viem RPC failure's .message can
+    // embed the request URL (and any API key in it). See SAFE_* above.
+    return { outcome: "balance_check_failed", reason: SAFE_BALANCE_CHECK_FAILED };
   }
   if (exceedsAvailableBalance(amountBaseUnits, balanceBaseUnits)) {
     return { outcome: "insufficient_balance" };
@@ -211,10 +226,23 @@ export async function resolvePreparePayment(input: {
       recipient: recipient as Address,
       amountBaseUnits,
     });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "Could not prepare the payment.";
-    await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "failed", patch: { failureReason: reason } });
-    return { outcome: "prepare_failed", reason };
+  } catch {
+    // Never the raw upstream error — prepareCashTransferUserOperation calls
+    // Pimlico over an API-key-bearing URL; a viem HttpRequestError/
+    // RpcRequestError's .message can embed that URL verbatim. See SAFE_*.
+    await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "failed", patch: { failureReason: SAFE_PREPARE_FAILED } });
+    return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
+  }
+
+  // Defense in depth: prepareCashTransferUserOperation derives its own
+  // sender (permissionless's computed Safe address from ownerAddress) —
+  // this must match the durable, session-derived safeAddress the rest of
+  // this function already trusts. A mismatch would mean building/signing a
+  // UserOperation for a different smart account than the one on record;
+  // fail closed before the user is ever asked to sign.
+  if (!addressesEqual(prepared.sender, safeAddress)) {
+    await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "failed", patch: { failureReason: SAFE_SENDER_MISMATCH } });
+    return { outcome: "prepare_failed", reason: SAFE_SENDER_MISMATCH };
   }
 
   const expectedUserOperationHash = computeExpectedUserOperationHash(prepared);
@@ -246,10 +274,17 @@ export async function resolvePreparePayment(input: {
 export type SubmitPaymentOutcome =
   | { outcome: "unauthenticated" }
   | { outcome: "not_found" }
+  | { outcome: "invalid_signature" }
   | { outcome: "wrong_state"; state: PaymentAttemptState }
   | { outcome: "submitted"; attempt: PublicPaymentAttempt }
   | { outcome: "failed"; attempt: PublicPaymentAttempt }
   | { outcome: "unknown"; attempt: PublicPaymentAttempt };
+
+/** A Safe4337 signature is always `0x` + an even number of hex digits (validAfter/validUntil prefix + a packed owner signature). Checked BEFORE the awaiting_authorization -> signed CAS so structurally-malformed input never even claims the row — see safe-op-preflight.ts's splitSafeOpSignature for the more detailed, post-CAS shape checks this doesn't replace. */
+const HEX_SIGNATURE_PATTERN = /^0x[0-9a-fA-F]+$/;
+function isWellFormedHexSignature(value: string): boolean {
+  return HEX_SIGNATURE_PATTERN.test(value) && (value.length - 2) % 2 === 0;
+}
 
 /**
  * A valid app session alone is never enough to reach here successfully: the
@@ -277,6 +312,21 @@ export type SubmitPaymentOutcome =
  *
  * Only the caller that wins transition 2 may ever call
  * dispatchPreparedPayment for this attempt.
+ *
+ * Pre-2f hardening: everything between transition 1 and transition 2 —
+ * `toPreparedFields` (unguarded BigInt parsing of the stored row) and
+ * `verifyPreparedPaymentSignature` (can re-throw a non-preflight error) —
+ * used to run outside any try/catch here. A throw in that window left the
+ * row stranded at "signed" forever: not resendable (CAS source no longer
+ * "awaiting_authorization"), not reconcilable (RECONCILABLE_STATES below is
+ * submitting/submitted/unknown, never "signed"), and — since cancel only
+ * accepted "awaiting_authorization" — not cancellable either, permanently
+ * blocking the account's one-active-attempt slot. Two things now close
+ * this: a pre-CAS hex-format check on the signature (so structurally
+ * malformed input never even claims the row), and wrapping the whole
+ * signed-window in try/catch (so anything else that throws still reaches a
+ * durable, terminal "failed" — see the catch below). Cancel separately now
+ * accepts "signed" too (resolveCancelPayment) as the last line of defense.
  */
 export async function resolveSubmitPayment(input: {
   cookieValue: string | undefined | null;
@@ -295,6 +345,8 @@ export async function resolveSubmitPayment(input: {
   if (!authenticated) return { outcome: "unauthenticated" };
 
   if (typeof input.attemptId !== "string" || typeof input.signature !== "string") return { outcome: "not_found" };
+  if (!isValidUuid(input.attemptId)) return { outcome: "not_found" };
+  if (!isWellFormedHexSignature(input.signature)) return { outcome: "invalid_signature" };
 
   const attempt = await input.paymentStore.findById(input.attemptId);
   if (!attempt || attempt.appUserId !== authenticated.account.appUserId) return { outcome: "not_found" };
@@ -303,38 +355,51 @@ export async function resolveSubmitPayment(input: {
   const claimed = await input.paymentStore.transition({ id: attempt.id, from: "awaiting_authorization", to: "signed" });
   if (!claimed) return { outcome: "wrong_state", state: attempt.state };
 
-  const ownerAddress = validateAddressCasePreserving(authenticated.account.ownerAddress);
-  if (!ownerAddress || !claimed.expectedUserOperationHash) {
-    const updated = await input.paymentStore.transition({
-      id: claimed.id,
-      from: "signed",
-      to: "failed",
-      patch: { failureReason: "Account or prepared payment state is invalid." },
+  let fields: PreparedUserOperationFields;
+  let submitting: PaymentAttempt | null;
+  try {
+    const ownerAddress = validateAddressCasePreserving(authenticated.account.ownerAddress);
+    if (!ownerAddress || !claimed.expectedUserOperationHash) {
+      const updated = await input.paymentStore.transition({
+        id: claimed.id,
+        from: "signed",
+        to: "failed",
+        patch: { failureReason: SAFE_SIGNATURE_INVALID },
+      });
+      return { outcome: "failed", attempt: toPublicAttempt(updated ?? claimed) };
+    }
+
+    fields = toPreparedFields(claimed);
+    const verification = await verifyPreparedPaymentSignature({
+      fields,
+      expectedOwner: ownerAddress as Address,
+      expectedUserOperationHash: claimed.expectedUserOperationHash as Hash,
+      signature: input.signature as Hex,
     });
+
+    if (!verification.ok) {
+      // Nothing was ever dispatched — a definitive, retryable failure.
+      const updated = await input.paymentStore.transition({ id: claimed.id, from: "signed", to: "failed", patch: { failureReason: SAFE_SIGNATURE_INVALID } });
+      return { outcome: "failed", attempt: toPublicAttempt(updated ?? claimed) };
+    }
+
+    // The signature independently verified. Durably record "we are about to
+    // dispatch" BEFORE ever calling the bundler — see the doc comment above.
+    submitting = await input.paymentStore.transition({ id: claimed.id, from: "signed", to: "submitting" });
+  } catch {
+    // Anything unexpected in this window (a corrupted stored row, an
+    // unrecognized signature-recovery failure, ...) becomes a terminal,
+    // safe failure — never a raw exception, and never a row stuck at
+    // "signed". Nothing was dispatched.
+    const updated = await input.paymentStore.transition({ id: claimed.id, from: "signed", to: "failed", patch: { failureReason: SAFE_INTERNAL_ERROR } });
     return { outcome: "failed", attempt: toPublicAttempt(updated ?? claimed) };
   }
 
-  const fields = toPreparedFields(claimed);
-  const verification = await verifyPreparedPaymentSignature({
-    fields,
-    expectedOwner: ownerAddress as Address,
-    expectedUserOperationHash: claimed.expectedUserOperationHash as Hash,
-    signature: input.signature as Hex,
-  });
-
-  if (!verification.ok) {
-    // Nothing was ever dispatched — a definitive, retryable failure.
-    const updated = await input.paymentStore.transition({ id: claimed.id, from: "signed", to: "failed", patch: { failureReason: verification.reason } });
-    return { outcome: "failed", attempt: toPublicAttempt(updated ?? claimed) };
-  }
-
-  // The signature independently verified. Durably record "we are about to
-  // dispatch" BEFORE ever calling the bundler — see the doc comment above.
-  const submitting = await input.paymentStore.transition({ id: claimed.id, from: "signed", to: "submitting" });
   if (!submitting) {
-    // Should not happen (this caller is the only one that could be holding
-    // "signed" for this attempt, per the CAS above) — refuse rather than
-    // dispatch against a state we can no longer account for.
+    // Lost the signed -> submitting CAS — most likely a concurrent cancel
+    // won first (resolveCancelPayment now accepts "signed"). Either way,
+    // refuse rather than dispatch against a state we can no longer account
+    // for; never re-attempt the CAS or the dispatch.
     const current = await input.paymentStore.findById(claimed.id);
     return { outcome: "wrong_state", state: current?.state ?? claimed.state };
   }
@@ -392,6 +457,7 @@ export async function resolvePaymentStatus(input: {
     registry: input.registry,
   });
   if (!authenticated) return { outcome: "unauthenticated" };
+  if (!isValidUuid(input.attemptId)) return { outcome: "not_found" };
 
   const attempt = await input.paymentStore.findById(input.attemptId);
   if (!attempt || attempt.appUserId !== authenticated.account.appUserId) return { outcome: "not_found" };
@@ -463,12 +529,29 @@ export type CancelPaymentOutcome =
   | { outcome: "cancelled"; attempt: PublicPaymentAttempt };
 
 /**
- * Lets a user abandon an attempt that is still awaiting_authorization —
- * e.g. after cancelling the passkey prompt and deciding not to retry —
- * without leaving it stuck occupying the account's one-active-attempt slot
- * forever. Only valid from awaiting_authorization: once a signature exists
- * (signed/submitting/submitted/unknown), cancelling would be meaningless or
- * unsafe (the operation may already be on its way to the chain).
+ * Pre-2f hardening: cancellable states expanded from just
+ * awaiting_authorization to every pre-dispatch state — prepared,
+ * awaiting_authorization, and signed. Nothing dispatched to the bundler in
+ * any of these states, so abandoning them is always safe; this is also the
+ * user's only way to clear an attempt that got stranded at "signed" by a
+ * crash resolveSubmitPayment's try/catch didn't fully absorb (e.g. the
+ * process died before that catch itself could run). submitting/submitted/
+ * unknown are deliberately excluded — the operation may already be on its
+ * way to (or already on) the chain, so those are never cancellable, only
+ * reconcilable (resolvePaymentStatus).
+ */
+const CANCELLABLE_STATES: readonly PaymentAttemptState[] = ["prepared", "awaiting_authorization", "signed"];
+
+/**
+ * CAS's from the attempt's OWN current state, not a hardcoded one — this is
+ * what makes the cancel-vs-submit race resolve correctly regardless of
+ * which one reads the row first: if a concurrent resolveSubmitPayment has
+ * already moved signed -> submitting by the time this CAS runs, `from`
+ * (read moments ago) not matching current reality makes the transition
+ * fail, this returns wrong_state, and the bundler is never touched by
+ * cancel. Conversely, if this CAS wins first (signed -> cancelled),
+ * resolveSubmitPayment's own signed -> submitting CAS then fails and it
+ * never dispatches either — see payments-cancel.test.ts's race tests.
  */
 export async function resolveCancelPayment(input: {
   cookieValue: string | undefined | null;
@@ -483,12 +566,19 @@ export async function resolveCancelPayment(input: {
     registry: input.registry,
   });
   if (!authenticated) return { outcome: "unauthenticated" };
+  if (!isValidUuid(input.attemptId)) return { outcome: "not_found" };
 
   const attempt = await input.paymentStore.findById(input.attemptId);
   if (!attempt || attempt.appUserId !== authenticated.account.appUserId) return { outcome: "not_found" };
+  if (!CANCELLABLE_STATES.includes(attempt.state)) return { outcome: "wrong_state", state: attempt.state };
 
-  const updated = await input.paymentStore.transition({ id: attempt.id, from: "awaiting_authorization", to: "cancelled" });
-  if (!updated) return { outcome: "wrong_state", state: attempt.state };
+  const updated = await input.paymentStore.transition({ id: attempt.id, from: attempt.state, to: "cancelled" });
+  if (!updated) {
+    // Lost a race (e.g. a concurrent signed -> submitting CAS already won)
+    // — re-read for the true current state rather than guessing.
+    const current = await input.paymentStore.findById(attempt.id);
+    return { outcome: "wrong_state", state: current?.state ?? attempt.state };
+  }
 
   return { outcome: "cancelled", attempt: toPublicAttempt(updated) };
 }

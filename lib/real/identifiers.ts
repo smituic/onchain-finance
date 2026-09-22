@@ -40,6 +40,17 @@ export function normalizeTurnkeyId(value: string | null | undefined): string | n
   return trimmed.toLowerCase();
 }
 
+/**
+ * Pre-2f hardening: validates a value is a well-formed UUID (matching
+ * payment_attempts.id, a Postgres UUID column) BEFORE it ever reaches a
+ * store lookup. Without this, a malformed id passed to the Neon adapter's
+ * `WHERE id = ${id}` throws a raw "invalid input syntax for type uuid"
+ * error, which used to propagate uncaught into a client-facing 500 body.
+ */
+export function isValidUuid(value: string): boolean {
+  return UUID_PATTERN.test(value);
+}
+
 export function assertNormalizedAddress(value: string, label: string): string {
   const normalized = normalizeAddress(value);
   if (!normalized) throw new Error(`${label} is not a valid Ethereum address.`);

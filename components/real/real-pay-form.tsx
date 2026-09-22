@@ -50,7 +50,16 @@ export function RealPayForm() {
   const reset = useRealPaymentStore((s) => s.reset);
 
   useEffect(() => {
-    if (account) void init();
+    // Pre-2f hardening: the else branch matters — without it, logging out
+    // (account -> null) left this store's recipient/amount/attempt/error
+    // untouched, so they could survive into whatever account signs in
+    // next. init() itself also resets first (see real-payment-store.ts),
+    // so "reset before init" holds either way this effect fires.
+    if (account) {
+      void init();
+    } else {
+      reset();
+    }
     // Re-check only when the signed-in account itself changes, not on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account?.safeAddress]);
@@ -190,6 +199,20 @@ export function RealPayForm() {
             Cancel payment
           </Button>
         </div>
+      </div>
+    );
+  }
+
+  if (status === "stranded") {
+    return (
+      <div className="flex flex-col gap-4" data-testid="real-pay-stranded">
+        <div className="flex flex-col gap-1 rounded-xl bg-muted/60 px-4 py-3.5">
+          <p className="text-sm font-medium">This payment didn&apos;t go through</p>
+          <p className="text-sm text-muted-foreground">It was never sent. You can safely cancel it and try again.</p>
+        </div>
+        <Button variant="outline" className="h-11 w-full" onClick={() => void cancel()}>
+          Cancel payment
+        </Button>
       </div>
     );
   }

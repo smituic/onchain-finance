@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 /**
  * The durable Real Pay state machine (Batch 2d):
  *
@@ -130,7 +132,6 @@ export interface PaymentAttemptStore {
 
 export function createInMemoryPaymentAttemptStore(): PaymentAttemptStore {
   const attempts = new Map<string, PaymentAttempt>();
-  let nextId = 0;
 
   function forAccount(appUserId: string): PaymentAttempt[] {
     return [...attempts.values()].filter((attempt) => attempt.appUserId === appUserId);
@@ -158,7 +159,12 @@ export function createInMemoryPaymentAttemptStore(): PaymentAttemptStore {
 
       const nowIso = new Date(now).toISOString();
       const attempt: PaymentAttempt = {
-        id: `payment-attempt-${(nextId += 1)}`,
+        // Pre-2f hardening: a real UUID, matching Neon's gen_random_uuid()
+        // shape — not a "payment-attempt-N" placeholder. The new
+        // isValidUuid() guard (identifiers.ts) rejects non-UUID ids before
+        // they ever reach a store lookup, so this store's ids must be
+        // structurally realistic, not just unique.
+        id: randomUUID(),
         appUserId: input.appUserId,
         safeAddress: input.safeAddress,
         recipient: input.recipient,

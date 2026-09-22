@@ -5,18 +5,19 @@ import type { ExternalProvisioningOutcome, RegistrationAttempt, RegistrationAtte
 import type { PaymentAttempt, PaymentAttemptState, PaymentAttemptStore, ReserveResult } from "./payment-attempts";
 
 /**
- * SERVER-ONLY durable adapters for the three vendor-neutral interfaces
- * (ChallengeStore, RealAccountRegistry, RegistrationAttemptStore), backed by
- * Neon Postgres via @neondatabase/serverless's HTTP query function — no
- * persistent socket, matching Next.js route handlers' request-scoped
- * lifetime. Schema: lib/real/server/schema.sql. Never imported by
- * components, lib/real's signing/domain modules, or any Zustand store —
- * only by app/api/real/** route handlers (via server/runtime.ts), and only
- * when DATABASE_URL is configured.
+ * SERVER-ONLY durable adapters for the four vendor-neutral interfaces
+ * (ChallengeStore, RealAccountRegistry, RegistrationAttemptStore,
+ * PaymentAttemptStore), backed by Neon Postgres via
+ * @neondatabase/serverless's HTTP query function — no persistent socket,
+ * matching Next.js route handlers' request-scoped lifetime. Schema:
+ * lib/real/server/schema.sql. Never imported by components, lib/real's
+ * signing/domain modules, or any Zustand store — only by app/api/real/**
+ * route handlers (via server/runtime.ts), and only when DATABASE_URL is
+ * configured.
  *
- * This file has never been exercised against a live database in this
- * session (no credentials were available) — see the Batch 2b report's "env
- * setup" section for what's needed before it can be.
+ * Live-verified against a real Neon database: registration/restoration
+ * (Batch 2b), Real Pay send (Batch 2d), and payment history (Batch 2e) —
+ * see test/lib/real/neon-smoke.test.ts.
  */
 
 type Row = Record<string, unknown>;
@@ -313,39 +314,48 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
 
 /**
  * Batch 2d: durable Real Pay attempts. `reserve()` is a SINGLE SQL statement
- * (a CTE) — never a separate count-then-insert pair — so the per-account
- * rate limit and the one-non-terminal-attempt-per-account invariant are both
- * enforced atomically at the database level, safe under concurrent requests
- * and across multiple serverless instances:
+ * (a CTE) — never a separate count-then-insert pair — so no caller can
+ * observe a "count says OK" result and then race a second INSERT past it;
+ * the count and the INSERT are the same statement:
  *
  *  1. `pg_advisory_xact_lock(hashtext(app_user_id))` — the TRANSACTION-scoped
  *     variant, not the session-scoped `pg_advisory_lock` — serializes
- *     concurrent reserve() calls for the SAME account only (different
- *     accounts never contend) and releases automatically when this single
- *     statement's implicit transaction ends. This matters specifically
- *     because Neon's HTTP query function opens a fresh connection per call
- *     (there is no persistent session to scope a session-level lock to, and
- *     a session-scoped lock could leak indefinitely on a driver that never
- *     reuses connections); a transaction-scoped lock has no such failure
- *     mode — it cannot outlive the statement that took it.
+ *     concurrent reserve() EXECUTION ORDER for the SAME account only
+ *     (different accounts never contend) and releases automatically when
+ *     this single statement's implicit transaction ends. This matters
+ *     specifically because Neon's HTTP query function opens a fresh
+ *     connection per call (there is no persistent session to scope a
+ *     session-level lock to, and a session-scoped lock could leak
+ *     indefinitely on a driver that never reuses connections); a
+ *     transaction-scoped lock has no such failure mode.
  *  2. `_lock` is marked `MATERIALIZED` and its result is cross-joined into
- *     `_counts`'s FROM clause — not just referenced in passing. Both of
- *     these are deliberate: MATERIALIZED forces Postgres to actually
- *     execute (and not inline-optimize-away) this CTE regardless of planner
- *     version, and the cross join means `_counts` cannot be computed
- *     without `_lock` having already produced its one row — i.e. the lock
- *     is provably acquired before the quota counts are read, not just
- *     "hopefully" ordered by CTE position.
- *  3. The hourly/daily/active counts are read inside that lock, so a second
- *     concurrent call for the same account can't read a stale count.
- *  4. The INSERT only happens `WHERE hourly < 10 AND daily < 30 AND active = 0`.
+ *     `_counts`'s FROM clause, so the lock is provably acquired before the
+ *     quota counts are read WITHIN THIS STATEMENT's own execution.
+ *  3. The INSERT only happens `WHERE hourly < 10 AND daily < 30 AND active = 0`.
  *
- * The partial unique index (payment_attempts_one_active_per_account, see
- * schema.sql) is the independent, final backstop for the one-active-
- * attempt-per-account invariant — even if the lock/count logic here were
- * ever bypassed or buggy, Postgres itself refuses a second non-terminal row
- * for the same account, surfaced here as a 23505 unique-violation mapped to
- * the same "payment_in_progress" result.
+ * PRE-2F CORRECTED CLAIM (two independent audits, 2026-09): the advisory
+ * lock does NOT refresh this statement's read-committed snapshot. If this
+ * statement was blocked waiting on the lock, and the transaction holding it
+ * committed a new row in the meantime, that row is not guaranteed visible
+ * to `_counts` once the lock is granted and this statement resumes —
+ * Postgres does not re-snapshot mid-statement under READ COMMITTED. So the
+ * lock does not, by itself, make the hourly/daily numeric quota counts
+ * airtight under concurrency; they're serially enforced and best-effort
+ * precise, not a cryptographically tight bound.
+ *
+ * What DOES hold unconditionally is the one-active-attempt-per-account
+ * invariant: the partial unique index (payment_attempts_one_active_per_account,
+ * see schema.sql) is a hard Postgres constraint checked against current
+ * committed reality at INSERT time, independent of any statement's
+ * snapshot — so a second concurrent reserve() for the same account is
+ * refused either by this statement's own active-count check or, failing
+ * that, by the unique index itself (surfaced here as a 23505
+ * unique-violation mapped to "payment_in_progress"). Quota is not
+ * bypassable in the way that would matter (two active payments at once);
+ * the numeric hourly/daily counts just aren't proven mathematically exact.
+ * If a future design ever allows more than one active payment per account,
+ * this reservation logic must be revisited — the unique index's backstop
+ * role goes away.
  */
 export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, false>): PaymentAttemptStore {
   return {

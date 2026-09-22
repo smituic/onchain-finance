@@ -13,9 +13,12 @@ import { createNeonDurableStores } from "./neon-store";
  * during onboarding is unrecoverable by design (there is nothing to
  * recover from), which is fine for local development, not production.
  *
- * This file has never connected to a live Neon database in this session —
- * no DATABASE_URL/credentials were available. See the Batch 2b report's
- * "env setup" section for what's needed before this path is exercised.
+ * Live-verified against a real Neon database (Batch 2b registration/
+ * restoration, Batch 2d Real Pay, Batch 2e payment history) — this is no
+ * longer an unexercised path.
+ *
+ * Pre-2f hardening: production must never silently fall back to in-memory
+ * storage — see the NODE_ENV check below.
  */
 let registry: RealAccountRegistry | null = null;
 let challengeStore: ChallengeStore | null = null;
@@ -33,6 +36,16 @@ function ensureStoresInitialized(): void {
     attemptStore = durable.attempts;
     paymentAttemptStore = durable.payments;
     return;
+  }
+
+  if (process.env.NODE_ENV === "production") {
+    // Fail closed: a production deployment with no durable database would
+    // otherwise silently run on ephemeral, single-process in-memory
+    // stores — accounts, passkeys, and payment attempts all vanish on the
+    // next restart/cold start, with no signal beyond a doc comment. This
+    // throw surfaces as a clear server-side error (visible in the
+    // platform's own function/request logs) instead.
+    throw new Error("Real Mode is misconfigured: DATABASE_URL is required in production and none was provided.");
   }
 
   registry = createInMemoryRealAccountRegistry();

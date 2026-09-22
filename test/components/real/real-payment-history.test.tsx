@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RealPaymentHistory } from "@/components/real/real-payment-history";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
@@ -176,5 +176,31 @@ describe("RealPaymentHistory", () => {
     render(<RealPaymentHistory />);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(fetchMock.mock.calls[0]?.[1]?.method ?? "GET").toBe("GET");
+  });
+
+  it("pre-2f hardening: switching to a different account's address never leaves the prior account's history on screen", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    stubHistoryOnlyFetch([entry({ id: "payment-attempt-account-a", state: "confirmed" })]);
+    render(<RealPaymentHistory />);
+    await waitFor(() => expect(screen.getByTestId("real-payment-history-row-payment-attempt-account-a")).toBeInTheDocument());
+
+    const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+    let resolveSecondFetch: (value: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => (resolveSecondFetch = resolve))),
+    );
+
+    act(() => {
+      useRealAccountStore.setState({ account: ACCOUNT_B, status: "ready" });
+    });
+
+    // Before B's fetch has resolved, A's row must already be gone.
+    expect(screen.queryByTestId("real-payment-history-row-payment-attempt-account-a")).not.toBeInTheDocument();
+
+    resolveSecondFetch(
+      new Response(JSON.stringify({ entries: [entry({ id: "payment-attempt-account-b" })] }), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    await waitFor(() => expect(screen.getByTestId("real-payment-history-row-payment-attempt-account-b")).toBeInTheDocument());
   });
 });

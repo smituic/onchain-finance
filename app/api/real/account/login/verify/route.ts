@@ -1,6 +1,6 @@
 import { cookies } from "next/headers";
 import type { AuthenticationResponseJSON } from "@simplewebauthn/server";
-import { asErrorMessage, disabledResponse, isRealModeEnabled, jsonError, requireRealServerConfig } from "@/lib/real/server/http";
+import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readJsonBody, requireRealServerConfig } from "@/lib/real/server/http";
 import { completeLogin } from "@/lib/real/server/login";
 import { getChallengeStore, getRealAccountRegistry, getRegistrationAttemptStore } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME, realSessionCookieOptions } from "@/lib/real/server/session";
@@ -9,7 +9,9 @@ export async function POST(request: Request) {
   if (!isRealModeEnabled()) return disabledResponse();
   try {
     const config = requireRealServerConfig();
-    const body = (await request.json()) as { response?: AuthenticationResponseJSON };
+    const rawBody = await readJsonBody(request);
+    if (rawBody === null) return jsonError("Invalid request body.", 400);
+    const body = rawBody as { response?: AuthenticationResponseJSON };
     if (!body.response) return jsonError("A WebAuthn login response is required.", 400);
 
     const result = await completeLogin({
@@ -34,7 +36,7 @@ export async function POST(request: Request) {
       ownerAddress: result.account.ownerAddress,
       safeAddress: result.account.safeAddress,
     });
-  } catch (error) {
-    return jsonError(asErrorMessage(error), 500);
+  } catch {
+    return jsonInternalError();
   }
 }

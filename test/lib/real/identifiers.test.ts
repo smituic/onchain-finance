@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   addressesEqual,
+  isValidUuid,
   normalizeAddress,
   normalizeHash,
   normalizeTurnkeyId,
@@ -50,5 +51,12 @@ describe("identifier normalization", () => {
     expect(validateAddressCasePreserving("  0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF  ")).toBe(
       "0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF",
     );
+  });
+
+  it("pre-2f hardening: isValidUuid accepts a well-formed payment_attempts-style UUID and rejects malformed ids before they reach a store lookup", () => {
+    expect(isValidUuid("11111111-1111-4111-8111-111111111111")).toBe(true);
+    expect(isValidUuid("not-a-uuid")).toBe(false);
+    expect(isValidUuid("")).toBe(false);
+    expect(isValidUuid("11111111-1111-1111-1111-111111111111")).toBe(false); // wrong version nibble
   });
 });

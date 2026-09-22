@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { asErrorMessage, disabledResponse, isRealModeEnabled, jsonError, requireRealServerConfig } from "@/lib/real/server/http";
+import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readJsonBody, requireRealServerConfig } from "@/lib/real/server/http";
 import { resolvePreparePayment } from "@/lib/real/server/payments";
 import { getPaymentAttemptStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
@@ -17,7 +17,9 @@ export async function POST(request: Request) {
   if (!isRealModeEnabled()) return disabledResponse();
   try {
     const config = requireRealServerConfig();
-    const body = (await request.json()) as { recipient?: unknown; amountBaseUnits?: unknown };
+    const rawBody = await readJsonBody(request);
+    if (rawBody === null) return jsonError("Invalid request body.", 400);
+    const body = rawBody as { recipient?: unknown; amountBaseUnits?: unknown };
     const store = await cookies();
 
     const outcome = await resolvePreparePayment({
@@ -53,7 +55,7 @@ export async function POST(request: Request) {
       case "ready":
         return Response.json({ attempt: outcome.attempt, subOrganizationId: outcome.subOrganizationId });
     }
-  } catch (error) {
-    return jsonError(asErrorMessage(error), 500);
+  } catch {
+    return jsonInternalError();
   }
 }

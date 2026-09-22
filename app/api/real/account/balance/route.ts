@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { asErrorMessage, disabledResponse, isRealModeEnabled, jsonError, requireRealServerConfig } from "@/lib/real/server/http";
+import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, requireRealServerConfig } from "@/lib/real/server/http";
 import { resolveAuthenticatedCashBalance } from "@/lib/real/server/balance";
 import { getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
@@ -27,7 +27,7 @@ export async function GET() {
     if (outcome.outcome === "read_failed") return jsonError(outcome.reason, 502);
 
     return Response.json(outcome.balance);
-  } catch (error) {
-    return jsonError(asErrorMessage(error), 500);
+  } catch {
+    return jsonInternalError();
   }
 }
