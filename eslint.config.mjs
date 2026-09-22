@@ -10,11 +10,37 @@ import nextTs from "eslint-config-next/typescript";
  * pieces here — rather than relying on blocks layering.
  */
 
-// Blockchain SDKs (Phase 2). None are installed yet; the fence exists ahead
-// of them so Real Mode's account/chain code can only land inside lib/real/**
-// and the server-side route handlers under app/api/real/**. Components,
-// pages, and stores talk to lib/real's interface, never to a chain SDK.
-const CHAIN_SDK_PACKAGES = ["viem", "@base-org/account", "wagmi", "@wagmi/core", "ethers", "web3"];
+// Blockchain SDKs (Phase 2, Batch 2). Real Mode's account/chain code may
+// only land inside lib/real/** and the server-side route handlers under
+// app/api/real/**. Components, pages, and stores talk to lib/real's
+// interface, never to a chain SDK.
+const CHAIN_SDK_PACKAGES = [
+  "viem",
+  "@base-org/account",
+  "wagmi",
+  "@wagmi/core",
+  "ethers",
+  "web3",
+  "permissionless",
+  "ox",
+  "@turnkey/http",
+  "@turnkey/webauthn-stamper",
+  "@turnkey/api-key-stamper",
+  // Not installed and not needed: createVerifiedTurnkeyOwnerAccount builds
+  // its LocalAccount directly from plain viem's toAccount(), since
+  // permissionless's signUserOperation only ever calls .address and
+  // .signTypedData() on the owner (verified against installed source before
+  // this decision) — @turnkey/viem's own signTypedData adapter is also the
+  // one proven to recover the wrong signer. These entries stay banned so an
+  // future `pnpm add` can't reintroduce it, or the persistent-session
+  // tooling it (and the wider Turnkey browser SDK family) pulls in, without
+  // tripping this fence first.
+  "@turnkey/viem",
+  "@turnkey/sdk-browser",
+  "@turnkey/sdk-server",
+  "@turnkey/core",
+  "@turnkey/indexed-db-stamper",
+];
 const CHAIN_SDK_MESSAGE =
   "Blockchain SDKs may only be imported inside lib/real/** (and app/api/real/** route handlers). Everything else goes through lib/real's interface — see ARCHITECTURE.md.";
 const noChainSdk = {
@@ -81,9 +107,9 @@ const eslintConfig = defineConfig([
     },
   },
   {
-    // Real Mode's account/chain layer (Phase 2): framework-agnostic like
-    // simulation/, and the other half of the same boundary — it must never
-    // read or write Practice state. Reserved now; populated in Batch 2.
+    // Real Mode's account/chain layer (Phase 2, Batch 2): framework-agnostic
+    // like simulation/, and the other half of the same boundary — it must
+    // never read or write Practice state.
     files: ["lib/real/**/*.{ts,tsx}"],
     rules: {
       "no-restricted-imports": restrictImports(noFramework("lib/real/"), {
