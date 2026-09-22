@@ -17,7 +17,7 @@ Before doing substantive work, be aware of these documents and treat them as sou
 
 ## Current Phase
 
-**Phase 2 (testnet Real Mode) is active** — see ROADMAP.md for the batch order, which deliberately starts with Pay. Batch 1 (the Practice/Real boundary) and Batches 2a–2e (the signing/account foundation, account provisioning and restoration, Cash balance, Real Pay, and Real Pay history) are built and live-verified. A final Phase 2 hardening pass (prompted by independent security audits) is in progress; Batch 2f (the final repo-wide audit, docs, PR, and merge) is next and begins only when the user authorizes it.
+**Phase 2's testnet Real Mode foundation is complete and merged into `main`** — see ROADMAP.md for the batch order, which deliberately started with Pay. Batch 1 built the Practice/Real boundary; 2a the signing/Safe foundation; 2b account provisioning and restoration; 2c the real Cash balance; 2d Real Pay; 2e bounded Real Pay history; 2f the final repo-wide audit, docs, PR, and merge. Broader Real Mode expansion (Swap, Save, Borrow, Invest) is future work, scoped separately when it's taken up.
 
 ## Hard Constraints
 

@@ -20,10 +20,12 @@ The MVP lets people *learn by doing*: manage a simulated portfolio, swap assets,
 
 Two rounds of post-completion product-quality cleanup are also done: Batch A (Home recent payments, clearer Swap-rate explanation, Borrow interest disclosure, Explore sandbox clarity) and Batch B (consistent consumer vocabulary — Cash instead of USDC, Buy/Sell in Invest, clearer Save/Pay wording, friendlier Swap errors).
 
-**Phase 2 (Real Mode on a testnet) is active**, starting with Pay — a deliberate change from the earlier plan, recorded in [ROADMAP.md](ROADMAP.md). So far:
+**Phase 2's testnet Real Mode foundation is complete**, proved starting with Pay — a deliberate change from the earlier plan, recorded in [ROADMAP.md](ROADMAP.md):
 
 - **Practice/Real boundary (done).** A Practice / Real switch in the header, a one-time introduction on first entry, and a per-page boundary that renders each area's Practice or Real presentation. Areas with no Real implementation yet (Save, Invest, Swap, Borrow) say so and offer "Try it in Practice". Explore stays the same isolated Practice sandbox in both modes.
-- **Real account, Cash balance, Pay, and payment history (done).** A real, blockchain-backed account set up with a passkey (no seed phrases or browser extensions), a real testnet Cash (USDC) balance on Base Sepolia, sending Cash with explicit preparing/awaiting-approval/sent/failed states, and a bounded, read-only view of recent payments — all live-verified against a real Neon database and Base Sepolia. See [ARCHITECTURE.md](ARCHITECTURE.md)'s Phase 2 decisions for what's built, and `.env.example` for the environment variables a real setup needs. A final Phase 2 hardening/audit pass is in progress before Swap, Save, and Borrow get their own Real Mode implementations.
+- **Real account, Cash balance, Pay, payment history, and hardening (done).** A real, blockchain-backed account set up with a passkey (no seed phrases or browser extensions), a real testnet Cash (USDC) balance on Base Sepolia, sponsored Cash payments that require a fresh authorization for every send, and a bounded, read-only view of recent payments — all live-verified against a real Neon database and Base Sepolia, with final security/audit hardening completed and merged. See [ARCHITECTURE.md](ARCHITECTURE.md)'s Phase 2 decisions for what's built, and `.env.example` for the environment variables a real setup needs.
+
+Real Mode for Save, Invest, Swap, and Borrow is future work, to be scoped separately once undertaken.
 
 Real Mode is **testnet-only** for all of Phase 2 — no mainnet, no real-value funds. Practice Mode is untouched: the simulation engine and its persistence are unchanged, and tests assert Real Mode never mutates Practice state.
 

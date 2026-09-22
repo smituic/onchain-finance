@@ -37,13 +37,13 @@ Two rounds of post-completion product-quality polish followed: Batch A (Home rec
 
 ## Phase 2 — Testnet: Introducing Real Mode
 
-**Status: Active.** Batch 1 (the Practice/Real boundary), the real account foundation (Batch 2b), the real Cash balance read (Batch 2c), Real Pay (Batch 2d), and a bounded Real Pay transaction history read (Batch 2e) are all built and live-verified on Base Sepolia + a real Neon database — registration, Turnkey provisioning, fresh-browser restore, an authenticated balance read, one real sponsored Cash payment ($0.01, confirmed on-chain with a fresh Turnkey/WebAuthn signature per payment), and (Batch 2e) a real-Neon-verified, live-browser-verified read-only history view over those same payment rows. A final Phase 2 repo-wide audit and PR (Batch 2f) is next; see ARCHITECTURE.md's "Phase 2 Batch 2d Decisions" and "Phase 2 Batch 2e Decisions" for what's built.
+**Status: Complete.** Batch 1 (the Practice/Real boundary), the signing/Safe foundation (Batch 2a), the real account foundation (Batch 2b), the real Cash balance read (Batch 2c), Real Pay (Batch 2d), a bounded Real Pay transaction history read (Batch 2e), and the final repo-wide audit, docs, PR, and merge (Batch 2f) are all built, live-verified on Base Sepolia + a real Neon database, and merged into `main` — registration, Turnkey provisioning, fresh-browser restore, an authenticated balance read, one real sponsored Cash payment ($0.01, confirmed on-chain with a fresh Turnkey/WebAuthn signature per payment), a real-Neon-verified, live-browser-verified read-only history view over those same payment rows, and security hardening closed from two independent audits. See ARCHITECTURE.md's "Phase 2 Batch 2d Decisions", "Phase 2 Batch 2e Decisions", and "Phase 2 Pre-2f Hardening Decisions" for what's built. This completes Phase 2's real-account foundation, proved via Pay; broader Real Mode expansion (Swap, Save, Borrow, Invest) is future work — see "Future: broader Real Mode expansion" below.
 
 **Goal:** Introduce Real Mode, backed by real (testnet) infrastructure, one area at a time, while Practice Mode remains fully available for everything — including areas Real Mode doesn't support yet. Prove one real end-to-end path before broadening.
 
 ### Sequencing decision (September 2026)
 
-This phase was originally planned to start with Real Mode for Swap, Save, and Borrow, with Pay staying Practice-only until Phase 3. That ordering has been deliberately reversed: **Pay comes first.** Sending a stablecoin to another account is the simplest real financial action there is — one account, one balance, one transfer, one transaction to watch — so it is the cheapest way to prove the whole Real Mode foundation (account, balance, transaction lifecycle, history) before any protocol integration adds its own complexity. Swap, Save, and Borrow in Real Mode remain Phase 2 goals; they follow once that foundation exists.
+This phase was originally planned to start with Real Mode for Swap, Save, and Borrow, with Pay staying Practice-only until Phase 3. That ordering has been deliberately reversed: **Pay comes first.** Sending a stablecoin to another account is the simplest real financial action there is — one account, one balance, one transfer, one transaction to watch — so it is the cheapest way to prove the whole Real Mode foundation (account, balance, transaction lifecycle, history) before any protocol integration adds its own complexity. Swap, Save, and Borrow in Real Mode were originally scoped to follow within Phase 2 once that foundation existed; now that the foundation is built, live-verified, and merged, they've moved out of Phase 2 and into future work — see "Future: broader Real Mode expansion" below.
 
 The new order:
 
@@ -52,27 +52,32 @@ The new order:
 3. **Real testnet Cash balance** — reading a real testnet stablecoin balance and presenting it as Cash. *Done — a read-only, session-authenticated USDC `balanceOf` read for the durable Safe address, live-verified against the real (unfunded, $0.00) account from Batch 2b. No signing, no Turnkey/Pimlico involvement.*
 4. **Real Pay** — sending Cash to another address, with explicit preparing / awaiting approval / submitted / confirmed / failed / unknown states. *Done — a real sponsored Cash transfer ($0.01) confirmed on Base Sepolia, with a fresh Turnkey/WebAuthn signature required per payment, a server-bound payment intent (no arbitrary calldata/target), a durable Neon state machine with atomic reservation, and reconcile-never-resend recovery. See ARCHITECTURE.md's "Phase 2 Batch 2d Decisions".*
 5. **Transaction lifecycle and history** — persisted, recoverable across reload, with the real transaction hash and status one tap away. *Done — a bounded, read-only view (default 10 rows, hard max 25) over Batch 2d's `payment_attempts` rows, authenticated/account-scoped the same way the balance/latest reads already are, in consumer status language, with no reconciliation or mutation from the history UI itself. Live-verified: a real-Neon smoke suite (newest-first, limit-honoring, account-scoped) and a live browser check against Base Sepolia + the real database, confirming the existing confirmed/cancelled rows render truthfully and Refresh calls only the history endpoint. See ARCHITECTURE.md's "Phase 2 Batch 2e Decisions".*
-6. Real Mode for Swap, Save, and Borrow against public testnet protocols — off-the-shelf or well-audited testnet deployments where possible, not novel contracts.
+6. Real Mode for Swap, Save, and Borrow against public testnet protocols — off-the-shelf or well-audited testnet deployments where possible, not novel contracts. *Deferred: moved out of Phase 2's completed foundation scope; now future work — see "Future: broader Real Mode expansion" below.*
 
 **In scope:**
 - Real account/wallet on a public testnet, with a consumer-grade setup (no seed phrases or extensions in the default path)
-- Real Mode for Pay first (balance, send, transaction status/history), then Swap, Save, and Borrow
+- Real Mode for Pay (balance, send, transaction status/history) — the foundation Phase 2 set out to prove. (Swap, Save, and Borrow were originally sequenced to follow within Phase 2; they're now future work — see below.)
 - The Practice ⇄ Real mode switch, shared across the app, with a build-time feature flag that is authoritative over any remembered choice
 - Practice and Real as parallel state paths: the Practice simulation engine is not extended, wrapped, or made asynchronous for Real Mode
 - Introducing real-world friction points transparently but gently: confirmation times, transaction failures, and (where not abstracted) gas — explained contextually, same as any other concept
 
 **Out of scope:**
 - Real/mainnet funds or anything of real value — testnet only, for the whole phase
-- Real Mode for Invest — still Practice-only
+- Real Mode for Invest, Swap, Save, and Borrow — future work beyond Phase 2's completed foundation (see below)
 - Bank/payment rails, usernames/handles, requests, or contacts in Real Mode
 - Full asset/protocol breadth — still a curated, teaching-oriented set
 - Recovery, spending limits, session permissions, transaction simulation, fraud/scam screening
 - Any cross-chain abstraction or bridging
 
-**Exit criteria:**
+**Exit criteria (met):**
 - A user can set up a real account, hold a real testnet Cash balance, send Cash to another account, and see the payment move through its states to confirmed — without needing to understand wallets, gas, or hashes beyond what's explained in context.
-- Users can complete the Swap/Save/Borrow loop from Phase 1 in Real Mode against testnet protocols.
 - Switching between Practice and Real mode feels like the same product, and Practice Mode is provably unchanged by anything Real Mode does.
+
+The Swap/Save/Borrow-in-Real-Mode criterion originally listed here reflected Phase 2's original full scope. Now that the account/balance/transaction-lifecycle foundation is proved end to end via Pay, that criterion has moved to "Future: broader Real Mode expansion" below rather than blocking Phase 2 from being considered done.
+
+### Future: broader Real Mode expansion
+
+Real Mode for Swap, Save, Borrow, and Invest — against public testnet protocols, off-the-shelf or well-audited testnet deployments where possible, not novel contracts — remains a real product goal, but is no longer part of Phase 2's exit criteria. It builds on the same foundation Phase 2 just proved (account, signing, balance, transaction lifecycle) and will get its own sequencing, batches, and exit criteria when it's actually taken up. This is testnet Real Mode broadening, distinct from and prior to Phase 3's production/mainnet scope below.
 
 ## Phase 3 — Consumer Product: Full Vision, Real Mode
 
