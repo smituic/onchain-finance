@@ -1,12 +1,10 @@
-import { createPublicClient, http } from "viem";
+import { createPublicClient, http, type PublicClient, type Transport } from "viem";
 import { baseSepolia } from "viem/chains";
 
 /**
- * Only a client factory — balance/history reads are Batch 2c's scope. Pulled
- * forward into 2b only because deriving/persisting a Safe address at
- * registration time needs a real read (the Safe proxy factory's
- * proxyCreationCode()), which createRealSafeAccount (account/safe.ts)
- * already requires a client for.
+ * A client factory — used both for deriving/persisting a Safe address at
+ * registration time (account/safe.ts's proxyCreationCode() read) and for
+ * Batch 2c's balance reads (chain/balance.ts).
  */
 export function createRealPublicClient(rpcUrl: string) {
   return createPublicClient({
@@ -14,3 +12,12 @@ export function createRealPublicClient(rpcUrl: string) {
     transport: http(rpcUrl),
   });
 }
+
+/**
+ * Chain-pinned (typeof baseSepolia) so chain-dependent return shapes (e.g.
+ * getBlock()) can't structurally diverge from a bare, chain-less viem
+ * PublicClient — but transport-generic (base Transport, not the specific
+ * HttpTransport createRealPublicClient happens to use), so tests can supply
+ * an in-process `custom(...)` transport client instead of a live RPC.
+ */
+export type RealPublicClient = PublicClient<Transport, typeof baseSepolia>;

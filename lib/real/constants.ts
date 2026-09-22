@@ -47,3 +47,17 @@ export const REAL_WALLET_ACCOUNT = {
 };
 
 export const REAL_SESSION_COOKIE_NAME = "ocf_real_session";
+
+/**
+ * Circle-issued testnet USDC on Base Sepolia — the asset behind consumer-
+ * facing "Cash" in Real Mode (see lib/real/display/cash.ts for the
+ * domain->presentation rename; this constant stays USDC/decimals truth).
+ * Address confirmed against Circle's published testnet contract addresses
+ * (developers.circle.com/stablecoins/usdc-contract-addresses) as of Batch
+ * 2c — not a candidate, a verified fact, same footing as REAL_SAFE above.
+ */
+export const REAL_CASH_TOKEN = {
+  symbol: "USDC" as const,
+  address: "0x036CbD53842c5426634e7929541eC2318f3dCF7e" as Address,
+  decimals: 6,
+} as const;

@@ -5,15 +5,16 @@ import { ChevronRight } from "lucide-react";
 import { PRODUCT_AREAS_BY_ID } from "@/lib/product-areas";
 import { Note } from "@/components/shell/note";
 import { AccountSetup } from "@/components/real/account-setup";
+import { CashBalance } from "@/components/real/cash-balance";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 
 /**
  * Real Mode's Home. Truthful about account state either way: before an
  * account exists it says so and offers create/restore (AccountSetup);
- * afterward it says the account is connected — never a balance it can't
- * yet read, since real Cash balance reads are Batch 2c. Nothing here reads
- * Practice state — Real Mode is a parallel path, not a view over the
- * simulation.
+ * afterward the real (Base Sepolia) Cash balance is the primary thing shown
+ * (CashBalance), with account details still one tap away via AccountSetup's
+ * own expander. Nothing here reads Practice state — Real Mode is a parallel
+ * path, not a view over the simulation.
  */
 export function RealHomeView() {
   const pay = PRODUCT_AREAS_BY_ID.pay;
@@ -32,6 +33,8 @@ export function RealHomeView() {
             : "Connecting a real, blockchain-backed account is the next step. Until then there's no balance or activity to show here."}
         </p>
       </section>
+
+      <CashBalance />
 
       <AccountSetup />
 

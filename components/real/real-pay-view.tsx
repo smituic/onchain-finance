@@ -6,12 +6,14 @@ import { Button } from "@/components/ui/button";
 import { PageHeader } from "@/components/shell/page-header";
 import { Note } from "@/components/shell/note";
 import { AccountSetup } from "@/components/real/account-setup";
+import { CashBalance } from "@/components/real/cash-balance";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 
 /**
  * Real Mode's Pay. Pay is where Real Mode starts, so this is where account
- * setup lives; sending Cash itself is Batch 2d, still ahead even once an
- * account is connected.
+ * setup lives; once an account exists, its real Cash balance is shown here
+ * too (CashBalance) so there's an honest answer to "what could I send" —
+ * sending itself, the form and transaction flow, is still Batch 2d.
  */
 export function RealPayView() {
   const area = PRODUCT_AREAS_BY_ID.pay;
@@ -33,6 +35,8 @@ export function RealPayView() {
             : "The next step is connecting a real account and showing its real test-network Cash balance. Sending Cash, each payment's status, and history follow from there."}
         </p>
       </section>
+
+      <CashBalance />
 
       <AccountSetup />
 

@@ -37,7 +37,7 @@ Two rounds of post-completion product-quality polish followed: Batch A (Home rec
 
 ## Phase 2 — Testnet: Introducing Real Mode
 
-**Status: Active.** Batch 1 (the Practice/Real boundary) and the real account foundation (Batch 2) are built and live-verified on Base Sepolia + a real Neon database — registration, Turnkey provisioning, and fresh-browser restore. Real Pay submission is the next batch; see ARCHITECTURE.md's "Phase 2 Batch 2b Decisions" for what's built and what's deferred to it.
+**Status: Active.** Batch 1 (the Practice/Real boundary), the real account foundation (Batch 2b), and the real Cash balance read (Batch 2c) are built and live-verified on Base Sepolia + a real Neon database — registration, Turnkey provisioning, fresh-browser restore, and an authenticated read of the real (currently $0.00, unfunded) Safe balance. Real Pay submission is the next batch; see ARCHITECTURE.md's "Phase 2 Batch 2b/2c Decisions" for what's built and what's deferred to it.
 
 **Goal:** Introduce Real Mode, backed by real (testnet) infrastructure, one area at a time, while Practice Mode remains fully available for everything — including areas Real Mode doesn't support yet. Prove one real end-to-end path before broadening.
 
@@ -49,8 +49,8 @@ The new order:
 
 1. **Practice/Real boundary** — the mode switch, the per-page boundary, honest "Practice-only for now" states, and a lint-enforced separation between the Practice engine and the future Real layer. *Done.*
 2. **Real account foundation** — a real, blockchain-backed account the user sets up without seed phrases or browser extensions; the app never holds key material. *Done — registration, durable Neon persistence, and fresh-browser restore are live-verified. Fresh per-payment Turnkey authorization is proven in principle (Batch 2a) but its end-to-end acceptance check waits for real payment submission below.*
-3. **Real testnet Cash balance** — reading a real testnet stablecoin balance and presenting it as Cash.
-4. **Real Pay** — sending Cash to another address, with explicit preparing / awaiting approval / submitted / pending / confirmed / failed states.
+3. **Real testnet Cash balance** — reading a real testnet stablecoin balance and presenting it as Cash. *Done — a read-only, session-authenticated USDC `balanceOf` read for the durable Safe address, live-verified against the real (unfunded, $0.00) account from Batch 2b. No signing, no Turnkey/Pimlico involvement.*
+4. **Real Pay** — sending Cash to another address, with explicit preparing / awaiting approval / submitted / pending / confirmed / failed states. *Next.*
 5. **Transaction lifecycle and history** — persisted, recoverable across reload, with the real transaction hash and status one tap away.
 6. Real Mode for Swap, Save, and Borrow against public testnet protocols — off-the-shelf or well-audited testnet deployments where possible, not novel contracts.
 

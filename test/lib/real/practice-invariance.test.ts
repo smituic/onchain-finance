@@ -8,6 +8,7 @@ vi.mock("@simplewebauthn/browser", () => ({
 }));
 
 const { useRealAccountStore } = await import("@/lib/stores/real-account-store");
+const { useRealBalanceStore } = await import("@/lib/stores/real-balance-store");
 
 /** A deliberately non-default Practice portfolio, matching the pattern already established for Explore's isolation tests (experiment-isolation.test.tsx). */
 function buildNonDefaultMainState(): SimulationState {
@@ -52,6 +53,38 @@ describe("Real account store — Practice invariance", () => {
     // never called at all by anything Real-account-related — the strongest
     // possible proof of isolation, matching the pattern already proven for
     // Explore's sandbox (see experiment-isolation.test.tsx).
+    expect(useSimulationStore.getState().state).toBe(mainState);
+    expect(useSimulationStore.getState().state).toEqual(mainState);
+
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("Real balance store — Practice invariance", () => {
+  beforeEach(() => {
+    useRealBalanceStore.setState({ balance: null, status: "idle", error: null });
+  });
+
+  it("fetchBalance never touches the Practice simulation store, even by reference", async () => {
+    const mainState = buildNonDefaultMainState();
+    useSimulationStore.setState({ state: mainState, hasHydrated: true });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/api/real/account/balance")) {
+          return new Response(JSON.stringify({ token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        throw new Error(`Unexpected network call to ${url}`);
+      }),
+    );
+
+    await useRealBalanceStore.getState().fetchBalance();
+
     expect(useSimulationStore.getState().state).toBe(mainState);
     expect(useSimulationStore.getState().state).toEqual(mainState);
 
