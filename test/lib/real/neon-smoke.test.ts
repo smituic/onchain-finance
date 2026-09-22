@@ -456,4 +456,47 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
       expect(serialized).not.toContain(forbidden);
     }
   });
+
+  it("J: findRecentByAppUserId (Batch 2e history read) — newest-first, limit honored, scoped to the requesting account, against the real database", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("history");
+    const otherUserId = appUserId("history-other");
+    cleanupAppUserIds.add(userId);
+    cleanupAppUserIds.add(otherUserId);
+    await seedRealAccount(userId);
+    await seedRealAccount(otherUserId);
+
+    // Cancelling between reservations frees the one-active-attempt slot,
+    // same pattern test D above uses — three real, sequential rows for the
+    // account under test.
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const reserved = await store.reserve(reserveInput(userId));
+      expect(reserved.ok).toBe(true);
+      if (!reserved.ok) return;
+      await store.transition({ id: reserved.attempt.id, from: "prepared", to: "cancelled" });
+      ids.push(reserved.attempt.id);
+    }
+
+    const otherReserved = await store.reserve(reserveInput(otherUserId));
+    expect(otherReserved.ok).toBe(true);
+    if (!otherReserved.ok) return;
+    await store.transition({ id: otherReserved.attempt.id, from: "prepared", to: "cancelled" });
+
+    const all = await store.findRecentByAppUserId({ appUserId: userId, limit: 10 });
+    expect(all.map((a) => a.id)).toEqual([ids[2], ids[1], ids[0]]);
+    expect(all.every((a) => a.appUserId === userId)).toBe(true);
+    expect(all.some((a) => a.id === otherReserved.attempt.id)).toBe(false);
+
+    const limited = await store.findRecentByAppUserId({ appUserId: userId, limit: 2 });
+    expect(limited.map((a) => a.id)).toEqual([ids[2], ids[1]]);
+
+    // Cleanup happens in this describe block's afterAll (deletes
+    // payment_attempts + real_accounts by app_user_id) — nothing extra
+    // needed here, and no existing live payment row (outside these two
+    // smoke-prefixed app_user_ids) is ever touched.
+  }, 30_000);
 });

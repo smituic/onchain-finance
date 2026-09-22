@@ -108,6 +108,7 @@ describe("Real Mode never touches Practice financial state", () => {
         const url = String(input);
         const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
         if (url.endsWith("/api/real/payments/latest")) return ok({ attempt: null });
+        if (url.includes("/api/real/payments/history")) return ok({ entries: [] });
         if (url.endsWith("/api/real/account/balance")) return ok({ token: "USDC", decimals: 6, balanceBaseUnits: "20000000" });
         if (url.endsWith("/api/real/session")) return ok({ authenticated: false });
         return ok({});

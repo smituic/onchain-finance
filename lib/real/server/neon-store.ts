@@ -407,6 +407,24 @@ export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, fals
       return rows[0] ? toPaymentAttempt(rows[0]) : null;
     },
 
+    // Batch 2e: bounded history read, served by the same
+    // (app_user_id, created_at DESC) index findLatestByAppUserId already
+    // uses. `limit` is a plain integer already clamped by the caller
+    // (server/payment-history.ts), passed as a bound parameter — never
+    // string-interpolated into the query. `id DESC` is a secondary,
+    // deterministic tie-break for the (rare, TIMESTAMPTZ-microsecond-
+    // resolution) case of two rows sharing created_at — it does not carry
+    // "most recently inserted" meaning the way the in-memory adapter's own
+    // tie-break does, since payment_attempts.id is a random UUID with no
+    // correlation to insertion order; it only guarantees a fixed, repeatable
+    // order for a given data set.
+    async findRecentByAppUserId({ appUserId, limit }) {
+      const rows = (await sql`
+        SELECT * FROM payment_attempts WHERE app_user_id = ${appUserId} ORDER BY created_at DESC, id DESC LIMIT ${limit}
+      `) as Row[];
+      return rows.map(toPaymentAttempt);
+    },
+
     async transition({ id, from, to, patch }) {
       const rows = (await sql`
         UPDATE payment_attempts

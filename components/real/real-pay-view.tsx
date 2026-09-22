@@ -8,6 +8,7 @@ import { Note } from "@/components/shell/note";
 import { AccountSetup } from "@/components/real/account-setup";
 import { CashBalance } from "@/components/real/cash-balance";
 import { RealPayForm } from "@/components/real/real-pay-form";
+import { RealPaymentHistory } from "@/components/real/real-payment-history";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 
 /**
@@ -39,6 +40,8 @@ export function RealPayView() {
       <CashBalance />
 
       {account ? <RealPayForm /> : null}
+
+      {account ? <RealPaymentHistory /> : null}
 
       <AccountSetup />
 

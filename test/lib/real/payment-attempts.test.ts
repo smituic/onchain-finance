@@ -159,4 +159,45 @@ describe("payment attempt state machine (in-memory store)", () => {
     const latest = await store.findLatestByAppUserId("app-user-1");
     expect(latest?.id).toBe(second.attempt.id);
   });
+
+  describe("findRecentByAppUserId (Batch 2e history read)", () => {
+    it("returns attempts newest-first, most-recently-inserted first on a timestamp tie", async () => {
+      const store = createInMemoryPaymentAttemptStore();
+      const first = await store.reserve(reserveInput());
+      if (!first.ok) throw new Error("expected reservation to succeed");
+      await store.transition({ id: first.attempt.id, from: "prepared", to: "cancelled" });
+      const second = await store.reserve(reserveInput());
+      if (!second.ok) throw new Error("expected reservation to succeed");
+      await store.transition({ id: second.attempt.id, from: "prepared", to: "cancelled" });
+
+      const recent = await store.findRecentByAppUserId({ appUserId: "app-user-1", limit: 10 });
+      expect(recent.map((a) => a.id)).toEqual([second.attempt.id, first.attempt.id]);
+    });
+
+    it("respects the limit", async () => {
+      const store = createInMemoryPaymentAttemptStore();
+      const ids: string[] = [];
+      for (let i = 0; i < 5; i += 1) {
+        const reserved = await store.reserve(reserveInput());
+        if (!reserved.ok) throw new Error("expected reservation to succeed");
+        await store.transition({ id: reserved.attempt.id, from: "prepared", to: "cancelled" });
+        ids.push(reserved.attempt.id);
+      }
+
+      const recent = await store.findRecentByAppUserId({ appUserId: "app-user-1", limit: 2 });
+      expect(recent).toHaveLength(2);
+      expect(recent.map((a) => a.id)).toEqual([ids[4], ids[3]]);
+    });
+
+    it("never returns another account's attempts", async () => {
+      const store = createInMemoryPaymentAttemptStore();
+      const mine = await store.reserve(reserveInput());
+      if (!mine.ok) throw new Error("expected reservation to succeed");
+      const theirs = await store.reserve(reserveInput({ appUserId: "app-user-2" }));
+      if (!theirs.ok) throw new Error("expected reservation to succeed");
+
+      const recent = await store.findRecentByAppUserId({ appUserId: "app-user-1", limit: 10 });
+      expect(recent.map((a) => a.id)).toEqual([mine.attempt.id]);
+    });
+  });
 });

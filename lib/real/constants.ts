@@ -61,3 +61,10 @@ export const REAL_CASH_TOKEN = {
   address: "0x036CbD53842c5426634e7929541eC2318f3dCF7e" as Address,
   decimals: 6,
 } as const;
+
+/**
+ * Batch 2e: a plain link target for "see this on-chain" in the history
+ * view, not an SDK dependency — the UI builds `${BASE_SEPOLIA_EXPLORER_TX_BASE_URL}/${hash}`
+ * as an ordinary <a href>.
+ */
+export const BASE_SEPOLIA_EXPLORER_TX_BASE_URL = "https://sepolia.basescan.org/tx";

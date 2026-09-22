@@ -111,6 +111,14 @@ export interface PaymentAttemptStore {
   findLatestByAppUserId(appUserId: string): Promise<PaymentAttempt | null>;
 
   /**
+   * Batch 2e: bounded, newest-first read for the history view — never
+   * signs, never mutates. `limit` is expected to already be validated/
+   * clamped by the caller (see server/payment-history.ts's
+   * clampHistoryLimit); adapters trust it as a plain positive integer.
+   */
+  findRecentByAppUserId(input: { appUserId: string; limit: number }): Promise<PaymentAttempt[]>;
+
+  /**
    * Concurrency-safe compare-and-swap: applies only if the attempt is
    * currently in `from` state. Returns null (never throws) if another
    * concurrent caller already moved it — this is also the duplicate-submit
@@ -202,6 +210,24 @@ export function createInMemoryPaymentAttemptStore(): PaymentAttemptStore {
       const next: PaymentAttempt = { ...current, ...patch, state: to, updatedAt: new Date().toISOString() };
       attempts.set(id, next);
       return next;
+    },
+
+    async findRecentByAppUserId({ appUserId, limit }) {
+      // Reverse (Map iteration order is insertion order) BEFORE the stable
+      // sort so that attempts tied on millisecond-resolution createdAt
+      // resolve most-recently-inserted-first — same tie-break convention as
+      // findLatestByAppUserId above. This is deliberately NOT the same
+      // tie-break the Neon adapter uses (created_at DESC, id DESC): this
+      // store's ids are sequential strings, so "most recently inserted"
+      // already is the meaningful, deterministic order here; Neon's ids are
+      // random UUIDs, where an id-based tie-break can only be a fixed,
+      // repeatable order, not a recency signal. Both are deterministic —
+      // they just can't agree value-for-value given the different id schemes.
+      return forAccount(appUserId)
+        .slice()
+        .reverse()
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        .slice(0, limit);
     },
   };
 }

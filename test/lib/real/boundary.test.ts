@@ -105,14 +105,20 @@ describe("Pimlico access — no generic proxy, key stays server-only", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("no payments route imports lib/real/server/pimlico.ts directly, or forwards a client-supplied JSON-RPC method/params — every route goes through the purpose-built server/payments.ts resolvers", () => {
+  it("no payments route imports lib/real/server/pimlico.ts directly, or forwards a client-supplied JSON-RPC method/params — every route goes through a purpose-built server resolver module", () => {
     const routesDir = path.resolve(process.cwd(), "app/api/real/payments");
     const files = listFilesRecursive(routesDir).filter((f) => f.endsWith(".ts"));
     expect(files.length).toBeGreaterThan(0);
     for (const file of files) {
       const source = readFileSync(file, "utf8");
       expect(source).not.toMatch(/from\s+["']@\/lib\/real\/server\/pimlico["']/);
-      expect(source).toMatch(/from\s+["']@\/lib\/real\/server\/payments["']/);
+      // The Batch 2e history route is a deliberate exception: it goes
+      // through the physically separate, read-only server/payment-history.ts
+      // module instead of server/payments.ts (see the "history read path
+      // never depends on the write/signing module graph" suite below) —
+      // every other payments route still goes through server/payments.ts.
+      const isHistoryRoute = file.includes(`${path.sep}history${path.sep}`);
+      expect(source).toMatch(isHistoryRoute ? /from\s+["']@\/lib\/real\/server\/payment-history["']/ : /from\s+["']@\/lib\/real\/server\/payments["']/);
     }
   });
 });
@@ -140,6 +146,91 @@ describe("Payment records never hold signing material", () => {
     expect(source).not.toMatch(/zustand\/middleware/);
     expect(source).not.toMatch(/\bpersist\(/);
     expect(source).not.toMatch(/localStorage/);
+  });
+});
+
+/**
+ * Batch 2e boundary — the history read path never depends on the
+ * write/signing module graph.
+ *
+ * These are direct source-text scans of the specific files listed below,
+ * not a transitive dependency analyzer — they prove none of these four
+ * files themselves reference a forbidden import/identifier, the same way
+ * every other check in this file works. They don't prove nothing forbidden
+ * could ever be reached indirectly through some future import chain; the
+ * physical-separation design (a dedicated payment-history.ts that never
+ * imports server/payments.ts) is what makes that structurally unlikely, not
+ * this scan alone.
+ */
+describe("Batch 2e boundary — the history read path never depends on the write/signing module graph", () => {
+  const HISTORY_MODULE = path.resolve(process.cwd(), "lib/real/server/payment-history.ts");
+  const HISTORY_ROUTE = path.resolve(process.cwd(), "app/api/real/payments/history/route.ts");
+  const HISTORY_STORE = path.resolve(process.cwd(), "lib/stores/real-payment-history-store.ts");
+  const HISTORY_UI = path.resolve(process.cwd(), "components/real/real-payment-history.tsx");
+
+  const FORBIDDEN_IMPORT_PATTERNS = [
+    /from\s+["']\.{1,2}\/payments["']/, // relative "./payments" / "../payments"
+    /from\s+["'].*\/server\/payments["']/, // any path ending in server/payments
+    /from\s+["'].*\/lib\/real\/payments\//, // lib/real/payments/** (client-sign, submit, prepared-operation, transfer, hash, ...)
+    /from\s+["'].*\/lib\/real\/signing\//, // lib/real/signing/**
+    /from\s+["'].*\/server\/pimlico["']/,
+    /from\s+["'].*\/submit["']/,
+    /from\s+["'].*\/client-sign["']/,
+    /from\s+["'].*\/reconcile["']/,
+    /from\s+["']@turnkey\//,
+  ];
+  const FORBIDDEN_CALL_PATTERNS = [
+    /\bsendUserOperation\b/,
+    /\bprepareUserOperation\b/,
+    /\bresolvePaymentStatus\b/,
+    /\bresolveSubmitPayment\b/,
+    /\bresolvePreparePayment\b/,
+    /\bdispatchPreparedPayment\b/,
+    /\bverifyPreparedPaymentSignature\b/,
+  ];
+
+  function assertClean(file: string) {
+    const source = readFileSync(file, "utf8");
+    for (const pattern of FORBIDDEN_IMPORT_PATTERNS) expect(source).not.toMatch(pattern);
+    for (const pattern of FORBIDDEN_CALL_PATTERNS) expect(source).not.toMatch(pattern);
+  }
+
+  it("payment-history.ts never imports the write/signing modules or calls their functions", () => {
+    assertClean(HISTORY_MODULE);
+  });
+
+  it("the history route imports only server/payment-history.ts, never server/payments.ts, and is itself clean", () => {
+    const source = readFileSync(HISTORY_ROUTE, "utf8");
+    expect(source).toMatch(/from\s+["']@\/lib\/real\/server\/payment-history["']/);
+    expect(source).not.toMatch(/from\s+["']@\/lib\/real\/server\/payments["']/);
+    assertClean(HISTORY_ROUTE);
+  });
+
+  // Path-shaped, not bare substrings: a bare /\/cancel/ or /\/status/ also
+  // matches this very file's own explanatory prose (e.g. "never calls
+  // /cancel or /status") — the same naive-substring lesson this file's
+  // Turnkey-session checks already learned at the top of the file. These
+  // require the actual /api/real/payments/... call shape real code uses
+  // (a template literal like `/api/real/payments/${id}/cancel`), which no
+  // comment happens to contain.
+  const CANCEL_OR_STATUS_CALL_PATTERNS = [/\/api\/real\/payments\/[^"'`]*\/cancel/, /\/api\/real\/payments\/[^"'`]*\/status/];
+
+  it("the history client store never calls /prepare, /submit, /cancel, or /status — only /history — stays unpersisted, and is itself clean", () => {
+    const source = readFileSync(HISTORY_STORE, "utf8");
+    expect(source).not.toMatch(/\/api\/real\/payments\/prepare/);
+    expect(source).not.toMatch(/\/api\/real\/payments\/submit/);
+    for (const pattern of CANCEL_OR_STATUS_CALL_PATTERNS) expect(source).not.toMatch(pattern);
+    expect(source).not.toMatch(/persist\(/);
+    expect(source).not.toMatch(/localStorage/);
+    assertClean(HISTORY_STORE);
+  });
+
+  it("the history UI component never calls /prepare, /submit, /cancel, or /status, and is itself clean", () => {
+    const source = readFileSync(HISTORY_UI, "utf8");
+    expect(source).not.toMatch(/\/api\/real\/payments\/prepare/);
+    expect(source).not.toMatch(/\/api\/real\/payments\/submit/);
+    for (const pattern of CANCEL_OR_STATUS_CALL_PATTERNS) expect(source).not.toMatch(pattern);
+    assertClean(HISTORY_UI);
   });
 });
 
