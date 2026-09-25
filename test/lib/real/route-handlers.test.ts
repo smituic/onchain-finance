@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
-import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
+import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals } from "@/lib/real/server/registry";
+import { createInMemoryPasskeyRevocationStore } from "@/lib/real/server/passkey-revocation-attempts";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import type { PaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
@@ -166,5 +167,94 @@ describe("route handlers — pre-2f hardening (actual route.ts code, not resolve
     const body = (await response.json()) as { error: string };
     expect(body.error).toBe(GENERIC_SERVER_ERROR_MESSAGE);
     expect(body.error).not.toMatch(/ECONNREFUSED|postgres:\/\//);
+  });
+});
+
+describe("PATCH /api/real/account/passkeys/[credentialId] — rename (actual route.ts code)", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** Two accounts; the session (when signedIn) is app-user-1 / credential-1. */
+  async function setup({ signedIn = true } = {}) {
+    vi.resetModules();
+    stubRequiredConfigEnv();
+    const registry = await seedRegistry();
+    await registry.createAccountWithPasskey({
+      account: { appUserId: "app-user-2", subOrganizationId: "sub-org-2", turnkeyUserId: "turnkey-user-2", walletId: "wallet-2", walletAccountId: "wallet-account-2", ownerAddress: OWNER_ADDRESS, safeAddress: SAFE_ADDRESS, accountConfigVersion: 1 },
+      passkey: { credentialId: "credential-2", appUserId: "app-user-2", credentialPublicKey: "cose-key-2", userHandle: "user-handle-2", counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false },
+    });
+    const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), REAL_SESSION_SECRET_VALUE);
+    vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar(signedIn ? { [REAL_SESSION_COOKIE_NAME]: cookieValue } : {}) }));
+    const revocations = createInMemoryPasskeyRevocationStore(registry);
+    vi.doMock("@/lib/real/server/runtime", () => ({
+      getRealAccountRegistry: () => registry,
+      getPasskeyRevocationStore: () => revocations,
+    }));
+    const { PATCH } = await import("@/app/api/real/account/passkeys/[credentialId]/route");
+    const rename = (credentialId: string, body: string) =>
+      PATCH(new NextRequest(`http://localhost/api/real/account/passkeys/${credentialId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body }), {
+        params: Promise.resolve({ credentialId }),
+      });
+    return { registry, rename };
+  }
+
+  it("without a session: 401, nothing renamed", async () => {
+    const { registry, rename } = await setup({ signedIn: false });
+    const response = await rename("credential-1", JSON.stringify({ displayName: "iPhone" }));
+    expect(response.status).toBe(401);
+    expect((await registry.findPasskeyByCredentialId("credential-1"))?.displayName).toBeNull();
+  });
+
+  it("another account's passkey: the same 404 as a missing one, and it stays unnamed", async () => {
+    const { registry, rename } = await setup();
+    const foreign = await rename("credential-2", JSON.stringify({ displayName: "Hijacked" }));
+    const missing = await rename("no-such-credential", JSON.stringify({ displayName: "Hijacked" }));
+    expect(foreign.status).toBe(404);
+    expect(missing.status).toBe(404);
+    expect(await foreign.json()).toEqual(await missing.json());
+    expect((await registry.findPasskeyByCredentialId("credential-2"))?.displayName).toBeNull();
+  });
+
+  it("invalid input is a 400: malformed JSON, missing name, whitespace-only, too long", async () => {
+    const { registry, rename } = await setup();
+    for (const body of ["{not valid json", "null", JSON.stringify({}), JSON.stringify({ displayName: "   " }), JSON.stringify({ displayName: "a".repeat(41) })]) {
+      expect((await rename("credential-1", body)).status).toBe(400);
+    }
+    expect((await registry.findPasskeyByCredentialId("credential-1"))?.displayName).toBeNull();
+  });
+
+  it("a non-active passkey is a 409", async () => {
+    const { registry, rename } = await setup();
+    const internals = getInMemoryRegistryInternals(registry);
+    internals.passkeysByCredentialId.set("credential-1b", { ...internals.passkeysByCredentialId.get("credential-1")!, credentialId: "credential-1b", status: "revoked" });
+    expect((await rename("credential-1b", JSON.stringify({ displayName: "Old key" }))).status).toBe(409);
+  });
+
+  it("GET omits revoked passkeys (history), keeps pending/revoking (live operations), and never deletes the revoked row", async () => {
+    const { registry } = await setup();
+    const internals = getInMemoryRegistryInternals(registry);
+    const base = internals.passkeysByCredentialId.get("credential-1")!;
+    for (const status of ["revoked", "pending", "revoking"] as const) {
+      internals.passkeysByCredentialId.set(`credential-${status}`, { ...base, credentialId: `credential-${status}`, role: "backup", status });
+    }
+
+    const { GET } = await import("@/app/api/real/account/passkeys/route");
+    const list = (await (await GET()).json()) as { passkeys: { credentialId: string }[] };
+
+    expect(list.passkeys.map((p) => p.credentialId).sort()).toEqual(["credential-1", "credential-pending", "credential-revoking"]);
+    expect(await registry.findPasskeyByCredentialId("credential-revoked")).toMatchObject({ status: "revoked" });
+  });
+
+  it("renames the session account's own passkey (trimmed), and the list returns the name", async () => {
+    const { rename } = await setup();
+    const response = await rename("credential-1", JSON.stringify({ displayName: "  MacBook Touch ID " }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ passkey: { credentialId: "credential-1", displayName: "MacBook Touch ID" } });
+
+    const { GET } = await import("@/app/api/real/account/passkeys/route");
+    const list = (await (await GET()).json()) as { passkeys: { credentialId: string; displayName: string | null }[] };
+    expect(list.passkeys).toEqual([expect.objectContaining({ credentialId: "credential-1", displayName: "MacBook Touch ID" })]);
   });
 });

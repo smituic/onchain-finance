@@ -59,6 +59,9 @@ export function passkeyStateLabel(state: PasskeyDisplayState): string {
   }
 }
 
+/** Shown once a removal is confirmed (both halves of the evidence) — the passkey then leaves the list. */
+export const PASSKEY_REMOVED_MESSAGE = "Passkey removed.";
+
 /** Shown for every state where app sign-in is off but Turnkey removal isn't confirmed. */
 export const MAY_STILL_AUTHORIZE_NOTE = "This passkey may still be able to authorize this account until removal is confirmed.";
 

@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RealPasskeysManager } from "@/components/real/real-passkeys-manager";
 import { MAY_STILL_AUTHORIZE_NOTE } from "@/lib/real/display/passkey-status";
@@ -9,6 +9,7 @@ function passkey(overrides: Passkey): Passkey {
   return {
     credentialId: "cred-a",
     role: "primary",
+    displayName: null,
     status: "active",
     credentialDeviceType: "singleDevice",
     credentialBackedUp: false,
@@ -123,5 +124,96 @@ describe("RealPasskeysManager", () => {
     expect(screen.getByText("Primary and backup passkeys have the same access to this account.")).toBeTruthy();
     expect(screen.getByText(/can't currently be recovered/)).toBeTruthy();
     expect(document.body.textContent).not.toMatch(/never lose access|guaranteed recovery|prevents theft/i);
+  });
+});
+
+describe("RealPasskeysManager — names", () => {
+  it("a named passkey shows its name with the role; an unnamed (older) one falls back to the role label", async () => {
+    stubServer([passkey({ displayName: "MacBook Touch ID" }), passkey({ credentialId: "cred-b", role: "backup", isCurrentSession: false })], null);
+    render(<RealPasskeysManager />);
+    const rows = await screen.findAllByTestId("real-passkey-row");
+    expect(within(rows[0]!).getByText("MacBook Touch ID (signed in)")).toBeTruthy();
+    expect(within(rows[0]!).getByText("Primary passkey · Active")).toBeTruthy();
+    expect(within(rows[1]!).getByText("Backup passkey")).toBeTruthy();
+    expect(within(rows[1]!).getByText("Active")).toBeTruthy();
+  });
+
+  it("Rename is offered only on active passkeys — never pending, revoking, or removed", async () => {
+    stubServer(
+      [
+        passkey({}),
+        passkey({ credentialId: "cred-b", role: "backup", status: "pending", isCurrentSession: false }),
+        passkey({ credentialId: "cred-c", role: "backup", status: "revoking", isCurrentSession: false, removal: { attemptId: "r1", state: "dispatch_in_flight", ownedBySession: true } }),
+        passkey({ credentialId: "cred-d", role: "backup", status: "revoked", isCurrentSession: false, removal: { attemptId: "r2", state: "confirmed", ownedBySession: true } }),
+      ],
+      null,
+    );
+    render(<RealPasskeysManager />);
+    const rows = await screen.findAllByTestId("real-passkey-row");
+    expect(within(rows[0]!).getByRole("button", { name: "Rename" })).toBeTruthy();
+    for (const row of rows.slice(1)) expect(within(row).queryByRole("button", { name: "Rename" })).toBeNull();
+  });
+
+  it("saving sends the trimmed name to the rename route and shows it after refresh", async () => {
+    let name: string | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/api/real/account/passkeys/cred-a") && init?.method === "PATCH") {
+        name = (JSON.parse(String(init.body)) as { displayName: string }).displayName;
+        return ok({ passkey: { credentialId: "cred-a", displayName: name } });
+      }
+      if (url.endsWith("/api/real/account/passkeys")) return ok({ passkeys: [passkey({ displayName: name })] });
+      if (url.endsWith("/api/real/account/passkeys/backup/status")) return ok({ enrollment: null });
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<RealPasskeysManager />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Rename" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Passkey name" }), { target: { value: "  YubiKey  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText("YubiKey (signed in)")).toBeTruthy();
+    expect(name).toBe("YubiKey");
+    expect(screen.queryByRole("textbox", { name: "Passkey name" })).toBeNull();
+  });
+
+  it("an empty name is refused in the browser without calling the server", async () => {
+    stubServer([passkey({})], null);
+    render(<RealPasskeysManager />);
+    fireEvent.click(await screen.findByRole("button", { name: "Rename" }));
+    const callsBefore = vi.mocked(fetch).mock.calls.length;
+    fireEvent.change(screen.getByRole("textbox", { name: "Passkey name" }), { target: { value: "   " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText("Enter a name for this passkey.")).toBeTruthy();
+    expect(vi.mocked(fetch).mock.calls.length).toBe(callsBefore);
+    expect(screen.getByRole("textbox", { name: "Passkey name" })).toBeTruthy();
+  });
+
+  it("after the primary is removed, the sole survivor shows its name and 'Primary · Active'; a revoked row never renders", async () => {
+    stubServer(
+      [
+        passkey({ credentialId: "old-primary", status: "revoked", isCurrentSession: false, removal: { attemptId: "r1", state: "confirmed", ownedBySession: true } }),
+        passkey({ credentialId: "survivor", role: "primary", displayName: "YubiKey" }),
+      ],
+      null,
+    );
+    render(<RealPasskeysManager />);
+    expect(await screen.findByText("YubiKey (signed in)")).toBeTruthy();
+    const rows = screen.getAllByTestId("real-passkey-row");
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]!).getByText("Primary passkey · Active")).toBeTruthy();
+    expect(screen.queryByText("Removed")).toBeNull();
+    expect(screen.queryByText(/Backup passkey/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Add a backup passkey" })).toBeTruthy();
+  });
+
+  it("the removal dialog names the passkey being removed", async () => {
+    stubServer([passkey({}), passkey({ credentialId: "cred-b", role: "backup", displayName: "Old iPhone", isCurrentSession: false })], null);
+    render(<RealPasskeysManager />);
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    expect(await screen.findByText("Remove “Old iPhone”?")).toBeTruthy();
   });
 });

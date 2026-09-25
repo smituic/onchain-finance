@@ -350,6 +350,86 @@ describe("revocation — confirmation standard (completed delete activity AND co
   });
 });
 
+describe("revocation — app role after a confirmed removal (metadata only)", () => {
+  const passkey = async (w: World, who: FixtureAuthenticator) => (await w.registry.findPasskeyByCredentialId(who.credentialIdBase64Url))!;
+
+  it("removing the primary using the backup: target revoked (row kept), sole survivor promoted to primary — nothing else about it changes", async () => {
+    const w = await world();
+    const accountBefore = await w.registry.findAccountByAppUserId("app-user-1");
+    const survivorBefore = await passkey(w, w.b);
+    expect(survivorBefore.role).toBe("backup");
+
+    const { attemptId, signed } = await prepareAndSign(w, w.a, w.b);
+    expect((await submit(w, w.a, w.b, attemptId, signed)).outcome).toBe("revoked");
+
+    // Revoked row is history, never deleted — and still what the attempt points at.
+    expect(await passkey(w, w.a)).toMatchObject({ status: "revoked", role: "primary", turnkeyAuthenticatorId: "authenticator-a" });
+    expect((await w.revocations.findById(attemptId))).toMatchObject({ state: "confirmed", targetCredentialId: w.a.credentialIdBase64Url });
+    // Promotion is role only: identity, status, Turnkey mapping, key material, owner and Safe unchanged.
+    expect(await passkey(w, w.b)).toEqual({ ...survivorBefore, role: "primary" });
+    expect(await w.registry.findAccountByAppUserId("app-user-1")).toEqual(accountBefore);
+    expect(w.fake.forwarded).toHaveLength(1); // only the one delete — promotion makes no Turnkey call
+  });
+
+  it("removing the backup while the primary stays active: no promotion, the primary stays primary", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
+    expect((await submit(w, w.b, w.a, attemptId, signed)).outcome).toBe("revoked");
+    expect(await passkey(w, w.a)).toMatchObject({ status: "active", role: "primary" });
+    expect(await passkey(w, w.b)).toMatchObject({ status: "revoked", role: "backup" });
+  });
+
+  it("a dispatched but unconfirmed primary removal promotes nothing yet (the old primary may still authorize)", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.a, w.b);
+    w.fake.nextMode = "pending_activity";
+    await submit(w, w.a, w.b, attemptId, signed);
+    expect(await passkey(w, w.a)).toMatchObject({ status: "revoking", role: "primary" });
+    expect((await passkey(w, w.b)).role).toBe("backup");
+  });
+
+  it("after the promotion, adding another passkey creates it as backup and the promoted survivor stays primary", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.a, w.b);
+    await submit(w, w.a, w.b, attemptId, signed);
+
+    const c = createFixtureAuthenticator();
+    const enrollments = (await import("@/lib/real/server/backup-passkey-enrollment")).createInMemoryBackupPasskeyEnrollmentStore(w.registry);
+    const enrollment = (await enrollments.createStarted({ appUserId: "app-user-1" }))!;
+    await enrollments.registerCredential({
+      id: enrollment.id,
+      credential: { credentialId: c.credentialIdBase64Url, userHandle: "handle-c", credentialPublicKey: bytesToBase64Url(c.publicKeyCose), counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false, registrationChallenge: "c", rawClientDataJson: "d", rawAttestationObject: "e" },
+    });
+    await w.registry.transitionPasskeyStatus({ credentialId: c.credentialIdBase64Url, from: "pending", to: "active", patch: { turnkeyAuthenticatorId: "authenticator-c" } });
+
+    expect(await passkey(w, c)).toMatchObject({ status: "active", role: "backup" });
+    expect(await passkey(w, w.b)).toMatchObject({ status: "active", role: "primary" });
+  });
+
+  it("a pending setup in progress during a primary removal is never promoted — the active survivor is", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.a, w.b);
+    w.fake.nextMode = "pending_activity";
+    await submit(w, w.a, w.b, attemptId, signed);
+
+    const c = createFixtureAuthenticator();
+    const enrollments = (await import("@/lib/real/server/backup-passkey-enrollment")).createInMemoryBackupPasskeyEnrollmentStore(w.registry);
+    const enrollment = (await enrollments.createStarted({ appUserId: "app-user-1" }))!;
+    await enrollments.registerCredential({
+      id: enrollment.id,
+      credential: { credentialId: c.credentialIdBase64Url, userHandle: "handle-c", credentialPublicKey: bytesToBase64Url(c.publicKeyCose), counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false, registrationChallenge: "c", rawClientDataJson: "d", rawAttestationObject: "e" },
+    });
+
+    const activityId = (await w.revocations.findById(attemptId))!.turnkeyActivityId!;
+    Object.assign(w.fake.activities.get(activityId)!, { status: "ACTIVITY_STATUS_COMPLETED", result: { deleteAuthenticatorsResult: { authenticatorIds: ["authenticator-a"] } } });
+    w.fake.users.set("turnkey-user-1", w.fake.authenticators().filter((x) => x.authenticatorId !== "authenticator-a"));
+
+    expect((await reconcile(w, w.a, attemptId)).outcome).toBe("revoked");
+    expect(await passkey(w, w.b)).toMatchObject({ status: "active", role: "primary" });
+    expect(await passkey(w, c)).toMatchObject({ status: "pending", role: "backup" });
+  });
+});
+
 describe("revocation — one-way after dispatch: a dispatched target is never automatically restored", () => {
   it.each(["ACTIVITY_STATUS_FAILED", "ACTIVITY_STATUS_REJECTED"])(
     "first-forward %s with the target observed PRESENT => blocked, target stays revoking (the browser could have sent the same signed bytes itself)",

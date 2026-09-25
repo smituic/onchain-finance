@@ -5,9 +5,11 @@ import { readPasskeySession } from "@/app/api/real/account/passkeys/session";
 /**
  * Read-only. Every passkey on the session's own account plus, where one
  * exists, the latest removal attempt's truthful state. Never a public key,
- * signed request, stamp, or anything signing-relevant. Revoked passkeys that
- * never reached Turnkey (an abandoned setup) are omitted — there is nothing
- * to show for them.
+ * signed request, stamp, or anything signing-relevant. Revoked passkeys are
+ * omitted — they stay in the database as audit history (and are referenced
+ * by their removal attempts), but a confirmed removal is finished and an
+ * abandoned setup never reached Turnkey. Pending and revoking rows are live
+ * operations and stay visible.
  */
 export async function GET() {
   if (!isRealModeEnabled()) return disabledResponse();
@@ -22,12 +24,13 @@ export async function GET() {
 
     return Response.json({
       passkeys: passkeys
-        .filter((p) => p.status !== "revoked" || latestByTarget.get(p.credentialId)?.state === "confirmed")
+        .filter((p) => p.status !== "revoked")
         .map((p) => {
           const attempt = latestByTarget.get(p.credentialId);
           return {
             credentialId: p.credentialId,
             role: p.role,
+            displayName: p.displayName,
             status: p.status,
             credentialDeviceType: p.credentialDeviceType,
             credentialBackedUp: p.credentialBackedUp,

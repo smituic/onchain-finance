@@ -91,7 +91,15 @@ export interface PasskeyRevocationStore {
    * if another send (a concurrent byte-identical replay) already recorded one.
    */
   recordActivity(input: { id: string; activityId: string; activityStatus: string }): Promise<PasskeyRevocationAttempt | null>;
-  /** ONE transaction: attempt 'dispatch_in_flight' -> 'confirmed' AND target 'revoking' -> 'revoked'. The caller must already hold BOTH halves of the deletion evidence. */
+  /**
+   * ONE transaction: attempt 'dispatch_in_flight' -> 'confirmed' AND target
+   * 'revoking' -> 'revoked' AND, if that leaves the account with no
+   * non-revoked primary, its oldest active passkey's role -> 'primary'. Role
+   * is app metadata only (no Turnkey/owner/Safe/identity change), but the
+   * three writes are the final app state together: never "confirmed" with
+   * the sole survivor still labeled backup. The caller must already hold
+   * BOTH halves of the deletion evidence.
+   */
   confirmDeleted(input: { id: string; turnkeyActivityStatus: string }): Promise<PasskeyRevocationAttempt | null>;
 }
 
@@ -119,6 +127,14 @@ export function createInMemoryPasskeyRevocationStore(registry: RealAccountRegist
   function eligible(appUserId: string, credentialId: string) {
     const passkey = passkeysByCredentialId.get(credentialId);
     return passkey && passkey.appUserId === appUserId && passkey.status === "active" && passkey.turnkeyAuthenticatorId ? passkey : null;
+  }
+
+  /** Same rule as the Neon confirmDeleted: no non-revoked primary left -> the oldest active passkey becomes primary. */
+  function passkeyToPromote(appUserId: string) {
+    const account = [...passkeysByCredentialId.values()].filter((p) => p.appUserId === appUserId);
+    if (account.some((p) => p.role === "primary" && p.status !== "revoked")) return null;
+    const active = account.filter((p) => p.status === "active").sort((x, y) => x.createdAt.localeCompare(y.createdAt) || x.credentialId.localeCompare(y.credentialId));
+    return active[0] ?? null;
   }
 
   function save(next: PasskeyRevocationAttempt): PasskeyRevocationAttempt {
@@ -194,6 +210,8 @@ export function createInMemoryPasskeyRevocationStore(registry: RealAccountRegist
       const target = passkeysByCredentialId.get(current.targetCredentialId);
       if (!target || target.status !== "revoking") return null;
       passkeysByCredentialId.set(target.credentialId, { ...target, status: "revoked" });
+      const survivor = passkeyToPromote(current.appUserId);
+      if (survivor) passkeysByCredentialId.set(survivor.credentialId, { ...survivor, role: "primary" });
       return save({ ...current, state: "confirmed", turnkeyActivityStatus, turnkeyRequestStamp: null });
     },
   };

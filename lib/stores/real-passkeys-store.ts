@@ -8,7 +8,8 @@ import {
   type DeleteAuthenticatorsActivity,
 } from "@/lib/real/signing/authenticator-requests";
 import { signDigestViaTurnkeyRaw } from "@/lib/real/signing/raw-sign";
-import type { PasskeyRole, PasskeyStatus, RemovalAttemptState } from "@/lib/real/display/passkey-status";
+import { PASSKEY_REMOVED_MESSAGE, type PasskeyRole, type PasskeyStatus, type RemovalAttemptState } from "@/lib/real/display/passkey-status";
+import { validatePasskeyDisplayName } from "@/lib/real/display/passkey-name";
 
 /**
  * Client orchestration of backup-passkey setup and passkey removal. The
@@ -22,6 +23,8 @@ import type { PasskeyRole, PasskeyStatus, RemovalAttemptState } from "@/lib/real
 export type RealPasskeySummary = {
   credentialId: string;
   role: PasskeyRole;
+  /** Presentation only — null until renamed; see passkeyDisplayName for the fallback. */
+  displayName: string | null;
   status: PasskeyStatus;
   credentialDeviceType: "singleDevice" | "multiDevice" | null;
   credentialBackedUp: boolean | null;
@@ -54,6 +57,8 @@ export type RealPasskeysStore = {
   removalBusyCredentialId: string | null;
   removalMessage: { credentialId: string; text: string } | null;
   removalError: string | null;
+  renameBusyCredentialId: string | null;
+  renameError: { credentialId: string; text: string } | null;
 
   refresh: () => Promise<void>;
   continueBackupSetup: () => Promise<void>;
@@ -61,6 +66,9 @@ export type RealPasskeysStore = {
   removePasskey: (credentialId: string) => Promise<void>;
   checkRemoval: (credentialId: string, attemptId: string) => Promise<void>;
   cancelRemoval: (credentialId: string, attemptId: string) => Promise<void>;
+  /** Resolves true once the server accepted the name (the caller can close its editor). */
+  renamePasskey: (credentialId: string, displayName: string) => Promise<boolean>;
+  clearRenameError: () => void;
 };
 
 type Outcome = { outcome: string; reason?: string };
@@ -161,7 +169,13 @@ export function createRealPasskeysStore() {
         () => post<Outcome>(`/api/real/account/passkeys/${encodeURIComponent(credentialId)}/revoke/reconcile`, { attemptId }),
         (o) => o.outcome !== "pending",
       );
-      if (result.outcome !== "revoked" && result.reason) set({ removalMessage: { credentialId, text: result.reason } });
+      showRemovalOutcome(credentialId, result);
+    }
+
+    /** A confirmed removal's row disappears from the list, so it gets its own message. */
+    function showRemovalOutcome(credentialId: string, result: Outcome) {
+      if (result.outcome === "revoked") set({ removalMessage: { credentialId, text: PASSKEY_REMOVED_MESSAGE } });
+      else if (result.reason) set({ removalMessage: { credentialId, text: result.reason } });
     }
 
     return {
@@ -175,6 +189,8 @@ export function createRealPasskeysStore() {
       removalBusyCredentialId: null,
       removalMessage: null,
       removalError: null,
+      renameBusyCredentialId: null,
+      renameError: null,
 
       refresh: async () => {
         set({ listStatus: "loading", listError: null });
@@ -226,7 +242,7 @@ export function createRealPasskeysStore() {
           const signedRequest = await stampDeleteAuthenticatorsRequest(prepared);
           const submitted = await post<Outcome>(`${path}/submit`, { attemptId: prepared.attemptId, signedRequest });
           if (submitted.outcome === "pending") await reconcileRemoval(credentialId, prepared.attemptId);
-          else if (submitted.outcome !== "revoked" && submitted.reason) set({ removalMessage: { credentialId, text: submitted.reason } });
+          else showRemovalOutcome(credentialId, submitted);
         } catch (error) {
           if (!isWebAuthnCancellation(error)) set({ removalError: error instanceof Error ? error.message : "Couldn't remove this passkey." });
         } finally {
@@ -259,6 +275,27 @@ export function createRealPasskeysStore() {
           await get().refresh();
         }
       },
+
+      renamePasskey: async (credentialId, displayName) => {
+        const validation = validatePasskeyDisplayName(displayName);
+        if (!validation.ok) {
+          set({ renameError: { credentialId, text: validation.reason } });
+          return false;
+        }
+        set({ renameBusyCredentialId: credentialId, renameError: null });
+        try {
+          await api(`/api/real/account/passkeys/${encodeURIComponent(credentialId)}`, { method: "PATCH", body: JSON.stringify({ displayName: validation.name }) });
+          await get().refresh();
+          return true;
+        } catch (error) {
+          set({ renameError: { credentialId, text: error instanceof Error ? error.message : "Couldn't rename this passkey." } });
+          return false;
+        } finally {
+          set({ renameBusyCredentialId: null });
+        }
+      },
+
+      clearRenameError: () => set({ renameError: null }),
     };
   });
 }

@@ -196,7 +196,8 @@ describe("backup enrollment — local registration", () => {
     const { enrollmentId, backup } = await registerBackup(w);
     expect(backup.credentialIdBase64Url).not.toBe(w.primary.credentialIdBase64Url);
     const passkey = await w.registry.findPasskeyByCredentialId(backup.credentialIdBase64Url);
-    expect(passkey).toMatchObject({ status: "pending", role: "backup", appUserId: "app-user-1" });
+    // No name is stored at enrollment — the UI falls back to "Backup passkey" until the user renames it.
+    expect(passkey).toMatchObject({ status: "pending", role: "backup", appUserId: "app-user-1", displayName: null });
     expect((await w.enrollments.findById(enrollmentId))?.state).toBe("credential_registered");
 
     const loginChallenges = createInMemoryChallengeStore();

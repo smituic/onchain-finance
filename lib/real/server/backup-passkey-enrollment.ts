@@ -247,6 +247,7 @@ export function createInMemoryBackupPasskeyEnrollmentStore(registry: RealAccount
         status: "pending",
         role: "backup",
         turnkeyAuthenticatorId: null,
+        displayName: null,
         createdAt: new Date().toISOString(),
       };
       passkeysByCredentialId.set(passkey.credentialId, passkey);

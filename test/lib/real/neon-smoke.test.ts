@@ -702,4 +702,49 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
     const sql = await sqlFn();
     await expect(sql`UPDATE passkey_revocation_attempts SET state = 'failed' WHERE id = ${attemptId}`).rejects.toThrow();
   });
+
+  it("confirmDeleted: removing the primary promotes the sole active survivor in the same transaction (role only); removing a backup promotes nothing", async () => {
+    const s = await stores();
+    const sql = await sqlFn();
+    const run = async (purpose: string, remove: "primary" | "backup") => {
+      const [p, b] = [id("cred", `${purpose}-primary`), id("cred", `${purpose}-backup`)];
+      const appUserId = await seed(purpose, [{ credentialId: p, status: "active", authenticatorId: id("auth", `${purpose}-p`) }, { credentialId: b, status: "active", authenticatorId: id("auth", `${purpose}-b`) }]);
+      await sql`UPDATE real_passkeys SET role = 'backup', created_at = now() + interval '1 second' WHERE credential_id = ${b}`;
+      const [target, survivor] = remove === "primary" ? [p, b] : [b, p];
+      const survivorBefore = await s.registry.findPasskeyByCredentialId(survivor);
+      const accountBefore = await s.registry.findAccountByAppUserId(appUserId);
+      const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: target, authorizerCredentialId: survivor });
+      if (!prepared.ok || !(await s.revocations.beginDispatch({ id: prepared.attempt.id, patch: dispatchPatch }))) throw new Error("setup");
+      expect((await s.registry.findPasskeyByCredentialId(survivor))?.role).toBe(survivorBefore!.role); // not promoted while only 'revoking'
+      expect(await s.revocations.confirmDeleted({ id: prepared.attempt.id, turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" })).toMatchObject({ state: "confirmed" });
+      return { target: await s.registry.findPasskeyByCredentialId(target), survivor: await s.registry.findPasskeyByCredentialId(survivor), survivorBefore, accountBefore, account: await s.registry.findAccountByAppUserId(appUserId) };
+    };
+
+    const removedPrimary = await run("promote-remove-primary", "primary");
+    expect(removedPrimary.target).toMatchObject({ status: "revoked", role: "primary" }); // row kept as history
+    expect(removedPrimary.survivor).toEqual({ ...removedPrimary.survivorBefore, role: "primary" });
+    expect(removedPrimary.account).toEqual(removedPrimary.accountBefore);
+
+    const removedBackup = await run("promote-remove-backup", "backup");
+    expect(removedBackup.target).toMatchObject({ status: "revoked", role: "backup" });
+    expect(removedBackup.survivor).toEqual(removedBackup.survivorBefore);
+  });
+
+  it("passkey names: rename is scoped to the owning account and active status; the DB CHECK caps length; seeded rows default to NULL", async () => {
+    const s = await stores();
+    const purpose = "rename";
+    const [a, revoked] = [id("cred", `${purpose}-a`), id("cred", `${purpose}-revoked`)];
+    const appUserId = await seed(purpose, [{ credentialId: a, status: "active", authenticatorId: null }, { credentialId: revoked, status: "revoked", authenticatorId: null }]);
+    const otherUser = await seed(`${purpose}-other`, [{ credentialId: id("cred", `${purpose}-other`), status: "active", authenticatorId: null }]);
+
+    expect((await s.registry.findPasskeyByCredentialId(a))?.displayName).toBeNull();
+    expect(await s.registry.renamePasskey({ appUserId: otherUser, credentialId: a, displayName: "Hijacked" })).toEqual({ outcome: "not_found" });
+    expect(await s.registry.renamePasskey({ appUserId, credentialId: revoked, displayName: "Old key" })).toEqual({ outcome: "not_active" });
+    expect(await s.registry.renamePasskey({ appUserId, credentialId: a, displayName: "MacBook Touch ID" })).toMatchObject({ outcome: "renamed", passkey: { displayName: "MacBook Touch ID", status: "active" } });
+    expect((await s.registry.findPasskeyByCredentialId(revoked))?.displayName).toBeNull();
+
+    const sql = await sqlFn();
+    await expect(sql`UPDATE real_passkeys SET display_name = ${"a".repeat(41)} WHERE credential_id = ${a}`).rejects.toThrow();
+    await expect(sql`UPDATE real_passkeys SET display_name = '' WHERE credential_id = ${a}`).rejects.toThrow();
+  });
 });

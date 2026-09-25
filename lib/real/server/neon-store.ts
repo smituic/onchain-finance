@@ -87,6 +87,7 @@ function toPasskey(row: Row): RealPasskeyRecord {
     status: row.status as RealPasskeyRecord["status"],
     role: row.role as RealPasskeyRecord["role"],
     turnkeyAuthenticatorId: (row.turnkey_authenticator_id as string | null) ?? null,
+    displayName: (row.display_name as string | null) ?? null,
     createdAt: new Date(row.created_at as string).toISOString(),
   };
 }
@@ -299,6 +300,18 @@ export function createNeonRealAccountRegistry(sql: NeonQueryFunction<false, fals
         RETURNING *
       `) as Row[];
       return rows[0] ? toPasskey(rows[0]) : null;
+    },
+
+    async renamePasskey({ appUserId, credentialId, displayName }) {
+      const rows = (await sql`
+        UPDATE real_passkeys SET display_name = ${displayName}
+        WHERE credential_id = ${credentialId} AND app_user_id = ${appUserId} AND status = 'active'
+        RETURNING *
+      `) as Row[];
+      if (rows[0]) return { outcome: "renamed", passkey: toPasskey(rows[0]) };
+      // Only to pick the right refusal — scoped to the same account, so another account's credential stays "not_found".
+      const existing = (await sql`SELECT 1 FROM real_passkeys WHERE credential_id = ${credentialId} AND app_user_id = ${appUserId}`) as Row[];
+      return { outcome: existing.length > 0 ? "not_active" : "not_found" };
     },
   };
 }
@@ -605,6 +618,9 @@ export function createNeonPasskeyRevocationStore(sql: NeonQueryFunction<false, f
     async confirmDeleted({ id, turnkeyActivityStatus }) {
       try {
         const results = await sql.transaction([
+          // Same per-account serialization as beginDispatch, so the role
+          // promotion below can't interleave with another removal's dispatch.
+          sql`SELECT app_user_id FROM real_accounts WHERE app_user_id = (SELECT app_user_id FROM passkey_revocation_attempts WHERE id = ${id}) FOR UPDATE`,
           sql`
             UPDATE passkey_revocation_attempts SET state = 'confirmed', turnkey_activity_status = ${turnkeyActivityStatus}, turnkey_request_stamp = NULL, updated_at = now()
             WHERE id = ${id} AND state = 'dispatch_in_flight'
@@ -614,13 +630,34 @@ export function createNeonPasskeyRevocationStore(sql: NeonQueryFunction<false, f
             UPDATE real_passkeys SET status = 'revoked'
             WHERE credential_id = (SELECT target_credential_id FROM passkey_revocation_attempts WHERE id = ${id} AND state = 'confirmed') AND status = 'revoking'
           `,
+          // Role is app metadata only: no non-revoked primary left -> the
+          // oldest active passkey becomes primary. Never touches status,
+          // identity, or Turnkey mapping.
+          sql`
+            UPDATE real_passkeys p SET role = 'primary'
+            WHERE p.credential_id = (
+                SELECT s.credential_id FROM real_passkeys s
+                JOIN passkey_revocation_attempts a ON a.app_user_id = s.app_user_id
+                WHERE a.id = ${id} AND a.state = 'confirmed' AND s.status = 'active'
+                ORDER BY s.created_at ASC, s.credential_id ASC LIMIT 1
+              )
+              AND p.role = 'backup'
+              AND NOT EXISTS (SELECT 1 FROM real_passkeys q WHERE q.app_user_id = p.app_user_id AND q.role = 'primary' AND q.status <> 'revoked')
+          `,
           sql`
             SELECT (a.state || ':revocation_confirm_mismatch')::int FROM passkey_revocation_attempts a
             WHERE a.id = ${id} AND a.state = 'confirmed'
               AND NOT EXISTS (SELECT 1 FROM real_passkeys p WHERE p.credential_id = a.target_credential_id AND p.status = 'revoked')
           `,
+          // Never "confirmed" while an active survivor is left without a primary: abort the whole batch instead.
+          sql`
+            SELECT (a.state || ':revocation_confirm_mismatch')::int FROM passkey_revocation_attempts a
+            WHERE a.id = ${id} AND a.state = 'confirmed'
+              AND EXISTS (SELECT 1 FROM real_passkeys p WHERE p.app_user_id = a.app_user_id AND p.status = 'active')
+              AND NOT EXISTS (SELECT 1 FROM real_passkeys p WHERE p.app_user_id = a.app_user_id AND p.role = 'primary' AND p.status <> 'revoked')
+          `,
         ]);
-        const rows = results[0] as Row[];
+        const rows = results[1] as Row[];
         return rows[0] ? toRevocationAttempt(rows[0]) : null;
       } catch (error) {
         if (isGuardAbort(error, "revocation_confirm_mismatch")) return null;

@@ -112,7 +112,15 @@ CREATE TABLE IF NOT EXISTS real_accounts (
 --              absent), or an abandoned enrollment that never reached Turnkey.
 --
 -- role is display/bookkeeping only: primary and backup have EQUAL Turnkey
--- authority once active; role is never an authorization check.
+-- authority once active; role is never an authorization check. A new
+-- credential added to an existing account is always 'backup'; when a
+-- confirmed removal leaves no non-revoked primary, the oldest active
+-- passkey is promoted to 'primary' in that same transaction.
+--
+-- Revoked rows are never deleted — they are audit history and are referenced
+-- by passkey_revocation_attempts. The management list simply hides them.
+--
+-- display_name: user-chosen label (see the migration below); never identity.
 --
 -- turnkey_authenticator_id: the Turnkey-side id, required before a passkey
 -- can be removed or act as the surviving authorizer of a removal. Set by
@@ -130,6 +138,7 @@ CREATE TABLE IF NOT EXISTS real_passkeys (
   status                     TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('pending', 'active', 'revoking', 'revoked')),
   role                       TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary', 'backup')),
   turnkey_authenticator_id   TEXT,
+  display_name               TEXT CHECK (display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 40),
   created_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS real_passkeys_app_user_id_idx ON real_passkeys (app_user_id);
@@ -160,6 +169,29 @@ END $$;
 -- relies on this to refuse (never overwrite) a conflicting mapping.
 CREATE UNIQUE INDEX IF NOT EXISTS real_passkeys_turnkey_authenticator_id_key
   ON real_passkeys (turnkey_authenticator_id) WHERE turnkey_authenticator_id IS NOT NULL;
+
+-- Passkey names hand-applied migration. Presentation metadata ONLY: never
+-- unique, never indexed, never used in any lookup or authorization — identity
+-- is always credential_id / turnkey_authenticator_id. NULL (every pre-existing
+-- row and every new enrollment) means "show the role label". Idempotent.
+ALTER TABLE real_passkeys ADD COLUMN IF NOT EXISTS display_name TEXT
+  CHECK (display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 40);
+
+-- Hand-applied one-time repair for removals confirmed BEFORE confirmDeleted
+-- promoted survivors: same rule, role column only (never status, identity,
+-- or Turnkey mapping). Idempotent — a no-op once every account with an
+-- active passkey has a non-revoked primary. Pre-live check (read-only):
+--   SELECT credential_id, app_user_id, status, role FROM real_passkeys p
+--   WHERE p.status = 'active' AND NOT EXISTS (SELECT 1 FROM real_passkeys q
+--     WHERE q.app_user_id = p.app_user_id AND q.role = 'primary' AND q.status <> 'revoked');
+UPDATE real_passkeys p SET role = 'primary'
+WHERE p.status = 'active' AND p.role = 'backup'
+  AND NOT EXISTS (SELECT 1 FROM real_passkeys q WHERE q.app_user_id = p.app_user_id AND q.role = 'primary' AND q.status <> 'revoked')
+  AND p.credential_id = (
+    SELECT s.credential_id FROM real_passkeys s
+    WHERE s.app_user_id = p.app_user_id AND s.status = 'active'
+    ORDER BY s.created_at ASC, s.credential_id ASC LIMIT 1
+  );
 
 -- Batch 2g: durable enrollment of a second (backup) passkey against the SAME
 -- Turnkey user. Same "durable row before the uncertain external call, never

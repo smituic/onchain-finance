@@ -3,6 +3,7 @@ import {
   createInMemoryRealAccountRegistry,
   DuplicateAccountError,
   DuplicateCredentialError,
+  getInMemoryRegistryInternals,
   type RealAccountRecord,
   type RealPasskeyRecord,
 } from "@/lib/real/server/registry";
@@ -21,7 +22,7 @@ function accountInput(overrides: Partial<Omit<RealAccountRecord, "createdAt">> =
   };
 }
 
-type PrimaryPasskeyInput = Omit<RealPasskeyRecord, "createdAt" | "status" | "role" | "turnkeyAuthenticatorId">;
+type PrimaryPasskeyInput = Omit<RealPasskeyRecord, "createdAt" | "status" | "role" | "turnkeyAuthenticatorId" | "displayName">;
 
 function passkeyInput(overrides: Partial<PrimaryPasskeyInput> = {}): PrimaryPasskeyInput {
   return {
@@ -114,8 +115,55 @@ describe("createInMemoryRealAccountRegistry", () => {
   it("a primary passkey is created role='primary', active, with no Turnkey mapping until one is confirmed", async () => {
     const registry = createInMemoryRealAccountRegistry();
     const { passkey } = await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
-    expect(passkey).toMatchObject({ role: "primary", status: "active", turnkeyAuthenticatorId: null });
+    expect(passkey).toMatchObject({ role: "primary", status: "active", turnkeyAuthenticatorId: null, displayName: null });
     expect(await registry.findPasskeysByAppUserId("app-user-1")).toHaveLength(1);
+  });
+
+  it("renamePasskey sets display_name on the account's own active passkey and changes nothing else", async () => {
+    const registry = createInMemoryRealAccountRegistry();
+    const { passkey: before } = await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
+    await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "active", to: "active", patch: { turnkeyAuthenticatorId: "auth-1" } });
+
+    const result = await registry.renamePasskey({ appUserId: "app-user-1", credentialId: "credential-1", displayName: "MacBook Touch ID" });
+
+    expect(result.outcome).toBe("renamed");
+    const after = await registry.findPasskeyByCredentialId("credential-1");
+    expect(after).toEqual({ ...before, turnkeyAuthenticatorId: "auth-1", displayName: "MacBook Touch ID" });
+  });
+
+  it("renamePasskey on another account's credential is 'not_found' (same as missing) and leaves it untouched", async () => {
+    const registry = createInMemoryRealAccountRegistry();
+    await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
+    await registry.createAccountWithPasskey({
+      account: accountInput({ appUserId: "app-user-2" }),
+      passkey: passkeyInput({ credentialId: "credential-2", appUserId: "app-user-2" }),
+    });
+
+    expect(await registry.renamePasskey({ appUserId: "app-user-1", credentialId: "credential-2", displayName: "Hijacked" })).toEqual({ outcome: "not_found" });
+    expect(await registry.renamePasskey({ appUserId: "app-user-1", credentialId: "no-such-credential", displayName: "x" })).toEqual({ outcome: "not_found" });
+    expect((await registry.findPasskeyByCredentialId("credential-2"))?.displayName).toBeNull();
+  });
+
+  it("renamePasskey refuses anything not 'active' (pending/revoking/revoked) and leaves the row untouched", async () => {
+    for (const status of ["pending", "revoking", "revoked"] as const) {
+      const registry = createInMemoryRealAccountRegistry();
+      await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
+      await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "active", to: status });
+
+      expect(await registry.renamePasskey({ appUserId: "app-user-1", credentialId: "credential-1", displayName: "Old key" })).toEqual({ outcome: "not_active" });
+      expect(await registry.findPasskeyByCredentialId("credential-1")).toMatchObject({ status, displayName: null });
+    }
+  });
+
+  it("names are not unique: two passkeys on one account may share a name", async () => {
+    const registry = createInMemoryRealAccountRegistry();
+    await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
+    const internals = getInMemoryRegistryInternals(registry);
+    const primary = internals.passkeysByCredentialId.get("credential-1")!;
+    internals.passkeysByCredentialId.set("credential-b", { ...primary, credentialId: "credential-b", role: "backup" });
+
+    expect((await registry.renamePasskey({ appUserId: "app-user-1", credentialId: "credential-1", displayName: "iPhone" })).outcome).toBe("renamed");
+    expect((await registry.renamePasskey({ appUserId: "app-user-1", credentialId: "credential-b", displayName: "iPhone" })).outcome).toBe("renamed");
   });
 
   it("never stores anything private-key- or signing-session-shaped", async () => {

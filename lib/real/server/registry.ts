@@ -46,12 +46,16 @@ export type RealPasskeyRecord = {
   credentialDeviceType: "singleDevice" | "multiDevice" | null;
   credentialBackedUp: boolean | null;
   status: RealPasskeyStatus;
-  /** Display/bookkeeping only — primary and backup have EQUAL Turnkey authority once active; never an authorization check. */
+  /** Display/bookkeeping only — primary and backup have EQUAL Turnkey authority once active; never an authorization check. Added credentials start as backup; a confirmed removal that leaves no non-revoked primary promotes the oldest active passkey (passkey-revocation-attempts.ts's confirmDeleted). */
   role: "primary" | "backup";
   /** Turnkey-side authenticator id; required before this passkey can be removed or authorize a removal. Null until enrollment confirmation (backups) or the admin backfill (pre-2g primaries). */
   turnkeyAuthenticatorId: string | null;
+  /** User-chosen label — presentation metadata only, never identity or an authorization input. Null until renamed (the UI falls back to the role label). */
+  displayName: string | null;
   createdAt: string;
 };
+
+export type RenamePasskeyResult = { outcome: "renamed"; passkey: RealPasskeyRecord } | { outcome: "not_found" } | { outcome: "not_active" };
 
 export class DuplicateCredentialError extends Error {
   constructor(readonly credentialId: string) {
@@ -85,7 +89,7 @@ export interface RealAccountRegistry {
   createAccountWithPasskey(input: {
     account: Omit<RealAccountRecord, "createdAt">;
     /** Always creates the passkey as role="primary", status="active" — backups go through backup-passkey-enrollment.ts. */
-    passkey: Omit<RealPasskeyRecord, "createdAt" | "status" | "role" | "turnkeyAuthenticatorId">;
+    passkey: Omit<RealPasskeyRecord, "createdAt" | "status" | "role" | "turnkeyAuthenticatorId" | "displayName">;
   }): Promise<{ account: RealAccountRecord; passkey: RealPasskeyRecord }>;
   findAccountByAppUserId(appUserId: string): Promise<RealAccountRecord | null>;
   findPasskeyByCredentialId(credentialId: string): Promise<RealPasskeyRecord | null>;
@@ -105,6 +109,15 @@ export interface RealAccountRegistry {
     to: RealPasskeyStatus;
     patch?: { turnkeyAuthenticatorId?: string };
   }): Promise<RealPasskeyRecord | null>;
+
+  /**
+   * Sets display_name only — no other column. Ownership (appUserId) and
+   * status='active' are enforced in the same write, so a passkey on another
+   * account is indistinguishable from a missing one ("not_found"), and
+   * pending/revoking/revoked rows are never touched ("not_active").
+   * `displayName` must already be validated (validatePasskeyDisplayName).
+   */
+  renamePasskey(input: { appUserId: string; credentialId: string; displayName: string }): Promise<RenamePasskeyResult>;
 }
 
 /**
@@ -152,6 +165,7 @@ export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
         status: "active",
         role: "primary",
         turnkeyAuthenticatorId: null,
+        displayName: null,
         createdAt,
       };
       accountsByAppUserId.set(account.appUserId, accountRecord);
@@ -187,6 +201,15 @@ export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
       };
       passkeysByCredentialId.set(credentialId, next);
       return next;
+    },
+
+    async renamePasskey({ appUserId, credentialId, displayName }) {
+      const current = passkeysByCredentialId.get(credentialId);
+      if (!current || current.appUserId !== appUserId) return { outcome: "not_found" };
+      if (current.status !== "active") return { outcome: "not_active" };
+      const next: RealPasskeyRecord = { ...current, displayName };
+      passkeysByCredentialId.set(credentialId, next);
+      return { outcome: "renamed", passkey: next };
     },
   };
   inMemoryInternals.set(registry, { accountsByAppUserId, passkeysByCredentialId });
