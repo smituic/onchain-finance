@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Expander } from "@/components/shell/expander";
 import { Note } from "@/components/shell/note";
+import { RealPasskeysManager } from "@/components/real/real-passkeys-manager";
 import { useHasRealAccountHydrated, useRealAccountStore } from "@/lib/stores/real-account-store";
 
 /**
@@ -45,6 +46,7 @@ export function AccountSetup() {
           <p>Owner address: {account.ownerAddress}</p>
           <p>Safe address: {account.safeAddress}</p>
         </Expander>
+        <RealPasskeysManager />
         <Button variant="outline" className="h-11 w-full" disabled={busy} onClick={() => void logout()}>
           Sign out
         </Button>

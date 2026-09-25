@@ -10,6 +10,7 @@ vi.mock("@simplewebauthn/browser", () => ({
 const { useRealAccountStore } = await import("@/lib/stores/real-account-store");
 const { useRealBalanceStore } = await import("@/lib/stores/real-balance-store");
 const { useRealPaymentStore } = await import("@/lib/stores/real-payment-store");
+const { useRealPasskeysStore } = await import("@/lib/stores/real-passkeys-store");
 
 /** A deliberately non-default Practice portfolio, matching the pattern already established for Explore's isolation tests (experiment-isolation.test.tsx). */
 function buildNonDefaultMainState(): SimulationState {
@@ -126,6 +127,39 @@ describe("Real payment store — Practice invariance", () => {
     await useRealPaymentStore.getState().checkStatus(); // no attempt — no-op
     await useRealPaymentStore.getState().cancel();
     useRealPaymentStore.getState().reset();
+
+    expect(useSimulationStore.getState().state).toBe(mainState);
+    expect(useSimulationStore.getState().state).toEqual(mainState);
+
+    vi.unstubAllGlobals();
+  });
+});
+
+describe("Real passkeys store — Practice invariance", () => {
+  beforeEach(() => {
+    useRealPasskeysStore.setState({ passkeys: [], enrollment: null, listStatus: "idle", listError: null, setupBusy: false, setupMessage: null, setupError: null, removalBusyCredentialId: null, removalMessage: null, removalError: null });
+  });
+
+  it("refresh, abandoning setup, and cancelling a removal never touch the Practice simulation store, even by reference", async () => {
+    const mainState = buildNonDefaultMainState();
+    useSimulationStore.setState({ state: mainState, hasHydrated: true });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+        if (url.endsWith("/api/real/account/passkeys")) return ok({ passkeys: [] });
+        if (url.endsWith("/api/real/account/passkeys/backup/status")) return ok({ enrollment: { id: "e1", state: "credential_registered", externalOutcome: "not_attempted", abandonable: true, blockReason: null } });
+        if (url.endsWith("/backup/abandon")) return ok({ abandoned: true });
+        if (url.endsWith("/revoke/cancel")) return ok({ cancelled: true });
+        throw new Error(`Unexpected network call to ${url}`);
+      }),
+    );
+
+    await useRealPasskeysStore.getState().refresh();
+    await useRealPasskeysStore.getState().abandonBackupSetup();
+    await useRealPasskeysStore.getState().cancelRemoval("some-credential", "some-attempt");
 
     expect(useSimulationStore.getState().state).toBe(mainState);
     expect(useSimulationStore.getState().state).toEqual(mainState);

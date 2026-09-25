@@ -2,6 +2,8 @@ import { createInMemoryChallengeStore, type ChallengeStore } from "./challenge-s
 import { createInMemoryRealAccountRegistry, type RealAccountRegistry } from "./registry";
 import { createInMemoryRegistrationAttemptStore, type RegistrationAttemptStore } from "./registration-attempts";
 import { createInMemoryPaymentAttemptStore, type PaymentAttemptStore } from "./payment-attempts";
+import { createInMemoryBackupPasskeyEnrollmentStore, type BackupPasskeyEnrollmentStore } from "./backup-passkey-enrollment";
+import { createInMemoryPasskeyRevocationStore, type PasskeyRevocationStore } from "./passkey-revocation-attempts";
 import { createNeonDurableStores } from "./neon-store";
 
 /**
@@ -24,9 +26,11 @@ let registry: RealAccountRegistry | null = null;
 let challengeStore: ChallengeStore | null = null;
 let attemptStore: RegistrationAttemptStore | null = null;
 let paymentAttemptStore: PaymentAttemptStore | null = null;
+let backupEnrollmentStore: BackupPasskeyEnrollmentStore | null = null;
+let revocationStore: PasskeyRevocationStore | null = null;
 
 function ensureStoresInitialized(): void {
-  if (registry && challengeStore && attemptStore && paymentAttemptStore) return;
+  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore) return;
 
   const databaseUrl = process.env.DATABASE_URL?.trim();
   if (databaseUrl) {
@@ -35,6 +39,8 @@ function ensureStoresInitialized(): void {
     challengeStore = durable.challengeStore;
     attemptStore = durable.attempts;
     paymentAttemptStore = durable.payments;
+    backupEnrollmentStore = durable.backupEnrollments;
+    revocationStore = durable.revocations;
     return;
   }
 
@@ -52,6 +58,8 @@ function ensureStoresInitialized(): void {
   challengeStore = createInMemoryChallengeStore();
   attemptStore = createInMemoryRegistrationAttemptStore();
   paymentAttemptStore = createInMemoryPaymentAttemptStore();
+  backupEnrollmentStore = createInMemoryBackupPasskeyEnrollmentStore(registry);
+  revocationStore = createInMemoryPasskeyRevocationStore(registry);
 }
 
 export function getRealAccountRegistry(): RealAccountRegistry {
@@ -72,4 +80,14 @@ export function getRegistrationAttemptStore(): RegistrationAttemptStore {
 export function getPaymentAttemptStore(): PaymentAttemptStore {
   ensureStoresInitialized();
   return paymentAttemptStore!;
+}
+
+export function getBackupPasskeyEnrollmentStore(): BackupPasskeyEnrollmentStore {
+  ensureStoresInitialized();
+  return backupEnrollmentStore!;
+}
+
+export function getPasskeyRevocationStore(): PasskeyRevocationStore {
+  ensureStoresInitialized();
+  return revocationStore!;
 }

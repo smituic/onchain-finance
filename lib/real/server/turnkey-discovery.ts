@@ -1,4 +1,6 @@
+import { credentialIdsEqual } from "../credential-id";
 import { createParentTurnkeyClient } from "./turnkey-provisioning";
+import { summarizeActivity, type TurnkeyActivitySummary } from "./turnkey-signed-request";
 import type { RealServerConfig } from "./config";
 
 export type TurnkeyDiscoveryMatch = {
@@ -69,4 +71,62 @@ export async function discoverAccountByCredentialId(input: {
       ownerAddress: account.address ?? null,
     },
   };
+}
+
+export type TurnkeyUserAuthenticator = { authenticatorId: string; credentialId: string; publicKey: string };
+
+/**
+ * SERVER-ONLY, parent-key-stamped, READ-ONLY: the current authenticators of
+ * exactly one Turnkey user in one child sub-organization, or null if that
+ * user isn't present in the response. Parent-key authority here is the
+ * same read access turnkey-discovery already had (getUsers) — it never
+ * creates, deletes, or approves anything.
+ */
+export async function listTurnkeyUserAuthenticators(input: {
+  config: RealServerConfig;
+  subOrganizationId: string;
+  turnkeyUserId: string;
+}): Promise<TurnkeyUserAuthenticator[] | null> {
+  const client = createParentTurnkeyClient(input.config);
+  const { users } = await client.getUsers({ organizationId: input.subOrganizationId });
+  const user = (users ?? []).find((candidate) => candidate.userId === input.turnkeyUserId);
+  if (!user) return null;
+  return (user.authenticators ?? []).map((authenticator) => ({
+    authenticatorId: authenticator.authenticatorId,
+    credentialId: authenticator.credentialId,
+    publicKey: authenticator.credential?.publicKey ?? "",
+  }));
+}
+
+export type AuthenticatorMatch =
+  | { outcome: "found"; authenticator: TurnkeyUserAuthenticator }
+  | { outcome: "not_found" }
+  | { outcome: "ambiguous"; authenticatorIds: string[] }
+  | { outcome: "user_not_found" };
+
+/**
+ * Matches by DECODED CREDENTIAL-ID BYTES (credential-id.ts), never raw
+ * string equality — Turnkey's and WebAuthn's encodings of the same id need
+ * not be byte-identical strings. More than one match is reported, never
+ * resolved silently. "not_found" is a single read with no read-after-write
+ * guarantee: callers must never treat it as proof something was or wasn't
+ * created/deleted on its own.
+ */
+export function matchAuthenticatorByCredentialId(authenticators: TurnkeyUserAuthenticator[] | null, credentialId: string): AuthenticatorMatch {
+  if (!authenticators) return { outcome: "user_not_found" };
+  const matches = authenticators.filter((authenticator) => credentialIdsEqual(authenticator.credentialId, credentialId));
+  if (matches.length === 0) return { outcome: "not_found" };
+  if (matches.length > 1) return { outcome: "ambiguous", authenticatorIds: matches.map((m) => m.authenticatorId) };
+  return { outcome: "found", authenticator: matches[0]! };
+}
+
+/** SERVER-ONLY, parent-key-stamped, READ-ONLY poll of one child activity — never a resubmission of the mutation it describes. Returns null on any read failure (the caller stays pending). */
+export async function readTurnkeyActivity(input: { config: RealServerConfig; subOrganizationId: string; activityId: string }): Promise<TurnkeyActivitySummary | null> {
+  try {
+    const client = createParentTurnkeyClient(input.config);
+    const response = await client.getActivity({ organizationId: input.subOrganizationId, activityId: input.activityId });
+    return summarizeActivity(response.activity);
+  } catch {
+    return null;
+  }
 }

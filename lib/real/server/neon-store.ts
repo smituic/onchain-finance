@@ -1,13 +1,16 @@
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import type { ChallengePurpose, ChallengeStore, StoredChallenge } from "./challenge-store";
 import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
+import type { BackupPasskeyEnrollment, BackupPasskeyEnrollmentPatch, BackupPasskeyEnrollmentState, BackupPasskeyEnrollmentStore, EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
+import type { PasskeyRevocationAttempt, PasskeyRevocationStore, RevocationAttemptPatch, RevocationAttemptState } from "./passkey-revocation-attempts";
 import type { ExternalProvisioningOutcome, RegistrationAttempt, RegistrationAttemptState, RegistrationAttemptStore } from "./registration-attempts";
 import type { PaymentAttempt, PaymentAttemptState, PaymentAttemptStore, ReserveResult } from "./payment-attempts";
 
 /**
- * SERVER-ONLY durable adapters for the four vendor-neutral interfaces
+ * SERVER-ONLY durable adapters for the vendor-neutral interfaces
  * (ChallengeStore, RealAccountRegistry, RegistrationAttemptStore,
- * PaymentAttemptStore), backed by Neon Postgres via
+ * PaymentAttemptStore, and Batch 2g's BackupPasskeyEnrollmentStore /
+ * PasskeyRevocationStore), backed by Neon Postgres via
  * @neondatabase/serverless's HTTP query function — no persistent socket,
  * matching Next.js route handlers' request-scoped lifetime. Schema:
  * lib/real/server/schema.sql. Never imported by components, lib/real's
@@ -82,7 +85,75 @@ function toPasskey(row: Row): RealPasskeyRecord {
     credentialDeviceType: (row.credential_device_type as RealPasskeyRecord["credentialDeviceType"]) ?? null,
     credentialBackedUp: (row.credential_backed_up as boolean | null) ?? null,
     status: row.status as RealPasskeyRecord["status"],
+    role: row.role as RealPasskeyRecord["role"],
+    turnkeyAuthenticatorId: (row.turnkey_authenticator_id as string | null) ?? null,
     createdAt: new Date(row.created_at as string).toISOString(),
+  };
+}
+
+function isoOrNull(value: unknown): string | null {
+  return value ? new Date(value as string).toISOString() : null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  return value === null || value === undefined ? null : Number(value);
+}
+
+function toBackupEnrollment(row: Row): BackupPasskeyEnrollment {
+  return {
+    id: row.id as string,
+    appUserId: row.app_user_id as string,
+    newCredentialId: (row.new_credential_id as string | null) ?? null,
+    userHandle: (row.user_handle as string | null) ?? null,
+    credentialPublicKey: (row.credential_public_key as string | null) ?? null,
+    counter: numberOrNull(row.counter),
+    transports: toStringArray(row.transports),
+    credentialDeviceType: (row.credential_device_type as BackupPasskeyEnrollment["credentialDeviceType"]) ?? null,
+    credentialBackedUp: (row.credential_backed_up as boolean | null) ?? null,
+    registrationChallenge: (row.registration_challenge as string | null) ?? null,
+    rawClientDataJson: (row.raw_client_data_json as string | null) ?? null,
+    rawAttestationObject: (row.raw_attestation_object as string | null) ?? null,
+    state: row.state as BackupPasskeyEnrollmentState,
+    externalOutcome: row.external_outcome as EnrollmentExternalOutcome,
+    externalEnrollmentAttemptedAt: isoOrNull(row.external_enrollment_attempted_at),
+    authorizingCredentialId: (row.authorizing_credential_id as string | null) ?? null,
+    turnkeyRequestEndpoint: (row.turnkey_request_endpoint as string | null) ?? null,
+    turnkeyRequestBody: (row.turnkey_request_body as string | null) ?? null,
+    turnkeyRequestBodySha256: (row.turnkey_request_body_sha256 as string | null) ?? null,
+    turnkeyRequestTimestampMs: numberOrNull(row.turnkey_request_timestamp_ms),
+    turnkeyRequestStamp: (row.turnkey_request_stamp as string | null) ?? null,
+    turnkeyActivityId: (row.turnkey_activity_id as string | null) ?? null,
+    turnkeyActivityStatus: (row.turnkey_activity_status as string | null) ?? null,
+    turnkeyAuthenticatorId: (row.turnkey_authenticator_id as string | null) ?? null,
+    turnkeyAuthenticatorPublicKey: (row.turnkey_authenticator_public_key as string | null) ?? null,
+    signingProofChallenge: (row.signing_proof_challenge as string | null) ?? null,
+    signingProofActivityId: (row.signing_proof_activity_id as string | null) ?? null,
+    loginVerifiedAt: isoOrNull(row.login_verified_at),
+    signingVerifiedAt: isoOrNull(row.signing_verified_at),
+    blockReason: (row.block_reason as string | null) ?? null,
+    createdAt: new Date(row.created_at as string).toISOString(),
+    updatedAt: new Date(row.updated_at as string).toISOString(),
+  };
+}
+
+function toRevocationAttempt(row: Row): PasskeyRevocationAttempt {
+  return {
+    id: row.id as string,
+    appUserId: row.app_user_id as string,
+    targetCredentialId: row.target_credential_id as string,
+    targetTurnkeyAuthenticatorId: row.target_turnkey_authenticator_id as string,
+    authorizerCredentialId: row.authorizer_credential_id as string,
+    state: row.state as RevocationAttemptState,
+    turnkeyRequestBody: (row.turnkey_request_body as string | null) ?? null,
+    turnkeyRequestBodySha256: (row.turnkey_request_body_sha256 as string | null) ?? null,
+    turnkeyRequestTimestampMs: numberOrNull(row.turnkey_request_timestamp_ms),
+    turnkeyRequestStamp: (row.turnkey_request_stamp as string | null) ?? null,
+    externalAttemptedAt: isoOrNull(row.external_attempted_at),
+    turnkeyActivityId: (row.turnkey_activity_id as string | null) ?? null,
+    turnkeyActivityStatus: (row.turnkey_activity_status as string | null) ?? null,
+    failureReason: (row.failure_reason as string | null) ?? null,
+    createdAt: new Date(row.created_at as string).toISOString(),
+    updatedAt: new Date(row.updated_at as string).toISOString(),
   };
 }
 
@@ -115,6 +186,26 @@ function toPaymentAttempt(row: Row): PaymentAttempt {
     createdAt: new Date(row.created_at as string).toISOString(),
     updatedAt: new Date(row.updated_at as string).toISOString(),
   };
+}
+
+/**
+ * Neon's HTTP sql.transaction() is a NON-interactive batch: a later
+ * statement can't be skipped based on an earlier one's row count. Multi-row
+ * Batch 2g operations therefore end with a guard SELECT that casts a
+ * row-dependent string to int only when the batch's outcome is
+ * inconsistent (a lost race) — the resulting 22P02 error aborts and rolls
+ * back the WHOLE transaction. The cast operand always references a column,
+ * so the planner can never constant-fold it into an unconditional error.
+ */
+function isGuardAbort(error: unknown, sentinel: string): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = "code" in error ? String((error as { code: unknown }).code) : "";
+  const message = "message" in error ? String((error as { message: unknown }).message) : "";
+  return code === "22P02" && message.includes(sentinel);
+}
+
+function has<T extends object>(patch: T | undefined, key: keyof T): boolean {
+  return patch !== undefined && patch[key] !== undefined;
 }
 
 function isUniqueViolation(error: unknown, constraintHint?: string): boolean {
@@ -166,8 +257,8 @@ export function createNeonRealAccountRegistry(sql: NeonQueryFunction<false, fals
             RETURNING *
           `,
           sql`
-            INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter, transports, credential_device_type, credential_backed_up, status)
-            VALUES (${passkey.credentialId}, ${passkey.appUserId}, ${passkey.credentialPublicKey}, ${passkey.userHandle}, ${passkey.counter}, ${passkey.transports}, ${passkey.credentialDeviceType}, ${passkey.credentialBackedUp}, 'active')
+            INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter, transports, credential_device_type, credential_backed_up, status, role)
+            VALUES (${passkey.credentialId}, ${passkey.appUserId}, ${passkey.credentialPublicKey}, ${passkey.userHandle}, ${passkey.counter}, ${passkey.transports}, ${passkey.credentialDeviceType}, ${passkey.credentialBackedUp}, 'active', 'primary')
             RETURNING *
           `,
         ]);
@@ -189,12 +280,352 @@ export function createNeonRealAccountRegistry(sql: NeonQueryFunction<false, fals
       return rows[0] ? toPasskey(rows[0]) : null;
     },
 
+    async findPasskeysByAppUserId(appUserId) {
+      const rows = (await sql`SELECT * FROM real_passkeys WHERE app_user_id = ${appUserId} ORDER BY created_at ASC`) as Row[];
+      return rows.map(toPasskey);
+    },
+
     async updateAuthenticatorCounter({ credentialId, counter }) {
       await sql`UPDATE real_passkeys SET counter = ${counter} WHERE credential_id = ${credentialId}`;
     },
 
-    async revokePasskey(credentialId) {
-      await sql`UPDATE real_passkeys SET status = 'revoked' WHERE credential_id = ${credentialId}`;
+    async transitionPasskeyStatus({ credentialId, from, to, patch }) {
+      const rows = (await sql`
+        UPDATE real_passkeys
+        SET
+          status = ${to},
+          turnkey_authenticator_id = COALESCE(${patch?.turnkeyAuthenticatorId ?? null}, turnkey_authenticator_id)
+        WHERE credential_id = ${credentialId} AND status = ${from}
+        RETURNING *
+      `) as Row[];
+      return rows[0] ? toPasskey(rows[0]) : null;
+    },
+  };
+}
+
+export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<false, false>): BackupPasskeyEnrollmentStore {
+  return {
+    async createStarted({ appUserId }) {
+      try {
+        const rows = (await sql`INSERT INTO backup_passkey_enrollments (app_user_id, state) VALUES (${appUserId}, 'started') RETURNING *`) as Row[];
+        return toBackupEnrollment(rows[0]!);
+      } catch (error) {
+        if (isUniqueViolation(error, "backup_passkey_enrollments_one_active_per_account")) return null;
+        throw error;
+      }
+    },
+
+    async findById(id) {
+      const rows = (await sql`SELECT * FROM backup_passkey_enrollments WHERE id = ${id}`) as Row[];
+      return rows[0] ? toBackupEnrollment(rows[0]) : null;
+    },
+
+    async findActiveByAppUserId(appUserId) {
+      const rows = (await sql`
+        SELECT * FROM backup_passkey_enrollments
+        WHERE app_user_id = ${appUserId} AND state NOT IN ('active', 'abandoned', 'blocked')
+        ORDER BY created_at DESC LIMIT 1
+      `) as Row[];
+      return rows[0] ? toBackupEnrollment(rows[0]) : null;
+    },
+
+    async registerCredential({ id, credential }) {
+      try {
+        const results = await sql.transaction([
+          sql`
+            INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter, transports, credential_device_type, credential_backed_up, status, role)
+            SELECT ${credential.credentialId}, e.app_user_id, ${credential.credentialPublicKey}, ${credential.userHandle}, ${credential.counter}, ${credential.transports}, ${credential.credentialDeviceType}, ${credential.credentialBackedUp}, 'pending', 'backup'
+            FROM backup_passkey_enrollments e WHERE e.id = ${id} AND e.state = 'started'
+          `,
+          sql`
+            UPDATE backup_passkey_enrollments SET
+              state = 'credential_registered',
+              new_credential_id = ${credential.credentialId},
+              user_handle = ${credential.userHandle},
+              credential_public_key = ${credential.credentialPublicKey},
+              counter = ${credential.counter},
+              transports = ${credential.transports},
+              credential_device_type = ${credential.credentialDeviceType},
+              credential_backed_up = ${credential.credentialBackedUp},
+              registration_challenge = ${credential.registrationChallenge},
+              raw_client_data_json = ${credential.rawClientDataJson},
+              raw_attestation_object = ${credential.rawAttestationObject},
+              updated_at = now()
+            WHERE id = ${id} AND state = 'started'
+            RETURNING *
+          `,
+          // Lost the CAS (another request attached a different credential):
+          // abort, rolling back the INSERT above — never an orphan pending row.
+          sql`
+            SELECT (e.state || ':backup_attach_lost_race')::int FROM backup_passkey_enrollments e
+            WHERE e.id = ${id} AND (e.state <> 'credential_registered' OR e.new_credential_id IS DISTINCT FROM ${credential.credentialId})
+          `,
+        ]);
+        const rows = results[1] as Row[];
+        return rows[0] ? toBackupEnrollment(rows[0]) : null;
+      } catch (error) {
+        if (isGuardAbort(error, "backup_attach_lost_race")) return null;
+        if (isUniqueViolation(error, "real_passkeys_pkey") || isUniqueViolation(error, "backup_passkey_enrollments_new_credential_id_key")) {
+          throw new DuplicateCredentialError(credential.credentialId);
+        }
+        throw error;
+      }
+    },
+
+    async transition({ id, from, to, patch }) {
+      const p: BackupPasskeyEnrollmentPatch | undefined = patch;
+      const rows = (await sql`
+        UPDATE backup_passkey_enrollments SET
+          state = ${to},
+          external_outcome = COALESCE(${p?.externalOutcome ?? null}, external_outcome),
+          external_enrollment_attempted_at = CASE WHEN ${has(p, "externalEnrollmentAttemptedAt")} THEN ${p?.externalEnrollmentAttemptedAt ?? null}::timestamptz ELSE external_enrollment_attempted_at END,
+          authorizing_credential_id = CASE WHEN ${has(p, "authorizingCredentialId")} THEN ${p?.authorizingCredentialId ?? null} ELSE authorizing_credential_id END,
+          turnkey_request_endpoint = CASE WHEN ${has(p, "turnkeyRequestEndpoint")} THEN ${p?.turnkeyRequestEndpoint ?? null} ELSE turnkey_request_endpoint END,
+          turnkey_request_body = CASE WHEN ${has(p, "turnkeyRequestBody")} THEN ${p?.turnkeyRequestBody ?? null} ELSE turnkey_request_body END,
+          turnkey_request_body_sha256 = CASE WHEN ${has(p, "turnkeyRequestBodySha256")} THEN ${p?.turnkeyRequestBodySha256 ?? null} ELSE turnkey_request_body_sha256 END,
+          turnkey_request_timestamp_ms = CASE WHEN ${has(p, "turnkeyRequestTimestampMs")} THEN ${p?.turnkeyRequestTimestampMs ?? null}::bigint ELSE turnkey_request_timestamp_ms END,
+          turnkey_request_stamp = CASE WHEN ${has(p, "turnkeyRequestStamp")} THEN ${p?.turnkeyRequestStamp ?? null} ELSE turnkey_request_stamp END,
+          turnkey_activity_id = CASE WHEN ${has(p, "turnkeyActivityId")} THEN ${p?.turnkeyActivityId ?? null} ELSE turnkey_activity_id END,
+          turnkey_activity_status = CASE WHEN ${has(p, "turnkeyActivityStatus")} THEN ${p?.turnkeyActivityStatus ?? null} ELSE turnkey_activity_status END,
+          signing_proof_challenge = CASE WHEN ${has(p, "signingProofChallenge")} THEN ${p?.signingProofChallenge ?? null} ELSE signing_proof_challenge END,
+          login_verified_at = CASE WHEN ${has(p, "loginVerifiedAt")} THEN ${p?.loginVerifiedAt ?? null}::timestamptz ELSE login_verified_at END,
+          block_reason = CASE WHEN ${has(p, "blockReason")} THEN ${p?.blockReason ?? null} ELSE block_reason END,
+          updated_at = now()
+        WHERE id = ${id} AND state = ${from}
+        RETURNING *
+      `) as Row[];
+      return rows[0] ? toBackupEnrollment(rows[0]) : null;
+    },
+
+    async confirmCreated({ id, turnkeyAuthenticatorId, turnkeyAuthenticatorPublicKey, turnkeyActivityStatus }) {
+      try {
+        const results = await sql.transaction([
+          sql`
+            UPDATE backup_passkey_enrollments SET
+              state = 'turnkey_authenticator_created',
+              external_outcome = 'confirmed_created',
+              turnkey_authenticator_id = ${turnkeyAuthenticatorId},
+              turnkey_authenticator_public_key = ${turnkeyAuthenticatorPublicKey},
+              turnkey_activity_status = COALESCE(${turnkeyActivityStatus}, turnkey_activity_status),
+              turnkey_request_stamp = NULL,
+              updated_at = now()
+            WHERE id = ${id} AND state = 'turnkey_enrollment_in_flight'
+            RETURNING *
+          `,
+          sql`
+            UPDATE real_passkeys SET turnkey_authenticator_id = ${turnkeyAuthenticatorId}
+            WHERE credential_id = (SELECT new_credential_id FROM backup_passkey_enrollments WHERE id = ${id} AND state = 'turnkey_authenticator_created' AND turnkey_authenticator_id = ${turnkeyAuthenticatorId})
+              AND status = 'pending' AND turnkey_authenticator_id IS NULL
+          `,
+          sql`
+            SELECT (e.state || ':backup_confirm_mismatch')::int FROM backup_passkey_enrollments e
+            WHERE e.id = ${id} AND e.state = 'turnkey_authenticator_created' AND e.turnkey_authenticator_id = ${turnkeyAuthenticatorId}
+              AND NOT EXISTS (SELECT 1 FROM real_passkeys p WHERE p.credential_id = e.new_credential_id AND p.turnkey_authenticator_id = ${turnkeyAuthenticatorId})
+          `,
+        ]);
+        const rows = results[0] as Row[];
+        return rows[0] ? toBackupEnrollment(rows[0]) : null;
+      } catch (error) {
+        if (isGuardAbort(error, "backup_confirm_mismatch") || isUniqueViolation(error, "real_passkeys_turnkey_authenticator_id_key")) return null;
+        throw error;
+      }
+    },
+
+    async activate({ id, signingProofActivityId }) {
+      try {
+        const results = await sql.transaction([
+          sql`
+            UPDATE backup_passkey_enrollments SET state = 'active', signing_proof_activity_id = ${signingProofActivityId}, signing_verified_at = now(), updated_at = now()
+            WHERE id = ${id} AND state = 'login_verified' AND login_verified_at IS NOT NULL
+            RETURNING *
+          `,
+          sql`
+            UPDATE real_passkeys SET status = 'active'
+            WHERE credential_id = (SELECT new_credential_id FROM backup_passkey_enrollments WHERE id = ${id} AND state = 'active')
+              AND status = 'pending' AND turnkey_authenticator_id IS NOT NULL
+          `,
+          // Never "enrollment active + passkey not active": abort the whole batch instead.
+          sql`
+            SELECT (e.state || ':backup_activation_mismatch')::int FROM backup_passkey_enrollments e
+            WHERE e.id = ${id} AND e.state = 'active'
+              AND NOT EXISTS (SELECT 1 FROM real_passkeys p WHERE p.credential_id = e.new_credential_id AND p.status = 'active')
+          `,
+        ]);
+        const rows = results[0] as Row[];
+        return rows[0] ? toBackupEnrollment(rows[0]) : null;
+      } catch (error) {
+        if (isGuardAbort(error, "backup_activation_mismatch")) return null;
+        throw error;
+      }
+    },
+
+    async abandon({ id }) {
+      const results = await sql.transaction([
+        sql`
+          UPDATE backup_passkey_enrollments SET state = 'abandoned', turnkey_request_stamp = NULL, updated_at = now()
+          WHERE id = ${id} AND (state = 'started' OR (state = 'credential_registered' AND external_outcome IN ('not_attempted', 'definitive_failure')))
+          RETURNING *
+        `,
+        sql`
+          UPDATE real_passkeys SET status = 'revoked'
+          WHERE credential_id = (SELECT new_credential_id FROM backup_passkey_enrollments WHERE id = ${id} AND state = 'abandoned') AND status = 'pending'
+        `,
+      ]);
+      const rows = results[0] as Row[];
+      return rows[0] ? toBackupEnrollment(rows[0]) : null;
+    },
+  };
+}
+
+export function createNeonPasskeyRevocationStore(sql: NeonQueryFunction<false, false>): PasskeyRevocationStore {
+  async function explainRefusal(appUserId: string, targetCredentialId: string, authorizerCredentialId: string) {
+    const rows = (await sql`
+      SELECT
+        (SELECT status FROM real_passkeys WHERE credential_id = ${authorizerCredentialId} AND app_user_id = ${appUserId} AND turnkey_authenticator_id IS NOT NULL) AS authorizer_status,
+        EXISTS (SELECT 1 FROM passkey_revocation_attempts WHERE target_credential_id = ${targetCredentialId} AND state = 'dispatch_in_flight') AS dispatched
+    `) as Row[];
+    const row = rows[0] ?? {};
+    if (row.authorizer_status !== "active") return "authorizer_not_eligible" as const;
+    if (row.dispatched === true) return "removal_in_progress" as const;
+    return "target_not_removable" as const;
+  }
+
+  return {
+    async prepare({ appUserId, targetCredentialId, authorizerCredentialId }) {
+      if (targetCredentialId === authorizerCredentialId) return { ok: false, reason: "same_credential" };
+      // Changes no passkey status — a cookie alone never disables a credential.
+      const rows = (await sql`
+        INSERT INTO passkey_revocation_attempts (app_user_id, target_credential_id, target_turnkey_authenticator_id, authorizer_credential_id, state)
+        SELECT ${appUserId}, t.credential_id, t.turnkey_authenticator_id, ${authorizerCredentialId}, 'authorization_needed'
+        FROM real_passkeys t
+        WHERE t.credential_id = ${targetCredentialId} AND t.app_user_id = ${appUserId} AND t.status = 'active' AND t.turnkey_authenticator_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM real_passkeys s
+            WHERE s.credential_id = ${authorizerCredentialId} AND s.app_user_id = ${appUserId} AND s.status = 'active' AND s.turnkey_authenticator_id IS NOT NULL
+          )
+          AND NOT EXISTS (SELECT 1 FROM passkey_revocation_attempts d WHERE d.target_credential_id = ${targetCredentialId} AND d.state = 'dispatch_in_flight')
+        RETURNING *
+      `) as Row[];
+      if (rows[0]) return { ok: true, attempt: toRevocationAttempt(rows[0]) };
+      return { ok: false, reason: await explainRefusal(appUserId, targetCredentialId, authorizerCredentialId) };
+    },
+
+    async findById(id) {
+      const rows = (await sql`SELECT * FROM passkey_revocation_attempts WHERE id = ${id}`) as Row[];
+      return rows[0] ? toRevocationAttempt(rows[0]) : null;
+    },
+
+    async findLatestPerTarget(appUserId) {
+      const rows = (await sql`
+        SELECT DISTINCT ON (target_credential_id) * FROM passkey_revocation_attempts
+        WHERE app_user_id = ${appUserId}
+        ORDER BY target_credential_id, created_at DESC
+      `) as Row[];
+      return rows.map(toRevocationAttempt);
+    },
+
+    async transition({ id, from, to, patch }) {
+      const p: RevocationAttemptPatch | undefined = patch;
+      const rows = (await sql`
+        UPDATE passkey_revocation_attempts SET
+          state = ${to},
+          turnkey_request_body = CASE WHEN ${has(p, "turnkeyRequestBody")} THEN ${p?.turnkeyRequestBody ?? null} ELSE turnkey_request_body END,
+          turnkey_request_body_sha256 = CASE WHEN ${has(p, "turnkeyRequestBodySha256")} THEN ${p?.turnkeyRequestBodySha256 ?? null} ELSE turnkey_request_body_sha256 END,
+          turnkey_request_timestamp_ms = CASE WHEN ${has(p, "turnkeyRequestTimestampMs")} THEN ${p?.turnkeyRequestTimestampMs ?? null}::bigint ELSE turnkey_request_timestamp_ms END,
+          turnkey_request_stamp = CASE WHEN ${has(p, "turnkeyRequestStamp")} THEN ${p?.turnkeyRequestStamp ?? null} ELSE turnkey_request_stamp END,
+          external_attempted_at = CASE WHEN ${has(p, "externalAttemptedAt")} THEN ${p?.externalAttemptedAt ?? null}::timestamptz ELSE external_attempted_at END,
+          turnkey_activity_status = CASE WHEN ${has(p, "turnkeyActivityStatus")} THEN ${p?.turnkeyActivityStatus ?? null} ELSE turnkey_activity_status END,
+          failure_reason = CASE WHEN ${has(p, "failureReason")} THEN ${p?.failureReason ?? null} ELSE failure_reason END,
+          updated_at = now()
+        WHERE id = ${id} AND state = ${from}
+        RETURNING *
+      `) as Row[];
+      return rows[0] ? toRevocationAttempt(rows[0]) : null;
+    },
+
+    async beginDispatch({ id, patch }) {
+      try {
+        const results = await sql.transaction([
+          // Serializes every dispatch for this account: a racing beginDispatch
+          // blocks here until this transaction commits, and its next
+          // statement reads the committed result (READ COMMITTED takes a fresh
+          // snapshot per statement).
+          sql`SELECT app_user_id FROM real_accounts WHERE app_user_id = (SELECT app_user_id FROM passkey_revocation_attempts WHERE id = ${id}) FOR UPDATE`,
+          sql`
+            UPDATE passkey_revocation_attempts r SET
+              state = 'dispatch_in_flight',
+              turnkey_request_body = ${patch.turnkeyRequestBody ?? null},
+              turnkey_request_body_sha256 = ${patch.turnkeyRequestBodySha256 ?? null},
+              turnkey_request_timestamp_ms = ${patch.turnkeyRequestTimestampMs ?? null}::bigint,
+              turnkey_request_stamp = ${patch.turnkeyRequestStamp ?? null},
+              external_attempted_at = ${patch.externalAttemptedAt ?? null}::timestamptz,
+              updated_at = now()
+            WHERE r.id = ${id} AND r.state = 'authorization_needed' AND r.target_credential_id <> r.authorizer_credential_id
+              AND EXISTS (
+                SELECT 1 FROM real_passkeys t
+                WHERE t.credential_id = r.target_credential_id AND t.app_user_id = r.app_user_id AND t.status = 'active'
+                  AND t.turnkey_authenticator_id = r.target_turnkey_authenticator_id
+              )
+              AND EXISTS (
+                SELECT 1 FROM real_passkeys s
+                WHERE s.credential_id = r.authorizer_credential_id AND s.app_user_id = r.app_user_id AND s.status = 'active' AND s.turnkey_authenticator_id IS NOT NULL
+              )
+            RETURNING *
+          `,
+          sql`
+            UPDATE real_passkeys SET status = 'revoking'
+            WHERE credential_id = (SELECT target_credential_id FROM passkey_revocation_attempts WHERE id = ${id} AND state = 'dispatch_in_flight')
+              AND status = 'active'
+          `,
+          // Never "attempt dispatched + target still active": abort the whole batch instead.
+          sql`
+            SELECT (r.state || ':revocation_dispatch_mismatch')::int FROM passkey_revocation_attempts r
+            WHERE r.id = ${id} AND r.state = 'dispatch_in_flight'
+              AND NOT EXISTS (SELECT 1 FROM real_passkeys p WHERE p.credential_id = r.target_credential_id AND p.status = 'revoking')
+          `,
+        ]);
+        const rows = results[1] as Row[];
+        return rows[0] ? toRevocationAttempt(rows[0]) : null;
+      } catch (error) {
+        if (isGuardAbort(error, "revocation_dispatch_mismatch") || isUniqueViolation(error, "passkey_revocation_attempts_one_dispatch_per_target")) return null;
+        throw error;
+      }
+    },
+
+    async recordActivity({ id, activityId, activityStatus }) {
+      const rows = (await sql`
+        UPDATE passkey_revocation_attempts SET
+          turnkey_activity_id = ${activityId}, turnkey_activity_status = ${activityStatus}, turnkey_request_stamp = NULL, updated_at = now()
+        WHERE id = ${id} AND state = 'dispatch_in_flight' AND turnkey_activity_id IS NULL
+        RETURNING *
+      `) as Row[];
+      return rows[0] ? toRevocationAttempt(rows[0]) : null;
+    },
+
+    async confirmDeleted({ id, turnkeyActivityStatus }) {
+      try {
+        const results = await sql.transaction([
+          sql`
+            UPDATE passkey_revocation_attempts SET state = 'confirmed', turnkey_activity_status = ${turnkeyActivityStatus}, turnkey_request_stamp = NULL, updated_at = now()
+            WHERE id = ${id} AND state = 'dispatch_in_flight'
+            RETURNING *
+          `,
+          sql`
+            UPDATE real_passkeys SET status = 'revoked'
+            WHERE credential_id = (SELECT target_credential_id FROM passkey_revocation_attempts WHERE id = ${id} AND state = 'confirmed') AND status = 'revoking'
+          `,
+          sql`
+            SELECT (a.state || ':revocation_confirm_mismatch')::int FROM passkey_revocation_attempts a
+            WHERE a.id = ${id} AND a.state = 'confirmed'
+              AND NOT EXISTS (SELECT 1 FROM real_passkeys p WHERE p.credential_id = a.target_credential_id AND p.status = 'revoked')
+          `,
+        ]);
+        const rows = results[0] as Row[];
+        return rows[0] ? toRevocationAttempt(rows[0]) : null;
+      } catch (error) {
+        if (isGuardAbort(error, "revocation_confirm_mismatch")) return null;
+        throw error;
+      }
     },
   };
 }
@@ -470,9 +901,11 @@ export type NeonDurableStores = {
   registry: RealAccountRegistry;
   attempts: RegistrationAttemptStore;
   payments: PaymentAttemptStore;
+  backupEnrollments: BackupPasskeyEnrollmentStore;
+  revocations: PasskeyRevocationStore;
 };
 
-/** One connection (Neon's HTTP query function is stateless/per-request-safe), four adapters. */
+/** One connection (Neon's HTTP query function is stateless/per-request-safe), six adapters. */
 export function createNeonDurableStores(databaseUrl: string): NeonDurableStores {
   const sql = neon(databaseUrl);
   return {
@@ -480,5 +913,7 @@ export function createNeonDurableStores(databaseUrl: string): NeonDurableStores 
     registry: createNeonRealAccountRegistry(sql),
     attempts: createNeonRegistrationAttemptStore(sql),
     payments: createNeonPaymentAttemptStore(sql),
+    backupEnrollments: createNeonBackupPasskeyEnrollmentStore(sql),
+    revocations: createNeonPasskeyRevocationStore(sql),
   };
 }

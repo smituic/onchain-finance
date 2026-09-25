@@ -73,6 +73,67 @@ describe("lib/real/** boundary — no Turnkey session-login authority anywhere",
   });
 });
 
+describe("Batch 2g boundary — Model B: child-stamped Turnkey mutations, server raw-forward only", () => {
+  const read = (file: string) => readFileSync(path.resolve(process.cwd(), file), "utf8");
+  const SERVER_MODULES = ["lib/real/server/backup-passkey-pipeline.ts", "lib/real/server/passkey-revocation.ts", "lib/real/server/turnkey-signed-request.ts"];
+  const BROWSER_STAMPER = "lib/real/signing/authenticator-requests.ts";
+  const CLIENT_STORE = "lib/stores/real-passkeys-store.ts";
+
+  it("no source file anywhere dispatches createAuthenticators/deleteAuthenticators through a TurnkeyClient method", () => {
+    const files = ["app", "components", "lib"].flatMap((dir) => listFilesRecursive(path.resolve(process.cwd(), dir))).filter((f) => f.endsWith(".ts") || f.endsWith(".tsx"));
+    const offenders = files.filter((file) => /\.(createAuthenticators|deleteAuthenticators)\s*\(/.test(readFileSync(file, "utf8")));
+    expect(offenders).toEqual([]);
+  });
+
+  it("the browser module only STAMPS (stampCreateAuthenticators / stampDeleteAuthenticators) and never fetches", () => {
+    const source = read(BROWSER_STAMPER);
+    expect(source).toMatch(/\.stampCreateAuthenticators\s*\(/);
+    expect(source).toMatch(/\.stampDeleteAuthenticators\s*\(/);
+    expect(source).not.toMatch(/\bfetch\s*\(/);
+  });
+
+  it("server modules never stamp, never hold the parent API key stamper, and never build a parent client themselves", () => {
+    for (const file of SERVER_MODULES) {
+      const source = read(file);
+      expect(source).not.toMatch(/\.stamp(Create|Delete)Authenticators\s*\(/);
+      expect(source).not.toMatch(/from\s+["']@turnkey\/api-key-stamper["']/);
+      expect(source).not.toMatch(/\bcreateParentTurnkeyClient\b/);
+    }
+  });
+
+  it("the forwarder raw-POSTs the exact body with fetch — never TurnkeyClient.request (which re-stringifies and re-stamps)", () => {
+    const source = read("lib/real/server/turnkey-signed-request.ts");
+    expect(source).toMatch(/body:\s*input\.body/);
+    expect(source).not.toMatch(/\.request\s*\(/);
+    expect(source).not.toMatch(/new\s+TurnkeyClient/);
+  });
+
+  it("backup-passkey client code never builds, prepares, or sends a UserOperation — enrollment and removal never move funds", () => {
+    for (const file of [BROWSER_STAMPER, CLIENT_STORE, ...SERVER_MODULES]) {
+      const source = read(file);
+      expect(source).not.toMatch(/\bsendUserOperation\b/);
+      expect(source).not.toMatch(/\bprepareUserOperation\b/);
+    }
+  });
+
+  it("Real Pay and the backup-passkey slice don't import each other", () => {
+    const paymentFiles = [...listFilesRecursive(path.resolve(process.cwd(), "lib/real/payments")), path.resolve(process.cwd(), "lib/real/server/payments.ts"), path.resolve(process.cwd(), "lib/stores/real-payment-store.ts")];
+    for (const file of paymentFiles) {
+      expect(readFileSync(file, "utf8")).not.toMatch(/backup-passkey|passkey-revocation|turnkey-signed-request|authenticator-requests/);
+    }
+    for (const file of [...SERVER_MODULES, BROWSER_STAMPER, CLIENT_STORE]) {
+      expect(read(file)).not.toMatch(/from\s+["'][^"']*\/payments(\/|["'])/);
+    }
+  });
+
+  it("no one-off tsx runner or esbuild build-script approval was left behind", () => {
+    const pkg = JSON.parse(read("package.json")) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string>; scripts?: Record<string, string> };
+    expect({ ...pkg.dependencies, ...pkg.devDependencies }).not.toHaveProperty("tsx");
+    expect(Object.values(pkg.scripts ?? {}).join(" ")).not.toMatch(/\btsx\b/);
+    expect(read("pnpm-workspace.yaml")).not.toMatch(/esbuild/);
+  });
+});
+
 describe("Pimlico access — no generic proxy, key stays server-only", () => {
   it("PIMLICO_API_KEY / pimlicoApiKey is referenced only under lib/real/server/** and the payment route handlers that pass it through", () => {
     const projectRoot = process.cwd();

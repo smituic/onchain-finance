@@ -242,7 +242,7 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
   it("a revoked passkey can no longer log in", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
-    await registry.revokePasskey(authenticator.credentialIdBase64Url);
+    await registry.transitionPasskeyStatus({ credentialId: authenticator.credentialIdBase64Url, from: "active", to: "revoked" });
     const challengeStore = createInMemoryChallengeStore();
     const attempts = newAttempts();
     const { optionsJSON } = await beginLogin({ config, challengeStore });

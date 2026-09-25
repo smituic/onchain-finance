@@ -10,8 +10,9 @@ export type AuthenticatedRealAccount = {
  * The one place "does this cookie value grant access" is decided. A valid
  * signature and unexpired exp are necessary but not sufficient: the
  * credential the session was issued for must still be active in the
- * registry — revokePasskey immediately invalidates every session that
- * credential ever issued, with no separate session-revocation list to
+ * registry — transitionPasskeyStatus moving a passkey out of 'active'
+ * (Batch 2g: 'revoking' or 'revoked') immediately invalidates every session
+ * that credential ever issued, with no separate session-revocation list to
  * maintain — and must still belong to the same appUserId the session names.
  * None of this ever authorizes wallet signing; it only identifies which
  * account's public state the caller may read.

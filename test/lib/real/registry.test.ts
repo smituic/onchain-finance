@@ -21,7 +21,9 @@ function accountInput(overrides: Partial<Omit<RealAccountRecord, "createdAt">> =
   };
 }
 
-function passkeyInput(overrides: Partial<Omit<RealPasskeyRecord, "createdAt" | "status">> = {}): Omit<RealPasskeyRecord, "createdAt" | "status"> {
+type PrimaryPasskeyInput = Omit<RealPasskeyRecord, "createdAt" | "status" | "role" | "turnkeyAuthenticatorId">;
+
+function passkeyInput(overrides: Partial<PrimaryPasskeyInput> = {}): PrimaryPasskeyInput {
   return {
     credentialId: "credential-1",
     appUserId: "app-user-1",
@@ -92,15 +94,28 @@ describe("createInMemoryRealAccountRegistry", () => {
     expect(passkey?.status).toBe("active");
   });
 
-  it("revokePasskey marks the passkey revoked without deleting the account", async () => {
+  it("transitionPasskeyStatus (active -> revoking -> revoked) changes app status without deleting the account", async () => {
     const registry = createInMemoryRealAccountRegistry();
     await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
 
-    await registry.revokePasskey("credential-1");
-
-    const passkey = await registry.findPasskeyByCredentialId("credential-1");
-    expect(passkey?.status).toBe("revoked");
+    expect((await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "active", to: "revoking" }))?.status).toBe("revoking");
+    expect((await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "revoking", to: "revoked" }))?.status).toBe("revoked");
     expect(await registry.findAccountByAppUserId("app-user-1")).not.toBeNull();
+  });
+
+  it("transitionPasskeyStatus is a CAS: returns null (never throws) when the current status doesn't match `from`", async () => {
+    const registry = createInMemoryRealAccountRegistry();
+    await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
+
+    expect(await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "revoking", to: "revoked" })).toBeNull();
+    expect((await registry.findPasskeyByCredentialId("credential-1"))?.status).toBe("active");
+  });
+
+  it("a primary passkey is created role='primary', active, with no Turnkey mapping until one is confirmed", async () => {
+    const registry = createInMemoryRealAccountRegistry();
+    const { passkey } = await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
+    expect(passkey).toMatchObject({ role: "primary", status: "active", turnkeyAuthenticatorId: null });
+    expect(await registry.findPasskeysByAppUserId("app-user-1")).toHaveLength(1);
   });
 
   it("never stores anything private-key- or signing-session-shaped", async () => {

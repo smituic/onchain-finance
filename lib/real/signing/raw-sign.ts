@@ -4,6 +4,8 @@ import { serializeTurnkeyRawSignature } from "./raw-signature";
 
 export type TurnkeyRawSignResult = {
   signature: Hex;
+  /** Turnkey's activity id — Batch 2g's Proof B reads the activity's votes back by this id. Unused by the payment path. */
+  activityId: string;
 };
 
 /**
@@ -21,8 +23,10 @@ export async function signDigestViaTurnkeyRaw(input: {
   subOrganizationId: string;
   ownerAddress: string;
   digest: Hex;
+  /** Batch 2g only: scopes the WebAuthn ceremony to one specific credential — see createRequiredWebauthnStamper's doc comment. The ordinary payment-signing call site never passes this. */
+  authorizingCredentialId?: string;
 }): Promise<TurnkeyRawSignResult> {
-  const client = createPasskeyTurnkeyClient(input.rpId);
+  const client = createPasskeyTurnkeyClient(input.rpId, input.authorizingCredentialId ? { allowCredentialId: input.authorizingCredentialId } : undefined);
   const response = await client.signRawPayload({
     type: "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
     timestampMs: String(Date.now()),
@@ -39,5 +43,5 @@ export async function signDigestViaTurnkeyRaw(input: {
   if (!result?.r || !result?.s || !result?.v) {
     throw new Error("Turnkey returned a completed activity without a signature.");
   }
-  return { signature: serializeTurnkeyRawSignature(result) };
+  return { signature: serializeTurnkeyRawSignature(result), activityId: response.activity.id };
 }

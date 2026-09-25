@@ -6,9 +6,9 @@
  * reconciliation-only and never mints a session).
  *
  * Two record types, not one: an account can outlive/gain additional
- * passkeys later (not implemented yet — revokePasskey exists for when a
- * passkey needs replacing), so credential identity and account identity are
- * modeled separately even though Batch 2b only ever creates one of each.
+ * passkeys (Batch 2g backup enrollment), so
+ * credential identity and account identity are modeled separately even
+ * though Batch 2b only ever creates one of each.
  */
 
 export type RealAccountRecord = {
@@ -25,6 +25,15 @@ export type RealAccountRecord = {
   createdAt: string;
 };
 
+/**
+ * APP state only — never a statement about Turnkey (see schema.sql):
+ * 'pending' (backup mid-enrollment) -> 'active' -> 'revoking' (app login
+ * disabled; Turnkey removal NOT yet confirmed — may still authorize at
+ * Turnkey) -> 'revoked'. readAuthenticatedRealAccount and completeLogin
+ * refuse anything but 'active'.
+ */
+export type RealPasskeyStatus = "pending" | "active" | "revoking" | "revoked";
+
 export type RealPasskeyRecord = {
   credentialId: string;
   appUserId: string;
@@ -36,7 +45,11 @@ export type RealPasskeyRecord = {
   transports: string[] | null;
   credentialDeviceType: "singleDevice" | "multiDevice" | null;
   credentialBackedUp: boolean | null;
-  status: "active" | "revoked";
+  status: RealPasskeyStatus;
+  /** Display/bookkeeping only — primary and backup have EQUAL Turnkey authority once active; never an authorization check. */
+  role: "primary" | "backup";
+  /** Turnkey-side authenticator id; required before this passkey can be removed or authorize a removal. Null until enrollment confirmation (backups) or the admin backfill (pre-2g primaries). */
+  turnkeyAuthenticatorId: string | null;
   createdAt: string;
 };
 
@@ -71,19 +84,55 @@ export interface RealAccountRegistry {
    */
   createAccountWithPasskey(input: {
     account: Omit<RealAccountRecord, "createdAt">;
-    passkey: Omit<RealPasskeyRecord, "createdAt" | "status">;
+    /** Always creates the passkey as role="primary", status="active" — backups go through backup-passkey-enrollment.ts. */
+    passkey: Omit<RealPasskeyRecord, "createdAt" | "status" | "role" | "turnkeyAuthenticatorId">;
   }): Promise<{ account: RealAccountRecord; passkey: RealPasskeyRecord }>;
   findAccountByAppUserId(appUserId: string): Promise<RealAccountRecord | null>;
   findPasskeyByCredentialId(credentialId: string): Promise<RealPasskeyRecord | null>;
+  findPasskeysByAppUserId(appUserId: string): Promise<RealPasskeyRecord[]>;
   updateAuthenticatorCounter(input: { credentialId: string; counter: number }): Promise<void>;
-  revokePasskey(credentialId: string): Promise<void>;
+
+  /**
+   * Concurrency-safe compare-and-swap on one passkey row's status (same
+   * shape as registration-attempts.ts's transition()). Returns null, never
+   * throws, when the row isn't currently `from`. Multi-row Batch 2g
+   * transitions (enrollment activation, revocation) do NOT use this — they
+   * go through their stores' own atomic operations.
+   */
+  transitionPasskeyStatus(input: {
+    credentialId: string;
+    from: RealPasskeyStatus;
+    to: RealPasskeyStatus;
+    patch?: { turnkeyAuthenticatorId?: string };
+  }): Promise<RealPasskeyRecord | null>;
+}
+
+/**
+ * The in-memory adapter's raw maps, reachable only through
+ * getInMemoryRegistryInternals — lets the in-memory backup-enrollment and
+ * revocation stores perform their multi-row operations SYNCHRONOUSLY (no
+ * await between check and write), which is what makes them atomic under
+ * concurrent Promise.all, mirroring the Neon adapter's single-transaction
+ * guarantees. Never used by production code paths (Neon has no such hook).
+ */
+export type InMemoryRegistryInternals = {
+  accountsByAppUserId: Map<string, RealAccountRecord>;
+  passkeysByCredentialId: Map<string, RealPasskeyRecord>;
+};
+
+const inMemoryInternals = new WeakMap<RealAccountRegistry, InMemoryRegistryInternals>();
+
+export function getInMemoryRegistryInternals(registry: RealAccountRegistry): InMemoryRegistryInternals {
+  const internals = inMemoryInternals.get(registry);
+  if (!internals) throw new Error("In-memory Batch 2g stores require the in-memory registry.");
+  return internals;
 }
 
 export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
   const accountsByAppUserId = new Map<string, RealAccountRecord>();
   const passkeysByCredentialId = new Map<string, RealPasskeyRecord>();
 
-  return {
+  const registry: RealAccountRegistry = {
     async createAccountWithPasskey({ account, passkey }) {
       // Checked (and thrown on) before either Map is written — this function
       // never partially applies. In-memory Map access is synchronous, so
@@ -98,7 +147,13 @@ export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
 
       const createdAt = new Date().toISOString();
       const accountRecord: RealAccountRecord = { ...account, createdAt };
-      const passkeyRecord: RealPasskeyRecord = { ...passkey, status: "active", createdAt };
+      const passkeyRecord: RealPasskeyRecord = {
+        ...passkey,
+        status: "active",
+        role: "primary",
+        turnkeyAuthenticatorId: null,
+        createdAt,
+      };
       accountsByAppUserId.set(account.appUserId, accountRecord);
       passkeysByCredentialId.set(passkey.credentialId, passkeyRecord);
       return { account: accountRecord, passkey: passkeyRecord };
@@ -112,16 +167,28 @@ export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
       return passkeysByCredentialId.get(credentialId) ?? null;
     },
 
+    async findPasskeysByAppUserId(appUserId) {
+      return [...passkeysByCredentialId.values()].filter((passkey) => passkey.appUserId === appUserId);
+    },
+
     async updateAuthenticatorCounter({ credentialId, counter }) {
       const existing = passkeysByCredentialId.get(credentialId);
       if (!existing) return;
       passkeysByCredentialId.set(credentialId, { ...existing, counter });
     },
 
-    async revokePasskey(credentialId) {
-      const existing = passkeysByCredentialId.get(credentialId);
-      if (!existing) return;
-      passkeysByCredentialId.set(credentialId, { ...existing, status: "revoked" });
+    async transitionPasskeyStatus({ credentialId, from, to, patch }) {
+      const current = passkeysByCredentialId.get(credentialId);
+      if (!current || current.status !== from) return null;
+      const next: RealPasskeyRecord = {
+        ...current,
+        ...(patch?.turnkeyAuthenticatorId !== undefined ? { turnkeyAuthenticatorId: patch.turnkeyAuthenticatorId } : {}),
+        status: to,
+      };
+      passkeysByCredentialId.set(credentialId, next);
+      return next;
     },
   };
+  inMemoryInternals.set(registry, { accountsByAppUserId, passkeysByCredentialId });
+  return registry;
 }

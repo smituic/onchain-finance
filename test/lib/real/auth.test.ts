@@ -55,7 +55,15 @@ describe("readAuthenticatedRealAccount", () => {
   it("returns null once the referenced passkey has been revoked — revocation invalidates every session it issued", async () => {
     const { registry } = await seedAccount();
     const cookie = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
-    await registry.revokePasskey("credential-1");
+    await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "active", to: "revoked" });
+
+    expect(await readAuthenticatedRealAccount({ cookieValue: cookie, sessionSecret: SECRET, registry })).toBeNull();
+  });
+
+  it("returns null while the referenced passkey is mid-revocation ('revoking') — locked out immediately, not only once confirmed", async () => {
+    const { registry } = await seedAccount();
+    const cookie = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "active", to: "revoking" });
 
     expect(await readAuthenticatedRealAccount({ cookieValue: cookie, sessionSecret: SECRET, registry })).toBeNull();
   });

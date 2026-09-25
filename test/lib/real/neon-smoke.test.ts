@@ -56,10 +56,10 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
     }
   });
 
-  it("schema applies: all four tables exist", async () => {
+  it("schema applies: all core tables exist", async () => {
     const { neon } = await import("@neondatabase/serverless");
     const sql = neon(databaseUrl!);
-    for (const table of ["webauthn_challenges", "registration_attempts", "real_accounts", "real_passkeys"]) {
+    for (const table of ["webauthn_challenges", "registration_attempts", "real_accounts", "real_passkeys", "backup_passkey_enrollments", "passkey_revocation_attempts"]) {
       const rows = (await sql`SELECT to_regclass(${table}) AS exists`) as { exists: string | null }[];
       expect(rows[0]?.exists, `table "${table}" is missing — apply lib/real/server/schema.sql first`).toBe(table);
     }
@@ -499,4 +499,207 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
     // needed here, and no existing live payment row (outside these two
     // smoke-prefixed app_user_ids) is ever touched.
   }, 30_000);
+});
+
+/**
+ * Batch 2g live proofs — same explicit gate as above (skipped unless
+ * DATABASE_URL is set). These exist to prove, against REAL Postgres through
+ * the Neon HTTP transaction path, what the in-memory adapters can only
+ * model: the account-row FOR UPDATE serialization, and that each
+ * multi-statement sql.transaction() batch rolls back as a whole when its
+ * guard statement aborts on a lost race. Every row is namespaced by a run id
+ * and deleted in afterAll, children before parents.
+ */
+describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g backup passkeys (live database)", () => {
+  const databaseUrl = process.env.DATABASE_URL;
+  const runId = randomUUID().slice(0, 8);
+  const users = new Set<string>();
+  const id = (kind: string, n: number | string) => `smoke2g-${runId}-${kind}-${n}`;
+
+  async function sqlFn() {
+    const { neon } = await import("@neondatabase/serverless");
+    return neon(databaseUrl!);
+  }
+
+  async function stores() {
+    const { createNeonDurableStores } = await import("@/lib/real/server/neon-store");
+    return createNeonDurableStores(databaseUrl!);
+  }
+
+  /**
+   * An account with the given passkeys (all Turnkey-mapped unless
+   * authenticatorId is null). `purpose` must be a string unique to the
+   * calling test — e.g. "confirm-created", "revocation-race-3" — never a
+   * bare integer, so a test's fixed purpose can never collide with another
+   * test's purpose-prefixed, round-varying id regardless of how many rounds
+   * NEON_SMOKE_AB_ROUNDS requests (a round's id always contains the literal
+   * "revocation-race-" prefix, which no other purpose string is a prefix
+   * match for).
+   */
+  async function seed(purpose: string, passkeys: Array<{ credentialId: string; status: string; authenticatorId: string | null }>) {
+    const sql = await sqlFn();
+    const appUserId = id("user", purpose);
+    users.add(appUserId);
+    await sql`
+      INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
+      VALUES (${appUserId}, 'smoke-sub-org', 'smoke-turnkey-user', 'smoke-wallet', 'smoke-wallet-account', '0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF', '0xd9a4c22fb34dc74317edc8006140d66c8fa03266', 1)
+    `;
+    for (const p of passkeys) {
+      await sql`
+        INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter, status, role, turnkey_authenticator_id)
+        VALUES (${p.credentialId}, ${appUserId}, 'pk', 'uh', 0, ${p.status}, 'primary', ${p.authenticatorId})
+      `;
+    }
+    return appUserId;
+  }
+
+  const attachInput = (credentialId: string) => ({
+    credentialId,
+    userHandle: "uh",
+    credentialPublicKey: "pk",
+    counter: 0,
+    transports: null,
+    credentialDeviceType: null,
+    credentialBackedUp: null,
+    registrationChallenge: "c",
+    rawClientDataJson: "d",
+    rawAttestationObject: "a",
+  });
+
+  const dispatchPatch = { turnkeyRequestBody: "{}", turnkeyRequestBodySha256: "h", turnkeyRequestTimestampMs: Date.now(), turnkeyRequestStamp: "{}", externalAttemptedAt: new Date().toISOString() };
+
+  afterAll(async () => {
+    if (!databaseUrl) return;
+    const sql = await sqlFn();
+    for (const appUserId of users) {
+      await sql`DELETE FROM passkey_revocation_attempts WHERE app_user_id = ${appUserId}`;
+      await sql`DELETE FROM backup_passkey_enrollments WHERE app_user_id = ${appUserId}`;
+      await sql`DELETE FROM real_passkeys WHERE app_user_id = ${appUserId}`;
+      await sql`DELETE FROM real_accounts WHERE app_user_id = ${appUserId}`;
+    }
+  });
+
+  it("revocation prepare records an attempt WITHOUT changing the target's status (a cookie alone disables nothing)", async () => {
+    const s = await stores();
+    const purpose = "prepare";
+    const [a, b] = [id("cred", `${purpose}-a`), id("cred", `${purpose}-b`)];
+    const appUserId = await seed(purpose, [{ credentialId: a, status: "active", authenticatorId: id("auth", `${purpose}-a`) }, { credentialId: b, status: "active", authenticatorId: id("auth", `${purpose}-b`) }]);
+    const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: b, authorizerCredentialId: a });
+    expect(prepared.ok).toBe(true);
+    expect((await s.registry.findPasskeyByCredentialId(b))?.status).toBe("active");
+  });
+
+  it("FOR UPDATE serialization over the real Neon HTTP transaction path: racing dispatches 'A by B' and 'B by A' never leave zero active credentials", async () => {
+    const s = await stores();
+    // Default 5 for routine runs; override for a deeper live-verification pass, e.g.
+    // NEON_SMOKE_AB_ROUNDS=20 pnpm exec vitest run test/lib/real/neon-smoke.test.ts -t "Batch 2g"
+    const rounds = Number(process.env.NEON_SMOKE_AB_ROUNDS ?? 5);
+    for (let round = 1; round <= rounds; round += 1) {
+      const purpose = `revocation-race-${round}`;
+      const [a, b] = [id("cred", `${purpose}-a`), id("cred", `${purpose}-b`)];
+      const appUserId = await seed(purpose, [{ credentialId: a, status: "active", authenticatorId: id("auth", `${purpose}-a`) }, { credentialId: b, status: "active", authenticatorId: id("auth", `${purpose}-b`) }]);
+      const aByB = await s.revocations.prepare({ appUserId, targetCredentialId: a, authorizerCredentialId: b });
+      const bByA = await s.revocations.prepare({ appUserId, targetCredentialId: b, authorizerCredentialId: a });
+      if (!aByB.ok || !bByA.ok) throw new Error("setup");
+      const results = await Promise.all([s.revocations.beginDispatch({ id: aByB.attempt.id, patch: dispatchPatch }), s.revocations.beginDispatch({ id: bByA.attempt.id, patch: dispatchPatch })]);
+      expect(results.filter(Boolean)).toHaveLength(1);
+      const active = (await s.registry.findPasskeysByAppUserId(appUserId)).filter((p) => p.status === "active" && p.turnkeyAuthenticatorId);
+      expect(active).toHaveLength(1);
+      // The loser changed nothing: its attempt is still undispatched.
+      const loser = results[0] ? bByA.attempt.id : aByB.attempt.id;
+      expect((await s.revocations.findById(loser))?.state).toBe("authorization_needed");
+    }
+  }, 60_000);
+
+  it("concurrent pending-credential registration onto one enrollment leaves exactly one valid pending row and no orphan", async () => {
+    const s = await stores();
+    const purpose = "registration-race";
+    const appUserId = await seed(purpose, [{ credentialId: id("cred", `${purpose}-primary`), status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
+    const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    const results = await Promise.all([
+      s.backupEnrollments.registerCredential({ id: enrollment.id, credential: attachInput(id("cred", `${purpose}-x`)) }),
+      s.backupEnrollments.registerCredential({ id: enrollment.id, credential: attachInput(id("cred", `${purpose}-y`)) }),
+    ]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const pending = (await s.registry.findPasskeysByAppUserId(appUserId)).filter((p) => p.status === "pending");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.credentialId).toBe((results[0] ?? results[1])!.newCredentialId);
+  });
+
+  it("a lost CAS in confirmCreated rolls back the WHOLE transaction (the enrollment never advances without the passkey mapping)", async () => {
+    const s = await stores();
+    const sql = await sqlFn();
+    const purpose = "confirm-created";
+    const appUserId = await seed(purpose, [{ credentialId: id("cred", `${purpose}-primary`), status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
+    const cred = id("cred", `${purpose}-new`);
+    const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.registerCredential({ id: enrollment.id, credential: attachInput(cred) });
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "credential_registered", to: "turnkey_enrollment_in_flight", patch: { externalOutcome: "unknown" } });
+    // Something else mapped the passkey first -> statement 2 matches nothing -> guard aborts.
+    await sql`UPDATE real_passkeys SET turnkey_authenticator_id = ${id("auth", `${purpose}-conflict`)} WHERE credential_id = ${cred}`;
+
+    expect(await s.backupEnrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: id("auth", `${purpose}-new`), turnkeyAuthenticatorPublicKey: "02ab", turnkeyActivityStatus: null })).toBeNull();
+    const after = (await s.backupEnrollments.findById(enrollment.id))!;
+    expect(after.state).toBe("turnkey_enrollment_in_flight");
+    expect(after.turnkeyAuthenticatorId).toBeNull();
+    expect(after.externalOutcome).toBe("unknown");
+  });
+
+  it("a lost CAS in activation rolls back the WHOLE transaction (never 'enrollment active + passkey not active')", async () => {
+    const s = await stores();
+    const sql = await sqlFn();
+    const purpose = "activation";
+    const appUserId = await seed(purpose, [{ credentialId: id("cred", `${purpose}-primary`), status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
+    const cred = id("cred", `${purpose}-new`);
+    const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.registerCredential({ id: enrollment.id, credential: attachInput(cred) });
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "credential_registered", to: "turnkey_enrollment_in_flight", patch: { externalOutcome: "unknown" } });
+    expect(await s.backupEnrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: id("auth", `${purpose}-new`), turnkeyAuthenticatorPublicKey: "02ab", turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" })).not.toBeNull();
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "turnkey_authenticator_created", to: "login_verified", patch: { loginVerifiedAt: new Date().toISOString() } });
+    // The pending passkey stops being pending -> statement 2 matches nothing -> guard aborts.
+    await sql`UPDATE real_passkeys SET status = 'revoked' WHERE credential_id = ${cred}`;
+
+    expect(await s.backupEnrollments.activate({ id: enrollment.id, signingProofActivityId: "sign-1" })).toBeNull();
+    const after = (await s.backupEnrollments.findById(enrollment.id))!;
+    expect(after.state).toBe("login_verified");
+    expect(after.signingVerifiedAt).toBeNull();
+  });
+
+  it("beginDispatch re-checks the survivor inside the locked transaction: an ineligible survivor changes nothing (attempt stays undispatched, target stays active)", async () => {
+    const s = await stores();
+    const purpose = "dispatch-eligibility";
+    const [a, b] = [id("cred", `${purpose}-a`), id("cred", `${purpose}-b`)];
+    const appUserId = await seed(purpose, [{ credentialId: a, status: "active", authenticatorId: id("auth", `${purpose}-a`) }, { credentialId: b, status: "active", authenticatorId: id("auth", `${purpose}-b`) }]);
+    const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: b, authorizerCredentialId: a });
+    if (!prepared.ok) throw new Error("setup");
+    // The survivor is no longer eligible -> statement 2 matches nothing; nothing may change.
+    const sql = await sqlFn();
+    await sql`UPDATE real_passkeys SET turnkey_authenticator_id = NULL WHERE credential_id = ${a}`;
+    expect(await s.revocations.beginDispatch({ id: prepared.attempt.id, patch: dispatchPatch })).toBeNull();
+    expect((await s.revocations.findById(prepared.attempt.id))?.state).toBe("authorization_needed");
+    expect((await s.registry.findPasskeyByCredentialId(b))?.status).toBe("active");
+  });
+
+  async function dispatched(purpose: string) {
+    const s = await stores();
+    const [a, b] = [id("cred", `${purpose}-a`), id("cred", `${purpose}-b`)];
+    const appUserId = await seed(purpose, [{ credentialId: a, status: "active", authenticatorId: id("auth", `${purpose}-a`) }, { credentialId: b, status: "active", authenticatorId: id("auth", `${purpose}-b`) }]);
+    const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: b, authorizerCredentialId: a });
+    if (!prepared.ok || !(await s.revocations.beginDispatch({ id: prepared.attempt.id, patch: dispatchPatch }))) throw new Error("setup");
+    return { s, attemptId: prepared.attempt.id, target: b };
+  }
+
+  it("recordActivity SQL is first-writer-wins and clears the stamp; blocking a dispatched attempt leaves the target 'revoking'", async () => {
+    const { s, attemptId, target } = await dispatched("activity-recording");
+    expect(await s.revocations.recordActivity({ id: attemptId, activityId: "act-1", activityStatus: "ACTIVITY_STATUS_FAILED" })).toMatchObject({ turnkeyActivityId: "act-1", turnkeyRequestStamp: null });
+    expect(await s.revocations.recordActivity({ id: attemptId, activityId: "act-2", activityStatus: "ACTIVITY_STATUS_COMPLETED" })).toBeNull();
+    expect(await s.revocations.transition({ id: attemptId, from: "dispatch_in_flight", to: "blocked", patch: { failureReason: "delete_activity_failed" } })).toMatchObject({ state: "blocked", turnkeyActivityId: "act-1" });
+    expect((await s.registry.findPasskeyByCredentialId(target))?.status).toBe("revoking");
+  });
+
+  it("the schema has no post-dispatch restore state: 'failed' is rejected by the state CHECK", async () => {
+    const { attemptId } = await dispatched("schema-guard");
+    const sql = await sqlFn();
+    await expect(sql`UPDATE passkey_revocation_attempts SET state = 'failed' WHERE id = ${attemptId}`).rejects.toThrow();
+  });
 });

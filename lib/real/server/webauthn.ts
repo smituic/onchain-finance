@@ -69,14 +69,26 @@ export async function verifyRegistration(input: {
 
 export async function buildLoginOptions(input: {
   config: RealServerConfig;
+  /**
+   * Batch 2g only: scopes the ceremony to specific credential id(s) instead
+   * of the ordinary discoverable-credential restore flow. Used exclusively
+   * by the backup-passkey verification step (proof "A" of
+   * backup-passkey-pipeline.ts) to prove a SPECIFIC newly-enrolled
+   * credential can independently log in — never by the ordinary login
+   * route, which must keep letting the platform authenticator present
+   * whichever synced passkey it has (fresh-device restore depends on that).
+   */
+  allowCredentialIds?: string[];
 }): Promise<PublicKeyCredentialRequestOptionsJSON> {
   // Same reasoning as buildRegistrationOptions: no explicit `challenge`, let
   // the library mint its own random bytes; capture optionsJSON.challenge.
   return generateAuthenticationOptions({
     rpID: input.config.rpId,
     userVerification: "required",
-    // No allowCredentials: this is the discoverable-credential restore flow —
-    // the platform authenticator itself presents the user's synced passkeys.
+    // No allowCredentials for the ordinary restore flow (allowCredentialIds
+    // unset) — the platform authenticator itself presents the user's synced
+    // passkeys. Set only for the backup-verification path above.
+    allowCredentials: input.allowCredentialIds?.map((id) => ({ id })),
   });
 }
 

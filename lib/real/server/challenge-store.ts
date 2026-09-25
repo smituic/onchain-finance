@@ -1,4 +1,9 @@
-export type ChallengePurpose = "registration" | "login";
+/**
+ * 'backup_registration'/'backup_login_verification' are Batch 2g's
+ * backup-passkey purposes — see schema.sql's identical CHECK constraint
+ * comment for why they're kept distinct from 'registration'/'login'.
+ */
+export type ChallengePurpose = "registration" | "login" | "backup_registration" | "backup_login_verification";
 
 export type StoredChallenge = {
   challenge: string;
