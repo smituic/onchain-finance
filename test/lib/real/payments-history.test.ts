@@ -223,6 +223,8 @@ describe("toPaymentHistoryEntry — data minimization", () => {
       paymasterVerificationGasLimit: "100000",
       paymasterPostOpGasLimit: "50000",
       expectedUserOperationHash: "0xexpectedhash",
+      validUntil: 1_900_000_600,
+      prepareBlockNumber: "47000000",
       transactionHash: "0xtxhash",
       failureReason: "internal bundler diagnostic text",
       createdAt: "2026-01-01T00:00:00.000Z",

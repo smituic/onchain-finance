@@ -393,6 +393,28 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
     expect(eleventh).toEqual({ ok: false, reason: "quota_exceeded" });
   }, 60_000);
 
+  it("K: finite expiry — valid_until / prepare_block_number persist as numbers, survive later transitions, and a full uint256 nonce round-trips exactly", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("expiry");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+
+    const reserved = await store.reserve(reserveInput(userId));
+    if (!reserved.ok) throw new Error("reserve failed");
+    expect(reserved.attempt).toMatchObject({ validUntil: null, prepareBlockNumber: null });
+
+    const liveShapedNonce = "33025095892748469342255938797568"; // timestamp nonce key << 64, sequence 0
+    await store.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization", patch: { nonce: liveShapedNonce, validUntil: 1_900_000_600, prepareBlockNumber: "47265792" } });
+    await store.transition({ id: reserved.attempt.id, from: "awaiting_authorization", to: "signed" });
+    const failed = await store.transition({ id: reserved.attempt.id, from: "signed", to: "failed", patch: { failureReason: "smoke" } });
+
+    expect(failed).toMatchObject({ nonce: liveShapedNonce, validUntil: 1_900_000_600, prepareBlockNumber: "47265792" });
+    expect(await store.findById(reserved.attempt.id)).toMatchObject({ validUntil: 1_900_000_600, prepareBlockNumber: "47265792" });
+  });
+
   it("G/H: CAS state transitions and expected_user_operation_hash persistence work against the real database", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { neon } = await import("@neondatabase/serverless");

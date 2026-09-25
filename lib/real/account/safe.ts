@@ -19,8 +19,15 @@ export type SafeAccountPublicClient = Parameters<typeof toSafeSmartAccount>[0]["
  * belongs to a later batch; tests supply an in-process transport instead of
  * a live RPC (see the signing chain test).
  */
-export async function createRealSafeAccount(input: { owner: LocalAccount; publicClient: SafeAccountPublicClient }) {
+export async function createRealSafeAccount(input: {
+  owner: LocalAccount;
+  publicClient: SafeAccountPublicClient;
+  /** The SafeOp validity this account signs with (packed into the signature and part of the signed EIP-712 message). Omitted only where nothing is signed — address derivation, server-side prepare. Never affects the Safe address. */
+  validity?: { validAfter: number; validUntil: number };
+}) {
   return toSafeSmartAccount({
+    validAfter: input.validity?.validAfter,
+    validUntil: input.validity?.validUntil,
     client: input.publicClient,
     owners: [input.owner],
     version: REAL_SAFE.version,

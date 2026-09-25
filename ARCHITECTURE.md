@@ -131,8 +131,41 @@ A bounded security slice built after Phase 2 closed: an account may enroll a sec
 - **Passkey names are presentation metadata only.** `real_passkeys.display_name` (nullable, 1–40 characters by DB CHECK, not unique, not indexed) is never used in any lookup, session, stamp check, or removal — identity stays `credential_id` / `turnkey_authenticator_id`. No name is stored at enrollment or registration (those SQL paths are unchanged); `passkeyDisplayName()` (`lib/real/display/passkey-name.ts`) falls back to the role label, so pre-existing rows need no backfill. No device detection: the browser can't reliably tell "MacBook Touch ID" from "iPhone", so the user names it. `PATCH /api/real/account/passkeys/[credentialId]` renames with an app session alone — the name changes no identity, status, or authority — and the single `UPDATE` requires both `app_user_id = session` and `status = 'active'`; another account's credential gets the same 404 as a missing one. Input is NFC-normalized, trimmed, non-empty, control-character-free, ≤ 40 code points (shared validator on client and server).
 - **The sole survivor is the primary; revoked passkeys are hidden, never deleted.** Role stays app metadata only. A credential added to an existing account is always `backup`. `confirmDeleted` — the one transaction that marks a removal confirmed and its target `revoked` — also promotes the account's oldest active passkey to `primary` when no non-revoked primary is left. On Neon it takes the same per-account `FOR UPDATE` lock as `beginDispatch` and ends with a guard that rolls the whole batch back rather than commit "confirmed" with an active survivor and no primary. A dispatched but unconfirmed removal promotes nothing, because the old primary may still authorize. Promotion never touches status, credential or authenticator identity, Turnkey, owner, or Safe. Revoked rows stay in `real_passkeys` as audit history (removal attempts reference them); the management list and UI omit them, while pending/revoking rows stay visible as live operations. `schema.sql` carries an idempotent, hand-applied one-time repair using the same rule for removals confirmed before this change.
 - **Schema migration.** `schema.sql` drops and re-adds the `status`/`purpose` CHECK constraints by *discovering* their live names (the original inline CHECKs' auto-generated names are not assumed), atomically, in `DO` blocks; the exact read-only pre-live verification query is in the file.
-- **Deliberately unchanged:** SafeOp `validAfter`/`validUntil` (still `0`/`0`), nonce reconciliation, Real Pay semantics (`signDigestViaTurnkeyRaw` now also returns its activity id; the payment path ignores it), Practice Mode. No Turnkey webhooks: the durable-record + read-only-poll pattern needs no push signal.
+- **Deliberately unchanged (in 2g):** SafeOp `validAfter`/`validUntil` (then still `0`/`0` — see "Finite SafeOp expiry" below), nonce reconciliation, Real Pay semantics (`signDigestViaTurnkeyRaw` now also returns its activity id; the payment path ignores it), Practice Mode. No Turnkey webhooks: the durable-record + read-only-poll pattern needs no push signal.
 - **Not live-verified.** Everything above is proven offline against real WebAuthn ceremonies and a stateful fake Turnkey. Live Turnkey behavior (signed-request acceptance when raw-forwarded, freshness window, same-body replay semantics, activity/vote shapes, parent-key read access to child activities) and the Neon SQL remain to be verified before this is merged or enabled. Not mainnet-ready.
+
+### Finite SafeOp Expiry + EntryPoint Nonce Reconciliation
+
+A security slice on Real Pay. It does not change payment limits, the Safe owner, Turnkey signing, or Practice Mode.
+
+- **Why `0` was a real exposure.**
+  - Safe4337Module 0.3.0 passes the signature's `validAfter`/`validUntil` into `validationData` unchanged. EntryPoint v0.7's `_parseValidationData` maps `validUntil == 0` to `type(uint48).max` (verified against both upstream sources).
+  - permissionless's `toSafeSmartAccount` defaults both values to `0`, so every SafeOp was signed never-expiring.
+  - Every prepare gets its own nonce **key** at sequence 0 (viem's `nonceKeyManager`, a millisecond-timestamp key, verified in source and in all live rows). So a later payment never invalidates an earlier signed SafeOp.
+  - Passkey removal doesn't help either: the SafeOp is signed by the Turnkey owner key, which survives it.
+  - The only thing bounding a signed SafeOp was Pimlico's paymaster signature: `paymasterData` carries its own `validUntil`, observed at exactly prepare + 600 s. That is a third party's policy, never ours and never checked.
+- **Window: 600 s from the chain's latest block timestamp at prepare; `validAfter = 0`** (`lib/real/payments/validity.ts`).
+  - The EntryPoint enforces the intersection of the account's and paymaster's windows, so a longer window buys nothing for sponsored operations.
+  - A shorter window would fail real passkey ceremonies. Observed prepare-to-confirm times ranged from 8 s to about 3 min.
+  - The effective limit is unchanged, but it is now ours, enforced, and known to reconciliation.
+  - `valid_until` and `prepare_block_number` are persisted on `payment_attempts`, both nullable.
+- **Submit.**
+  - The signature must carry exactly `validAfter = 0` and the stored `validUntil`. The preflight proves only that the owner signed *some* window, so the window is pinned separately.
+  - With fewer than 60 s left, the server refuses to dispatch (`signed → failed`, nothing sent).
+  - Clock skew is safe both ways: refusing early sends nothing, and a late send is rejected on-chain with AA22.
+  - Rows without a window are never offered for signing and never dispatched.
+- **Reconciliation without the bundler** (`lib/real/chain/entry-point.ts`). This runs only when the bundler has no receipt. It is read-only, never resends, and any error leaves the attempt as it is.
+  - **Proven included:** this payment's own nonce lane has advanced **and** exactly one `UserOperationEvent` for its userOpHash and sender exists. The event's `success` decides between confirmed and failed.
+    - The event search covers `[prepareBlock, prepareBlock + 600]`. That is a hard bound, because block timestamps strictly increase.
+    - `sepolia.base.org` served a 601-block `getLogs` live.
+  - **Proven never includable:** the nonce is still unconsumed at the **finalized** block, and that block's timestamp is past `validUntil`. The attempt then becomes `failed` with "no money moved".
+    - `latest` is never enough for this negative conclusion.
+    - The cost is roughly 22 min of finalization lag, measured live. It applies only to operations that never land.
+  - **Never-dispatched rows** (`awaiting_authorization`/`signed`, e.g. a cancelled passkey prompt) past `validUntil` resolve through this same proof and nothing weaker. The server can't know the browser never signed, so "not submitted" is never read as "can't land". The update is a compare-and-swap from the row's own state, so a concurrent submit or cancel wins cleanly. Before this, an abandoned prepare held the account's one payment slot until the user cancelled it.
+- **No new states.** The finite window only bounds the edge cases:
+  - One residual trust assumption remains: a bundler rejection is still treated as final. The finite window now bounds even that case to 600 s.
+  - Same-nonce replacement is not supported and not wanted.
+  - No byte-for-byte resend is possible, because signatures are never persisted.
 
 ## Explicitly Not Yet Decided
 

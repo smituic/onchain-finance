@@ -182,6 +182,8 @@ function toPaymentAttempt(row: Row): PaymentAttempt {
     paymasterVerificationGasLimit: (row.paymaster_verification_gas_limit as string | null) ?? null,
     paymasterPostOpGasLimit: (row.paymaster_post_op_gas_limit as string | null) ?? null,
     expectedUserOperationHash: (row.expected_user_operation_hash as string | null) ?? null,
+    validUntil: row.valid_until === null || row.valid_until === undefined ? null : Number(row.valid_until),
+    prepareBlockNumber: row.prepare_block_number === null || row.prepare_block_number === undefined ? null : String(row.prepare_block_number),
     transactionHash: (row.transaction_hash as string | null) ?? null,
     failureReason: (row.failure_reason as string | null) ?? null,
     createdAt: new Date(row.created_at as string).toISOString(),
@@ -922,6 +924,8 @@ export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, fals
           paymaster_verification_gas_limit = COALESCE(${patch?.paymasterVerificationGasLimit ?? null}, paymaster_verification_gas_limit),
           paymaster_post_op_gas_limit = COALESCE(${patch?.paymasterPostOpGasLimit ?? null}, paymaster_post_op_gas_limit),
           expected_user_operation_hash = COALESCE(${patch?.expectedUserOperationHash ?? null}, expected_user_operation_hash),
+          valid_until = COALESCE(${patch?.validUntil ?? null}::bigint, valid_until),
+          prepare_block_number = COALESCE(${patch?.prepareBlockNumber ?? null}::bigint, prepare_block_number),
           transaction_hash = COALESCE(${patch?.transactionHash ?? null}, transaction_hash),
           failure_reason = COALESCE(${patch?.failureReason ?? null}, failure_reason),
           updated_at = now()

@@ -8,6 +8,8 @@ import { createSessionPayload, serializeSession } from "@/lib/real/server/sessio
 import { createInMemoryPaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { computeExpectedUserOperationHash } from "@/lib/real/payments/hash";
+import { SAFE_OP_VALIDITY_SECONDS } from "@/lib/real/payments/validity";
+import { rpcBlock, TEST_PREPARE_BLOCK_NUMBER } from "./fixtures/chain-block";
 
 const SECRET = "test-session-secret";
 const OWNER_ADDRESS = "0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF";
@@ -72,12 +74,18 @@ async function seedAccount() {
   return registry;
 }
 
-function buildPublicClient(balance: bigint) {
+const PREPARE_BLOCK_TIMESTAMP = BigInt(1_900_000_000);
+
+function buildPublicClient(balance: bigint, options: { failBlockRead?: boolean } = {}) {
   return createPublicClient({
     chain: baseSepolia,
     transport: custom({
       request: async ({ method, params }: { method: string; params?: unknown[] }) => {
         if (method === "eth_chainId") return `0x${baseSepolia.id.toString(16)}`;
+        if (method === "eth_getBlockByNumber") {
+          if (options.failBlockRead) throw new Error("RPC unavailable: https://rpc.example/secret-key");
+          return rpcBlock({ timestamp: PREPARE_BLOCK_TIMESTAMP });
+        }
         if (method === "eth_call") {
           const call = (params?.[0] ?? {}) as { data?: string };
           const selector = call.data?.slice(0, 10);
@@ -300,6 +308,35 @@ describe("resolvePreparePayment", () => {
     // Never persists a signature — there isn't one yet at prepare time, and
     // there is no column/field for it at all (see schema.sql).
     expect(persisted).not.toHaveProperty("signature");
+  });
+
+  it("finite expiry: validUntil = the chain's latest block timestamp + the window, persisted with its block number and returned for signing", async () => {
+    const registry = await seedAccount();
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const paymentStore = createInMemoryPaymentAttemptStore();
+
+    const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
+    if (outcome.outcome !== "ready") throw new Error(outcome.outcome);
+
+    const expectedValidUntil = Number(PREPARE_BLOCK_TIMESTAMP) + SAFE_OP_VALIDITY_SECONDS;
+    expect(await paymentStore.findById(outcome.attempt.id)).toMatchObject({ validUntil: expectedValidUntil, prepareBlockNumber: TEST_PREPARE_BLOCK_NUMBER.toString() });
+    expect(outcome.attempt.prepared?.validUntil).toBe(expectedValidUntil);
+    // The window never enters the userOpHash (ERC-4337 excludes the signature).
+    expect((await paymentStore.findById(outcome.attempt.id))?.expectedUserOperationHash).toBe(computeExpectedUserOperationHash(preparedFields));
+  });
+
+  it("finite expiry: if the chain clock can't be read, nothing is reserved or prepared and no upstream text leaks", async () => {
+    const registry = await seedAccount();
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const paymentStore = createInMemoryPaymentAttemptStore();
+    const reserveSpy = vi.spyOn(paymentStore, "reserve");
+
+    const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore, publicClient: buildPublicClient(BigInt(100_000_000), { failBlockRead: true }) }));
+
+    expect(outcome.outcome).toBe("prepare_failed");
+    expect(JSON.stringify(outcome)).not.toMatch(/secret-key|rpc\.example/);
+    expect(reserveSpy).not.toHaveBeenCalled();
+    expect(prepareCashTransferUserOperationMock).not.toHaveBeenCalled();
   });
 });
 

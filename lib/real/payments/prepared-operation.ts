@@ -59,6 +59,14 @@ export type WirePreparedFields = {
   paymasterData: string | null;
   paymasterVerificationGasLimit: string | null;
   paymasterPostOpGasLimit: string | null;
+  /**
+   * Unix seconds — the SafeOp validUntil the owner signs (validAfter is the
+   * constant SAFE_OP_VALID_AFTER). Not a UserOperation field, so
+   * parsePreparedFieldsFromWire deliberately ignores it and it never
+   * affects the userOpHash; it IS part of the SafeOp EIP-712 message, and
+   * the server rejects any signature that doesn't carry exactly this value.
+   */
+  validUntil: number;
 };
 
 export function parsePreparedFieldsFromWire(wire: WirePreparedFields): PreparedUserOperationFields {

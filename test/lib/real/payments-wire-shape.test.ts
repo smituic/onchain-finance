@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { createPublicClient, custom, encodeAbiParameters, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { baseSepolia } from "viem/chains";
+import { rpcBlock } from "./fixtures/chain-block";
+import { splitSafeOpSignature } from "@/lib/real/payments/safe-op-preflight";
 
 /**
  * Regression test for a live incident: a real Batch 2d payment attempt sat
@@ -76,6 +78,7 @@ function buildBalanceCheckClient(balanceBaseUnits: bigint) {
     transport: custom({
       request: async ({ method, params }: { method: string; params?: unknown[] }) => {
         if (method === "eth_chainId") return `0x${baseSepolia.id.toString(16)}`;
+        if (method === "eth_getBlockByNumber") return rpcBlock();
         if (method === "eth_call") {
           const call = (params?.[0] ?? {}) as { data?: string };
           const selector = call.data?.slice(0, 10);
@@ -125,7 +128,7 @@ vi.mock("@/lib/real/server/pimlico", () => ({
 }));
 
 const { resolvePreparePayment, resolveLatestPayment } = await import("@/lib/real/server/payments");
-const { signPreparedPayment } = await import("@/lib/real/payments/client-sign");
+const { signPreparedPayment, PAYMENT_EXPIRED_BEFORE_APPROVAL } = await import("@/lib/real/payments/client-sign");
 const { createInMemoryRealAccountRegistry } = await import("@/lib/real/server/registry");
 const { createInMemoryPaymentAttemptStore } = await import("@/lib/real/server/payment-attempts");
 const { createSessionPayload, serializeSession } = await import("@/lib/real/server/session");
@@ -201,6 +204,9 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       rpcUrl: "http://unused.invalid",
     });
     expect(signature).toMatch(/^0x[0-9a-f]+$/i);
+    // The browser signed EXACTLY the server-chosen finite window — never 0 (= never expires).
+    expect(wireAttempt.prepared!.validUntil).toBeGreaterThan(0);
+    expect(splitSafeOpSignature(signature)).toMatchObject({ validAfter: 0, validUntil: wireAttempt.prepared!.validUntil });
   });
 
   it("a payment restored through /latest (simulating a reload) also carries a defined `sender` and signs successfully — the exact live-incident path, no auto-submit", async () => {
@@ -264,6 +270,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       paymasterData: null,
       paymasterVerificationGasLimit: null,
       paymasterPostOpGasLimit: null,
+      validUntil: Math.floor(Date.now() / 1000) + 600,
     };
 
     await expect(
@@ -275,5 +282,30 @@ describe("live incident regression: prepared-fields wire shape must survive the 
         rpcUrl: "http://unused.invalid",
       }),
     ).rejects.toThrow(/reading 'toLowerCase'|Cannot read propert/);
+  });
+
+  it("finite expiry: a wire object with no window, or one too close to expiry, is refused BEFORE any passkey ceremony", async () => {
+    const base = {
+      sender: SAFE_ADDRESS,
+      nonce: "0",
+      factory: null,
+      factoryData: null,
+      callData: "0x1234",
+      callGasLimit: "80000",
+      verificationGasLimit: "150000",
+      preVerificationGas: "60000",
+      maxFeePerGas: "2000000",
+      maxPriorityFeePerGas: "1000000",
+      paymaster: null,
+      paymasterData: null,
+      paymasterVerificationGasLimit: null,
+      paymasterPostOpGasLimit: null,
+    };
+    const sign = (fields: unknown) => signPreparedPayment({ fields: fields as never, rpId: "localhost", subOrganizationId: "sub-org-1", ownerAddress: owner.address, rpcUrl: "http://unused.invalid" });
+    signRawPayloadMock.mockClear();
+
+    await expect(sign(base)).rejects.toThrow(PAYMENT_EXPIRED_BEFORE_APPROVAL);
+    await expect(sign({ ...base, validUntil: Math.floor(Date.now() / 1000) + 30 })).rejects.toThrow(PAYMENT_EXPIRED_BEFORE_APPROVAL);
+    expect(signRawPayloadMock).not.toHaveBeenCalled();
   });
 });

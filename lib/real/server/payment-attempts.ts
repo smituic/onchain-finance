@@ -8,6 +8,13 @@ import { randomUUID } from "node:crypto";
  *        \-> failed (definitive pre- or at-dispatch failure, retryable)
  *        \-> cancelled (the browser abandoned the flow before signing)
  *
+ * Finite expiry: every attempt carries the SafeOp validUntil its owner must
+ * sign (lib/real/payments/validity.ts). Submit refuses (signed -> failed,
+ * nothing dispatched) a signature over any other window or one too close to
+ * expiry; reconciliation may move submitting/submitted/unknown -> failed only
+ * on on-chain PROOF the operation can never land (its nonce unconsumed at a
+ * finalized block past validUntil — lib/real/chain/entry-point.ts).
+ *
  * Only confirmed/failed/cancelled are terminal. `submitting` and `unknown`
  * are both sticky, non-resendable states: `submitting` is written durably
  * BEFORE eth_sendUserOperation is ever dispatched (closing the crash window
@@ -69,6 +76,10 @@ export type PaymentAttempt = {
   paymasterPostOpGasLimit: string | null;
   /** Computed and persisted BEFORE eth_sendUserOperation is ever dispatched — see lib/real/payments/hash.ts. */
   expectedUserOperationHash: string | null;
+  /** Unix seconds — the SafeOp validUntil the owner must sign (lib/real/payments/validity.ts). Null only on pre-expiry legacy rows, which are never dispatched. */
+  validUntil: number | null;
+  /** Decimal string (uint64 block number) — lower bound of on-chain reconciliation's event search. */
+  prepareBlockNumber: string | null;
   transactionHash: string | null;
   failureReason: string | null;
   createdAt: string;
@@ -92,6 +103,8 @@ export type PaymentAttemptPatch = Partial<
     | "paymasterVerificationGasLimit"
     | "paymasterPostOpGasLimit"
     | "expectedUserOperationHash"
+    | "validUntil"
+    | "prepareBlockNumber"
     | "transactionHash"
     | "failureReason"
   >
@@ -195,6 +208,8 @@ export function createInMemoryPaymentAttemptStore(): PaymentAttemptStore {
         paymasterVerificationGasLimit: null,
         paymasterPostOpGasLimit: null,
         expectedUserOperationHash: null,
+        validUntil: null,
+        prepareBlockNumber: null,
         transactionHash: null,
         failureReason: null,
         createdAt: nowIso,

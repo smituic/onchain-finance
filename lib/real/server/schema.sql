@@ -338,6 +338,8 @@ CREATE TABLE IF NOT EXISTS payment_attempts (
   paymaster_verification_gas_limit     TEXT,
   paymaster_post_op_gas_limit          TEXT,
   expected_user_operation_hash         TEXT,
+  valid_until                          BIGINT,
+  prepare_block_number                 BIGINT,
   transaction_hash                     TEXT,
   failure_reason                       TEXT,
   created_at                           TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -350,3 +352,16 @@ CREATE INDEX IF NOT EXISTS payment_attempts_app_user_created_idx ON payment_atte
 CREATE UNIQUE INDEX IF NOT EXISTS payment_attempts_one_active_per_account
   ON payment_attempts (app_user_id)
   WHERE state NOT IN ('confirmed', 'failed', 'cancelled');
+
+-- Finite SafeOp expiry hand-applied migration. Idempotent; nullable, so every
+-- pre-existing row stays valid (a legacy row without a window is never
+-- offered for signing and never dispatched — see server/payments.ts).
+--   valid_until           unix seconds the owner signed as the SafeOp's
+--                         validUntil (chain block timestamp at prepare + the
+--                         window in lib/real/payments/validity.ts). submit
+--                         requires the signature to carry EXACTLY this value.
+--   prepare_block_number  the block that timestamp came from — the lower
+--                         bound of the on-chain UserOperationEvent search.
+-- The nonce (key = nonce >> 64, sequence = low 64 bits) is already stored.
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS valid_until BIGINT;
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS prepare_block_number BIGINT;

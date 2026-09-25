@@ -4,6 +4,7 @@ import { assertSafeOpPreflightOrThrow, verifySafeOpSignature, SafeOpPreflightErr
 import { computeExpectedUserOperationHash } from "./hash";
 import { toSafeOpOperation, type PreparedUserOperationFields } from "./prepared-operation";
 import { classifySendError } from "./classify-send-error";
+import { SAFE_OP_VALID_AFTER } from "./validity";
 
 export type SignatureVerificationOutcome = { ok: true } | { ok: false; reason: string };
 
@@ -26,6 +27,8 @@ export async function verifyPreparedPaymentSignature(input: {
   fields: PreparedUserOperationFields;
   expectedOwner: Address;
   expectedUserOperationHash: Hash;
+  /** The durable, server-chosen SafeOp validUntil. The signature must carry exactly this (and validAfter = SAFE_OP_VALID_AFTER) — never "whatever the client signed", which could be 0 = never expires. */
+  expectedValidUntil: number;
   signature: Hex;
 }): Promise<SignatureVerificationOutcome> {
   const operation = toSafeOpOperation(input.fields, { safe: input.fields.sender, entryPoint: REAL_SAFE.entryPoint.address });
@@ -45,6 +48,13 @@ export async function verifyPreparedPaymentSignature(input: {
       return { ok: false, reason: `Local SafeOp signature preflight failed before submission: ${preflight.reason ?? "unknown reason"}` };
     }
     throw error;
+  }
+
+  // The recovered owner signed over the validity embedded in the signature
+  // itself, so the preflight passing proves nothing about WHICH window was
+  // signed — that must be pinned separately to the server's own value.
+  if (preflight.validAfter !== SAFE_OP_VALID_AFTER || preflight.validUntil !== input.expectedValidUntil) {
+    return { ok: false, reason: "The signed validity window does not match the prepared payment's — refusing to submit." };
   }
 
   const recomputedHash = computeExpectedUserOperationHash(input.fields);

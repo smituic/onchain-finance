@@ -5,6 +5,8 @@ import { baseSepolia } from "viem/chains";
 import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import { createInMemoryPaymentAttemptStore, type PaymentAttemptPatch } from "@/lib/real/server/payment-attempts";
+import { SAFE_OP_VALIDITY_SECONDS } from "@/lib/real/payments/validity";
+import { createFakeEntryPoint } from "./fixtures/entry-point-fake";
 
 const SECRET = "test-session-secret";
 
@@ -43,7 +45,7 @@ vi.mock("@/lib/real/server/pimlico", () => ({
   fetchUserOperationReceipt: (...args: unknown[]) => fetchUserOperationReceiptMock(...(args as [never])),
 }));
 
-const { resolveSubmitPayment, resolvePaymentStatus, resolveCancelPayment } = await import("@/lib/real/server/payments");
+const { resolveSubmitPayment, resolvePaymentStatus, resolveCancelPayment, resolveLatestPayment } = await import("@/lib/real/server/payments");
 const { createVerifiedTurnkeyOwnerAccount } = await import("@/lib/real/signing/verified-account");
 const { createRealSafeAccount } = await import("@/lib/real/account/safe");
 const { computeExpectedUserOperationHash } = await import("@/lib/real/payments/hash");
@@ -76,10 +78,12 @@ const PREPARED_OPERATION = {
 };
 
 /** Builds a real Safe account (offline) and a real, valid signature over PREPARED_OPERATION, plus a matching durable PaymentAttempt row and registry — everything resolveSubmitPayment needs to independently re-verify the signature exactly like production would. */
-async function setup(options: { signAs?: typeof owner } = {}) {
+async function setup(options: { signAs?: typeof owner; storedValidUntil?: number | null; signedValidity?: { validAfter: number; validUntil: number } } = {}) {
   signWithKey = options.signAs ?? owner;
+  const storedValidUntil = options.storedValidUntil === undefined ? Math.floor(Date.now() / 1000) + SAFE_OP_VALIDITY_SECONDS : options.storedValidUntil;
+  const signedValidity = options.signedValidity ?? { validAfter: 0, validUntil: storedValidUntil ?? 0 };
   const verifiedOwner = createVerifiedTurnkeyOwnerAccount({ rpId: "example.com", subOrganizationId: "sub-org-1", ownerAddress: owner.address });
-  const account = await createRealSafeAccount({ owner: verifiedOwner, publicClient: buildOfflinePublicClient() });
+  const account = await createRealSafeAccount({ owner: verifiedOwner, publicClient: buildOfflinePublicClient(), validity: signedValidity });
   const signature = await account.signUserOperation({ ...PREPARED_OPERATION, sender: account.address });
 
   const registry = createInMemoryRealAccountRegistry();
@@ -131,6 +135,7 @@ async function setup(options: { signAs?: typeof owner } = {}) {
     maxFeePerGas: PREPARED_OPERATION.maxFeePerGas.toString(),
     maxPriorityFeePerGas: PREPARED_OPERATION.maxPriorityFeePerGas.toString(),
     expectedUserOperationHash,
+    ...(storedValidUntil === null ? {} : { validUntil: storedValidUntil, prepareBlockNumber: "47000000" }),
   };
   await paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization", patch });
 
@@ -374,7 +379,7 @@ describe("resolveSubmitPayment", () => {
       receipt: { transactionHash: "0xabc", status: "success" },
     });
 
-    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", attemptId });
+    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId });
 
     expect(outcome.outcome).toBe("ok");
     if (outcome.outcome !== "ok") return;
@@ -406,7 +411,7 @@ describe("resolveSubmitPayment", () => {
     await paymentStore.transition({ id: attemptId, from: "signed", to: "submitting" });
     fetchUserOperationReceiptMock.mockResolvedValueOnce(null);
 
-    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", attemptId });
+    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId });
 
     expect(outcome.outcome).toBe("ok");
     if (outcome.outcome !== "ok") return;
@@ -514,5 +519,74 @@ describe("cancel-vs-submit races (pre-2f hardening)", () => {
     expect(outcome.outcome).toBe("submitted");
     expect(sendPreparedUserOperationMock).toHaveBeenCalledTimes(1);
     transitionSpy.mockRestore();
+  });
+});
+
+describe("finite SafeOp expiry at submit", () => {
+  const submit = (ctx: Awaited<ReturnType<typeof setup>>, overrides: { signature?: Hex; now?: () => number } = {}) =>
+    resolveSubmitPayment({
+      cookieValue: ctx.cookieValue,
+      sessionSecret: SECRET,
+      registry: ctx.registry,
+      paymentStore: ctx.paymentStore,
+      pimlicoApiKey: "pim_test_key",
+      attemptId: ctx.attemptId,
+      signature: overrides.signature ?? ctx.signature,
+      now: overrides.now,
+    });
+
+  it("a validly-signed but UNBOUNDED SafeOp (validUntil = 0, 'never expires') is refused and never dispatched — the window is the server's, not the client's", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const ctx = await setup({ signedValidity: { validAfter: 0, validUntil: 0 } });
+
+    const outcome = await submit(ctx);
+
+    expect(outcome.outcome).toBe("failed");
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+    expect((await ctx.paymentStore.findById(ctx.attemptId))?.state).toBe("failed");
+  });
+
+  it("a signature over a DIFFERENT finite window (longer, or a non-zero validAfter) is refused and never dispatched", async () => {
+    for (const signedValidity of [{ validAfter: 0, validUntil: Math.floor(Date.now() / 1000) + 86_400 }, { validAfter: 1, validUntil: Math.floor(Date.now() / 1000) + SAFE_OP_VALIDITY_SECONDS }]) {
+      sendPreparedUserOperationMock.mockReset();
+      const stored = Math.floor(Date.now() / 1000) + SAFE_OP_VALIDITY_SECONDS;
+      const ctx = await setup({ storedValidUntil: stored, signedValidity: { ...signedValidity, validUntil: signedValidity.validAfter === 1 ? stored : signedValidity.validUntil } });
+
+      expect((await submit(ctx)).outcome).toBe("failed");
+      expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+    }
+  });
+
+  it("fewer than 60 s of the signed window left: refused as expired before dispatch — nothing sent, slot freed", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const ctx = await setup();
+    const validUntil = (await ctx.paymentStore.findById(ctx.attemptId))!.validUntil!;
+
+    const outcome = await submit(ctx, { now: () => (validUntil - 59) * 1000 });
+
+    expect(outcome.outcome).toBe("failed");
+    if (outcome.outcome === "failed") expect(outcome.attempt.failureReason).toMatch(/expired before it could be sent/);
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+  });
+
+  it("exactly 60 s left is still enough to dispatch (boundary)", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const ctx = await setup();
+    sendPreparedUserOperationMock.mockResolvedValueOnce(ctx.expectedUserOperationHash);
+    const validUntil = (await ctx.paymentStore.findById(ctx.attemptId))!.validUntil!;
+
+    expect((await submit(ctx, { now: () => (validUntil - 60) * 1000 })).outcome).toBe("submitted");
+    expect(sendPreparedUserOperationMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a legacy row with no window is never offered for signing and never dispatched, even with a (0-window) signature that verifies", async () => {
+    sendPreparedUserOperationMock.mockReset();
+    const ctx = await setup({ storedValidUntil: null });
+
+    const latest = await resolveLatestPayment({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore });
+    expect(latest.outcome === "ok" && latest.attempt.prepared).toBeNull();
+
+    expect((await submit(ctx)).outcome).toBe("failed");
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
   });
 });

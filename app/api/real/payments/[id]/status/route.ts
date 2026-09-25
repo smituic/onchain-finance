@@ -2,6 +2,7 @@ import { cookies } from "next/headers";
 import type { NextRequest } from "next/server";
 import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, requireRealServerConfig } from "@/lib/real/server/http";
 import { resolvePaymentStatus } from "@/lib/real/server/payments";
+import { createRealPublicClient } from "@/lib/real/chain/client";
 import { getPaymentAttemptStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
 
@@ -10,10 +11,11 @@ import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
  * its precomputed expected_user_operation_hash — see
  * lib/real/server/payments.ts's resolvePaymentStatus and its
  * RECONCILABLE_STATES (submitting is included deliberately: it's written
- * durably before eth_sendUserOperation is ever dispatched). Read-only from
+ * durably before eth_sendUserOperation is ever dispatched), and resolves an
+ * expired never-dispatched attempt only by on-chain proof. Read-only from
  * the client's perspective (it never signs or resubmits); the only mutation
  * is moving the durable attempt to confirmed/failed on an unambiguous
- * receipt.
+ * receipt or EntryPoint proof.
  */
 export async function GET(_request: NextRequest, ctx: RouteContext<"/api/real/payments/[id]/status">) {
   if (!isRealModeEnabled()) return disabledResponse();
@@ -28,6 +30,7 @@ export async function GET(_request: NextRequest, ctx: RouteContext<"/api/real/pa
       registry: getRealAccountRegistry(),
       paymentStore: getPaymentAttemptStore(),
       pimlicoApiKey: config.pimlicoApiKey,
+      publicClient: createRealPublicClient(config.rpcUrl),
       attemptId: id,
     });
 
