@@ -21,6 +21,7 @@ export async function POST(request: Request) {
       registry: getRealAccountRegistry(),
       enrollments: getBackupPasskeyEnrollmentStore(),
       appUserId: authenticated.account.appUserId,
+      sessionCredentialId: authenticated.session.credentialId,
       response: body.response,
     });
     if (result.outcome === "rejected") return jsonError(result.reason, 400);

@@ -586,6 +586,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
     registrationChallenge: "c",
     rawClientDataJson: "d",
     rawAttestationObject: "a",
+    stepUpCredentialId: "smoke-step-up-credential",
+    registrationMintId: "smoke-mint",
   });
 
   const dispatchPatch = { turnkeyRequestBody: "{}", turnkeyRequestBodySha256: "h", turnkeyRequestTimestampMs: Date.now(), turnkeyRequestStamp: "{}", externalAttemptedAt: new Date().toISOString() };
@@ -638,6 +640,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
     const purpose = "registration-race";
     const appUserId = await seed(purpose, [{ credentialId: id("cred", `${purpose}-primary`), status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
     const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "smoke-mint" } });
     const results = await Promise.all([
       s.backupEnrollments.registerCredential({ id: enrollment.id, credential: attachInput(id("cred", `${purpose}-x`)) }),
       s.backupEnrollments.registerCredential({ id: enrollment.id, credential: attachInput(id("cred", `${purpose}-y`)) }),
@@ -655,6 +658,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
     const appUserId = await seed(purpose, [{ credentialId: id("cred", `${purpose}-primary`), status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
     const cred = id("cred", `${purpose}-new`);
     const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "smoke-mint" } });
     await s.backupEnrollments.registerCredential({ id: enrollment.id, credential: attachInput(cred) });
     await s.backupEnrollments.transition({ id: enrollment.id, from: "credential_registered", to: "turnkey_enrollment_in_flight", patch: { externalOutcome: "unknown" } });
     // Something else mapped the passkey first -> statement 2 matches nothing -> guard aborts.
@@ -674,6 +678,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
     const appUserId = await seed(purpose, [{ credentialId: id("cred", `${purpose}-primary`), status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
     const cred = id("cred", `${purpose}-new`);
     const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "smoke-mint" } });
     await s.backupEnrollments.registerCredential({ id: enrollment.id, credential: attachInput(cred) });
     await s.backupEnrollments.transition({ id: enrollment.id, from: "credential_registered", to: "turnkey_enrollment_in_flight", patch: { externalOutcome: "unknown" } });
     expect(await s.backupEnrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: id("auth", `${purpose}-new`), turnkeyAuthenticatorPublicKey: "02ab", turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" })).not.toBeNull();
@@ -751,6 +756,190 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
     expect(removedBackup.target).toMatchObject({ status: "revoked", role: "backup" });
     expect(removedBackup.survivor).toEqual(removedBackup.survivorBefore);
   });
+
+  // ---------------------------------------------------------------- 2g-H
+
+  it("2g-H: the 'backup_step_up' challenge purpose is accepted by the migrated CHECK, and consume stays single-use and purpose-bound", async () => {
+    const s = await stores();
+    const sql = await sqlFn();
+    const challenge = id("challenge", "step-up");
+    try {
+      await s.challengeStore.create({ challenge, purpose: "backup_step_up", ttlMs: 60_000, context: { appUserId: "x", credentialId: "y" } });
+      expect(await s.challengeStore.consume({ challenge, purpose: "backup_registration" })).toBeNull(); // wrong purpose (and now consumed)
+      await s.challengeStore.create({ challenge, purpose: "backup_step_up", ttlMs: 60_000, context: { appUserId: "x", credentialId: "y" } });
+      expect(await s.challengeStore.consume({ challenge, purpose: "backup_step_up" })).toMatchObject({ purpose: "backup_step_up", context: { appUserId: "x", credentialId: "y" } });
+      expect(await s.challengeStore.consume({ challenge, purpose: "backup_step_up" })).toBeNull();
+    } finally {
+      await sql`DELETE FROM webauthn_challenges WHERE challenge = ${challenge}`;
+    }
+  });
+
+  /** An account with an active mapped primary plus a backup enrollment driven to `turnkey_authenticator_created` (the pending passkey is mapped). */
+  async function pendingLive(purpose: string) {
+    const s = await stores();
+    const primary = id("cred", `${purpose}-primary`);
+    const appUserId = await seed(purpose, [{ credentialId: primary, status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
+    const pending = id("cred", `${purpose}-pending`);
+    const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "smoke-mint" } });
+    expect(await s.backupEnrollments.registerCredential({ id: enrollment.id, credential: { ...attachInput(pending), stepUpCredentialId: primary } })).toMatchObject({ registrationStepUpCredentialId: primary });
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "credential_registered", to: "turnkey_enrollment_in_flight", patch: { externalOutcome: "unknown" } });
+    if (!(await s.backupEnrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: id("auth", `${purpose}-pending`), turnkeyAuthenticatorPublicKey: "02ab", turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" }))) throw new Error("setup");
+    return { s, appUserId, primary, pending, enrollmentId: enrollment.id };
+  }
+
+  it("2g-H: a pending passkey WITHOUT a Turnkey mapping is not removable", async () => {
+    const s = await stores();
+    const purpose = "pending-unmapped";
+    const primary = id("cred", `${purpose}-primary`);
+    const appUserId = await seed(purpose, [{ credentialId: primary, status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
+    const pending = id("cred", `${purpose}-pending`);
+    const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "smoke-mint" } });
+    await s.backupEnrollments.registerCredential({ id: enrollment.id, credential: { ...attachInput(pending), stepUpCredentialId: primary } });
+    expect(await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary })).toEqual({ ok: false, reason: "target_not_removable" });
+  });
+
+  it("2g-H: removing a pending-but-mapped passkey — the locked dispatch moves the enrollment to 'removal_in_progress' (slot STILL HELD) and the passkey to 'revoking'; only confirmDeleted makes it 'revoked' + 'removed' and frees the slot", async () => {
+    const { s, appUserId, primary, pending, enrollmentId } = await pendingLive("pending-removal");
+    const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary });
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared));
+    expect((await s.registry.findPasskeyByCredentialId(pending))?.status).toBe("pending"); // prepare alone changes nothing
+
+    expect(await s.revocations.beginDispatch({ id: prepared.attempt.id, patch: dispatchPatch })).toMatchObject({ state: "dispatch_in_flight" });
+    expect((await s.registry.findPasskeyByCredentialId(pending))?.status).toBe("revoking");
+    expect((await s.backupEnrollments.findById(enrollmentId))?.state).toBe("removal_in_progress");
+    expect(await s.backupEnrollments.findActiveByAppUserId(appUserId)).toMatchObject({ id: enrollmentId, state: "removal_in_progress" });
+    expect(await s.backupEnrollments.createStarted({ appUserId })).toBeNull(); // slot held while unresolved
+    expect(await s.backupEnrollments.activate({ id: enrollmentId, signingProofActivityId: "late" })).toBeNull();
+
+    expect(await s.revocations.confirmDeleted({ id: prepared.attempt.id, turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" })).toMatchObject({ state: "confirmed" });
+    expect(await s.registry.findPasskeyByCredentialId(pending)).toMatchObject({ status: "revoked", role: "backup" }); // row kept as history
+    expect((await s.backupEnrollments.findById(enrollmentId))?.state).toBe("removed");
+    expect((await s.registry.findPasskeyByCredentialId(primary))?.status).toBe("active");
+    expect(await s.backupEnrollments.createStarted({ appUserId })).toMatchObject({ state: "started" }); // freed atomically with the confirmation
+  });
+
+  it("2g-H: a BLOCKED removal keeps the slot and is retryable — a new attempt dispatches (target stays 'revoking'), and its confirmation revokes + frees the slot", async () => {
+    const { s, appUserId, primary, pending, enrollmentId } = await pendingLive("pending-retry");
+    const first = await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary });
+    if (!first.ok || !(await s.revocations.beginDispatch({ id: first.attempt.id, patch: dispatchPatch }))) throw new Error("setup");
+    expect(await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary })).toEqual({ ok: false, reason: "removal_in_progress" });
+    expect(await s.revocations.transition({ id: first.attempt.id, from: "dispatch_in_flight", to: "blocked", patch: { failureReason: "delete_activity_failed" } })).toMatchObject({ state: "blocked" });
+    expect(await s.backupEnrollments.createStarted({ appUserId })).toBeNull();
+
+    const retry = await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary });
+    if (!retry.ok) throw new Error(JSON.stringify(retry));
+    expect(retry.attempt.targetTurnkeyAuthenticatorId).toBe(first.attempt.targetTurnkeyAuthenticatorId);
+    // FIX 3: the retry's signed bytes must differ from every earlier dispatched attempt's — reusing them is refused atomically.
+    expect(await s.revocations.beginDispatch({ id: retry.attempt.id, patch: dispatchPatch })).toBeNull();
+    expect((await s.revocations.findById(retry.attempt.id))?.state).toBe("authorization_needed");
+    expect(await s.revocations.beginDispatch({ id: retry.attempt.id, patch: { ...dispatchPatch, turnkeyRequestBodySha256: "h-fresh-retry" } })).toMatchObject({ state: "dispatch_in_flight" });
+    expect((await s.registry.findPasskeyByCredentialId(pending))?.status).toBe("revoking");
+    expect(await s.revocations.confirmDeleted({ id: retry.attempt.id, turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" })).toMatchObject({ state: "confirmed" });
+    expect((await s.registry.findPasskeyByCredentialId(pending))?.status).toBe("revoked");
+    expect((await s.backupEnrollments.findById(enrollmentId))?.state).toBe("removed");
+    expect((await s.revocations.findById(first.attempt.id))?.state).toBe("blocked"); // history kept
+    expect(await s.backupEnrollments.createStarted({ appUserId })).toMatchObject({ state: "started" });
+  });
+
+  it("2g-H: an unresolved create HOLDS the slot (in flight, and 'blocked' review under the new index); the replay claim and activity recording are first-writer-wins under real concurrency; exact-match recovery maps it and clears the review reason", async () => {
+    const s = await stores();
+    const purpose = "unresolved-create";
+    const primary = id("cred", `${purpose}-primary`);
+    const appUserId = await seed(purpose, [{ credentialId: primary, status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
+    const pending = id("cred", `${purpose}-pending`);
+    const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "smoke-mint" } });
+    await s.backupEnrollments.registerCredential({ id: enrollment.id, credential: { ...attachInput(pending), stepUpCredentialId: primary } });
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "credential_registered", to: "turnkey_enrollment_in_flight", patch: { externalOutcome: "unknown", turnkeyRequestBody: "{}", turnkeyRequestStamp: "{}" } });
+    expect(await s.backupEnrollments.createStarted({ appUserId })).toBeNull();
+
+    const claims = await Promise.all([1, 2, 3].map(() => s.backupEnrollments.claimReplay({ id: enrollment.id })));
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const records = await Promise.all(["act-a", "act-b", "act-c"].map((activityId) => s.backupEnrollments.recordActivity({ id: enrollment.id, activityId, activityStatus: "ACTIVITY_STATUS_FAILED" })));
+    const winner = records.filter(Boolean);
+    expect(winner).toHaveLength(1);
+    expect(await s.backupEnrollments.findById(enrollment.id)).toMatchObject({ turnkeyActivityId: winner[0]!.turnkeyActivityId, turnkeyRequestReplayed: true, turnkeyRequestStamp: null });
+
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "turnkey_enrollment_in_flight", to: "blocked", patch: { blockReason: "review" } });
+    expect(await s.backupEnrollments.createStarted({ appUserId })).toBeNull(); // 'blocked' now counts as open
+    expect(await s.backupEnrollments.findActiveByAppUserId(appUserId)).toMatchObject({ state: "blocked" });
+    expect(await s.backupEnrollments.abandon({ id: enrollment.id })).toBeNull();
+
+    expect(await s.backupEnrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: id("auth", `${purpose}-pending`), turnkeyAuthenticatorPublicKey: "02ab", turnkeyActivityStatus: null })).toMatchObject({ state: "turnkey_authenticator_created", blockReason: null });
+    expect(await s.registry.findPasskeyByCredentialId(pending)).toMatchObject({ status: "pending", turnkeyAuthenticatorId: id("auth", `${purpose}-pending`) });
+  });
+
+  it("2g-H: a superseded registration mint never attaches (and leaves no orphan passkey); a dispatched create can never be abandoned", async () => {
+    const s = await stores();
+    const purpose = "mint-supersede";
+    const primary = id("cred", `${purpose}-primary`);
+    const appUserId = await seed(purpose, [{ credentialId: primary, status: "active", authenticatorId: id("auth", `${purpose}-primary`) }]);
+    const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "mint-old" } });
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "mint-new" } });
+    const stale = id("cred", `${purpose}-stale`);
+    expect(await s.backupEnrollments.registerCredential({ id: enrollment.id, credential: { ...attachInput(stale), stepUpCredentialId: primary, registrationMintId: "mint-old" } })).toBeNull();
+    expect(await s.registry.findPasskeyByCredentialId(stale)).toBeNull();
+    const fresh = id("cred", `${purpose}-fresh`);
+    expect(await s.backupEnrollments.registerCredential({ id: enrollment.id, credential: { ...attachInput(fresh), stepUpCredentialId: primary, registrationMintId: "mint-new" } })).toMatchObject({ newCredentialId: fresh });
+    // A legacy 'definitive_failure' (a create WAS dispatched) is no longer abandonable at the SQL level either.
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "credential_registered", to: "credential_registered", patch: { externalOutcome: "definitive_failure" } });
+    expect(await s.backupEnrollments.abandon({ id: enrollment.id })).toBeNull();
+    expect((await s.registry.findPasskeyByCredentialId(fresh))?.status).toBe("pending");
+  });
+
+  it("2g-H migration (exact schema.sql block, on a scratch table): refuses on a blocked + open conflict with the OLD index intact and enforcing, then swaps once resolved, and reruns idempotently", async () => {
+    const sql = await sqlFn();
+    const { readFileSync } = await import("node:fs");
+    const schema = readFileSync("lib/real/server/schema.sql", "utf8");
+    const block = schema.slice(schema.indexOf("-- BEGIN 2g-H one-open-index migration"), schema.indexOf("-- END 2g-H one-open-index migration"));
+    expect(block).toContain("DO $$");
+    const t = `smoke_2gh_migration_${runId}`.replace(/[^a-z0-9_]/g, "_");
+    const migration = block
+      .replaceAll("backup_passkey_enrollments_one_open_per_account", `${t}_one_open`)
+      .replaceAll("backup_passkey_enrollments_one_active_per_account", `${t}_one_active`)
+      .replaceAll("backup_passkey_enrollments", t);
+    const indexes = async () => ((await sql.query(`SELECT indexname FROM pg_indexes WHERE tablename = $1 ORDER BY indexname`, [t])) as { indexname: string }[]).map((r) => r.indexname);
+    try {
+      await sql.query(`CREATE TABLE ${t} (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), app_user_id TEXT NOT NULL, state TEXT NOT NULL)`);
+      await sql.query(`CREATE UNIQUE INDEX ${t}_one_active ON ${t} (app_user_id) WHERE state NOT IN ('active', 'abandoned', 'blocked')`);
+      await sql.query(`INSERT INTO ${t} (app_user_id, state) VALUES ('u1', 'blocked'), ('u1', 'started')`);
+
+      await expect(sql.query(migration)).rejects.toThrow(/migration refused/);
+      expect(await indexes()).toEqual([`${t}_one_active`, `${t}_pkey`].sort());
+      await expect(sql.query(`INSERT INTO ${t} (app_user_id, state) VALUES ('u1', 'credential_registered')`)).rejects.toThrow(); // old protection still enforced
+
+      await sql.query(`UPDATE ${t} SET state = 'abandoned' WHERE state = 'blocked'`);
+      await sql.query(migration);
+      expect(await indexes()).toEqual([`${t}_one_open`, `${t}_pkey`].sort());
+      await sql.query(migration); // rerunnable
+      expect(await indexes()).toEqual([`${t}_one_open`, `${t}_pkey`].sort());
+      await sql.query(`INSERT INTO ${t} (app_user_id, state) VALUES ('u2', 'blocked')`);
+      await expect(sql.query(`INSERT INTO ${t} (app_user_id, state) VALUES ('u2', 'started')`)).rejects.toThrow(); // new rule: blocked holds the slot
+    } finally {
+      await sql.query(`DROP TABLE IF EXISTS ${t}`);
+    }
+  });
+
+  it("2g-H: activation vs pending removal under real concurrency — one serialization order, always consistent, never frees the slot at dispatch", async () => {
+    const rounds = Number(process.env.NEON_SMOKE_AB_ROUNDS ?? 5);
+    for (let round = 1; round <= rounds; round += 1) {
+      const { s, appUserId, primary, pending, enrollmentId } = await pendingLive(`activation-race-${round}`);
+      await s.backupEnrollments.transition({ id: enrollmentId, from: "turnkey_authenticator_created", to: "login_verified", patch: { loginVerifiedAt: new Date().toISOString() } });
+      const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary });
+      if (!prepared.ok) throw new Error("setup");
+      const [activated, dispatched] = await Promise.all([
+        s.backupEnrollments.activate({ id: enrollmentId, signingProofActivityId: `sign-${round}` }),
+        s.revocations.beginDispatch({ id: prepared.attempt.id, patch: dispatchPatch }),
+      ]);
+      expect(dispatched).toMatchObject({ state: "dispatch_in_flight" });
+      expect((await s.registry.findPasskeyByCredentialId(pending))?.status).toBe("revoking");
+      const state = (await s.backupEnrollments.findById(enrollmentId))!.state;
+      expect(state).toBe(activated ? "active" : "removal_in_progress");
+    }
+  }, 60_000);
 
   it("passkey names: rename is scoped to the owning account and active status; the DB CHECK caps length; seeded rows default to NULL", async () => {
     const s = await stores();

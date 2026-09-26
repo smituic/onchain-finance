@@ -1,3 +1,5 @@
+import type { BackupPasskeyEnrollment } from "./backup-passkey-enrollment";
+
 /**
  * The account/passkey registry is the APP AUTHENTICATION boundary's source
  * of truth — deliberately separate from Turnkey. A row existing here is
@@ -131,6 +133,8 @@ export interface RealAccountRegistry {
 export type InMemoryRegistryInternals = {
   accountsByAppUserId: Map<string, RealAccountRecord>;
   passkeysByCredentialId: Map<string, RealPasskeyRecord>;
+  /** Every in-memory enrollment store built on this registry registers its map here (2g-H: a pending passkey's removal moves its enrollment atomically). */
+  backupEnrollmentMaps: Map<string, BackupPasskeyEnrollment>[];
 };
 
 const inMemoryInternals = new WeakMap<RealAccountRegistry, InMemoryRegistryInternals>();
@@ -212,6 +216,6 @@ export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
       return { outcome: "renamed", passkey: next };
     },
   };
-  inMemoryInternals.set(registry, { accountsByAppUserId, passkeysByCredentialId });
+  inMemoryInternals.set(registry, { accountsByAppUserId, passkeysByCredentialId, backupEnrollmentMaps: [] });
   return registry;
 }

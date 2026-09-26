@@ -74,9 +74,10 @@ async function world(): Promise<World> {
   });
   const enrollmentStore = (await import("@/lib/real/server/backup-passkey-enrollment")).createInMemoryBackupPasskeyEnrollmentStore(registry);
   const enrollment = (await enrollmentStore.createStarted({ appUserId: "app-user-1" }))!;
+  await enrollmentStore.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "mint-1" } });
   await enrollmentStore.registerCredential({
     id: enrollment.id,
-    credential: { credentialId: b.credentialIdBase64Url, userHandle: "handle-b", credentialPublicKey: bytesToBase64Url(b.publicKeyCose), counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false, registrationChallenge: "c", rawClientDataJson: "d", rawAttestationObject: "e" },
+    credential: { credentialId: b.credentialIdBase64Url, userHandle: "handle-b", credentialPublicKey: bytesToBase64Url(b.publicKeyCose), counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false, registrationChallenge: "c", rawClientDataJson: "d", rawAttestationObject: "e", stepUpCredentialId: "step-up-credential", registrationMintId: "mint-1" },
   });
   await registry.transitionPasskeyStatus({ credentialId: a.credentialIdBase64Url, from: "active", to: "active", patch: { turnkeyAuthenticatorId: "authenticator-a" } });
   await registry.transitionPasskeyStatus({ credentialId: b.credentialIdBase64Url, from: "pending", to: "active", patch: { turnkeyAuthenticatorId: "authenticator-b" } });
@@ -396,9 +397,10 @@ describe("revocation — app role after a confirmed removal (metadata only)", ()
     const c = createFixtureAuthenticator();
     const enrollments = (await import("@/lib/real/server/backup-passkey-enrollment")).createInMemoryBackupPasskeyEnrollmentStore(w.registry);
     const enrollment = (await enrollments.createStarted({ appUserId: "app-user-1" }))!;
+    await enrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "mint-1" } });
     await enrollments.registerCredential({
       id: enrollment.id,
-      credential: { credentialId: c.credentialIdBase64Url, userHandle: "handle-c", credentialPublicKey: bytesToBase64Url(c.publicKeyCose), counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false, registrationChallenge: "c", rawClientDataJson: "d", rawAttestationObject: "e" },
+      credential: { credentialId: c.credentialIdBase64Url, userHandle: "handle-c", credentialPublicKey: bytesToBase64Url(c.publicKeyCose), counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false, registrationChallenge: "c", rawClientDataJson: "d", rawAttestationObject: "e", stepUpCredentialId: "step-up-credential", registrationMintId: "mint-1" },
     });
     await w.registry.transitionPasskeyStatus({ credentialId: c.credentialIdBase64Url, from: "pending", to: "active", patch: { turnkeyAuthenticatorId: "authenticator-c" } });
 
@@ -415,9 +417,10 @@ describe("revocation — app role after a confirmed removal (metadata only)", ()
     const c = createFixtureAuthenticator();
     const enrollments = (await import("@/lib/real/server/backup-passkey-enrollment")).createInMemoryBackupPasskeyEnrollmentStore(w.registry);
     const enrollment = (await enrollments.createStarted({ appUserId: "app-user-1" }))!;
+    await enrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "mint-1" } });
     await enrollments.registerCredential({
       id: enrollment.id,
-      credential: { credentialId: c.credentialIdBase64Url, userHandle: "handle-c", credentialPublicKey: bytesToBase64Url(c.publicKeyCose), counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false, registrationChallenge: "c", rawClientDataJson: "d", rawAttestationObject: "e" },
+      credential: { credentialId: c.credentialIdBase64Url, userHandle: "handle-c", credentialPublicKey: bytesToBase64Url(c.publicKeyCose), counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false, registrationChallenge: "c", rawClientDataJson: "d", rawAttestationObject: "e", stepUpCredentialId: "step-up-credential", registrationMintId: "mint-1" },
     });
 
     const activityId = (await w.revocations.findById(attemptId))!.turnkeyActivityId!;
@@ -448,7 +451,8 @@ describe("revocation — one-way after dispatch: a dispatched target is never au
       expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "blocked", failureReason: "delete_activity_failed", turnkeyActivityStatus: terminal });
       expect(await status(w, w.b)).toBe("revoking"); // not Active, not Removed
       expect(await readAuthenticatedRealAccount({ cookieValue: session, sessionSecret: config.sessionSecret, registry: w.registry })).toBeNull();
-      expect((await prepare(w, w.b, w.a)).outcome).toBe("rejected"); // no automatic (or manual) new delete
+      // 2g-H: never an AUTOMATIC new delete — but the user may authorize a NEW attempt (fresh survivor stamp); preparing one sends nothing.
+      expect((await prepare(w, w.b, w.a)).outcome).toBe("ready");
       expect(w.fake.forwarded).toHaveLength(1);
       expect(await reconcile(w, w.b, attemptId)).toEqual(result); // stable
     },
@@ -470,7 +474,9 @@ describe("revocation — one-way after dispatch: a dispatched target is never au
     expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "blocked", failureReason: "no_activity_receipt", turnkeyActivityId: null, turnkeyRequestStamp: null });
     expect(await status(w, w.b)).toBe("revoking"); // not Active, not Removed
     expect(w.fake.forwarded).toHaveLength(forwards); // no replay, no re-stamp after the window
-    expect((await prepare(w, w.b, w.a)).outcome).toBe("rejected"); // no silent new deletion
+    // 2g-H: no silent new deletion — only a NEW, user-authorized attempt may be prepared, and preparing it sends nothing.
+    expect((await prepare(w, w.b, w.a)).outcome).toBe("ready");
+    expect(w.fake.forwarded).toHaveLength(forwards);
     expect(await reconcile(w, w.b, attemptId)).toEqual(result); // stable
   });
 

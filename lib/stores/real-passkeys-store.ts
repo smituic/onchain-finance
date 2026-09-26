@@ -31,6 +31,8 @@ export type RealPasskeySummary = {
   createdAt: string;
   isCurrentSession: boolean;
   canAuthorizeRemovals: boolean;
+  /** 2g-H: whether this credential may authorize at the wallet provider. Missing (older API) is treated as "may". */
+  walletAccess?: "none" | "uncertain" | "granted";
   removal: { attemptId: string; state: RemovalAttemptState; ownedBySession: boolean } | null;
 };
 
@@ -42,7 +44,9 @@ export type BackupEnrollmentState =
   | "login_verified"
   | "active"
   | "abandoned"
-  | "blocked";
+  | "blocked"
+  | "removal_in_progress"
+  | "removed";
 
 export type BackupEnrollmentStatus = { id: string; state: BackupEnrollmentState; externalOutcome: string; abandonable: boolean; blockReason: string | null };
 
@@ -108,19 +112,34 @@ export function createRealPasskeysStore() {
     async function runSetupStep(enrollment: BackupEnrollmentStatus | null): Promise<boolean> {
       const state = enrollment?.state ?? null;
       if (state === null || state === "started") {
+        // 2g-H: every registration challenge requires a fresh confirmation by
+        // the passkey this browser is signed in with — never the cookie alone.
+        set({ setupMessage: "Confirm it's you with the passkey you're signed in with…" });
+        const stepUpOptions = await post<{ optionsJSON: PublicKeyCredentialRequestOptionsJSON }>("/api/real/account/passkeys/backup/step-up/options");
+        const stepUp = await performLoginCeremony(stepUpOptions.optionsJSON);
         set({ setupMessage: "Create your new backup passkey…" });
-        const { optionsJSON } = await post<{ optionsJSON: PublicKeyCredentialCreationOptionsJSON }>("/api/real/account/passkeys/backup/options");
+        const { optionsJSON } = await post<{ optionsJSON: PublicKeyCredentialCreationOptionsJSON }>("/api/real/account/passkeys/backup/options", { stepUp });
         const response = await performRegistrationCeremony(optionsJSON);
         await post("/api/real/account/passkeys/backup/register", { response });
         return true;
       }
       const enrollmentId = enrollment!.id;
+      if (state === "credential_registered" && enrollment!.externalOutcome !== "not_attempted") {
+        // 2g-H: a create was already sent (a legacy "declined" one included) — only a read-only re-check, never a new authorization.
+        set({ setupMessage: "Checking whether your backup setup went through…" });
+        return handleCreateOutcome(await post<Outcome>("/api/real/account/passkeys/backup/authorize/reconcile", { enrollmentId }));
+      }
       if (state === "credential_registered") {
         set({ setupMessage: "Approve with the passkey you're signed in with…" });
         const prepared = await post<{ activity: CreateAuthenticatorsActivity; rpId: string; authorizingCredentialId: string }>("/api/real/account/passkeys/backup/authorize/options", { enrollmentId });
         const signedRequest = await stampCreateAuthenticatorsRequest(prepared);
         const result = await post<Outcome>("/api/real/account/passkeys/backup/authorize/submit", { enrollmentId, signedRequest });
         return handleCreateOutcome(result);
+      }
+      if (state === "blocked") {
+        // Review: one read-only re-check (server-side discovery). Never a new authorization.
+        set({ setupMessage: "Checking whether your backup setup went through…" });
+        return handleCreateOutcome(await post<Outcome>("/api/real/account/passkeys/backup/authorize/reconcile", { enrollmentId }));
       }
       if (state === "turnkey_enrollment_in_flight") {
         set({ setupMessage: "Confirming your authorization…" });
@@ -152,10 +171,6 @@ export function createRealPasskeysStore() {
 
     function handleCreateOutcome(result: Outcome): boolean {
       if (result.outcome === "confirmed") return true;
-      if (result.outcome === "failed_retryable") {
-        set({ setupMessage: result.reason ?? "The authorization was declined. You can try again or cancel setup." });
-        return false;
-      }
       if (result.outcome === "blocked") {
         set({ setupError: result.reason ?? "This setup needs manual review." });
         return false;

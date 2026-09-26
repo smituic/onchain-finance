@@ -1,5 +1,6 @@
 import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, requireRealServerConfig } from "@/lib/real/server/http";
-import { getPasskeyRevocationStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
+import { getBackupPasskeyEnrollmentStore, getPasskeyRevocationStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
+import { passkeyWalletAccess } from "@/lib/real/server/backup-passkey-pipeline";
 import { readPasskeySession } from "@/app/api/real/account/passkeys/session";
 
 /**
@@ -19,7 +20,11 @@ export async function GET() {
     if (!authenticated) return jsonError("Not authenticated.", 401);
 
     const appUserId = authenticated.account.appUserId;
-    const [passkeys, attempts] = await Promise.all([getRealAccountRegistry().findPasskeysByAppUserId(appUserId), getPasskeyRevocationStore().findLatestPerTarget(appUserId)]);
+    const [passkeys, attempts, openEnrollment] = await Promise.all([
+      getRealAccountRegistry().findPasskeysByAppUserId(appUserId),
+      getPasskeyRevocationStore().findLatestPerTarget(appUserId),
+      getBackupPasskeyEnrollmentStore().findActiveByAppUserId(appUserId),
+    ]);
     const latestByTarget = new Map(attempts.map((a) => [a.targetCredentialId, a]));
 
     return Response.json({
@@ -37,6 +42,7 @@ export async function GET() {
             createdAt: p.createdAt,
             isCurrentSession: p.credentialId === authenticated.session.credentialId,
             canAuthorizeRemovals: p.status === "active" && p.turnkeyAuthenticatorId !== null,
+            walletAccess: passkeyWalletAccess(p, openEnrollment),
             removal: attempt && attempt.state !== "cancelled" ? { attemptId: attempt.id, state: attempt.state, ownedBySession: attempt.authorizerCredentialId === authenticated.session.credentialId } : null,
           };
         }),

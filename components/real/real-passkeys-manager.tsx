@@ -7,8 +7,11 @@ import { AlertDialog, AlertDialogContent, AlertDialogDescription, AlertDialogTit
 import { passkeyDisplayName } from "@/lib/real/display/passkey-name";
 import {
   BACKUP_PASSKEY_EXPLANATION,
+  BACKUP_REMOVAL_PENDING_NOTE,
   EQUAL_AUTHORITY_NOTE,
   MAY_STILL_AUTHORIZE_NOTE,
+  SETUP_INCOMPLETE_NOTE,
+  SETUP_NEEDS_REVIEW_NOTE,
   TOTAL_LOSS_NOTE,
   mayStillAuthorize,
   passkeyDisplayState,
@@ -85,11 +88,18 @@ export function RealPasskeysManager() {
 
       <ul className="flex flex-col gap-2">
         {passkeys.map((passkey) => {
-          const state = passkeyDisplayState({ status: passkey.status, removalState: passkey.removal?.state ?? null });
+          const state = passkeyDisplayState({ status: passkey.status, removalState: passkey.removal?.state ?? null, walletAccess: passkey.walletAccess });
           const rowBusy = removalBusyCredentialId === passkey.credentialId;
           const isEditing = editing?.credentialId === passkey.credentialId;
           const renaming = renameBusyCredentialId === passkey.credentialId;
-          const canRemove = (state === "active" || state === "removal_not_authorized") && !passkey.isCurrentSession && activeCount > 1 && !passkey.removal?.ownedBySession;
+          const awaitingMyAuthorization = passkey.removal?.state === "authorization_needed" && passkey.removal.ownedBySession;
+          // An incomplete setup that already has wallet access is removable by
+          // the (active) passkey this browser is signed in with.
+          const canRemove =
+            !awaitingMyAuthorization &&
+            (((state === "active" || state === "removal_not_authorized") && !passkey.isCurrentSession && activeCount > 1) || state === "setup_incomplete");
+          // 2g-H: a removal that blocked can be tried again — a fresh approval, never automatic.
+          const canRetryRemoval = !awaitingMyAuthorization && state === "removal_needs_review" && !passkey.isCurrentSession;
           return (
             <li key={passkey.credentialId} className="flex flex-col gap-2 rounded-xl bg-muted/60 px-4 py-3" data-testid="real-passkey-row">
               <div className="flex items-center justify-between gap-3">
@@ -129,7 +139,7 @@ export function RealPasskeysManager() {
                     {passkey.displayName ? `${passkeyRoleLabel(passkey.role)} · ${passkeyStateLabel(state)}` : passkeyStateLabel(state)}
                   </span>
                 </div>
-                {!isEditing && (passkey.status === "active" || canRemove) ? (
+                {!isEditing && (passkey.status === "active" || canRemove || canRetryRemoval) ? (
                   <div className="flex shrink-0 gap-1">
                     {passkey.status === "active" ? (
                       <Button
@@ -149,6 +159,11 @@ export function RealPasskeysManager() {
                         Remove
                       </Button>
                     ) : null}
+                    {canRetryRemoval ? (
+                      <Button variant="ghost" size="sm" disabled={busy} onClick={() => setConfirmingRemoval(passkey)}>
+                        Try removal again
+                      </Button>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
@@ -157,8 +172,10 @@ export function RealPasskeysManager() {
                 <p className="text-xs text-muted-foreground">To remove this passkey, sign in with a different one.</p>
               ) : null}
               {mayStillAuthorize(state) ? <p className="text-xs text-muted-foreground">{MAY_STILL_AUTHORIZE_NOTE}</p> : null}
+              {state === "setup_incomplete" ? <p className="text-xs text-muted-foreground">{SETUP_INCOMPLETE_NOTE}</p> : null}
+              {state === "setup_needs_review" ? <p className="text-xs text-muted-foreground">{SETUP_NEEDS_REVIEW_NOTE}</p> : null}
               {removalMessage?.credentialId === passkey.credentialId ? <p className="text-xs text-muted-foreground">{removalMessage.text}</p> : null}
-              {passkey.removal && state === "removal_not_authorized" && passkey.removal.ownedBySession ? (
+              {passkey.removal && awaitingMyAuthorization && (state === "removal_not_authorized" || state === "setup_incomplete" || state === "removal_needs_review") ? (
                 <div className="flex gap-2">
                   <Button variant="outline" size="sm" disabled={busy} onClick={() => void removePasskey(passkey.credentialId)}>
                     Authorize removal
@@ -181,10 +198,13 @@ export function RealPasskeysManager() {
       {detachedRemovalMessage ? <p className="text-xs text-muted-foreground">{detachedRemovalMessage}</p> : null}
       {removalError ? <p className="text-sm text-destructive">{removalError}</p> : null}
 
-      {enrollment ? (
+      {enrollment?.state === "removal_in_progress" ? (
+        <p className="text-xs text-muted-foreground">{BACKUP_REMOVAL_PENDING_NOTE}</p>
+      ) : enrollment ? (
         <div className="flex flex-col gap-2">
+          {/* A setup under review never sends a new authorization — "Check" only re-reads whether it went through. */}
           <Button variant="outline" className="h-11 w-full" disabled={busy} onClick={() => void continueBackupSetup()}>
-            {setupBusy ? (setupMessage ?? "Working…") : "Resume backup passkey setup"}
+            {setupBusy ? (setupMessage ?? "Working…") : enrollment.state === "blocked" ? "Check backup setup again" : "Resume backup passkey setup"}
           </Button>
           {enrollment.abandonable ? (
             <Button variant="ghost" className="h-11 w-full" disabled={busy} onClick={() => void abandonBackupSetup()}>

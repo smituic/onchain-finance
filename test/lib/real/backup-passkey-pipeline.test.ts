@@ -100,12 +100,23 @@ async function world(): Promise<World> {
   };
 }
 
+async function stepUpResponse(w: World) {
+  const prepared = await pipeline.prepareBackupStepUp({ config, challengeStore: w.challengeStore, registry: w.registry, appUserId: "app-user-1", sessionCredentialId: w.primary.credentialIdBase64Url });
+  if (prepared.outcome !== "ready") throw new Error(JSON.stringify(prepared));
+  return buildAuthenticationResponseJSON({ authenticator: w.primary, challenge: prepared.optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: "primary-user-handle" });
+}
+
+/** 2g-H: every begin (first start or re-mint) is preceded by a fresh step-up by the session credential. */
+async function begin(w: World) {
+  return pipeline.beginBackupEnrollment({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", sessionCredentialId: w.primary.credentialIdBase64Url, stepUpResponse: await stepUpResponse(w) });
+}
+
 async function registerBackup(w: World) {
-  const begun = await pipeline.beginBackupEnrollment({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1" });
+  const begun = await begin(w);
   if (begun.outcome !== "started") throw new Error(JSON.stringify(begun));
   const backup = createFixtureAuthenticator();
   const response = buildRegistrationResponseJSON({ authenticator: backup, challenge: begun.optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId });
-  const registered = await pipeline.completeBackupCredentialRegistration({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", response });
+  const registered = await pipeline.completeBackupCredentialRegistration({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", sessionCredentialId: w.primary.credentialIdBase64Url, response });
   if (registered.outcome !== "registered") throw new Error(JSON.stringify(registered));
   return { enrollmentId: begun.enrollmentId, backup, optionsJSON: begun.optionsJSON };
 }
@@ -175,19 +186,19 @@ describe("backup enrollment — local registration", () => {
 
   it("re-registering the primary credential as the 'backup' is rejected", async () => {
     const w = await world();
-    const begun = await pipeline.beginBackupEnrollment({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1" });
+    const begun = await begin(w);
     if (begun.outcome !== "started") throw new Error("setup");
     const response = buildRegistrationResponseJSON({ authenticator: w.primary, challenge: begun.optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId });
-    const result = await pipeline.completeBackupCredentialRegistration({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", response });
+    const result = await pipeline.completeBackupCredentialRegistration({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", sessionCredentialId: w.primary.credentialIdBase64Url, response });
     expect(result.outcome).toBe("rejected");
   });
 
   it("a registration challenge minted for one account can't be completed by another session", async () => {
     const w = await world();
-    const begun = await pipeline.beginBackupEnrollment({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1" });
+    const begun = await begin(w);
     if (begun.outcome !== "started") throw new Error("setup");
     const response = buildRegistrationResponseJSON({ authenticator: createFixtureAuthenticator(), challenge: begun.optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId });
-    const result = await pipeline.completeBackupCredentialRegistration({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "someone-else", response });
+    const result = await pipeline.completeBackupCredentialRegistration({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "someone-else", sessionCredentialId: w.primary.credentialIdBase64Url, response });
     expect(result.outcome).toBe("rejected");
   });
 
@@ -209,6 +220,7 @@ describe("backup enrollment — local registration", () => {
   it("pending-insert/attach race: two credentials racing onto one enrollment — exactly one attaches, the loser leaves NO orphan pending passkey", async () => {
     const w = await world();
     const created = (await w.enrollments.createStarted({ appUserId: "app-user-1" }))!;
+    await w.enrollments.transition({ id: created.id, from: "started", to: "started", patch: { registrationMintId: "mint-1" } });
     const credential = (id: string) => ({
       credentialId: id,
       userHandle: "h",
@@ -220,6 +232,8 @@ describe("backup enrollment — local registration", () => {
       registrationChallenge: "c",
       rawClientDataJson: "d",
       rawAttestationObject: "a",
+      stepUpCredentialId: w.primary.credentialIdBase64Url,
+      registrationMintId: "mint-1",
     });
     const [a, b] = await Promise.all([
       w.enrollments.registerCredential({ id: created.id, credential: credential("cred-a") }),
@@ -384,15 +398,17 @@ describe("backup enrollment — Model B dispatch of the child-authorized create"
     expect(w.fake.forwarded).toHaveLength(1);
   });
 
-  it("a FAILED activity is Turnkey's proof nothing was created: back to credential_registered, re-authorizable or abandonable", async () => {
+  it("2g-H: a FAILED activity + a getUsers miss is NOT proof nothing was created (the browser still holds the signed create) — review: not re-authorizable, not abandonable", async () => {
     const w = await world();
     const { enrollmentId } = await registerBackup(w);
     w.fake.nextMode = "fail_activity";
-    expect((await submit(w, enrollmentId, await signedCreate(w, enrollmentId))).outcome).toBe("failed_retryable");
-    expect((await w.enrollments.findById(enrollmentId))).toMatchObject({ state: "credential_registered", externalOutcome: "definitive_failure", turnkeyRequestBody: null });
+    expect((await submit(w, enrollmentId, await signedCreate(w, enrollmentId))).outcome).toBe("blocked");
+    expect(await w.enrollments.findById(enrollmentId)).toMatchObject({ state: "blocked", externalOutcome: "unknown" });
     w.fake.nextMode = "ok";
     w.clock.now += 1;
-    expect((await submit(w, enrollmentId, await signedCreate(w, enrollmentId))).outcome).toBe("confirmed");
+    await expect(signedCreate(w, enrollmentId)).rejects.toThrow(); // no new create can even be prepared
+    expect((await pipeline.abandonBackupEnrollment({ enrollments: w.enrollments, appUserId: "app-user-1", enrollmentId })).outcome).toBe("rejected");
+    expect(w.fake.forwarded).toHaveLength(1);
   });
 
   it("H2: with NO same-body dedupe — original create lands but its response is lost, the replay comes back FAILED — getUsers still shows the authenticator, so creation is CONFIRMED, not definitive_failure", async () => {
@@ -476,13 +492,13 @@ describe("backup enrollment — resume and abandon", () => {
     const status = () => pipeline.getActiveBackupEnrollment({ enrollments: w.enrollments, appUserId: "app-user-1" });
     expect(await status()).toBeNull();
 
-    const begun = await pipeline.beginBackupEnrollment({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1" });
+    const begun = await begin(w);
     if (begun.outcome !== "started") throw new Error("setup");
     expect(await status()).toMatchObject({ state: "started", abandonable: true });
 
     const backup = createFixtureAuthenticator();
     const response = buildRegistrationResponseJSON({ authenticator: backup, challenge: begun.optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId });
-    await pipeline.completeBackupCredentialRegistration({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", response });
+    await pipeline.completeBackupCredentialRegistration({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", sessionCredentialId: w.primary.credentialIdBase64Url, response });
     expect(await status()).toMatchObject({ state: "credential_registered", abandonable: true });
 
     w.fake.nextMode = "pending_activity";
@@ -503,14 +519,14 @@ describe("backup enrollment — resume and abandon", () => {
     expect((await w.enrollments.findById(begun.enrollmentId))?.state).toBe("active");
   });
 
-  it("a second setup can't start while one is past 'started', but a stale 'started' re-mints on the SAME row", async () => {
+  it("a second setup can't start while one is past 'started', but a stale 'started' re-mints on the SAME row (after its own fresh step-up)", async () => {
     const w = await world();
-    const a = await pipeline.beginBackupEnrollment({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1" });
-    const b = await pipeline.beginBackupEnrollment({ config, challengeStore: w.challengeStore, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1" });
+    const a = await begin(w);
+    const b = await begin(w);
     expect(a.outcome === "started" && b.outcome === "started" && a.enrollmentId === b.enrollmentId).toBe(true);
     const w2 = await world();
     await registerBackup(w2);
-    expect((await pipeline.beginBackupEnrollment({ config, challengeStore: w2.challengeStore, registry: w2.registry, enrollments: w2.enrollments, appUserId: "app-user-1" })).outcome).toBe("already_in_progress");
+    expect((await begin(w2)).outcome).toBe("already_in_progress");
   });
 
   it("abandoning a pre-dispatch enrollment cleans up its orphan pending passkey (revoked — it never reached Turnkey)", async () => {

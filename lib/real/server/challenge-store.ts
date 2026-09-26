@@ -2,8 +2,10 @@
  * 'backup_registration'/'backup_login_verification' are Batch 2g's
  * backup-passkey purposes — see schema.sql's identical CHECK constraint
  * comment for why they're kept distinct from 'registration'/'login'.
+ * 'backup_step_up' (2g-H) is the fresh session-credential assertion that must
+ * precede every backup registration challenge.
  */
-export type ChallengePurpose = "registration" | "login" | "backup_registration" | "backup_login_verification";
+export type ChallengePurpose = "registration" | "login" | "backup_registration" | "backup_login_verification" | "backup_step_up";
 
 export type StoredChallenge = {
   challenge: string;

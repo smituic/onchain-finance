@@ -28,8 +28,14 @@ import {
  *   - The surviving authorizer is ALWAYS the caller's session credential
  *     (never client-selected). Removing the credential you're signed in
  *     with requires signing in with another one first.
+ *   - Targets: an 'active' mapped passkey; (2g-H) a 'pending' backup whose
+ *     Turnkey authenticator is already confirmed — it may already authorize,
+ *     so an unfinished setup must never strand it (its dispatch moves the
+ *     enrollment to 'removal_in_progress': activation impossible, slot still
+ *     held; confirmDeleted makes it 'removed'); or (2g-H) a 'revoking' target
+ *     whose earlier removal blocked — a NEW user-authorized retry.
  *   - prepare only records an 'authorization_needed' attempt: the target
- *     stays 'active'. An app cookie alone can never disable a credential.
+ *     keeps its status. An app cookie alone can never disable a credential.
  *   - The survivor stamps the exact DELETE_AUTHENTICATORS body in the
  *     browser. This server verifies body/URL/stamp authorship FIRST, then
  *     in ONE per-account-locked transaction re-checks the survivor, records
@@ -44,7 +50,8 @@ import {
  *     automatically restored to 'active' — not on FAILED/REJECTED, not on a
  *     missing activity id, not on a positive getUsers read. Every outcome
  *     other than a confirmed deletion is 'blocked' for review: target stays
- *     'revoking', never claimed Removed, no automatic new delete. Before
+ *     'revoking', never claimed Removed, never retried automatically (the
+ *     user may authorize a NEW attempt with a fresh survivor stamp). Before
  *     dispatch (cancelled prompt, refused stamp/body) the target stays active.
  */
 const DELETE_ACTIVITY_TYPE = "ACTIVITY_TYPE_DELETE_AUTHENTICATORS";
@@ -172,7 +179,7 @@ export async function submitRevocation(input: {
       externalAttemptedAt: new Date(now()).toISOString(),
     },
   });
-  if (!claimed) return { outcome: "rejected", reason: "This removal can't proceed: it was already submitted, or your passkey or this one changed. Check status and try again." };
+  if (!claimed) return { outcome: "rejected", reason: "This removal can't proceed: it was already submitted, it needs a fresh approval, or your passkey or this one changed. Check status and try again." };
   await input.registry.updateAuthenticatorCounter({ credentialId: authorizer.credentialId, counter: stampCheck.newCounter });
 
   const forwarded = await forwardSignedRequest({ config: input.config, endpoint: "delete_authenticators", body: signed.body, stamp: signed.stamp, fetchImpl: input.deps?.fetchImpl });

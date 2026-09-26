@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RealPasskeysManager } from "@/components/real/real-passkeys-manager";
-import { MAY_STILL_AUTHORIZE_NOTE } from "@/lib/real/display/passkey-status";
+import { BACKUP_REMOVAL_PENDING_NOTE, MAY_STILL_AUTHORIZE_NOTE, SETUP_INCOMPLETE_NOTE, SETUP_NEEDS_REVIEW_NOTE } from "@/lib/real/display/passkey-status";
 
 type Passkey = Record<string, unknown>;
 
@@ -46,7 +46,8 @@ describe("RealPasskeysManager", () => {
     );
     render(<RealPasskeysManager />);
     expect(await screen.findByRole("button", { name: "Resume backup passkey setup" })).toBeTruthy();
-    expect(screen.getByText("Setup in progress")).toBeTruthy();
+    // 2g-H: once a create may have reached the wallet, the row is never shown as harmless.
+    expect(screen.getByText("Setup needs review")).toBeTruthy();
     // An uncertain Turnkey attempt is never offered for cancellation.
     expect(screen.queryByRole("button", { name: "Cancel setup" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Add a backup passkey" })).toBeNull();
@@ -215,5 +216,112 @@ describe("RealPasskeysManager — names", () => {
     render(<RealPasskeysManager />);
     fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
     expect(await screen.findByText("Remove “Old iPhone”?")).toBeTruthy();
+  });
+});
+
+describe("RealPasskeysManager — 2g-H: a pending passkey that already has wallet access", () => {
+  it("is shown as 'Setup incomplete' with a plain-language warning and a Remove action (even alongside the resumable setup)", async () => {
+    stubServer(
+      [passkey({}), passkey({ credentialId: "cred-b", role: "backup", status: "pending", isCurrentSession: false, canAuthorizeRemovals: false, walletAccess: "granted" })],
+      { id: "e1", state: "login_verified", externalOutcome: "confirmed_created", abandonable: false, blockReason: null },
+    );
+    render(<RealPasskeysManager />);
+    const row = within((await screen.findAllByTestId("real-passkey-row"))[1]!);
+    expect(row.getByText("Setup incomplete")).toBeTruthy();
+    expect(row.getByText(SETUP_INCOMPLETE_NOTE)).toBeTruthy();
+    expect(row.getByRole("button", { name: "Remove" })).toBeTruthy();
+    expect(row.queryByRole("button", { name: "Rename" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Resume backup passkey setup" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Cancel setup" })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/Turnkey|authenticator/i);
+  });
+
+  it("a pending passkey WITHOUT wallet access stays ordinary 'Setup in progress' — no warning, no Remove", async () => {
+    stubServer(
+      [passkey({}), passkey({ credentialId: "cred-b", role: "backup", status: "pending", isCurrentSession: false, canAuthorizeRemovals: false, walletAccess: "none" })],
+      { id: "e1", state: "credential_registered", externalOutcome: "not_attempted", abandonable: true, blockReason: null },
+    );
+    render(<RealPasskeysManager />);
+    const row = within((await screen.findAllByTestId("real-passkey-row"))[1]!);
+    expect(row.getByText("Setup in progress")).toBeTruthy();
+    expect(row.queryByText(SETUP_INCOMPLETE_NOTE)).toBeNull();
+    expect(row.queryByRole("button", { name: "Remove" })).toBeNull();
+  });
+
+  it("an undispatched removal of it that this session owns offers Authorize/Cancel instead of a second Remove", async () => {
+    stubServer(
+      [
+        passkey({}),
+        passkey({ credentialId: "cred-b", role: "backup", status: "pending", isCurrentSession: false, canAuthorizeRemovals: false, walletAccess: "granted", removal: { attemptId: "r1", state: "authorization_needed", ownedBySession: true } }),
+      ],
+      null,
+    );
+    render(<RealPasskeysManager />);
+    const row = within((await screen.findAllByTestId("real-passkey-row"))[1]!);
+    expect(row.getByText("Setup incomplete")).toBeTruthy();
+    expect(row.getByRole("button", { name: "Authorize removal" })).toBeTruthy();
+    expect(row.getByRole("button", { name: "Cancel removal" })).toBeTruthy();
+    expect(row.queryByRole("button", { name: "Remove" })).toBeNull();
+  });
+});
+
+describe("RealPasskeysManager — 2g-H authority lifecycle", () => {
+  it("10: an uncertain create (review) says 'Setup needs review' + may approve payments; offers only a re-check — no Resume, no Cancel, no new backup", async () => {
+    stubServer(
+      [passkey({}), passkey({ credentialId: "cred-b", role: "backup", status: "pending", isCurrentSession: false, canAuthorizeRemovals: false, walletAccess: "uncertain" })],
+      { id: "e1", state: "blocked", externalOutcome: "unknown", abandonable: false, blockReason: "needs review" },
+    );
+    render(<RealPasskeysManager />);
+    const row = within((await screen.findAllByTestId("real-passkey-row"))[1]!);
+    expect(row.getByText("Setup needs review")).toBeTruthy();
+    expect(row.getByText(SETUP_NEEDS_REVIEW_NOTE)).toBeTruthy();
+    expect(row.queryByText("Setup in progress")).toBeNull();
+    expect(screen.getByRole("button", { name: "Check backup setup again" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Resume backup passkey setup" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Cancel setup" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add a backup passkey" })).toBeNull();
+  });
+
+  it("a pending row with NO walletAccess answer (older API) is never shown as harmless", async () => {
+    stubServer([passkey({}), passkey({ credentialId: "cred-b", role: "backup", status: "pending", isCurrentSession: false })], null);
+    render(<RealPasskeysManager />);
+    const row = within((await screen.findAllByTestId("real-passkey-row"))[1]!);
+    expect(row.getByText("Setup needs review")).toBeTruthy();
+  });
+
+  it("while a not-yet-finished backup's removal is unconfirmed, the account can't add another backup", async () => {
+    stubServer(
+      [passkey({}), passkey({ credentialId: "cred-b", role: "backup", status: "revoking", isCurrentSession: false, removal: { attemptId: "r1", state: "dispatch_in_flight", ownedBySession: true } })],
+      { id: "e1", state: "removal_in_progress", externalOutcome: "confirmed_created", abandonable: false, blockReason: null },
+    );
+    render(<RealPasskeysManager />);
+    expect(await screen.findByText(BACKUP_REMOVAL_PENDING_NOTE)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Add a backup passkey" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Resume|Check backup setup/ })).toBeNull();
+    expect(screen.getByText("Removal submitted — not yet confirmed")).toBeTruthy();
+  });
+
+  it("a blocked removal offers 'Try removal again' (a fresh approval); a retry awaiting this session's approval offers Authorize/Cancel and is still 'needs review'", async () => {
+    stubServer(
+      [passkey({}), passkey({ credentialId: "cred-b", role: "backup", status: "revoking", isCurrentSession: false, removal: { attemptId: "r1", state: "blocked", ownedBySession: true } })],
+      null,
+    );
+    const { unmount } = render(<RealPasskeysManager />);
+    const row = within((await screen.findAllByTestId("real-passkey-row"))[1]!);
+    expect(row.getByText("Removal needs review")).toBeTruthy();
+    expect(row.getByRole("button", { name: "Try removal again" })).toBeTruthy();
+    expect(row.getByText(MAY_STILL_AUTHORIZE_NOTE)).toBeTruthy();
+    unmount();
+
+    stubServer(
+      [passkey({}), passkey({ credentialId: "cred-b", role: "backup", status: "revoking", isCurrentSession: false, removal: { attemptId: "r2", state: "authorization_needed", ownedBySession: true } })],
+      null,
+    );
+    render(<RealPasskeysManager />);
+    const retry = within((await screen.findAllByTestId("real-passkey-row"))[1]!);
+    expect(retry.getByText("Removal needs review")).toBeTruthy();
+    expect(retry.getByRole("button", { name: "Authorize removal" })).toBeTruthy();
+    expect(retry.queryByRole("button", { name: "Try removal again" })).toBeNull();
+    expect(retry.queryByText(/^Active/)).toBeNull();
   });
 });

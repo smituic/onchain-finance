@@ -1,7 +1,7 @@
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import type { ChallengePurpose, ChallengeStore, StoredChallenge } from "./challenge-store";
 import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
-import type { BackupPasskeyEnrollment, BackupPasskeyEnrollmentPatch, BackupPasskeyEnrollmentState, BackupPasskeyEnrollmentStore, EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
+import { type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentPatch, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { PasskeyRevocationAttempt, PasskeyRevocationStore, RevocationAttemptPatch, RevocationAttemptState } from "./passkey-revocation-attempts";
 import type { ExternalProvisioningOutcome, RegistrationAttempt, RegistrationAttemptState, RegistrationAttemptStore } from "./registration-attempts";
 import type { PaymentAttempt, PaymentAttemptState, PaymentAttemptStore, ReserveResult } from "./payment-attempts";
@@ -129,6 +129,9 @@ function toBackupEnrollment(row: Row): BackupPasskeyEnrollment {
     turnkeyAuthenticatorPublicKey: (row.turnkey_authenticator_public_key as string | null) ?? null,
     signingProofChallenge: (row.signing_proof_challenge as string | null) ?? null,
     signingProofActivityId: (row.signing_proof_activity_id as string | null) ?? null,
+    registrationStepUpCredentialId: (row.registration_step_up_credential_id as string | null) ?? null,
+    registrationMintId: (row.registration_mint_id as string | null) ?? null,
+    turnkeyRequestReplayed: row.turnkey_request_replayed === true,
     loginVerifiedAt: isoOrNull(row.login_verified_at),
     signingVerifiedAt: isoOrNull(row.signing_verified_at),
     blockReason: (row.block_reason as string | null) ?? null,
@@ -325,7 +328,8 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
         const rows = (await sql`INSERT INTO backup_passkey_enrollments (app_user_id, state) VALUES (${appUserId}, 'started') RETURNING *`) as Row[];
         return toBackupEnrollment(rows[0]!);
       } catch (error) {
-        if (isUniqueViolation(error, "backup_passkey_enrollments_one_active_per_account")) return null;
+        // 2g-H renamed the index (blocked/removal_in_progress now hold the slot); the old name covers a not-yet-migrated database.
+        if (isUniqueViolation(error, "backup_passkey_enrollments_one_open_per_account") || isUniqueViolation(error, "backup_passkey_enrollments_one_active_per_account")) return null;
         throw error;
       }
     },
@@ -338,7 +342,7 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
     async findActiveByAppUserId(appUserId) {
       const rows = (await sql`
         SELECT * FROM backup_passkey_enrollments
-        WHERE app_user_id = ${appUserId} AND state NOT IN ('active', 'abandoned', 'blocked')
+        WHERE app_user_id = ${appUserId} AND state NOT IN ('active', 'abandoned', 'removed')
         ORDER BY created_at DESC LIMIT 1
       `) as Row[];
       return rows[0] ? toBackupEnrollment(rows[0]) : null;
@@ -350,7 +354,7 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
           sql`
             INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter, transports, credential_device_type, credential_backed_up, status, role)
             SELECT ${credential.credentialId}, e.app_user_id, ${credential.credentialPublicKey}, ${credential.userHandle}, ${credential.counter}, ${credential.transports}, ${credential.credentialDeviceType}, ${credential.credentialBackedUp}, 'pending', 'backup'
-            FROM backup_passkey_enrollments e WHERE e.id = ${id} AND e.state = 'started'
+            FROM backup_passkey_enrollments e WHERE e.id = ${id} AND e.state = 'started' AND e.registration_mint_id = ${credential.registrationMintId}
           `,
           sql`
             UPDATE backup_passkey_enrollments SET
@@ -365,8 +369,9 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
               registration_challenge = ${credential.registrationChallenge},
               raw_client_data_json = ${credential.rawClientDataJson},
               raw_attestation_object = ${credential.rawAttestationObject},
+              registration_step_up_credential_id = ${credential.stepUpCredentialId},
               updated_at = now()
-            WHERE id = ${id} AND state = 'started'
+            WHERE id = ${id} AND state = 'started' AND registration_mint_id = ${credential.registrationMintId}
             RETURNING *
           `,
           // Lost the CAS (another request attached a different credential):
@@ -405,6 +410,8 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
           signing_proof_challenge = CASE WHEN ${has(p, "signingProofChallenge")} THEN ${p?.signingProofChallenge ?? null} ELSE signing_proof_challenge END,
           login_verified_at = CASE WHEN ${has(p, "loginVerifiedAt")} THEN ${p?.loginVerifiedAt ?? null}::timestamptz ELSE login_verified_at END,
           block_reason = CASE WHEN ${has(p, "blockReason")} THEN ${p?.blockReason ?? null} ELSE block_reason END,
+          registration_mint_id = CASE WHEN ${has(p, "registrationMintId")} THEN ${p?.registrationMintId ?? null} ELSE registration_mint_id END,
+          turnkey_request_replayed = CASE WHEN ${has(p, "turnkeyRequestReplayed")} THEN ${p?.turnkeyRequestReplayed ?? false} ELSE turnkey_request_replayed END,
           updated_at = now()
         WHERE id = ${id} AND state = ${from}
         RETURNING *
@@ -423,8 +430,9 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
               turnkey_authenticator_public_key = ${turnkeyAuthenticatorPublicKey},
               turnkey_activity_status = COALESCE(${turnkeyActivityStatus}, turnkey_activity_status),
               turnkey_request_stamp = NULL,
+              block_reason = NULL,
               updated_at = now()
-            WHERE id = ${id} AND state = 'turnkey_enrollment_in_flight'
+            WHERE id = ${id} AND state IN ('turnkey_enrollment_in_flight', 'blocked')
             RETURNING *
           `,
           sql`
@@ -446,9 +454,34 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
       }
     },
 
+    async claimReplay({ id }) {
+      // Only the first false -> true wins: concurrent reconciles forward at most one replay.
+      const rows = (await sql`
+        UPDATE backup_passkey_enrollments SET turnkey_request_replayed = true, updated_at = now()
+        WHERE id = ${id} AND state = 'turnkey_enrollment_in_flight' AND turnkey_activity_id IS NULL AND turnkey_request_replayed = false
+        RETURNING *
+      `) as Row[];
+      return rows[0] ? toBackupEnrollment(rows[0]) : null;
+    },
+
+    async recordActivity({ id, activityId, activityStatus }) {
+      // First writer wins — a later send's activity id never replaces the recorded one.
+      const rows = (await sql`
+        UPDATE backup_passkey_enrollments SET
+          turnkey_activity_id = ${activityId}, turnkey_activity_status = ${activityStatus}, turnkey_request_stamp = NULL, updated_at = now()
+        WHERE id = ${id} AND state = 'turnkey_enrollment_in_flight' AND turnkey_activity_id IS NULL
+        RETURNING *
+      `) as Row[];
+      return rows[0] ? toBackupEnrollment(rows[0]) : null;
+    },
+
     async activate({ id, signingProofActivityId }) {
       try {
         const results = await sql.transaction([
+          // 2g-H: the same per-account lock as a removal's beginDispatch, so
+          // "activate" and "remove this pending passkey before activation"
+          // serialize — whichever commits first wins, the other matches nothing.
+          sql`SELECT app_user_id FROM real_accounts WHERE app_user_id = (SELECT app_user_id FROM backup_passkey_enrollments WHERE id = ${id}) FOR UPDATE`,
           sql`
             UPDATE backup_passkey_enrollments SET state = 'active', signing_proof_activity_id = ${signingProofActivityId}, signing_verified_at = now(), updated_at = now()
             WHERE id = ${id} AND state = 'login_verified' AND login_verified_at IS NOT NULL
@@ -466,7 +499,7 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
               AND NOT EXISTS (SELECT 1 FROM real_passkeys p WHERE p.credential_id = e.new_credential_id AND p.status = 'active')
           `,
         ]);
-        const rows = results[0] as Row[];
+        const rows = results[1] as Row[];
         return rows[0] ? toBackupEnrollment(rows[0]) : null;
       } catch (error) {
         if (isGuardAbort(error, "backup_activation_mismatch")) return null;
@@ -478,7 +511,7 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
       const results = await sql.transaction([
         sql`
           UPDATE backup_passkey_enrollments SET state = 'abandoned', turnkey_request_stamp = NULL, updated_at = now()
-          WHERE id = ${id} AND (state = 'started' OR (state = 'credential_registered' AND external_outcome IN ('not_attempted', 'definitive_failure')))
+          WHERE id = ${id} AND (state = 'started' OR (state = 'credential_registered' AND external_outcome = 'not_attempted'))
           RETURNING *
         `,
         sql`
@@ -509,11 +542,25 @@ export function createNeonPasskeyRevocationStore(sql: NeonQueryFunction<false, f
     async prepare({ appUserId, targetCredentialId, authorizerCredentialId }) {
       if (targetCredentialId === authorizerCredentialId) return { ok: false, reason: "same_credential" };
       // Changes no passkey status — a cookie alone never disables a credential.
+      // Target: active + mapped; (2g-H) a pending backup whose Turnkey
+      // authenticator is already confirmed (it may already authorize); or
+      // (2g-H) a revoking target whose earlier removal blocked (retry — the
+      // one-dispatch-per-target index still allows only one in flight).
       const rows = (await sql`
         INSERT INTO passkey_revocation_attempts (app_user_id, target_credential_id, target_turnkey_authenticator_id, authorizer_credential_id, state)
         SELECT ${appUserId}, t.credential_id, t.turnkey_authenticator_id, ${authorizerCredentialId}, 'authorization_needed'
         FROM real_passkeys t
-        WHERE t.credential_id = ${targetCredentialId} AND t.app_user_id = ${appUserId} AND t.status = 'active' AND t.turnkey_authenticator_id IS NOT NULL
+        WHERE t.credential_id = ${targetCredentialId} AND t.app_user_id = ${appUserId} AND t.turnkey_authenticator_id IS NOT NULL
+          AND (
+            t.status = 'active'
+            OR (t.status = 'pending' AND EXISTS (
+              SELECT 1 FROM backup_passkey_enrollments e
+              WHERE e.new_credential_id = t.credential_id AND e.app_user_id = t.app_user_id AND e.state IN ('turnkey_authenticator_created', 'login_verified')
+            ))
+            OR (t.status = 'revoking' AND EXISTS (
+              SELECT 1 FROM passkey_revocation_attempts b WHERE b.target_credential_id = t.credential_id AND b.state = 'blocked'
+            ))
+          )
           AND EXISTS (
             SELECT 1 FROM real_passkeys s
             WHERE s.credential_id = ${authorizerCredentialId} AND s.app_user_id = ${appUserId} AND s.status = 'active' AND s.turnkey_authenticator_id IS NOT NULL
@@ -578,25 +625,57 @@ export function createNeonPasskeyRevocationStore(sql: NeonQueryFunction<false, f
             WHERE r.id = ${id} AND r.state = 'authorization_needed' AND r.target_credential_id <> r.authorizer_credential_id
               AND EXISTS (
                 SELECT 1 FROM real_passkeys t
-                WHERE t.credential_id = r.target_credential_id AND t.app_user_id = r.app_user_id AND t.status = 'active'
+                WHERE t.credential_id = r.target_credential_id AND t.app_user_id = r.app_user_id
                   AND t.turnkey_authenticator_id = r.target_turnkey_authenticator_id
+                  AND (
+                    t.status = 'active'
+                    OR (t.status = 'pending' AND EXISTS (
+                      SELECT 1 FROM backup_passkey_enrollments e
+                      WHERE e.new_credential_id = t.credential_id AND e.app_user_id = t.app_user_id AND e.state IN ('turnkey_authenticator_created', 'login_verified')
+                    ))
+                    OR (t.status = 'revoking' AND EXISTS (
+                      SELECT 1 FROM passkey_revocation_attempts b WHERE b.target_credential_id = t.credential_id AND b.state = 'blocked'
+                    ))
+                  )
               )
               AND EXISTS (
                 SELECT 1 FROM real_passkeys s
                 WHERE s.credential_id = r.authorizer_credential_id AND s.app_user_id = r.app_user_id AND s.status = 'active' AND s.turnkey_authenticator_id IS NOT NULL
               )
+              -- 2g-H: every attempt needs FRESH signed bytes — never the exact body an earlier attempt for this target already dispatched.
+              AND NOT EXISTS (
+                SELECT 1 FROM passkey_revocation_attempts o
+                WHERE o.target_credential_id = r.target_credential_id AND o.id <> r.id AND o.turnkey_request_body_sha256 = ${patch.turnkeyRequestBodySha256 ?? null}
+              )
             RETURNING *
           `,
+          // 2g-H: a pending target's not-yet-activated enrollment leaves every
+          // activatable state in this same transaction (before the passkey
+          // row, the same lock order as activate), so no Proof A/B or
+          // activation can ever resurrect it — but it still HOLDS the
+          // one-open-enrollment slot until the deletion is confirmed.
+          sql`
+            UPDATE backup_passkey_enrollments SET state = 'removal_in_progress', turnkey_request_stamp = NULL, updated_at = now()
+            WHERE new_credential_id = (SELECT target_credential_id FROM passkey_revocation_attempts WHERE id = ${id} AND state = 'dispatch_in_flight')
+              AND state IN ('turnkey_authenticator_created', 'login_verified')
+          `,
+          // A retry's target is already 'revoking' (unchanged).
           sql`
             UPDATE real_passkeys SET status = 'revoking'
             WHERE credential_id = (SELECT target_credential_id FROM passkey_revocation_attempts WHERE id = ${id} AND state = 'dispatch_in_flight')
-              AND status = 'active'
+              AND status IN ('active', 'pending')
           `,
-          // Never "attempt dispatched + target still active": abort the whole batch instead.
+          // Never "attempt dispatched + target still active/pending": abort the whole batch instead.
           sql`
             SELECT (r.state || ':revocation_dispatch_mismatch')::int FROM passkey_revocation_attempts r
             WHERE r.id = ${id} AND r.state = 'dispatch_in_flight'
               AND NOT EXISTS (SELECT 1 FROM real_passkeys p WHERE p.credential_id = r.target_credential_id AND p.status = 'revoking')
+          `,
+          // Never "attempt dispatched + the target's enrollment still activatable".
+          sql`
+            SELECT (r.state || ':revocation_dispatch_mismatch')::int FROM passkey_revocation_attempts r
+            WHERE r.id = ${id} AND r.state = 'dispatch_in_flight'
+              AND EXISTS (SELECT 1 FROM backup_passkey_enrollments e WHERE e.new_credential_id = r.target_credential_id AND e.state IN ('turnkey_authenticator_created', 'login_verified'))
           `,
         ]);
         const rows = results[1] as Row[];
@@ -632,6 +711,13 @@ export function createNeonPasskeyRevocationStore(sql: NeonQueryFunction<false, f
             UPDATE real_passkeys SET status = 'revoked'
             WHERE credential_id = (SELECT target_credential_id FROM passkey_revocation_attempts WHERE id = ${id} AND state = 'confirmed') AND status = 'revoking'
           `,
+          // 2g-H: only now — deletion confirmed — does a removed-before-activation
+          // enrollment become terminal and free the one-open-enrollment slot.
+          sql`
+            UPDATE backup_passkey_enrollments SET state = 'removed', updated_at = now()
+            WHERE new_credential_id = (SELECT target_credential_id FROM passkey_revocation_attempts WHERE id = ${id} AND state = 'confirmed')
+              AND state = 'removal_in_progress'
+          `,
           // Role is app metadata only: no non-revoked primary left -> the
           // oldest active passkey becomes primary. Never touches status,
           // identity, or Turnkey mapping.
@@ -650,6 +736,11 @@ export function createNeonPasskeyRevocationStore(sql: NeonQueryFunction<false, f
             SELECT (a.state || ':revocation_confirm_mismatch')::int FROM passkey_revocation_attempts a
             WHERE a.id = ${id} AND a.state = 'confirmed'
               AND NOT EXISTS (SELECT 1 FROM real_passkeys p WHERE p.credential_id = a.target_credential_id AND p.status = 'revoked')
+          `,
+          sql`
+            SELECT (a.state || ':revocation_confirm_mismatch')::int FROM passkey_revocation_attempts a
+            WHERE a.id = ${id} AND a.state = 'confirmed'
+              AND EXISTS (SELECT 1 FROM backup_passkey_enrollments e WHERE e.new_credential_id = a.target_credential_id AND e.state = 'removal_in_progress')
           `,
           // Never "confirmed" while an active survivor is left without a primary: abort the whole batch instead.
           sql`

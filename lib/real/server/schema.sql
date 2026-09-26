@@ -11,10 +11,12 @@
 -- challenge minted for one ceremony can never be consumed by the other
 -- route (a backup-registration challenge submitted to the primary
 -- register/verify route, or vice versa, is simply an unknown-purpose
--- challenge to that route's consume() call).
+-- challenge to that route's consume() call). 'backup_step_up' (2g-H) is the
+-- fresh assertion by the CURRENT SESSION CREDENTIAL that must precede every
+-- backup registration challenge — an app cookie alone never mints one.
 CREATE TABLE IF NOT EXISTS webauthn_challenges (
   challenge     TEXT PRIMARY KEY,
-  purpose       TEXT NOT NULL CHECK (purpose IN ('registration', 'login', 'backup_registration', 'backup_login_verification')),
+  purpose       TEXT NOT NULL CHECK (purpose IN ('registration', 'login', 'backup_registration', 'backup_login_verification', 'backup_step_up')),
   context       JSONB,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at    TIMESTAMPTZ NOT NULL
@@ -40,7 +42,7 @@ BEGIN
     EXECUTE format('ALTER TABLE webauthn_challenges DROP CONSTRAINT %I', c.conname);
   END LOOP;
   ALTER TABLE webauthn_challenges ADD CONSTRAINT webauthn_challenges_purpose_check
-    CHECK (purpose IN ('registration', 'login', 'backup_registration', 'backup_login_verification'));
+    CHECK (purpose IN ('registration', 'login', 'backup_registration', 'backup_login_verification', 'backup_step_up'));
 END $$;
 
 -- The durable onboarding workflow. A row is written the instant a WebAuthn
@@ -199,8 +201,26 @@ WHERE p.status = 'active' AND p.role = 'backup'
 --
 --   started -> credential_registered -> turnkey_enrollment_in_flight
 --     -> turnkey_authenticator_created -> login_verified -> active
---   off-ramps: abandoned (only while no Turnkey attempt is outstanding),
---              blocked (ambiguous discovery; manual review)
+--   off-ramps:
+--     abandoned            terminal; only while NOTHING was ever dispatched to
+--                          Turnkey (after a dispatch the browser still holds
+--                          the signed create and could send it itself, so no
+--                          server-observed failure proves absence — review)
+--     blocked              NOT terminal (2g-H): the create may have reached
+--                          Turnkey but the outcome is ambiguous — "setup needs
+--                          review". Holds the slot; read-only discovery that
+--                          finds exactly one byte-matching authenticator moves
+--                          it to turnkey_authenticator_created (then removable)
+--     removal_in_progress  NOT terminal (2g-H): another active passkey
+--                          dispatched the delete of this pending-but-live
+--                          credential. Activation impossible; slot held until
+--                          the delete is confirmed; a blocked removal is retryable
+--     removed              terminal (2g-H): the delete is confirmed (completed
+--                          activity naming the authenticator + absence read)
+--
+-- AUTHORITY INVARIANT: an enrollment whose credential MAY hold Turnkey
+-- authority never frees the one-open-enrollment slot (only active / abandoned /
+-- removed do), so the account can't pile up replacement backups around it.
 --
 -- turnkey_request_* hold the EXACT child-WebAuthn-stamped createAuthenticators
 -- request, written in the same CAS that moves the row into
@@ -209,6 +229,29 @@ WHERE p.status = 'active' AND p.role = 'backup'
 -- replay (while fresh) or read-only reconciliation — never a second create.
 -- turnkey_request_stamp is a live, body-bound bearer credential: it is
 -- cleared as soon as an activity id is recorded or the replay window closes.
+--
+-- registration_step_up_credential_id (2g-H): the session credential whose
+-- fresh assertion authorized minting the registration challenge the new
+-- credential answered. NULL means the credential was attached without that
+-- step-up (only possible before 2g-H) — such an enrollment is never offered
+-- for Turnkey authorization; it can only be abandoned.
+--
+-- registration_mint_id (2g-H): the newest registration challenge minted for a
+-- 'started' enrollment; a challenge from an earlier (superseded) mint never
+-- attaches a credential.
+--
+-- turnkey_request_replayed (2g-H): claimed by CAS (false -> true, no activity
+-- id yet) BEFORE reconciliation forwards the ONE byte-identical replay it may
+-- ever send, so concurrent reconciles forward at most one. external_outcome
+-- 'definitive_failure' is legacy only: 2g-H never writes it, and treats such a
+-- row as uncertain authority (moved into review; never abandonable/retryable).
+--
+-- A pending credential that already has a Turnkey authenticator
+-- (turnkey_authenticator_created / login_verified) may be removed by another
+-- active passkey (passkey_revocation_attempts): the dispatch transaction
+-- moves this enrollment to 'removal_in_progress' together with the passkey
+-- leaving 'pending' (activation can never resurrect it); only the confirmed
+-- deletion moves it to 'removed' and frees the slot.
 CREATE TABLE IF NOT EXISTS backup_passkey_enrollments (
   id                                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   app_user_id                       TEXT NOT NULL REFERENCES real_accounts (app_user_id),
@@ -224,7 +267,8 @@ CREATE TABLE IF NOT EXISTS backup_passkey_enrollments (
   raw_attestation_object            TEXT,
   state                             TEXT NOT NULL CHECK (state IN (
                                        'started', 'credential_registered', 'turnkey_enrollment_in_flight',
-                                       'turnkey_authenticator_created', 'login_verified', 'active', 'abandoned', 'blocked'
+                                       'turnkey_authenticator_created', 'login_verified', 'active', 'abandoned', 'blocked',
+                                       'removal_in_progress', 'removed'
                                      )),
   external_outcome                  TEXT NOT NULL DEFAULT 'not_attempted' CHECK (external_outcome IN ('not_attempted', 'unknown', 'confirmed_created', 'definitive_failure')),
   external_enrollment_attempted_at  TIMESTAMPTZ,
@@ -240,6 +284,9 @@ CREATE TABLE IF NOT EXISTS backup_passkey_enrollments (
   turnkey_authenticator_public_key  TEXT,
   signing_proof_challenge           TEXT,
   signing_proof_activity_id         TEXT,
+  registration_step_up_credential_id TEXT,
+  registration_mint_id              TEXT,
+  turnkey_request_replayed          BOOLEAN NOT NULL DEFAULT false,
   login_verified_at                 TIMESTAMPTZ,
   signing_verified_at               TIMESTAMPTZ,
   block_reason                      TEXT,
@@ -247,9 +294,67 @@ CREATE TABLE IF NOT EXISTS backup_passkey_enrollments (
   updated_at                        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS backup_passkey_enrollments_app_user_id_idx ON backup_passkey_enrollments (app_user_id);
-CREATE UNIQUE INDEX IF NOT EXISTS backup_passkey_enrollments_one_active_per_account
-  ON backup_passkey_enrollments (app_user_id)
-  WHERE state NOT IN ('active', 'abandoned', 'blocked');
+
+-- 2g-H hand-applied migration. Idempotent. New columns: nullable/defaulted, so
+-- every pre-existing row stays valid (and is treated as "no step-up proof",
+-- "no current mint", "never replayed").
+ALTER TABLE backup_passkey_enrollments ADD COLUMN IF NOT EXISTS registration_step_up_credential_id TEXT;
+ALTER TABLE backup_passkey_enrollments ADD COLUMN IF NOT EXISTS registration_mint_id TEXT;
+ALTER TABLE backup_passkey_enrollments ADD COLUMN IF NOT EXISTS turnkey_request_replayed BOOLEAN NOT NULL DEFAULT false;
+-- Widen the state CHECK (live constraint name not assumed; same atomic
+-- discover-drop-add pattern as above). Pre-live check (read-only):
+--   SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+--   WHERE conrelid = 'backup_passkey_enrollments'::regclass AND contype = 'c';
+DO $$
+DECLARE c record;
+BEGIN
+  FOR c IN
+    SELECT con.conname FROM pg_constraint con
+    JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY (con.conkey)
+    WHERE con.conrelid = 'backup_passkey_enrollments'::regclass AND con.contype = 'c' AND att.attname = 'state'
+  LOOP
+    EXECUTE format('ALTER TABLE backup_passkey_enrollments DROP CONSTRAINT %I', c.conname);
+  END LOOP;
+  ALTER TABLE backup_passkey_enrollments ADD CONSTRAINT backup_passkey_enrollments_state_check CHECK (state IN (
+    'started', 'credential_registered', 'turnkey_enrollment_in_flight',
+    'turnkey_authenticator_created', 'login_verified', 'active', 'abandoned', 'blocked',
+    'removal_in_progress', 'removed'
+  ));
+END $$;
+-- One OPEN enrollment per account, where 'blocked' and 'removal_in_progress'
+-- now count as open (they may hold Turnkey authority). Replaces the Batch 2g
+-- index (backup_passkey_enrollments_one_active_per_account), which let
+-- 'blocked' free the slot.
+--
+-- FAIL-SAFE SWAP: ONE DO block = ONE transaction. The table is locked against
+-- writes first; if any account already has more than one enrollment that the
+-- NEW rule counts as open (e.g. a 'blocked' one plus another), it RAISEs
+-- before anything changes — the old index is untouched. The old index is
+-- dropped only AFTER the new one was created in this same transaction (a
+-- unique-violation while building it also aborts everything). There is never
+-- a moment with neither index. Rerunnable: once the new index exists, only the
+-- (idempotent) drop of the old one runs. Pre-live check (read-only):
+--   SELECT app_user_id, count(*) FROM backup_passkey_enrollments
+--   WHERE state NOT IN ('active', 'abandoned', 'removed') GROUP BY app_user_id HAVING count(*) > 1;
+-- BEGIN 2g-H one-open-index migration
+DO $$
+BEGIN
+  IF to_regclass('backup_passkey_enrollments_one_open_per_account') IS NULL THEN
+    LOCK TABLE backup_passkey_enrollments IN SHARE ROW EXCLUSIVE MODE;
+    IF EXISTS (
+      SELECT 1 FROM backup_passkey_enrollments
+      WHERE state NOT IN ('active', 'abandoned', 'removed')
+      GROUP BY app_user_id HAVING count(*) > 1
+    ) THEN
+      RAISE EXCEPTION '2g-H migration refused: an account has more than one open backup enrollment (e.g. blocked + another). Resolve by hand; the existing one-active index was left in place.';
+    END IF;
+    CREATE UNIQUE INDEX backup_passkey_enrollments_one_open_per_account
+      ON backup_passkey_enrollments (app_user_id)
+      WHERE state NOT IN ('active', 'abandoned', 'removed');
+  END IF;
+  DROP INDEX IF EXISTS backup_passkey_enrollments_one_active_per_account;
+END $$;
+-- END 2g-H one-open-index migration
 
 -- Batch 2g: durable removal of one passkey, authorized by a DIFFERENT,
 -- surviving credential (always the caller's own session credential).
@@ -258,19 +363,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS backup_passkey_enrollments_one_active_per_acco
 --   off-ramps: cancelled (only from authorization_needed, only by the
 --              credential that owns it — the target never left 'active'),
 --              blocked (after dispatch: every outcome other than a confirmed
---              deletion; manual review, target stays 'revoking').
+--              deletion; target stays 'revoking').
+--
+-- RETRY (2g-H): a 'revoking' target with a 'blocked' attempt and NO attempt
+-- 'dispatch_in_flight' may get a NEW attempt — a fresh survivor stamp over a
+-- fresh body, naming the same authenticator id. Old attempts stay as history;
+-- nothing is retried automatically and the target never returns to 'active'.
 --
 -- ONE-WAY AFTER DISPATCH: the browser holds the valid signed delete and could
 -- send the same bytes to Turnkey directly, so no FAILED/REJECTED activity,
 -- missing activity id, or positive getUsers read proves the target wasn't
 -- deleted. A dispatched target is never automatically restored to 'active'.
 --
+-- Target: an 'active' passkey; (2g-H) a 'pending' backup that already has a
+-- Turnkey authenticator (its enrollment is turnkey_authenticator_created or
+-- login_verified) — it may already authorize at Turnkey, so it must be
+-- removable even if setup never finishes; or (2g-H) a 'revoking' target whose
+-- earlier removal blocked (retry). The authorizer is always a different
+-- 'active', mapped passkey.
+--
 -- An app cookie alone can only create an 'authorization_needed' row: the
--- target stays 'active'. Only after a fresh WebAuthn stamp by the survivor is
+-- target keeps its status. Only after a fresh WebAuthn stamp by the survivor is
 -- verified does ONE transaction (account row locked FOR UPDATE) re-check the
 -- survivor, move the attempt to 'dispatch_in_flight' with the exact request,
--- and move the target 'active' -> 'revoking' — committed BEFORE the request
--- is forwarded to Turnkey.
+-- move a pending target's enrollment to 'removal_in_progress', and move the
+-- target 'active'/'pending' -> 'revoking' — committed BEFORE the request is
+-- forwarded to Turnkey. confirmDeleted (both halves of the evidence) makes the
+-- target 'revoked' and that enrollment 'removed' in one transaction.
 --
 -- 'confirmed' requires BOTH a COMPLETED DELETE_AUTHENTICATORS activity whose
 -- result names exactly target_turnkey_authenticator_id AND a subsequent

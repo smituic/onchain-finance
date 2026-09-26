@@ -6,7 +6,7 @@ import { credentialIdsEqual } from "../credential-id";
 import { addressesEqual, isValidUuid } from "../identifiers";
 import { serializeTurnkeyRawSignature } from "../signing/raw-signature";
 import type { ChallengeStore } from "./challenge-store";
-import { DuplicateCredentialError, type RealAccountRecord, type RealAccountRegistry } from "./registry";
+import { DuplicateCredentialError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
 import { isAbandonable, type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { RealServerConfig } from "./config";
 import { buildLoginOptions, buildRegistrationOptions, verifyLogin, verifyRegistration } from "./webauthn";
@@ -33,6 +33,7 @@ export type { TurnkeyDispatchDeps };
 
 const BACKUP_REGISTRATION_CHALLENGE_TTL_MS = 1000 * 60 * 5;
 const BACKUP_LOGIN_CHALLENGE_TTL_MS = 1000 * 60 * 5;
+const BACKUP_STEP_UP_CHALLENGE_TTL_MS = 1000 * 60 * 5;
 const CREATE_ACTIVITY_TYPE = "ACTIVITY_TYPE_CREATE_AUTHENTICATORS_V2";
 const SIGN_ACTIVITY_TYPE = "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2";
 const ALLOWED_TRANSPORTS = new Set([
@@ -47,8 +48,20 @@ const ALLOWED_TRANSPORTS = new Set([
 const SAFE_REGISTRATION_VERIFICATION_FAILED = "Registration could not be verified.";
 const SAFE_LOGIN_VERIFICATION_FAILED = "Login could not be verified.";
 
-type BackupRegistrationContext = { enrollmentId: string; appUserId: string; userHandle: string };
+/**
+ * stepUpCredentialId: the session credential whose fresh step-up assertion authorized minting this registration challenge (2g-H).
+ * mintId: the enrollment's registrationMintId when this challenge was minted — a later re-mint supersedes it (2g-H).
+ */
+type BackupRegistrationContext = { enrollmentId: string; appUserId: string; userHandle: string; stepUpCredentialId?: string; mintId?: string };
 type BackupLoginContext = { enrollmentId: string; appUserId: string };
+type BackupStepUpContext = { appUserId: string; credentialId: string };
+
+const STEP_UP_REQUIRED = "Confirm it's you with the passkey you're signed in with, then try again.";
+const SETUP_NEEDS_RESTART = "This setup wasn't confirmed with your signed-in passkey. Cancel it and start again.";
+const SETUP_OTHER_PASSKEY = "Finish this setup signed in with the passkey that started it, or cancel it and start again.";
+const CREATE_OUTCOME_UNKNOWN =
+  "Turnkey reported this authorization as not completed, but the approved request could still be sent to it, so this setup needs review. This passkey may already be able to approve payments.";
+const SETUP_REMOVED = "This setup was removed before it finished.";
 
 /**
  * Ownership check for every step that takes an enrollmentId: a session for
@@ -83,6 +96,24 @@ function toTurnkeyTransport(transport: string): string {
 
 // ---------------------------------------------------------------- status
 
+/**
+ * 2g-H: can this credential (possibly) authorize at Turnkey? Never optimistic.
+ *   granted   — active/revoking, or pending with a CONFIRMED Turnkey authenticator
+ *   none      — pending, and provably never reached Turnkey (nothing dispatched,
+ *               or Turnkey authoritatively failed the one request we sent)
+ *   uncertain — pending after a create may have reached Turnkey (in flight or
+ *               in review), or anything we can't tie to its open enrollment
+ */
+export function passkeyWalletAccess(passkey: Pick<RealPasskeyRecord, "credentialId" | "status" | "turnkeyAuthenticatorId">, openEnrollment: BackupPasskeyEnrollment | null): "none" | "uncertain" | "granted" {
+  if (passkey.status === "active" || passkey.status === "revoking" || passkey.turnkeyAuthenticatorId !== null) return "granted";
+  if (passkey.status !== "pending") return "none";
+  const enrollment = openEnrollment && openEnrollment.newCredentialId === passkey.credentialId ? openEnrollment : null;
+  // Only "nothing was ever dispatched" is provably none. A dispatched create — even one Turnkey
+  // reported FAILED (a legacy 'definitive_failure') — may still be sent by the browser that holds it.
+  if (enrollment?.state === "credential_registered" && enrollment.externalOutcome === "not_attempted") return "none";
+  return "uncertain";
+}
+
 export type BackupEnrollmentStatus = {
   id: string;
   state: BackupPasskeyEnrollmentState;
@@ -99,10 +130,91 @@ export async function getActiveBackupEnrollment(input: { enrollments: BackupPass
   return { id: enrollment.id, state: enrollment.state, externalOutcome: enrollment.externalOutcome, abandonable: isAbandonable(enrollment), blockReason: enrollment.blockReason };
 }
 
+// ---------------------------------------------------------------- step 0: step-up (2g-H)
+
+/**
+ * Why this exists: the backup's credential is CHOSEN at registration, and a
+ * later Turnkey authorization by the signed-in passkey is bound (by
+ * validateCreateBody) to exactly that credential. If an app cookie alone
+ * could mint a registration challenge, whoever holds a stolen cookie could
+ * register THEIR authenticator into the enrollment, and the victim's next
+ * "Resume setup" tap would grant it full Turnkey authority. So every
+ * registration challenge is minted only after a fresh, user-verified
+ * assertion by the CURRENT SESSION CREDENTIAL (allowCredentials = that one
+ * credential; not "any passkey on the account" — the session credential is
+ * the one the browser demonstrably holds, and the one the later Turnkey
+ * authorization must come from anyway). App authentication only: nothing
+ * here touches Turnkey or signs anything.
+ */
+export type PrepareBackupStepUpResult = { outcome: "ready"; optionsJSON: Awaited<ReturnType<typeof buildLoginOptions>> } | { outcome: "rejected"; reason: string };
+
+export async function prepareBackupStepUp(input: {
+  config: RealServerConfig;
+  challengeStore: ChallengeStore;
+  registry: RealAccountRegistry;
+  appUserId: string;
+  sessionCredentialId: string;
+}): Promise<PrepareBackupStepUpResult> {
+  const passkey = await input.registry.findPasskeyByCredentialId(input.sessionCredentialId);
+  if (!passkey || passkey.appUserId !== input.appUserId || passkey.status !== "active") return { outcome: "rejected", reason: "The passkey you're signed in with isn't active." };
+  const optionsJSON = await buildLoginOptions({ config: input.config, allowCredentialIds: [passkey.credentialId] });
+  await input.challengeStore.create({
+    challenge: optionsJSON.challenge,
+    purpose: "backup_step_up",
+    ttlMs: BACKUP_STEP_UP_CHALLENGE_TTL_MS,
+    context: { appUserId: input.appUserId, credentialId: passkey.credentialId } satisfies BackupStepUpContext,
+  });
+  return { outcome: "ready", optionsJSON };
+}
+
+/** Single-use (consumed first, even on failure), expiring, purpose-bound, and bound to this app user AND this session credential. */
+async function verifyBackupStepUp(input: {
+  config: RealServerConfig;
+  challengeStore: ChallengeStore;
+  registry: RealAccountRegistry;
+  appUserId: string;
+  sessionCredentialId: string;
+  response: unknown;
+}): Promise<{ ok: true; credentialId: string } | { ok: false }> {
+  const response = input.response as AuthenticationResponseJSON | null | undefined;
+  if (!response || typeof response !== "object" || typeof response.id !== "string" || !response.response || typeof response.response.clientDataJSON !== "string") return { ok: false };
+  let clientData: ReturnType<typeof decodeClientDataJSON>;
+  try {
+    clientData = decodeClientDataJSON(response.response.clientDataJSON);
+  } catch {
+    return { ok: false };
+  }
+  const stored = await input.challengeStore.consume({ challenge: clientData.challenge, purpose: "backup_step_up" });
+  if (!stored) return { ok: false };
+  const context = stored.context as BackupStepUpContext | null;
+  if (!context || context.appUserId !== input.appUserId || context.credentialId !== input.sessionCredentialId) return { ok: false };
+
+  const passkey = await input.registry.findPasskeyByCredentialId(input.sessionCredentialId);
+  if (!passkey || passkey.appUserId !== input.appUserId || passkey.status !== "active") return { ok: false };
+  if (!credentialIdsEqual(response.id, passkey.credentialId)) return { ok: false };
+  if (!response.response.userHandle || response.response.userHandle !== passkey.userHandle) return { ok: false };
+
+  let verified;
+  try {
+    verified = await verifyLogin({
+      config: input.config,
+      response: { ...response, id: passkey.credentialId, rawId: passkey.credentialId },
+      expectedChallenge: stored.challenge,
+      credential: { id: passkey.credentialId, publicKey: base64UrlToBytes(passkey.credentialPublicKey), counter: passkey.counter, transports: passkey.transports ?? undefined },
+    });
+  } catch {
+    return { ok: false };
+  }
+  if (!verified.verified || !verified.authenticationInfo.userVerified) return { ok: false };
+  await input.registry.updateAuthenticatorCounter({ credentialId: passkey.credentialId, counter: verified.authenticationInfo.newCounter });
+  return { ok: true, credentialId: passkey.credentialId };
+}
+
 // ---------------------------------------------------------------- step 1: begin
 
 export type BeginBackupEnrollmentResult =
   | { outcome: "started"; enrollmentId: string; optionsJSON: Awaited<ReturnType<typeof buildRegistrationOptions>> }
+  | { outcome: "step_up_failed"; reason: string }
   | { outcome: "already_in_progress"; reason: string }
   | { outcome: "rejected"; reason: string };
 
@@ -111,6 +223,10 @@ export type BeginBackupEnrollmentResult =
  * active enrollment, excluding every non-revoked credential this account
  * already has — @simplewebauthn/server's excludeCredentials is what makes
  * re-registering an existing credential as the "backup" impossible.
+ *
+ * 2g-H: EVERY call — first start or re-mint — requires a fresh step-up
+ * assertion by the session credential (prepareBackupStepUp), verified before
+ * anything is created or minted. A cookie alone gets nothing.
  */
 export async function beginBackupEnrollment(input: {
   config: RealServerConfig;
@@ -118,7 +234,12 @@ export async function beginBackupEnrollment(input: {
   registry: RealAccountRegistry;
   enrollments: BackupPasskeyEnrollmentStore;
   appUserId: string;
+  sessionCredentialId: string;
+  stepUpResponse: unknown;
 }): Promise<BeginBackupEnrollmentResult> {
+  const stepUp = await verifyBackupStepUp({ ...input, response: input.stepUpResponse });
+  if (!stepUp.ok) return { outcome: "step_up_failed", reason: STEP_UP_REQUIRED };
+
   const account = await input.registry.findAccountByAppUserId(input.appUserId);
   if (!account) return { outcome: "rejected", reason: "No account found for this session." };
 
@@ -131,6 +252,12 @@ export async function beginBackupEnrollment(input: {
     }
     enrollment = existing;
   }
+  // 2g-H: every mint gets a fresh id, recorded by CAS while still 'started';
+  // registerCredential only accepts the CURRENT mint, so any challenge from an
+  // earlier mint (another tab, a captured response) can never attach later.
+  const mintId = bytesToBase64Url(randomBytes(16));
+  const minted = await input.enrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: mintId } });
+  if (!minted) return { outcome: "already_in_progress", reason: "A backup passkey setup is already in progress — resume it instead." };
 
   const existingPasskeys = await input.registry.findPasskeysByAppUserId(input.appUserId);
   const userIdBytes = randomBytes(32);
@@ -145,7 +272,7 @@ export async function beginBackupEnrollment(input: {
     challenge: optionsJSON.challenge,
     purpose: "backup_registration",
     ttlMs: BACKUP_REGISTRATION_CHALLENGE_TTL_MS,
-    context: { enrollmentId: enrollment.id, appUserId: input.appUserId, userHandle: bytesToBase64Url(userIdBytes) } satisfies BackupRegistrationContext,
+    context: { enrollmentId: enrollment.id, appUserId: input.appUserId, userHandle: bytesToBase64Url(userIdBytes), stepUpCredentialId: stepUp.credentialId, mintId } satisfies BackupRegistrationContext,
   });
 
   return { outcome: "started", enrollmentId: enrollment.id, optionsJSON };
@@ -160,6 +287,9 @@ export type CompleteBackupCredentialRegistrationResult = { outcome: "registered"
  * authentication only — nothing to do with Turnkey yet), then in ONE atomic
  * store operation inserts the pending passkey and attaches it to the
  * enrollment. A lost race leaves no orphan row.
+ *
+ * 2g-H: only a challenge minted after a fresh step-up by THIS session's
+ * credential is accepted, and that credential is recorded on the enrollment.
  */
 export async function completeBackupCredentialRegistration(input: {
   config: RealServerConfig;
@@ -167,6 +297,7 @@ export async function completeBackupCredentialRegistration(input: {
   registry: RealAccountRegistry;
   enrollments: BackupPasskeyEnrollmentStore;
   appUserId: string;
+  sessionCredentialId: string;
   response: RegistrationResponseJSON;
 }): Promise<CompleteBackupCredentialRegistrationResult> {
   let clientData: ReturnType<typeof decodeClientDataJSON>;
@@ -180,11 +311,16 @@ export async function completeBackupCredentialRegistration(input: {
   if (!stored) return { outcome: "rejected", reason: "Unknown, expired, or already-used setup challenge." };
   const context = stored.context as BackupRegistrationContext;
   if (context.appUserId !== input.appUserId) return { outcome: "rejected", reason: "This setup belongs to a different session." };
+  if (!context.stepUpCredentialId || context.stepUpCredentialId !== input.sessionCredentialId) return { outcome: "rejected", reason: STEP_UP_REQUIRED };
+  // The step-up credential may have been removed since the challenge was minted.
+  const stepUpPasskey = await input.registry.findPasskeyByCredentialId(context.stepUpCredentialId);
+  if (!stepUpPasskey || stepUpPasskey.appUserId !== input.appUserId || stepUpPasskey.status !== "active") return { outcome: "rejected", reason: STEP_UP_REQUIRED };
 
   const enrollment = await input.enrollments.findById(context.enrollmentId);
   if (!enrollment || enrollment.appUserId !== input.appUserId || enrollment.state !== "started") {
     return { outcome: "rejected", reason: "This setup is not awaiting a new passkey." };
   }
+  if (!context.mintId || enrollment.registrationMintId !== context.mintId) return { outcome: "rejected", reason: "This setup was restarted; use the newest passkey prompt." };
 
   let verified;
   try {
@@ -215,6 +351,8 @@ export async function completeBackupCredentialRegistration(input: {
         registrationChallenge: stored.challenge,
         rawClientDataJson: input.response.response.clientDataJSON,
         rawAttestationObject: input.response.response.attestationObject,
+        stepUpCredentialId: context.stepUpCredentialId,
+        registrationMintId: context.mintId,
       },
     });
     if (!registered) return { outcome: "rejected", reason: "This setup changed while registering; resume it instead." };
@@ -271,9 +409,15 @@ export async function prepareTurnkeyAuthorization(input: {
   now?: () => number;
 }): Promise<PrepareTurnkeyAuthorizationResult> {
   const enrollment = await loadOwnedEnrollment(input);
-  if (!enrollment || enrollment.state !== "credential_registered" || !enrollment.newCredentialId || !enrollment.registrationChallenge) {
+  // 2g-H: only a create that was NEVER dispatched may be authorized — never a second create after one was sent.
+  if (!enrollment || enrollment.state !== "credential_registered" || enrollment.externalOutcome !== "not_attempted" || !enrollment.newCredentialId || !enrollment.registrationChallenge) {
     return { outcome: "rejected", reason: "This setup is not ready for authorization." };
   }
+  // 2g-H: never ask the signed-in passkey to authorize a credential that was
+  // attached without a step-up (e.g. planted with a stolen cookie pre-2g-H),
+  // and only the SAME session credential whose step-up chose it may authorize it.
+  if (!enrollment.registrationStepUpCredentialId) return { outcome: "rejected", reason: SETUP_NEEDS_RESTART };
+  if (enrollment.registrationStepUpCredentialId !== input.sessionCredentialId) return { outcome: "rejected", reason: SETUP_OTHER_PASSKEY };
   const account = await input.registry.findAccountByAppUserId(input.appUserId);
   if (!account) return { outcome: "rejected", reason: "No account found for this session." };
   const authorizer = await input.registry.findPasskeyByCredentialId(input.sessionCredentialId);
@@ -313,7 +457,6 @@ function validateCreateBody(body: string, account: RealAccountRecord, enrollment
 export type ReconcileEnrollmentResult =
   | { outcome: "confirmed" }
   | { outcome: "pending"; reason: string }
-  | { outcome: "failed_retryable"; reason: string }
   | { outcome: "blocked"; reason: string }
   | { outcome: "rejected"; reason: string };
 
@@ -338,7 +481,9 @@ export async function submitTurnkeyAuthorization(input: {
   const { now } = resolveDispatchDeps(input.deps);
   const enrollment = await loadOwnedEnrollment(input);
   if (!enrollment) return { outcome: "rejected", reason: "Unknown setup." };
-  if (enrollment.state !== "credential_registered") return { outcome: "rejected", reason: "This setup already has an authorization in progress — check its status instead." };
+  if (enrollment.state !== "credential_registered" || enrollment.externalOutcome !== "not_attempted") return { outcome: "rejected", reason: "This setup already has an authorization in progress — check its status instead." };
+  if (!enrollment.registrationStepUpCredentialId) return { outcome: "rejected", reason: SETUP_NEEDS_RESTART };
+  if (enrollment.registrationStepUpCredentialId !== input.sessionCredentialId) return { outcome: "rejected", reason: SETUP_OTHER_PASSKEY };
 
   const account = await input.registry.findAccountByAppUserId(input.appUserId);
   if (!account) return { outcome: "rejected", reason: "No account found for this session." };
@@ -368,6 +513,7 @@ export async function submitTurnkeyAuthorization(input: {
       turnkeyRequestStamp: JSON.stringify(signed.stamp),
       turnkeyActivityId: null,
       turnkeyActivityStatus: null,
+      turnkeyRequestReplayed: false,
     },
   });
   if (!claimed) return { outcome: "rejected", reason: "This setup already has an authorization in progress — check its status instead." };
@@ -380,14 +526,10 @@ export async function submitTurnkeyAuthorization(input: {
 }
 
 async function recordCreateActivity(enrollments: BackupPasskeyEnrollmentStore, id: string, activity: TurnkeyActivitySummary): Promise<void> {
-  // The activity id now identifies this exact request — the stamp (a live,
-  // body-bound bearer credential) is no longer needed for replay.
-  await enrollments.transition({
-    id,
-    from: "turnkey_enrollment_in_flight",
-    to: "turnkey_enrollment_in_flight",
-    patch: { turnkeyActivityId: activity.id, turnkeyActivityStatus: activity.status, turnkeyRequestStamp: null },
-  });
+  // First writer wins: the activity id now identifies this exact request (the
+  // stamp, a live body-bound bearer credential, is cleared) and a concurrent
+  // send's activity can never replace it.
+  await enrollments.recordActivity({ id, activityId: activity.id, activityStatus: activity.status });
 }
 
 function createResultAuthenticatorId(activity: TurnkeyActivitySummary): string | null {
@@ -403,8 +545,17 @@ function createResultAuthenticatorId(activity: TurnkeyActivitySummary): string |
  * read-only getUsers matching by credential-id BYTES. Never a new create.
  *   - FAILED/REJECTED activity: confirmed anyway if getUsers shows exactly
  *     one byte-matching authenticator (the original request may have landed
- *     before a replay failed); blocked if ambiguous; only a clean miss goes
- *     back to credential_registered (definitive_failure), re-authorizable.
+ *     before a replay failed). Otherwise — ambiguous OR a miss — 'blocked'
+ *     review (2g-H): the browser still holds the exact signed body + stamp
+ *     and could post it to Turnkey itself, and Turnkey's own freshness /
+ *     same-body rules are unverified (our local replay window protects only
+ *     OUR server path), so a server-observed failure never proves absence.
+ *     Review keeps the slot, is never abandonable or re-authorizable, and
+ *     stays reconcilable by exact match. At most ONE replay is ever forwarded
+ *     (claimReplay), and the first recorded activity id wins.
+ *   - blocked (2g-H, not terminal): read-only discovery only; exactly one
+ *     byte-matching authenticator moves it to turnkey_authenticator_created
+ *     (then removable); anything else leaves it in review.
  *   - COMPLETED activity: accepted only when getUsers shows exactly one
  *     authenticator for this credential AND its id equals the activity
  *     result's id.
@@ -423,21 +574,40 @@ export async function reconcileTurnkeyEnrollment(input: {
   let enrollment = await loadOwnedEnrollment(input);
   if (!enrollment) return { outcome: "rejected", reason: "Unknown setup." };
   if (enrollment.state === "turnkey_authenticator_created" || enrollment.state === "login_verified" || enrollment.state === "active") return { outcome: "confirmed" };
-  if (enrollment.state === "blocked") return { outcome: "blocked", reason: enrollment.blockReason ?? "This setup needs manual review." };
+  if (enrollment.state === "removal_in_progress" || enrollment.state === "removed") return { outcome: "rejected", reason: SETUP_REMOVED };
   if (enrollment.state === "credential_registered" && enrollment.externalOutcome === "definitive_failure") {
-    return { outcome: "failed_retryable", reason: "Turnkey declined the authorization. You can authorize again or cancel setup." };
+    // 2g-H: a legacy (pre-2g-H) "definitive failure" is uncertain authority — move it into review.
+    await input.enrollments.transition({ id: enrollment.id, from: "credential_registered", to: "blocked", patch: { blockReason: CREATE_OUTCOME_UNKNOWN } });
+    enrollment = (await input.enrollments.findById(enrollment.id)) ?? enrollment;
   }
-  if (enrollment.state !== "turnkey_enrollment_in_flight" || !enrollment.newCredentialId) return { outcome: "rejected", reason: "This setup has no authorization in progress." };
+  if ((enrollment.state !== "turnkey_enrollment_in_flight" && enrollment.state !== "blocked") || !enrollment.newCredentialId) return { outcome: "rejected", reason: "This setup has no authorization in progress." };
 
   const account = await input.registry.findAccountByAppUserId(input.appUserId);
   if (!account) return { outcome: "rejected", reason: "No account found for this session." };
 
+  if (enrollment.state === "blocked") {
+    // Review: read-only discovery only — never a replay, never a new create,
+    // and a miss is never read as absence.
+    const reason = enrollment.blockReason ?? "This setup needs manual review.";
+    const match = matchAuthenticatorByCredentialId(await listTurnkeyUserAuthenticators({ config: input.config, subOrganizationId: account.subOrganizationId, turnkeyUserId: account.turnkeyUserId }), enrollment.newCredentialId);
+    if (match.outcome !== "found" || !match.authenticator.publicKey) return { outcome: "blocked", reason };
+    const recovered = await input.enrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: match.authenticator.authenticatorId, turnkeyAuthenticatorPublicKey: match.authenticator.publicKey, turnkeyActivityStatus: null });
+    if (recovered) return { outcome: "confirmed" };
+    const fresh = await input.enrollments.findById(enrollment.id);
+    return fresh && fresh.state !== "blocked" && fresh.state !== "turnkey_enrollment_in_flight" ? { outcome: "confirmed" } : { outcome: "blocked", reason };
+  }
+
   if (!enrollment.turnkeyActivityId) {
     const fresh = enrollment.turnkeyRequestTimestampMs !== null && isFreshTimestamp(enrollment.turnkeyRequestTimestampMs, deps.now());
     if (fresh && enrollment.turnkeyRequestBody && enrollment.turnkeyRequestStamp) {
-      const stamp = JSON.parse(enrollment.turnkeyRequestStamp) as TurnkeyStamp;
-      const replayed = await forwardSignedRequest({ config: input.config, endpoint: "create_authenticators", body: enrollment.turnkeyRequestBody, stamp, fetchImpl: deps.fetchImpl });
-      if (replayed.kind === "activity") await recordCreateActivity(input.enrollments, enrollment.id, replayed.activity);
+      // 2g-H: durably claim THE one replay before sending it — only the first
+      // false -> true wins, so concurrent reconciles forward at most one replay.
+      const claimedReplay = await input.enrollments.claimReplay({ id: enrollment.id });
+      if (claimedReplay) {
+        const stamp = JSON.parse(enrollment.turnkeyRequestStamp) as TurnkeyStamp;
+        const replayed = await forwardSignedRequest({ config: input.config, endpoint: "create_authenticators", body: enrollment.turnkeyRequestBody, stamp, fetchImpl: deps.fetchImpl });
+        if (replayed.kind === "activity") await recordCreateActivity(input.enrollments, enrollment.id, replayed.activity);
+      }
     } else if (!fresh && enrollment.turnkeyRequestStamp) {
       await input.enrollments.transition({ id: enrollment.id, from: "turnkey_enrollment_in_flight", to: "turnkey_enrollment_in_flight", patch: { turnkeyRequestStamp: null } });
     }
@@ -468,29 +638,15 @@ export async function reconcileTurnkeyEnrollment(input: {
 
   if (TERMINAL_FAILURE_STATUSES.has(activity.status)) {
     // A FAILED/REJECTED activity proves only that THIS activity created
-    // nothing. After a lost response, the observed activity may be a
-    // byte-identical replay while the ORIGINAL request succeeded (Turnkey
-    // same-body dedupe is not assumed). So read the user first: an exact
-    // credential match means the authenticator exists and creation is
-    // confirmed; only a clean miss permits re-authorization.
+    // nothing. The original may have landed after a lost response (Turnkey
+    // same-body dedupe is not assumed), and the browser still holds the exact
+    // signed body + stamp and could post it to Turnkey itself. So an exact
+    // credential match confirms; anything else — including a clean miss —
+    // is review: slot held, no abandon, no second create, discovery only.
     const match = matchAuthenticatorByCredentialId(await listTurnkeyUserAuthenticators({ config: input.config, subOrganizationId: account.subOrganizationId, turnkeyUserId: account.turnkeyUserId }), newCredentialId);
     if (match.outcome === "found") return confirmEnrollmentCreated(input.enrollments, enrollment.id, match.authenticator, activity.status);
     if (match.outcome === "ambiguous") return blockEnrollment(input.enrollments, enrollment.id, "More than one Turnkey authenticator matches this passkey; manual review is required.");
-    await input.enrollments.transition({
-      id: enrollment.id,
-      from: "turnkey_enrollment_in_flight",
-      to: "credential_registered",
-      patch: {
-        externalOutcome: "definitive_failure",
-        turnkeyActivityStatus: activity.status,
-        turnkeyRequestEndpoint: null,
-        turnkeyRequestBody: null,
-        turnkeyRequestBodySha256: null,
-        turnkeyRequestTimestampMs: null,
-        turnkeyRequestStamp: null,
-      },
-    });
-    return { outcome: "failed_retryable", reason: "Turnkey declined the authorization. You can authorize again or cancel setup." };
+    return blockEnrollment(input.enrollments, enrollment.id, CREATE_OUTCOME_UNKNOWN);
   }
   if (activity.status !== COMPLETED_STATUS) return { outcome: "pending", reason: "Your authorization is still being processed. Check again shortly." };
 
@@ -610,8 +766,12 @@ export async function confirmBackupLoginVerification(input: {
   if (!verified.authenticationInfo.userVerified) return { outcome: "rejected", reason: "User verification was not performed." };
 
   await input.registry.updateAuthenticatorCounter({ credentialId: passkey.credentialId, counter: verified.authenticationInfo.newCounter });
-  await input.enrollments.transition({ id: enrollment.id, from: "turnkey_authenticator_created", to: "login_verified", patch: { loginVerifiedAt: new Date().toISOString() } });
-  return { outcome: "verified" };
+  const advanced = await input.enrollments.transition({ id: enrollment.id, from: "turnkey_authenticator_created", to: "login_verified", patch: { loginVerifiedAt: new Date().toISOString() } });
+  if (advanced) return { outcome: "verified" };
+  // Lost the CAS — e.g. 2g-H: another passkey's removal of this pending
+  // credential moved the enrollment to 'removal_in_progress' first. Report the truth, never "verified".
+  const fresh = await input.enrollments.findById(enrollment.id);
+  return fresh?.state === "login_verified" || fresh?.state === "active" ? { outcome: "verified" } : { outcome: "rejected", reason: "This setup is no longer in progress." };
 }
 
 // ---------------------------------------------------------------- step 5: Proof B (Turnkey authorization BY the new authenticator)

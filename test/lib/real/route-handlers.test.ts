@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals } from "@/lib/real/server/registry";
 import { createInMemoryPasskeyRevocationStore } from "@/lib/real/server/passkey-revocation-attempts";
+import { createInMemoryBackupPasskeyEnrollmentStore } from "@/lib/real/server/backup-passkey-enrollment";
+import { createInMemoryChallengeStore } from "@/lib/real/server/challenge-store";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import type { PaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
@@ -188,9 +190,11 @@ describe("PATCH /api/real/account/passkeys/[credentialId] — rename (actual rou
     const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), REAL_SESSION_SECRET_VALUE);
     vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar(signedIn ? { [REAL_SESSION_COOKIE_NAME]: cookieValue } : {}) }));
     const revocations = createInMemoryPasskeyRevocationStore(registry);
+    const enrollments = createInMemoryBackupPasskeyEnrollmentStore(registry);
     vi.doMock("@/lib/real/server/runtime", () => ({
       getRealAccountRegistry: () => registry,
       getPasskeyRevocationStore: () => revocations,
+      getBackupPasskeyEnrollmentStore: () => enrollments,
     }));
     const { PATCH } = await import("@/app/api/real/account/passkeys/[credentialId]/route");
     const rename = (credentialId: string, body: string) =>
@@ -241,9 +245,11 @@ describe("PATCH /api/real/account/passkeys/[credentialId] — rename (actual rou
     }
 
     const { GET } = await import("@/app/api/real/account/passkeys/route");
-    const list = (await (await GET()).json()) as { passkeys: { credentialId: string }[] };
+    const list = (await (await GET()).json()) as { passkeys: { credentialId: string; walletAccess: string }[] };
 
     expect(list.passkeys.map((p) => p.credentialId).sort()).toEqual(["credential-1", "credential-pending", "credential-revoking"]);
+    // 2g-H: never optimistic — a pending row with no provable "never reached the wallet" is "uncertain", not harmless.
+    expect(Object.fromEntries(list.passkeys.map((p) => [p.credentialId, p.walletAccess]))).toEqual({ "credential-1": "granted", "credential-pending": "uncertain", "credential-revoking": "granted" });
     expect(await registry.findPasskeyByCredentialId("credential-revoked")).toMatchObject({ status: "revoked" });
   });
 
@@ -256,5 +262,68 @@ describe("PATCH /api/real/account/passkeys/[credentialId] — rename (actual rou
     const { GET } = await import("@/app/api/real/account/passkeys/route");
     const list = (await (await GET()).json()) as { passkeys: { credentialId: string; displayName: string | null }[] };
     expect(list.passkeys).toEqual([expect.objectContaining({ credentialId: "credential-1", displayName: "MacBook Touch ID" })]);
+  });
+});
+
+describe("2g-H: backup setup routes require a fresh step-up by the session credential (actual route.ts code)", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  async function setup({ signedIn = true } = {}) {
+    vi.resetModules();
+    stubRequiredConfigEnv();
+    const registry = await seedRegistry();
+    const challengeStore = createInMemoryChallengeStore();
+    const created: { challenge: string; purpose: string; context: unknown }[] = [];
+    const recordingChallengeStore = {
+      ...challengeStore,
+      create: async (input: Parameters<typeof challengeStore.create>[0]) => {
+        created.push({ challenge: input.challenge, purpose: input.purpose, context: input.context });
+        return challengeStore.create(input);
+      },
+    };
+    const enrollments = createInMemoryBackupPasskeyEnrollmentStore(registry);
+    const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), REAL_SESSION_SECRET_VALUE);
+    vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar(signedIn ? { [REAL_SESSION_COOKIE_NAME]: cookieValue } : {}) }));
+    vi.doMock("@/lib/real/server/runtime", () => ({
+      getRealAccountRegistry: () => registry,
+      getChallengeStore: () => recordingChallengeStore,
+      getBackupPasskeyEnrollmentStore: () => enrollments,
+    }));
+    const stepUpRoute = await import("@/app/api/real/account/passkeys/backup/step-up/options/route");
+    const optionsRoute = await import("@/app/api/real/account/passkeys/backup/options/route");
+    const options = (body?: string) => optionsRoute.POST(new Request("http://localhost/api/real/account/passkeys/backup/options", { method: "POST", headers: { "content-type": "application/json" }, body }));
+    return { enrollments, created, stepUp: () => stepUpRoute.POST(), options };
+  }
+
+  it("without a session: both routes are 401 and nothing is minted", async () => {
+    const { created, stepUp, options } = await setup({ signedIn: false });
+    expect((await stepUp()).status).toBe(401);
+    expect((await options(JSON.stringify({}))).status).toBe(401);
+    expect(created).toHaveLength(0);
+  });
+
+  it("step-up options are scoped to exactly the session credential, user-verification required, purpose backup_step_up", async () => {
+    const { created, stepUp } = await setup();
+    const response = await stepUp();
+    expect(response.status).toBe(200);
+    const { optionsJSON } = (await response.json()) as { optionsJSON: { allowCredentials: { id: string }[]; userVerification: string; challenge: string } };
+    expect(optionsJSON.allowCredentials.map((c) => c.id)).toEqual(["credential-1"]);
+    expect(optionsJSON.userVerification).toBe("required");
+    expect(created).toEqual([{ challenge: optionsJSON.challenge, purpose: "backup_step_up", context: { appUserId: "app-user-1", credentialId: "credential-1" } }]);
+  });
+
+  it("a cookie alone can't get a registration challenge: missing/garbage step-up is refused (403), nothing is created or minted", async () => {
+    const { enrollments, created, options } = await setup();
+    expect((await options()).status).toBe(400);
+    for (const body of [JSON.stringify({}), JSON.stringify({ stepUp: null }), JSON.stringify({ stepUp: { id: "credential-1", response: { clientDataJSON: "x" } } })]) {
+      const response = await options(body);
+      expect(response.status).toBe(403);
+      expect(await response.json()).not.toHaveProperty("optionsJSON");
+    }
+    expect(await enrollments.findActiveByAppUserId("app-user-1")).toBeNull();
+    expect(created.filter((c) => c.purpose === "backup_registration")).toHaveLength(0);
   });
 });

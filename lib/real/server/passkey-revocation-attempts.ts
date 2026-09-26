@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { REMOVABLE_PENDING_ENROLLMENT_STATES } from "./backup-passkey-enrollment";
 import { getInMemoryRegistryInternals, type RealAccountRegistry } from "./registry";
 
 /**
@@ -8,6 +9,19 @@ import { getInMemoryRegistryInternals, type RealAccountRegistry } from "./regist
  *
  *   authorization_needed -> dispatch_in_flight -> confirmed
  *   off-ramps: cancelled (only before dispatch), blocked (after dispatch)
+ *
+ * Removable targets: an 'active' mapped passkey; (2g-H) a 'pending' backup
+ * whose Turnkey authenticator is already CONFIRMED (enrollment
+ * turnkey_authenticator_created / login_verified) — it may already authorize
+ * at Turnkey, so setup never finishing must not strand it; or (2g-H) a
+ * 'revoking' target whose earlier removal BLOCKED, with nothing in flight — a
+ * new, user-authorized retry (fresh survivor stamp, fresh body, same
+ * authenticator id; never automatic, never back to 'active'). The authorizer
+ * is always a different 'active', mapped passkey.
+ *
+ * A pending target's enrollment moves to 'removal_in_progress' at dispatch
+ * (activation impossible, one-open-enrollment slot still HELD) and to
+ * 'removed' only with the confirmed deletion (slot freed).
  *
  * An app session alone can only create an 'authorization_needed' attempt —
  * the target stays 'active'. The target leaves 'active' only inside
@@ -65,7 +79,7 @@ export interface PasskeyRevocationStore {
    * Records an 'authorization_needed' attempt. Changes NO passkey status —
    * a cookie alone must never disable another credential. Requires:
    * authorizer != target; authorizer 'active' and Turnkey-mapped; target
-   * 'active' and mapped; no dispatched attempt for the target.
+   * removable (see above) and mapped; no dispatched attempt for the target.
    */
   prepare(input: { appUserId: string; targetCredentialId: string; authorizerCredentialId: string }): Promise<PrepareRevocationStoreResult>;
   findById(id: string): Promise<PasskeyRevocationAttempt | null>;
@@ -78,9 +92,13 @@ export interface PasskeyRevocationStore {
    * SELECT ... FOR UPDATE), run only after the survivor's stamp was
    * verified: re-reads target + survivor against committed reality, requires
    * the survivor still 'active', mapped, and != target, and the target still
-   * 'active' and mapped; then attempt 'authorization_needed' ->
-   * 'dispatch_in_flight' with the exact request recorded AND target
-   * 'active' -> 'revoking'. Null (nothing changed) if any check fails. Two
+   * removable and mapped; then attempt 'authorization_needed' ->
+   * 'dispatch_in_flight' with the exact request recorded, a pending target's
+   * enrollment -> 'removal_in_progress' (activation can never
+   * resurrect it — the slot stays held until confirmDeleted), AND target
+   * 'active'/'pending' -> 'revoking' (a retry's target already is). 2g-H:
+   * refused (null) if the signed body's hash equals any earlier attempt's for
+   * this target — a retry always needs fresh WebAuthn over fresh bytes. Null (nothing changed) if any check fails. Two
    * racing removals (A by B, B by A) can never both pass — at least one
    * mapped credential always stays 'active'. Commits before any Turnkey call.
    */
@@ -97,7 +115,9 @@ export interface PasskeyRevocationStore {
    * non-revoked primary, its oldest active passkey's role -> 'primary'. Role
    * is app metadata only (no Turnkey/owner/Safe/identity change), but the
    * three writes are the final app state together: never "confirmed" with
-   * the sole survivor still labeled backup. The caller must already hold
+   * the sole survivor still labeled backup. (2g-H) A removed-before-activation
+   * enrollment ('removal_in_progress') becomes 'removed' in the same step —
+   * the only point its one-open-enrollment slot frees. The caller must already hold
    * BOTH halves of the deletion evidence.
    */
   confirmDeleted(input: { id: string; turnkeyActivityStatus: string }): Promise<PasskeyRevocationAttempt | null>;
@@ -124,9 +144,41 @@ export function createInMemoryPasskeyRevocationStore(registry: RealAccountRegist
     return [...attempts.values()].some((a) => a.targetCredentialId === targetCredentialId && a.state === "dispatch_in_flight");
   }
 
+  const { backupEnrollmentMaps } = getInMemoryRegistryInternals(registry);
+
   function eligible(appUserId: string, credentialId: string) {
     const passkey = passkeysByCredentialId.get(credentialId);
     return passkey && passkey.appUserId === appUserId && passkey.status === "active" && passkey.turnkeyAuthenticatorId ? passkey : null;
+  }
+
+  /** The not-yet-activated enrollment whose pending credential already has a confirmed Turnkey authenticator. */
+  function removablePendingEnrollment(appUserId: string, credentialId: string) {
+    for (const map of backupEnrollmentMaps) {
+      for (const enrollment of map.values()) {
+        if (enrollment.appUserId === appUserId && enrollment.newCredentialId === credentialId && REMOVABLE_PENDING_ENROLLMENT_STATES.includes(enrollment.state)) return { map, enrollment };
+      }
+    }
+    return null;
+  }
+
+  function enrollmentFor(appUserId: string, credentialId: string, state: string) {
+    for (const map of backupEnrollmentMaps) {
+      for (const enrollment of map.values()) {
+        if (enrollment.appUserId === appUserId && enrollment.newCredentialId === credentialId && enrollment.state === state) return { map, enrollment };
+      }
+    }
+    return null;
+  }
+
+  function removableTarget(appUserId: string, credentialId: string) {
+    const active = eligible(appUserId, credentialId);
+    if (active) return active;
+    const passkey = passkeysByCredentialId.get(credentialId);
+    if (!passkey || passkey.appUserId !== appUserId || !passkey.turnkeyAuthenticatorId) return null;
+    if (passkey.status === "pending") return removablePendingEnrollment(appUserId, credentialId) ? passkey : null;
+    // Retry: a revoking target whose earlier removal blocked (prepare/beginDispatch separately require nothing in flight).
+    if (passkey.status === "revoking") return [...attempts.values()].some((a) => a.targetCredentialId === credentialId && a.state === "blocked") ? passkey : null;
+    return null;
   }
 
   /** Same rule as the Neon confirmDeleted: no non-revoked primary left -> the oldest active passkey becomes primary. */
@@ -148,7 +200,7 @@ export function createInMemoryPasskeyRevocationStore(registry: RealAccountRegist
       if (targetCredentialId === authorizerCredentialId) return { ok: false, reason: "same_credential" };
       if (!eligible(appUserId, authorizerCredentialId)) return { ok: false, reason: "authorizer_not_eligible" };
       if (hasDispatched(targetCredentialId)) return { ok: false, reason: "removal_in_progress" };
-      const target = eligible(appUserId, targetCredentialId);
+      const target = removableTarget(appUserId, targetCredentialId);
       if (!target) return { ok: false, reason: "target_not_removable" };
       const now = new Date().toISOString();
       const attempt: PasskeyRevocationAttempt = {
@@ -192,8 +244,14 @@ export function createInMemoryPasskeyRevocationStore(registry: RealAccountRegist
       const current = attempts.get(id);
       if (!current || current.state !== "authorization_needed" || current.targetCredentialId === current.authorizerCredentialId) return null;
       if (!eligible(current.appUserId, current.authorizerCredentialId) || hasDispatched(current.targetCredentialId)) return null;
-      const target = eligible(current.appUserId, current.targetCredentialId);
+      const target = removableTarget(current.appUserId, current.targetCredentialId);
       if (!target || target.turnkeyAuthenticatorId !== current.targetTurnkeyAuthenticatorId) return null;
+      // 2g-H: every attempt needs FRESH signed bytes — never a body an earlier attempt for this target already dispatched.
+      if ([...attempts.values()].some((a) => a.targetCredentialId === current.targetCredentialId && a.id !== current.id && a.turnkeyRequestBodySha256 !== null && a.turnkeyRequestBodySha256 === patch.turnkeyRequestBodySha256)) return null;
+      if (target.status === "pending") {
+        const pending = removablePendingEnrollment(current.appUserId, target.credentialId)!;
+        pending.map.set(pending.enrollment.id, { ...pending.enrollment, state: "removal_in_progress", turnkeyRequestStamp: null, updatedAt: new Date().toISOString() });
+      }
       passkeysByCredentialId.set(target.credentialId, { ...target, status: "revoking" });
       return save({ ...applyPatch(current, patch), state: "dispatch_in_flight" });
     },
@@ -210,6 +268,8 @@ export function createInMemoryPasskeyRevocationStore(registry: RealAccountRegist
       const target = passkeysByCredentialId.get(current.targetCredentialId);
       if (!target || target.status !== "revoking") return null;
       passkeysByCredentialId.set(target.credentialId, { ...target, status: "revoked" });
+      const removing = enrollmentFor(current.appUserId, target.credentialId, "removal_in_progress");
+      if (removing) removing.map.set(removing.enrollment.id, { ...removing.enrollment, state: "removed", updatedAt: new Date().toISOString() });
       const survivor = passkeyToPromote(current.appUserId);
       if (survivor) passkeysByCredentialId.set(survivor.credentialId, { ...survivor, role: "primary" });
       return save({ ...current, state: "confirmed", turnkeyActivityStatus, turnkeyRequestStamp: null });

@@ -16,6 +16,10 @@ export type PasskeyDisplayState =
   | "active"
   | "removal_not_authorized"
   | "setup_in_progress"
+  /** 2g-H: pending, but its wallet access was already granted — not harmless; removable. */
+  | "setup_incomplete"
+  /** 2g-H: pending after a create may have reached the wallet provider, outcome not confirmed — not harmless; under review. */
+  | "setup_needs_review"
   | "removal_submitted"
   | "removal_needs_review"
   | "removed";
@@ -23,18 +27,27 @@ export type PasskeyDisplayState =
 /**
  * 'revoking' only ever follows a verified, dispatched removal — an app
  * session alone can't produce it. An undispatched removal leaves the passkey
- * fully active.
+ * fully active. A pending passkey whose wallet access was already granted
+ * (`walletAccess: granted`) is "setup incomplete"; one whose create may have
+ * reached the wallet (`uncertain`, or no answer) is "setup needs review" — never
+ * "harmless in progress".
  */
-export function passkeyDisplayState(input: { status: PasskeyStatus; removalState: RemovalAttemptState | null }): PasskeyDisplayState {
+export type WalletAccess = "none" | "uncertain" | "granted";
+
+export function passkeyDisplayState(input: { status: PasskeyStatus; removalState: RemovalAttemptState | null; walletAccess?: WalletAccess }): PasskeyDisplayState {
   switch (input.status) {
     case "active":
       return input.removalState === "authorization_needed" ? "removal_not_authorized" : "active";
     case "pending":
-      return "setup_in_progress";
+      // Never optimistic: an unknown/missing answer is treated as "may authorize".
+      if (input.walletAccess === "granted") return "setup_incomplete";
+      if (input.walletAccess === "none") return "setup_in_progress";
+      return "setup_needs_review";
     case "revoked":
       return "removed";
     case "revoking":
-      return input.removalState === "blocked" ? "removal_needs_review" : "removal_submitted";
+      // Only an in-flight delete is "submitted"; a blocked one — or a retry not yet authorized — still needs review.
+      return input.removalState === "dispatch_in_flight" ? "removal_submitted" : "removal_needs_review";
   }
 }
 
@@ -50,6 +63,10 @@ export function passkeyStateLabel(state: PasskeyDisplayState): string {
       return "Active — removal not authorized yet";
     case "setup_in_progress":
       return "Setup in progress";
+    case "setup_incomplete":
+      return "Setup incomplete";
+    case "setup_needs_review":
+      return "Setup needs review";
     case "removal_submitted":
       return "Removal submitted — not yet confirmed";
     case "removal_needs_review":
@@ -61,6 +78,16 @@ export function passkeyStateLabel(state: PasskeyDisplayState): string {
 
 /** Shown once a removal is confirmed (both halves of the evidence) — the passkey then leaves the list. */
 export const PASSKEY_REMOVED_MESSAGE = "Passkey removed.";
+
+/** 2g-H: a pending passkey that already has wallet access. Plain language — no Turnkey/authenticator jargon. */
+export const SETUP_INCOMPLETE_NOTE =
+  "Setup isn't finished, but this passkey may already be able to approve payments on this account. If you can't finish setting it up on that device, remove it.";
+
+/** 2g-H: a pending passkey whose setup may or may not have reached the wallet. */
+export const SETUP_NEEDS_REVIEW_NOTE = "We couldn't confirm whether this setup went through. This passkey may already be able to approve payments on this account.";
+
+/** 2g-H: the account-level explanation while a not-yet-finished backup is being removed. */
+export const BACKUP_REMOVAL_PENDING_NOTE = "A backup passkey that wasn't finished is being removed. You can add another one once the removal is confirmed.";
 
 /** Shown for every state where app sign-in is off but Turnkey removal isn't confirmed. */
 export const MAY_STILL_AUTHORIZE_NOTE = "This passkey may still be able to authorize this account until removal is confirmed.";

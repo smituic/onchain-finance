@@ -5,7 +5,7 @@ import { readPasskeySession } from "@/app/api/real/account/passkeys/session";
 
 /**
  * Returns 200 with an explicit { outcome, reason } for every legitimate
- * state (confirmed / pending / failed_retryable / blocked) — the client
+ * state (confirmed / pending / blocked) — the client
  * branches on `outcome`. Only a refused request ("rejected") is non-2xx.
 *
  * Accepts the browser's child-stamped createAuthenticators request. The
