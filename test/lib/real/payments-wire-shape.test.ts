@@ -248,12 +248,15 @@ describe("live incident regression: prepared-fields wire shape must survive the 
 
     // Simulates a page reload: a brand-new request that only calls
     // /api/real/payments/latest — no prepare, no signing, no submit.
-    const latest = await resolveLatestPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore });
+    const fixedNowMs = 1_950_000_000_000;
+    const latest = await resolveLatestPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, now: () => fixedNowMs });
     expect(latest.outcome).toBe("ok");
     if (latest.outcome !== "ok") return;
     expect(latest.attempt.state).toBe("awaiting_authorization");
     expect(latest.subOrganizationId).toBe("sub-org-1");
     expect(latest.authorizingCredentialId).toBe("credential-1");
+    // Part E (S2): the server's own wall clock, for the client's advisory offset.
+    expect(latest.serverNowSeconds).toBe(Math.floor(fixedNowMs / 1000));
 
     const wireAttempt = throughJson(latest.attempt);
     expect(wireAttempt.prepared?.sender).toBeTruthy();

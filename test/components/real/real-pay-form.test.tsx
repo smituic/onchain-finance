@@ -76,6 +76,8 @@ describe("RealPayForm", () => {
       authorizingCredentialId: null,
       pendingSubmission: null,
       isAuthorizing: false,
+      clockOffsetSeconds: 0,
+      isAttemptPastValidity: false,
       error: null,
     });
     signPreparedPaymentMock.mockReset();
@@ -118,17 +120,27 @@ describe("RealPayForm", () => {
     expect(signPreparedPaymentMock).not.toHaveBeenCalled();
   });
 
-  it("cancelling the passkey prompt returns cleanly to the review screen — no submit call, no balance mutation", async () => {
+  it("S2: dismissing the passkey prompt stays on the SAME pending payment (full recipient, warning, Continue, Cancel payment) — no fresh compose/Edit path, no submit", async () => {
     useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
     let submitCalled = false;
+    let cancelCalled = false;
     routeFetch((url, method, body) => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
-        return jsonResponse(200, { attempt: attemptFixture({ recipient: (body as { recipient: string }).recipient }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" });
+        return jsonResponse(200, {
+          attempt: attemptFixture({ recipient: (body as { recipient: string }).recipient }),
+          subOrganizationId: "sub-org-1",
+          authorizingCredentialId: "credential-1",
+          serverNowSeconds: 1_900_000_000,
+        });
       }
       if (url.endsWith("/api/real/payments/submit") && method === "POST") {
         submitCalled = true;
         return jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }) });
+      }
+      if (url.endsWith("/api/real/payments/payment-attempt-1/cancel") && method === "POST") {
+        cancelCalled = true;
+        return jsonResponse(200, { attempt: attemptFixture({ state: "cancelled" }) });
       }
       return null;
     });
@@ -145,9 +157,20 @@ describe("RealPayForm", () => {
     await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
-    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
-    expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: "payment-attempt-1", state: "awaiting_authorization" } });
+    expect(screen.getByText(RECIPIENT, { exact: false })).toBeInTheDocument();
+    expect(screen.getByText(/Only continue if you started this payment/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-form")).not.toBeInTheDocument();
     expect(submitCalled).toBe(false);
+
+    // Only a real, successful cancel frees the compose form.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(cancelCalled).toBe(true);
+    expect(useRealPaymentStore.getState().attempt).toBeNull();
   });
 
   it("a confirmed payment shows 'Sent' and refreshes the real Cash balance", async () => {
@@ -334,6 +357,102 @@ describe("RealPayForm", () => {
     await waitFor(() => expect(submitBodies).toHaveLength(2));
     expect(submitBodies[1]).toEqual(submitBodies[0]);
     expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("Part C (S2): the resume screen shows the FULL recipient address and a stolen-cookie warning, not only a 4+4 shortened form", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 });
+      }
+      return null;
+    });
+
+    render(<RealPayForm />);
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    expect(screen.getByText(RECIPIENT, { exact: false })).toBeInTheDocument();
+    expect(screen.getByText(/Only continue if you started this payment/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeInTheDocument();
+  });
+
+  it("Part B (S2): an already-expired awaiting_authorization attempt auto-reconciles and shows the expiry-confirming copy, not the ordinary resume prompt", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    const validUntil = 1_900_000_600;
+    let statusCallCount = 0;
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, {
+          attempt: attemptFixture({ prepared: { ...PREPARED_FIELDS, validUntil } }),
+          subOrganizationId: "sub-org-1",
+          authorizingCredentialId: "credential-1",
+          serverNowSeconds: validUntil + 100,
+        });
+      }
+      if (url.includes("/status") && method === "GET") {
+        statusCallCount += 1;
+        return jsonResponse(200, {
+          attempt: attemptFixture({ state: "failed", failureReason: "This payment expired before it was included on-chain. No money moved.", prepared: null }),
+          serverNowSeconds: validUntil + 100,
+        });
+      }
+      return null;
+    });
+
+    render(<RealPayForm />);
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-failed")).toBeInTheDocument());
+    expect(statusCallCount).toBe(1);
+    expect(screen.getByText(/No money moved/)).toBeInTheDocument();
+  });
+
+  it("S2: an expired attempt still awaiting finality shows neutral pre-proof copy — never 'No money moved' or 'nothing moved'", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    const validUntil = 1_900_000_600;
+    const stillPending = () =>
+      jsonResponse(200, {
+        attempt: attemptFixture({ prepared: { ...PREPARED_FIELDS, validUntil } }),
+        subOrganizationId: "sub-org-1",
+        authorizingCredentialId: "credential-1",
+        serverNowSeconds: validUntil + 100,
+      });
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") return stillPending();
+      if (url.includes("/status") && method === "GET") return stillPending(); // finality hasn't caught up yet
+      return null;
+    });
+
+    render(<RealPayForm />);
+
+    await waitFor(() => expect(screen.getByText(/approval window expired/)).toBeInTheDocument());
+    expect(screen.getByText(/waiting for final confirmation before showing the final result/)).toBeInTheDocument();
+    expect(screen.queryByText(/no money moved/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/nothing moved/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel payment" })).toBeInTheDocument();
+    act(() => useRealPaymentStore.getState().reset()); // clear the pending follow-up timer
+  });
+
+  it("Part B (S2): a still-valid awaiting_authorization attempt shows the ordinary resume prompt with Continue, not the expiry copy", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    const validUntil = 1_900_000_600;
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, {
+          attempt: attemptFixture({ prepared: { ...PREPARED_FIELDS, validUntil } }),
+          subOrganizationId: "sub-org-1",
+          authorizingCredentialId: "credential-1",
+          serverNowSeconds: validUntil - 500,
+        });
+      }
+      return null;
+    });
+
+    render(<RealPayForm />);
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Continue" })).toBeInTheDocument();
+    expect(screen.queryByText(/confirming nothing moved/)).not.toBeInTheDocument();
   });
 
   it("Slice S1: a prepare response with no bound passkey never reaches the signing call — cancel-only", async () => {

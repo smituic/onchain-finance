@@ -158,6 +158,40 @@ describe("resolvePaymentStatus", () => {
     if (outcome.outcome !== "ok") return;
     expect(outcome.attempt.state).toBe("submitted");
   });
+
+  it("Part E (S2): returns serverNowSeconds from this server's own wall clock", async () => {
+    fetchUserOperationReceiptMock.mockReset().mockResolvedValueOnce(null);
+    const { registry, paymentStore, attemptId, cookieValue } = await seedSubmittedAttempt();
+    const fixedNowMs = 1_950_000_000_000;
+
+    const outcome = await resolvePaymentStatus({
+      cookieValue,
+      sessionSecret: SECRET,
+      registry,
+      paymentStore,
+      pimlicoApiKey: "pim_test_key",
+      publicClient: createFakeEntryPoint({}).reader,
+      attemptId,
+      now: () => fixedNowMs,
+    });
+
+    expect(outcome).toMatchObject({ outcome: "ok", serverNowSeconds: Math.floor(fixedNowMs / 1000) });
+  });
+
+  it("a stale failure_reason from an earlier 'unknown' resolution is cleared once the same attempt is later proven confirmed", async () => {
+    fetchUserOperationReceiptMock.mockReset();
+    const { paymentStore, registry, attemptId, cookieValue } = await seedSubmittedAttempt({ state: "unknown" });
+    // Simulate the earlier ambiguous-submit patch that left a failure_reason
+    // on the row (server/payments.ts's resolveSubmitPayment "unknown" branch).
+    await paymentStore.transition({ id: attemptId, from: "unknown", to: "unknown", patch: { failureReason: "No definitive result was received after the operation was signed and dispatched." } });
+    fetchUserOperationReceiptMock.mockResolvedValueOnce(receipt());
+
+    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId });
+
+    expect(outcome.outcome).toBe("ok");
+    if (outcome.outcome !== "ok") return;
+    expect(outcome.attempt).toMatchObject({ state: "confirmed", failureReason: null });
+  });
 });
 
 describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
@@ -194,10 +228,65 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
       }
     });
 
-    it("unconsumed at a FINALIZED block past validUntil => provably never includable", async () => {
+    const nonceReads = (fake: ReturnType<typeof createFakeEntryPoint>) =>
+      fake.calls.filter((c) => c.method === "readContract").map((c) => c.args as { args: [string, bigint]; blockNumber?: bigint; blockTag?: string });
+
+    it("S2-A: finalized timestamp > validUntil and getNonce at blockTag 'finalized' returns this exact key + sequence => expired_unincluded", async () => {
       const fake = createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0) });
       expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "expired_unincluded" });
-      expect(fake.calls.some((c) => c.method === "readContract" && (c.args as { blockNumber: bigint }).blockNumber === afterExpiry.finalized.number)).toBe(true);
+      expect(nonceReads(fake).some((r) => r.blockTag === "finalized")).toBe(true);
+    });
+
+    it("S2-B: latest looks unconsumed but FINALIZED state shows the lane consumed => never expired_unincluded (latest is not the proof)", async () => {
+      const fake = createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(1) });
+      expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "unresolved" });
+    });
+
+    it("S2-C: getNonce at blockTag 'finalized' throwing (unsupported tag / RPC error) propagates — never expired_unincluded", async () => {
+      const fake = createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), failFinalizedStateReads: true });
+      await expect(readUserOperationChainState(fake.reader, chainInput)).rejects.toThrow();
+    });
+
+    it("S2-D: a getNonce of 0n for our NON-zero key (key decodes to 0, sequence 0) is unresolved, not 'unconsumed'", async () => {
+      expect(KEY).not.toBe(BigInt(0));
+      for (const rawNonce of [{ finalized: BigInt(0) }, { latest: BigInt(0) }]) {
+        const fake = createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0), rawNonce });
+        expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "unresolved" });
+      }
+    });
+
+    it("S2-E: a packed value whose KEY differs but whose low 64-bit sequence matches is unresolved", async () => {
+      const wrongKey = (KEY + BigInt(1)) << BigInt(64); // sequence 0, same as ours
+      for (const rawNonce of [{ finalized: wrongKey }, { latest: wrongKey }]) {
+        const fake = createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0), rawNonce });
+        expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "unresolved" });
+      }
+    });
+
+    it("S2-E': a malformed getNonce value (non-bigint, negative, > uint256) is unresolved", async () => {
+      for (const bad of ["0", 0, null, BigInt(-1), BigInt(1) << BigInt(256)]) {
+        const fake = createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0), rawNonce: { finalized: bad } });
+        expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "unresolved" });
+      }
+    });
+
+    it("S2-F: finalized.timestamp exactly == validUntil is unresolved (the op is still valid AT validUntil)", async () => {
+      const fake = createFakeEntryPoint({ ...afterExpiry, finalized: { number: BigInt(47_000_600), timestamp: BigInt(VALID_UNTIL) }, latestSequence: BigInt(0), finalizedSequence: BigInt(0) });
+      expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "unresolved" });
+      expect(nonceReads(fake).some((r) => r.blockTag === "finalized")).toBe(false);
+    });
+
+    it("S2-G: another nonce key's lane advancing (latest or finalized) does not affect ours — every read requests OUR key", async () => {
+      const lanes = new Map([[KEY + BigInt(7), { latest: BigInt(9), finalized: BigInt(9) }]]);
+      const fake = createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0), lanes });
+      expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "expired_unincluded" });
+      expect(nonceReads(fake).every((r) => r.args[1] === KEY)).toBe(true);
+    });
+
+    it("S2-H: no numbered (historical) block read is ever required — every getNonce uses a block TAG", async () => {
+      const fake = createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0), failNumberedReads: true });
+      expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "expired_unincluded" });
+      expect(nonceReads(fake).every((r) => r.blockNumber === undefined && (r.blockTag === "latest" || r.blockTag === "finalized"))).toBe(true);
     });
 
     it("latest past validUntil is NOT enough — until the finalized block is past it, the answer stays unresolved (reorg-safe)", async () => {
@@ -251,6 +340,13 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
       const ctx = await seedSubmittedAttempt({ window });
       const outcome = await status(ctx, createFakeEntryPoint({ ...beforeFinalizedExpiry, latestSequence: BigInt(0) }).reader);
       expect(outcome.outcome === "ok" && outcome.attempt.state).toBe("submitted");
+    });
+
+    it("S2-C: a provider that can't serve getNonce at 'finalized' leaves the row unchanged — never 'No money moved'", async () => {
+      fetchUserOperationReceiptMock.mockReset().mockResolvedValue(null);
+      const ctx = await seedSubmittedAttempt({ state: "submitting", window });
+      const outcome = await status(ctx, createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), failFinalizedStateReads: true }).reader);
+      expect(outcome.outcome === "ok" && outcome.attempt).toMatchObject({ state: "submitting", failureReason: null });
     });
 
     it("any RPC failure fails closed: unchanged, no upstream text surfaced", async () => {
@@ -314,6 +410,18 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
         await statusAt(legacy, fake.reader, VALID_UNTIL + 3_000);
         expect((await legacy.paymentStore.findById(legacy.attemptId))?.state).toBe("awaiting_authorization");
         expect(fake.calls).toHaveLength(0);
+      });
+
+      it("a legacy row (no valid_until) is never offered for a new signing ceremony, even after polling /status well past when a normal window would have expired", async () => {
+        const legacy = await seedSubmittedAttempt({ state: "awaiting_authorization" });
+        const outcome = await statusAt(legacy, createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0) }).reader, VALID_UNTIL + 3_000);
+        expect(outcome.outcome).toBe("ok");
+        if (outcome.outcome !== "ok") return;
+        expect(outcome.attempt.state).toBe("awaiting_authorization");
+        // toPublicAttempt's hasPreparedFields requires validUntil !== null —
+        // a legacy row can never carry `prepared` on the wire, so the client
+        // can never reconstruct a SafeOp to sign for it, at any wall-clock time.
+        expect(outcome.attempt.prepared).toBeNull();
       });
 
       it("a concurrent submit that already moved the row on wins: the stale CAS changes nothing", async () => {

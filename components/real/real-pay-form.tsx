@@ -36,6 +36,7 @@ export function RealPayForm() {
   const recipientInput = useRealPaymentStore((s) => s.recipientInput);
   const amountInput = useRealPaymentStore((s) => s.amountInput);
   const attempt = useRealPaymentStore((s) => s.attempt);
+  const isPastValidity = useRealPaymentStore((s) => s.isAttemptPastValidity);
   const isAuthorizing = useRealPaymentStore((s) => s.isAuthorizing);
   const error = useRealPaymentStore((s) => s.error);
   const init = useRealPaymentStore((s) => s.init);
@@ -183,18 +184,31 @@ export function RealPayForm() {
     return (
       <div className="flex flex-col gap-4" data-testid="real-pay-resume">
         <div className="flex flex-col gap-2 rounded-xl bg-muted/60 px-4 py-3.5">
-          <p className="text-sm font-medium">A payment is waiting for your approval</p>
+          <p className="text-sm font-medium">{isPastValidity ? "This payment’s approval window expired" : "A payment is waiting for your approval"}</p>
           {attempt ? (
-            <p className="text-sm text-muted-foreground">
-              {formatAmount(attempt.amountBaseUnits)} to {short(attempt.recipient)}
-            </p>
+            <>
+              <p className="text-sm text-muted-foreground">{formatAmount(attempt.amountBaseUnits)}</p>
+              {/* Part C: the full address, not only a 4+4 shortened form — a
+                  stolen-session-cookie payment can be PREPARED but not
+                  authorized, so the real risk is the legitimate user later
+                  approving something they didn't start without a clear look
+                  at exactly where it's going. */}
+              <p className="break-all font-mono text-xs text-muted-foreground">To: {attempt.recipient}</p>
+            </>
           ) : null}
+          {isPastValidity ? (
+            <p className="text-xs text-muted-foreground">We&apos;re waiting for final confirmation before showing the final result. This can take a while.</p>
+          ) : (
+            <p className="text-xs font-medium text-destructive">Only continue if you started this payment.</p>
+          )}
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
         <div className="flex flex-col gap-2">
-          <Button size="lg" className="h-12 w-full" onClick={() => void resumeAuthorization()}>
-            Continue
-          </Button>
+          {isPastValidity ? null : (
+            <Button size="lg" className="h-12 w-full" onClick={() => void resumeAuthorization()}>
+              Continue
+            </Button>
+          )}
           <Button variant="ghost" className="h-11 w-full" onClick={() => void cancel()}>
             Cancel payment
           </Button>
@@ -207,8 +221,10 @@ export function RealPayForm() {
     return (
       <div className="flex flex-col gap-4" data-testid="real-pay-stranded">
         <div className="flex flex-col gap-1 rounded-xl bg-muted/60 px-4 py-3.5">
-          <p className="text-sm font-medium">This payment didn&apos;t go through</p>
-          <p className="text-sm text-muted-foreground">It was never sent. You can safely cancel it and try again.</p>
+          <p className="text-sm font-medium">{isPastValidity ? "This payment’s approval window expired" : "This payment didn’t go through"}</p>
+          <p className="text-sm text-muted-foreground">
+            {isPastValidity ? "We’re waiting for final confirmation before showing the final result. This can take a while." : "It was never sent. You can safely cancel it and try again."}
+          </p>
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
         <Button variant="outline" className="h-11 w-full" onClick={() => void cancel()}>

@@ -423,6 +423,32 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
     expect(await store.findById(reserved.attempt.id)).toMatchObject({ validUntil: 1_900_000_600, prepareBlockNumber: "47265792" });
   });
 
+  it("S2: an explicit failureReason: null clears a stale failure_reason on unknown -> confirmed; an omitted key leaves it alone", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("clear-reason");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+
+    const reserved = await store.reserve(reserveInput(userId));
+    if (!reserved.ok) throw new Error("reserve failed");
+    await store.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization" });
+    await store.transition({ id: reserved.attempt.id, from: "awaiting_authorization", to: "signed" });
+    await store.transition({ id: reserved.attempt.id, from: "signed", to: "submitting" });
+    await store.transition({ id: reserved.attempt.id, from: "submitting", to: "unknown", patch: { failureReason: "smoke: ambiguous send" } });
+
+    // Omitted key: unchanged (a self-transition, the CAS still applies).
+    const untouched = await store.transition({ id: reserved.attempt.id, from: "unknown", to: "unknown", patch: { transactionHash: null } });
+    expect(untouched?.failureReason).toBe("smoke: ambiguous send");
+
+    const confirmed = await store.transition({ id: reserved.attempt.id, from: "unknown", to: "confirmed", patch: { transactionHash: `0x${"ab".repeat(32)}`, failureReason: null } });
+    expect(confirmed).toMatchObject({ state: "confirmed", failureReason: null });
+    const rows = (await sql`SELECT failure_reason FROM payment_attempts WHERE id = ${reserved.attempt.id}`) as { failure_reason: string | null }[];
+    expect(rows[0]?.failure_reason).toBeNull();
+  });
+
   it("G/H: CAS state transitions and expected_user_operation_hash persistence work against the real database", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { neon } = await import("@neondatabase/serverless");

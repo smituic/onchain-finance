@@ -58,10 +58,20 @@ export type UserOperationChainState =
  *   only valid at timestamps <= validUntil = prepare timestamp + window, and
  *   block timestamps strictly increase by >= 1 s, so it can only sit in
  *   [prepareBlock, prepareBlock + window].
- * - NEVER INCLUDABLE: at the finalized block — which cannot be reorged — the
- *   timestamp is past validUntil and the nonce is still unconsumed, so no
- *   current or future block can include it. `latest` is deliberately NOT
- *   enough for this negative conclusion.
+ * - NEVER INCLUDABLE: the finalized block's timestamp is past validUntil
+ *   AND getNonce evaluated at blockTag "finalized" still returns this exact
+ *   key at this exact sequence. Both facts come from finalized state, which
+ *   cannot be reorged; `latest` state is never the proof of non-inclusion
+ *   (a latest read and a finalized header are separate RPC observations and
+ *   need not describe one coherent chain). The header and the state read are
+ *   also two observations, but finality only advances: a finalized state at
+ *   least as new as the header also has timestamp > validUntil. The state
+ *   read uses the "finalized" TAG, never a numbered block, so the proof never
+ *   needs a provider to serve arbitrary historical state.
+ *
+ * Every getNonce value is validated as a packed (key << 64 | sequence) nonce
+ * whose key is exactly the one requested before its sequence is trusted; a
+ * wrong key, a non-bigint, or an out-of-range value is unresolved.
  *
  * Any RPC error propagates; callers treat a throw as unresolved.
  */
@@ -70,13 +80,18 @@ export async function readUserOperationChainState(
   input: { sender: Address; nonce: bigint; userOperationHash: Hash; prepareBlockNumber: bigint; validUntil: number },
 ): Promise<UserOperationChainState> {
   const { key, sequence } = splitUserOperationNonce(input.nonce);
-  const readSequence = async (blockNumber: bigint) => {
-    const onChain = await client.readContract({ address: REAL_SAFE.entryPoint.address, abi: ENTRY_POINT_ABI, functionName: "getNonce", args: [input.sender, key], blockNumber });
-    return splitUserOperationNonce(onChain).sequence;
+  const readSequence = async (blockTag: "latest" | "finalized"): Promise<bigint | null> => {
+    const onChain: unknown = await client.readContract({ address: REAL_SAFE.entryPoint.address, abi: ENTRY_POINT_ABI, functionName: "getNonce", args: [input.sender, key], blockTag });
+    if (typeof onChain !== "bigint" || onChain < BigInt(0) || onChain >= BigInt(1) << BigInt(256)) return null;
+    const decoded = splitUserOperationNonce(onChain);
+    return decoded.key === key ? decoded.sequence : null;
   };
 
+  // Latest state is used only for inclusion DISCOVERY (the matching event is
+  // the proof); it never authorizes expired_unincluded.
   const latest = await readLatestBlockClock(client);
-  const latestSequence = await readSequence(latest.number);
+  const latestSequence = await readSequence("latest");
+  if (latestSequence === null) return { kind: "unresolved" };
 
   if (latestSequence > sequence) {
     const lastPossibleBlock = input.prepareBlockNumber + BigInt(SAFE_OP_VALIDITY_SECONDS);
@@ -97,5 +112,6 @@ export async function readUserOperationChainState(
 
   const finalized = await client.getBlock({ blockTag: "finalized" });
   if (finalized.timestamp <= BigInt(input.validUntil)) return { kind: "unresolved" };
-  return (await readSequence(finalized.number)) === sequence ? { kind: "expired_unincluded" } : { kind: "unresolved" };
+  const finalizedSequence = await readSequence("finalized");
+  return finalizedSequence === sequence ? { kind: "expired_unincluded" } : { kind: "unresolved" };
 }

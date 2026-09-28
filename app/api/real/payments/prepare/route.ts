@@ -53,7 +53,7 @@ export async function POST(request: Request) {
       case "prepare_failed":
         return jsonError(outcome.reason, 502);
       case "ready":
-        return Response.json({ attempt: outcome.attempt, subOrganizationId: outcome.subOrganizationId, authorizingCredentialId: outcome.authorizingCredentialId });
+        return Response.json({ attempt: outcome.attempt, subOrganizationId: outcome.subOrganizationId, authorizingCredentialId: outcome.authorizingCredentialId, serverNowSeconds: outcome.serverNowSeconds });
     }
   } catch {
     return jsonInternalError();

@@ -163,7 +163,8 @@ export type PreparePaymentOutcome =
   | { outcome: "quota_exceeded" }
   | { outcome: "payment_in_progress" }
   | { outcome: "prepare_failed"; reason: string }
-  | { outcome: "ready"; attempt: PublicPaymentAttempt; subOrganizationId: string; authorizingCredentialId: string };
+  /** serverNowSeconds: see PaymentStatusOutcome's doc comment — same server wall clock, same advisory-only purpose. */
+  | { outcome: "ready"; attempt: PublicPaymentAttempt; subOrganizationId: string; authorizingCredentialId: string; serverNowSeconds: number };
 
 /**
  * The one place a payment intent is validated and turned into a sponsored,
@@ -194,6 +195,8 @@ export async function resolvePreparePayment(input: {
   pimlicoApiKey: string;
   recipientInput: unknown;
   amountBaseUnitsInput: unknown;
+  /** Unix ms. Injectable for tests — the server's own wall clock, same one resolveSubmitPayment's dispatch-margin check uses. */
+  now?: () => number;
 }): Promise<PreparePaymentOutcome> {
   const authenticated = await readAuthenticatedRealAccount({
     cookieValue: input.cookieValue,
@@ -303,7 +306,13 @@ export async function resolvePreparePayment(input: {
     return { outcome: "prepare_failed", reason: "Could not persist the prepared payment." };
   }
 
-  return { outcome: "ready", attempt: toPublicAttempt(updated), subOrganizationId: authenticated.account.subOrganizationId, authorizingCredentialId: authenticated.passkey.credentialId };
+  return {
+    outcome: "ready",
+    attempt: toPublicAttempt(updated),
+    subOrganizationId: authenticated.account.subOrganizationId,
+    authorizingCredentialId: authenticated.passkey.credentialId,
+    serverNowSeconds: Math.floor((input.now ?? Date.now)() / 1000),
+  };
 }
 
 export type SubmitPaymentOutcome =
@@ -564,7 +573,17 @@ export async function resolveSubmitPayment(input: {
   return { outcome: "submitted", attempt: toPublicAttempt(updated ?? submitting) };
 }
 
-export type PaymentStatusOutcome = { outcome: "unauthenticated" } | { outcome: "not_found" } | { outcome: "ok"; attempt: PublicPaymentAttempt };
+export type PaymentStatusOutcome =
+  | { outcome: "unauthenticated" }
+  | { outcome: "not_found" }
+  /**
+   * Part E (S2): serverNowSeconds is this server's OWN wall clock
+   * (Date.now(), the same clock resolveSubmitPayment's dispatch-margin check
+   * is judged against) — never the chain's clock. It lets the client
+   * compute an advisory local-clock offset for its own pre-signing UX gate;
+   * the server remains independently authoritative at /submit regardless.
+   */
+  | { outcome: "ok"; attempt: PublicPaymentAttempt; serverNowSeconds: number };
 
 const RECONCILABLE_STATES: readonly PaymentAttemptState[] = ["submitting", "submitted", "unknown"];
 
@@ -617,20 +636,21 @@ export async function resolvePaymentStatus(input: {
   const attempt = await input.paymentStore.findById(input.attemptId);
   if (!attempt || attempt.appUserId !== authenticated.account.appUserId) return { outcome: "not_found" };
 
+  const nowSeconds = Math.floor((input.now ?? Date.now)() / 1000);
+
   if (PRE_DISPATCH_EXPIRABLE_STATES.includes(attempt.state)) {
-    const nowSeconds = Math.floor((input.now ?? Date.now)() / 1000);
-    if (attempt.validUntil === null || nowSeconds <= attempt.validUntil) return { outcome: "ok", attempt: toPublicAttempt(attempt) };
+    if (attempt.validUntil === null || nowSeconds <= attempt.validUntil) return { outcome: "ok", attempt: toPublicAttempt(attempt), serverNowSeconds: nowSeconds };
     const resolution = await reconcileAgainstEntryPoint(input.publicClient, attempt);
-    if (!resolution) return { outcome: "ok", attempt: toPublicAttempt(attempt) };
+    if (!resolution) return { outcome: "ok", attempt: toPublicAttempt(attempt), serverNowSeconds: nowSeconds };
     // CAS from the row's own state: a concurrent submit (awaiting -> signed
     // -> submitting) or cancel that got there first simply wins, and submit's
     // own expiry check refuses to dispatch past validUntil anyway.
     const updated = await input.paymentStore.transition({ id: attempt.id, from: attempt.state, to: resolution.to, patch: resolution.patch });
-    return { outcome: "ok", attempt: toPublicAttempt(updated ?? attempt) };
+    return { outcome: "ok", attempt: toPublicAttempt(updated ?? attempt), serverNowSeconds: nowSeconds };
   }
 
   if (!RECONCILABLE_STATES.includes(attempt.state) || !attempt.expectedUserOperationHash) {
-    return { outcome: "ok", attempt: toPublicAttempt(attempt) };
+    return { outcome: "ok", attempt: toPublicAttempt(attempt), serverNowSeconds: nowSeconds };
   }
 
   const receipt = await fetchUserOperationReceipt({
@@ -645,16 +665,21 @@ export async function resolvePaymentStatus(input: {
 
   let resolution: { to: PaymentAttemptState; patch: PaymentAttemptPatch } | null = null;
   if (classification.outcome === "confirmed") {
-    resolution = { to: "confirmed", patch: { transactionHash: classification.transactionHash } };
+    // Explicitly clears any failure_reason a prior "unknown" resolution left
+    // behind (e.g. an earlier submit-time send ambiguity) — a row that ends
+    // up confirmed must not carry stale failure metadata. See neon-store.ts's
+    // has()-guarded CASE WHEN: an explicit null here is what makes this
+    // clear, as opposed to merely omitting the field.
+    resolution = { to: "confirmed", patch: { transactionHash: classification.transactionHash, failureReason: null } };
   } else if (classification.outcome === "failed") {
     resolution = { to: "failed", patch: { transactionHash: classification.transactionHash, failureReason: SAFE_REVERTED } };
   } else {
     resolution = await reconcileAgainstEntryPoint(input.publicClient, attempt);
   }
 
-  if (!resolution) return { outcome: "ok", attempt: toPublicAttempt(attempt) };
+  if (!resolution) return { outcome: "ok", attempt: toPublicAttempt(attempt), serverNowSeconds: nowSeconds };
   const updated = await input.paymentStore.transition({ id: attempt.id, from: attempt.state, to: resolution.to, patch: resolution.patch });
-  return { outcome: "ok", attempt: toPublicAttempt(updated ?? attempt) };
+  return { outcome: "ok", attempt: toPublicAttempt(updated ?? attempt), serverNowSeconds: nowSeconds };
 }
 
 /**
@@ -679,8 +704,9 @@ async function reconcileAgainstEntryPoint(client: EntryPointReader, attempt: Pay
       validUntil: attempt.validUntil,
     });
     if (state.kind === "included") {
+      // Same explicit-clear reasoning as resolvePaymentStatus's bundler-receipt branch above.
       return state.success
-        ? { to: "confirmed", patch: { transactionHash: state.transactionHash } }
+        ? { to: "confirmed", patch: { transactionHash: state.transactionHash, failureReason: null } }
         : { to: "failed", patch: { transactionHash: state.transactionHash, failureReason: SAFE_REVERTED } };
     }
     if (state.kind === "expired_unincluded") return { to: "failed", patch: { failureReason: SAFE_EXPIRED_UNINCLUDED } };
@@ -693,7 +719,8 @@ async function reconcileAgainstEntryPoint(client: EntryPointReader, attempt: Pay
 export type LatestPaymentOutcome =
   | { outcome: "unauthenticated" }
   | { outcome: "none" }
-  | { outcome: "ok"; attempt: PublicPaymentAttempt; subOrganizationId: string | null; authorizingCredentialId: string | null };
+  /** serverNowSeconds: see PaymentStatusOutcome's doc comment — same server wall clock, same advisory-only purpose. */
+  | { outcome: "ok"; attempt: PublicPaymentAttempt; subOrganizationId: string | null; authorizingCredentialId: string | null; serverNowSeconds: number };
 
 /**
  * Reload/restore: returns the most recent attempt (any state) for the
@@ -709,6 +736,8 @@ export async function resolveLatestPayment(input: {
   sessionSecret: string;
   registry: RealAccountRegistry;
   paymentStore: PaymentAttemptStore;
+  /** Unix ms. Injectable for tests — the server's own wall clock, same one resolveSubmitPayment's dispatch-margin check uses. */
+  now?: () => number;
 }): Promise<LatestPaymentOutcome> {
   const authenticated = await readAuthenticatedRealAccount({
     cookieValue: input.cookieValue,
@@ -727,6 +756,7 @@ export async function resolveLatestPayment(input: {
     attempt: toPublicAttempt(attempt),
     subOrganizationId: resumable ? authenticated.account.subOrganizationId : null,
     authorizingCredentialId: resumable ? attempt.authorizingCredentialId : null,
+    serverNowSeconds: Math.floor((input.now ?? Date.now)() / 1000),
   };
 }
 

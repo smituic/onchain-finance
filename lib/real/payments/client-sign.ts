@@ -19,6 +19,17 @@ export type SignPreparedPaymentInput = {
   rpcUrl: string;
   /** Slice S1: the server-bound passkey for this payment (from /prepare or /latest) — the only credential the prompt may offer. */
   authorizingCredentialId: string;
+  /**
+   * Part E (S2): unix seconds to use for the UX-only pre-signing validity
+   * check below, in place of raw `Date.now()`. Callers should pass their own
+   * clock ADJUSTED by a server-derived offset (serverNowSeconds from
+   * /prepare or /latest, captured once and combined with local elapsed
+   * time) so a skewed local wall clock can't falsely refuse a payment that's
+   * actually still well inside its window. Defaults to `Date.now()` when
+   * omitted (e.g. existing callers/tests). Advisory only — the server
+   * independently and authoritatively re-checks at /submit regardless.
+   */
+  nowSeconds?: number;
 };
 
 export type SignedPreparedPayment = {
@@ -58,7 +69,9 @@ export async function signPreparedPayment(input: SignPreparedPaymentInput): Prom
   if (!input.authorizingCredentialId) throw new Error("This payment has no approving passkey — refusing to sign.");
   // UX only (the server re-checks authoritatively): never spend a passkey
   // ceremony on a payment whose signed window would be too short to send.
-  if (!hasEnoughValidityToDispatch(input.fields.validUntil, Math.floor(Date.now() / 1000))) {
+  // nowSeconds defaults to raw Date.now() only when the caller has no
+  // server-derived offset to apply (see SignPreparedPaymentInput.nowSeconds).
+  if (!hasEnoughValidityToDispatch(input.fields.validUntil, input.nowSeconds ?? Math.floor(Date.now() / 1000))) {
     throw new Error(PAYMENT_EXPIRED_BEFORE_APPROVAL);
   }
   const fields = parsePreparedFieldsFromWire(input.fields);

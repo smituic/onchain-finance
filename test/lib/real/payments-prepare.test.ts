@@ -131,6 +131,21 @@ describe("resolvePreparePayment", () => {
     );
   });
 
+  it("Part E (S2): returns serverNowSeconds from the server's own wall clock — the same clock resolveSubmitPayment's dispatch-margin check uses, not the chain's block timestamp", async () => {
+    const registry = await seedAccount();
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const fixedNowMs = 1_950_000_000_000;
+
+    const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, now: () => fixedNowMs }));
+
+    expect(outcome).toMatchObject({ outcome: "ready", serverNowSeconds: Math.floor(fixedNowMs / 1000) });
+    // Deliberately NOT the chain's block timestamp (PREPARE_BLOCK_TIMESTAMP,
+    // ~1_900_000_000) — a server wall clock and a chain clock are different
+    // authorities, and the client's advisory offset must be calibrated
+    // against the same clock /submit itself is judged against.
+    expect(Math.floor(fixedNowMs / 1000)).not.toBe(Number(PREPARE_BLOCK_TIMESTAMP));
+  });
+
   it("Slice S1: binds the attempt, at creation, to the session's OWN credential — P's session binds P, S's session binds S", async () => {
     const registry = await seedAccount();
     const primary = (await registry.findPasskeyByCredentialId("credential-1"))!;

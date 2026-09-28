@@ -4,7 +4,7 @@ import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRecord
 import { type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentPatch, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { PasskeyRevocationAttempt, PasskeyRevocationStore, RevocationAttemptPatch, RevocationAttemptState } from "./passkey-revocation-attempts";
 import type { ExternalProvisioningOutcome, RegistrationAttempt, RegistrationAttemptState, RegistrationAttemptStore } from "./registration-attempts";
-import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptState, type PaymentAttemptStore, type ReserveResult } from "./payment-attempts";
+import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveResult } from "./payment-attempts";
 
 /**
  * SERVER-ONLY durable adapters for the vendor-neutral interfaces
@@ -1002,6 +1002,15 @@ export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, fals
     // turnkey_sign_activity_id / authorization_verified_at are write-once:
     // COALESCE(existing, patch) never overwrites a recorded value.
     async transition({ id, from, to, patch }) {
+      // failure_reason uses the same has()-guarded CASE WHEN pattern as
+      // passkey_revocation_attempts.transition above — COALESCE cannot tell
+      // "explicitly clear it" (patch.failureReason: null) apart from
+      // "leave it alone" (key omitted), since both serialize to SQL NULL. A
+      // resolution that moves e.g. unknown -> confirmed passes
+      // failureReason: null on purpose (see server/payments.ts) and that
+      // must actually clear a stale reason left over from an earlier,
+      // non-terminal state.
+      const p: PaymentAttemptPatch | undefined = patch;
       let rows: Row[];
       try {
         rows = (await sql`
@@ -1027,7 +1036,7 @@ export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, fals
             turnkey_sign_activity_id = COALESCE(turnkey_sign_activity_id, ${patch?.turnkeySignActivityId ?? null}),
             authorization_verified_at = COALESCE(authorization_verified_at, ${patch?.authorizationVerifiedAt ?? null}::timestamptz),
             transaction_hash = COALESCE(${patch?.transactionHash ?? null}, transaction_hash),
-            failure_reason = COALESCE(${patch?.failureReason ?? null}, failure_reason),
+            failure_reason = CASE WHEN ${has(p, "failureReason")} THEN ${p?.failureReason ?? null} ELSE failure_reason END,
             updated_at = now()
           WHERE id = ${id} AND state = ${from}
           RETURNING *

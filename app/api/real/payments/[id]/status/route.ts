@@ -36,7 +36,7 @@ export async function GET(_request: NextRequest, ctx: RouteContext<"/api/real/pa
 
     if (outcome.outcome === "unauthenticated") return jsonError("Not authenticated.", 401);
     if (outcome.outcome === "not_found") return jsonError("Payment not found.", 404);
-    return Response.json({ attempt: outcome.attempt });
+    return Response.json({ attempt: outcome.attempt, serverNowSeconds: outcome.serverNowSeconds });
   } catch {
     return jsonInternalError();
   }
