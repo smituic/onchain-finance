@@ -3,7 +3,7 @@ import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPublicClient, custom, encodeAbiParameters } from "viem";
 import { baseSepolia } from "viem/chains";
-import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
+import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals } from "@/lib/real/server/registry";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import { createInMemoryPaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "@/lib/real/constants";
@@ -129,6 +129,35 @@ describe("resolvePreparePayment", () => {
     expect(prepareCashTransferUserOperationMock).toHaveBeenCalledWith(
       expect.objectContaining({ ownerAddress: OWNER_ADDRESS, recipient: RECIPIENT, amountBaseUnits: "1000000" }),
     );
+  });
+
+  it("Slice S1: binds the attempt, at creation, to the session's OWN credential — P's session binds P, S's session binds S", async () => {
+    const registry = await seedAccount();
+    const primary = (await registry.findPasskeyByCredentialId("credential-1"))!;
+    getInMemoryRegistryInternals(registry).passkeysByCredentialId.set("credential-backup", { ...primary, credentialId: "credential-backup", role: "backup" });
+
+    for (const credentialId of ["credential-1", "credential-backup"]) {
+      const paymentStore = createInMemoryPaymentAttemptStore();
+      const reserveSpy = vi.spyOn(paymentStore, "reserve");
+      const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId }), SECRET);
+
+      const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
+
+      expect(outcome).toMatchObject({ outcome: "ready", authorizingCredentialId: credentialId });
+      expect(reserveSpy).toHaveBeenCalledWith(expect.objectContaining({ authorizingCredentialId: credentialId }));
+      if (outcome.outcome === "ready") expect((await paymentStore.findById(outcome.attempt.id))?.authorizingCredentialId).toBe(credentialId);
+    }
+  });
+
+  it("Slice S1: a session whose credential is no longer active (e.g. being removed) can't prepare — nothing is reserved or bound", async () => {
+    const registry = await seedAccount();
+    await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "active", to: "revoking" });
+    const paymentStore = createInMemoryPaymentAttemptStore();
+    const reserveSpy = vi.spyOn(paymentStore, "reserve");
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+
+    expect((await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }))).outcome).toBe("unauthenticated");
+    expect(reserveSpy).not.toHaveBeenCalled();
   });
 
   it("always reserves against the canonical USDC token and Base Sepolia chain id", async () => {

@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import type { Hex } from "viem";
 import { bytesToBase64Url, base64UrlToBytes } from "@/lib/real/bytes";
+import { credentialIdsEqual } from "@/lib/real/credential-id";
 import { buildAuthenticationResponseJSON, type FixtureAuthenticator } from "./webauthn";
 
 /**
@@ -62,6 +64,12 @@ export class FakeTurnkey {
   private hidden = new Set<string>();
   private ghosts: FakeAuthenticator[] = [];
   onForward: (() => void | Promise<void>) | null = null;
+  /** The wallet key Turnkey holds for this user — signs raw payloads (signRawPayload below). */
+  walletSigner: ((hash: Hex) => Promise<Hex>) | null = null;
+  /** Credentials (base64url) the simulated browser holds, in the order its passkey picker would offer them. */
+  deviceCredentials: string[] = [];
+  /** The allowCredentials (as base64url) of every signRawPayload ceremony, in order. */
+  signCeremonies: Array<{ allowCredentials: string[] }> = [];
   private seq = 0;
 
   constructor(
@@ -96,6 +104,40 @@ export class FakeTurnkey {
     this.activities.set(activity.id, activity);
   }
 
+  /**
+   * Browser + Turnkey for one signRawPayload: the device answers with the
+   * first credential it holds that the stamper's allowCredentials permits
+   * (any, when empty) — a pinned prompt never offers another passkey, and
+   * with no match the ceremony fails like WebAuthn's NotAllowedError. Turnkey
+   * then records a COMPLETED activity whose intent echoes the request and
+   * whose one APPROVED vote carries that authenticator's public key.
+   */
+  signRawPayload = async (
+    request: { type: string; organizationId: string; parameters: { signWith: string; payload: Hex; encoding: string; hashFunction: string } },
+    stamper?: { allowCredentials?: Array<{ id: BufferSource }> },
+  ) => {
+    const allowCredentials = (stamper?.allowCredentials ?? []).map((c) => bytesToBase64Url(new Uint8Array(c.id as ArrayBuffer)));
+    this.signCeremonies.push({ allowCredentials });
+    const chosen = this.deviceCredentials.find((credentialId) => allowCredentials.length === 0 || allowCredentials.some((allowed) => credentialIdsEqual(allowed, credentialId)));
+    if (!chosen) throw Object.assign(new Error("No available passkey matches this request."), { name: "NotAllowedError" });
+    if (request.organizationId !== this.organizationId) throw new Error("Turnkey: organization not found");
+    const authenticator = this.authenticators().find((a) => credentialIdsEqual(a.credentialId, chosen));
+    if (!authenticator) throw new Error("Turnkey: unknown authenticator");
+    const signature = await this.walletSigner!(request.parameters.payload);
+    const id = `sign-activity-${++this.seq}`;
+    const activity: FakeActivity = {
+      id,
+      status: "ACTIVITY_STATUS_COMPLETED",
+      organizationId: request.organizationId,
+      type: request.type,
+      intent: { signRawPayloadIntentV2: { ...request.parameters } },
+      result: { signRawPayloadResult: { r: signature.slice(2, 66), s: signature.slice(66, 130), v: Number.parseInt(signature.slice(130), 16) === 27 ? "00" : "01" } },
+      votes: [{ id: `vote-${id}`, selection: "VOTE_SELECTION_APPROVED", activityId: id, userId: this.userId, publicKey: authenticator.credential.publicKey, message: "", signature: "", scheme: "SIGNATURE_SCHEME_TK_API_P256" }],
+    };
+    this.addActivity(activity);
+    return { activity: structuredClone(activity) };
+  };
+
   getUsers = async ({ organizationId }: { organizationId: string }) => {
     if (organizationId !== this.organizationId) return { users: [] };
     return {
@@ -109,7 +151,7 @@ export class FakeTurnkey {
   getActivity = async ({ organizationId, activityId }: { organizationId: string; activityId: string }) => {
     const activity = this.activities.get(activityId);
     if (!activity || organizationId !== this.organizationId) throw new Error("not found");
-    return { activity };
+    return { activity: structuredClone(activity) };
   };
 
   fetchImpl = (async (url: string, init: { body: string; headers: Record<string, string> }) => {

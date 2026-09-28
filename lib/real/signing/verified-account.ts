@@ -74,6 +74,10 @@ export function createVerifiedTurnkeyOwnerAccount(input: {
   rpId: string;
   subOrganizationId: string;
   ownerAddress: string;
+  /** Slice S1: scopes every WebAuthn ceremony to this ONE credential (raw-sign.ts's allowCredentials). */
+  authorizingCredentialId?: string;
+  /** Receives the Turnkey activity id of each verified signature — the server's locator for proving which passkey approved it. */
+  onTurnkeyActivity?: (activityId: string) => void;
 }): LocalAccount {
   return toAccount({
     address: input.ownerAddress as Address,
@@ -81,11 +85,12 @@ export function createVerifiedTurnkeyOwnerAccount(input: {
       const definition = typedData as TypedDataDefinition;
       const digest = hashTypedData(definition);
 
-      const { signature } = await signDigestViaTurnkeyRaw({
+      const { signature, activityId } = await signDigestViaTurnkeyRaw({
         rpId: input.rpId,
         subOrganizationId: input.subOrganizationId,
         ownerAddress: input.ownerAddress,
         digest,
+        authorizingCredentialId: input.authorizingCredentialId,
       });
 
       const recoveredAddress = await recoverTypedDataAddress({ ...definition, signature });
@@ -97,6 +102,7 @@ export function createVerifiedTurnkeyOwnerAccount(input: {
           signature,
         });
       }
+      input.onTurnkeyActivity?.(activityId);
       return signature;
     },
     sign: unsupported("sign"),

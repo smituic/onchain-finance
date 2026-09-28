@@ -1,9 +1,11 @@
-import type { RealAccountRecord, RealAccountRegistry } from "./registry";
+import type { RealAccountRecord, RealAccountRegistry, RealPasskeyRecord } from "./registry";
 import { parseSession, type RealSessionPayload } from "./session";
 
 export type AuthenticatedRealAccount = {
   session: RealSessionPayload;
   account: RealAccountRecord;
+  /** The session credential's registry row, as just re-checked (active, same account). */
+  passkey: RealPasskeyRecord;
 };
 
 /**
@@ -31,5 +33,5 @@ export async function readAuthenticatedRealAccount(input: {
   const account = await input.registry.findAccountByAppUserId(session.appUserId);
   if (!account) return null;
 
-  return { session, account };
+  return { session, account, passkey };
 }

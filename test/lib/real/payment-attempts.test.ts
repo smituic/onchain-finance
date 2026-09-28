@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createInMemoryPaymentAttemptStore } from "@/lib/real/server/payment-attempts";
+import { createInMemoryPaymentAttemptStore, DuplicateSignActivityError } from "@/lib/real/server/payment-attempts";
+import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 
 function reserveInput(overrides: Partial<{ appUserId: string }> = {}) {
   return {
@@ -9,6 +10,7 @@ function reserveInput(overrides: Partial<{ appUserId: string }> = {}) {
     amountBaseUnits: "1000000",
     chainId: 84532,
     tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    authorizingCredentialId: "credential-1",
   };
 }
 
@@ -199,5 +201,78 @@ describe("payment attempt state machine (in-memory store)", () => {
       const recent = await store.findRecentByAppUserId({ appUserId: "app-user-1", limit: 10 });
       expect(recent.map((a) => a.id)).toEqual([mine.attempt.id]);
     });
+  });
+});
+
+describe("Slice S1 — attribution fields (in-memory store)", () => {
+  async function awaiting(store: ReturnType<typeof createInMemoryPaymentAttemptStore>) {
+    const reserved = await store.reserve(reserveInput());
+    if (!reserved.ok) throw new Error("expected a reservation");
+    await store.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization" });
+    return reserved.attempt;
+  }
+
+  it("reserve() binds the credential at creation; the activity/verification fields start empty", async () => {
+    const store = createInMemoryPaymentAttemptStore();
+    const reserved = await store.reserve(reserveInput());
+    expect(reserved.ok && reserved.attempt).toMatchObject({ authorizingCredentialId: "credential-1", turnkeySignActivityId: null, authorizationVerifiedAt: null });
+  });
+
+  it("the signing activity id and verification time are write-once — a later patch never overwrites them", async () => {
+    const store = createInMemoryPaymentAttemptStore();
+    const attempt = await awaiting(store);
+    await store.transition({ id: attempt.id, from: "awaiting_authorization", to: "signed", patch: { turnkeySignActivityId: "activity-a", authorizationVerifiedAt: "2026-01-01T00:00:00.000Z" } });
+    const after = await store.transition({ id: attempt.id, from: "signed", to: "failed", patch: { turnkeySignActivityId: "activity-b", authorizationVerifiedAt: "2027-01-01T00:00:00.000Z" } });
+    expect(after).toMatchObject({ state: "failed", turnkeySignActivityId: "activity-a", authorizationVerifiedAt: "2026-01-01T00:00:00.000Z" });
+  });
+
+  it("an activity id already recorded on another payment throws DuplicateSignActivityError and applies nothing", async () => {
+    const store = createInMemoryPaymentAttemptStore();
+    const first = await awaiting(store);
+    await store.transition({ id: first.id, from: "awaiting_authorization", to: "signed", patch: { turnkeySignActivityId: "activity-a" } });
+    await store.transition({ id: first.id, from: "signed", to: "failed" });
+    const second = await awaiting(store);
+
+    await expect(store.transition({ id: second.id, from: "awaiting_authorization", to: "signed", patch: { turnkeySignActivityId: "activity-a" } })).rejects.toBeInstanceOf(DuplicateSignActivityError);
+    expect(await store.findById(second.id)).toMatchObject({ state: "awaiting_authorization", turnkeySignActivityId: null });
+  });
+});
+
+describe("Slice S1 — beginDispatch: signed -> submitting only while the bound passkey is active (in-memory store)", () => {
+  async function world(options: { withRegistry?: boolean } = {}) {
+    const registry = createInMemoryRealAccountRegistry();
+    await registry.createAccountWithPasskey({
+      account: { appUserId: "app-user-1", subOrganizationId: "s", turnkeyUserId: "t", walletId: "w", walletAccountId: "wa", ownerAddress: "0x1", safeAddress: "0x1111111111111111111111111111111111111111", accountConfigVersion: 1 },
+      passkey: { credentialId: "credential-1", appUserId: "app-user-1", credentialPublicKey: "k", userHandle: "h", counter: 0, transports: null, credentialDeviceType: null, credentialBackedUp: null },
+    });
+    const store = createInMemoryPaymentAttemptStore(options.withRegistry === false ? undefined : registry);
+    const reserved = await store.reserve(reserveInput());
+    if (!reserved.ok) throw new Error("expected a reservation");
+    await store.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization" });
+    await store.transition({ id: reserved.attempt.id, from: "awaiting_authorization", to: "signed" });
+    return { registry, store, id: reserved.attempt.id };
+  }
+
+  it("claims a signed row whose bound passkey is active", async () => {
+    const { store, id } = await world();
+    expect((await store.beginDispatch({ id }))?.state).toBe("submitting");
+    expect(await store.beginDispatch({ id })).toBeNull(); // no second claim
+  });
+
+  it.each(["revoking", "revoked"] as const)("refuses when the bound passkey is %s — the row stays signed", async (status) => {
+    const { registry, store, id } = await world();
+    await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "active", to: "revoking" });
+    if (status === "revoked") await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "revoking", to: "revoked" });
+    expect(await store.beginDispatch({ id })).toBeNull();
+    expect((await store.findById(id))?.state).toBe("signed");
+  });
+
+  it("refuses when the row isn't signed, or when there's no registry to check against", async () => {
+    const { store, id } = await world();
+    await store.transition({ id, from: "signed", to: "cancelled" });
+    expect(await store.beginDispatch({ id })).toBeNull();
+
+    const unchecked = await world({ withRegistry: false });
+    expect(await unchecked.store.beginDispatch({ id: unchecked.id })).toBeNull();
   });
 });

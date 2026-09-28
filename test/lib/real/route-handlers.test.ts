@@ -87,6 +87,9 @@ function createTrapPaymentAttemptStore(): PaymentAttemptStore {
     transition: async () => {
       throw new Error("not used in this test");
     },
+    beginDispatch: async () => {
+      throw new Error("not used in this test");
+    },
   };
 }
 
@@ -169,6 +172,76 @@ describe("route handlers — pre-2f hardening (actual route.ts code, not resolve
     const body = (await response.json()) as { error: string };
     expect(body.error).toBe(GENERIC_SERVER_ERROR_MESSAGE);
     expect(body.error).not.toMatch(/ECONNREFUSED|postgres:\/\//);
+  });
+});
+
+describe("POST /api/real/payments/submit — Slice S1 attribution contract (actual route.ts code)", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.doUnmock("@turnkey/http");
+  });
+
+  const SIGNATURE = `0x${"00".repeat(12)}${"11".repeat(64)}1b`;
+
+  async function setup(sessionCredentialId: string) {
+    vi.resetModules();
+    stubRequiredConfigEnv();
+    const registry = await seedRegistry();
+    const primary = (await registry.findPasskeyByCredentialId("credential-1"))!;
+    getInMemoryRegistryInternals(registry).passkeysByCredentialId.set("credential-backup", { ...primary, credentialId: "credential-backup", role: "backup" });
+    const { createInMemoryPaymentAttemptStore } = await import("@/lib/real/server/payment-attempts");
+    const paymentStore = createInMemoryPaymentAttemptStore();
+    const reserved = await paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SAFE_ADDRESS, recipient: "0x2222222222222222222222222222222222222222", amountBaseUnits: "10000", chainId: 84532, tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", authorizingCredentialId: "credential-1" });
+    if (!reserved.ok) throw new Error("expected reservation");
+    await paymentStore.transition({
+      id: reserved.attempt.id,
+      from: "prepared",
+      to: "awaiting_authorization",
+      patch: { nonce: "0", callData: "0x1234", callGasLimit: "80000", verificationGasLimit: "150000", preVerificationGas: "60000", maxFeePerGas: "2000000", maxPriorityFeePerGas: "1000000", expectedUserOperationHash: `0x${"ab".repeat(32)}`, validUntil: Math.floor(Date.now() / 1000) + 600, prepareBlockNumber: "1" },
+    });
+    const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: sessionCredentialId }), REAL_SESSION_SECRET_VALUE);
+    vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar({ [REAL_SESSION_COOKIE_NAME]: cookieValue }) }));
+    vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => registry, getPaymentAttemptStore: () => paymentStore }));
+    // Turnkey is unreachable: the parent-key read-back throws.
+    vi.doMock("@turnkey/http", () => ({
+      TurnkeyClient: vi.fn().mockImplementation(function TurnkeyClientMock() {
+        return {
+          getActivity: async () => {
+            throw new Error("ECONNRESET api.turnkey.com");
+          },
+          getUsers: async () => ({ users: [] }),
+        };
+      }),
+    }));
+    const { POST } = await import("@/app/api/real/payments/submit/route");
+    const submit = (body: object) => POST(new Request("http://localhost/api/real/payments/submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+    return { submit, paymentStore, attemptId: reserved.attempt.id };
+  }
+
+  it("no activity id: 400 before the row is touched — a signature alone is never enough", async () => {
+    const { submit, paymentStore, attemptId } = await setup("credential-1");
+    const response = await submit({ attemptId, signature: SIGNATURE });
+    expect(response.status).toBe(400);
+    expect((await paymentStore.findById(attemptId))?.state).toBe("awaiting_authorization");
+  });
+
+  it("another passkey's session: 409 with the start-a-new-payment message; the row is unchanged", async () => {
+    const { submit, paymentStore, attemptId } = await setup("credential-backup");
+    const response = await submit({ attemptId, signature: SIGNATURE, activityId: "activity-1", authorizingCredentialId: "credential-backup" });
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toMatch(/started with a different passkey/);
+    expect(await paymentStore.findById(attemptId)).toMatchObject({ state: "awaiting_authorization", authorizingCredentialId: "credential-1" });
+  });
+
+  it("Turnkey unreachable: 503 { retryable: true } with a fixed message (never upstream text); nothing changes", async () => {
+    const { submit, paymentStore, attemptId } = await setup("credential-1");
+    const response = await submit({ attemptId, signature: SIGNATURE, activityId: "activity-1" });
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { error: string; retryable: boolean };
+    expect(body.retryable).toBe(true);
+    expect(body.error).not.toMatch(/ECONNRESET|turnkey\.com/);
+    expect((await paymentStore.findById(attemptId))?.state).toBe("awaiting_authorization");
   });
 });
 

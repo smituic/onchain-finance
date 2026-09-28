@@ -57,7 +57,7 @@ function ensureStoresInitialized(): void {
   registry = createInMemoryRealAccountRegistry();
   challengeStore = createInMemoryChallengeStore();
   attemptStore = createInMemoryRegistrationAttemptStore();
-  paymentAttemptStore = createInMemoryPaymentAttemptStore();
+  paymentAttemptStore = createInMemoryPaymentAttemptStore(registry);
   backupEnrollmentStore = createInMemoryBackupPasskeyEnrollmentStore(registry);
   revocationStore = createInMemoryPasskeyRevocationStore(registry);
 }

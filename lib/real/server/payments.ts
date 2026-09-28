@@ -7,13 +7,17 @@ import type { RealAccountRegistry } from "./registry";
 import { exceedsAvailableBalance, exceedsPaymentCeiling, isCanonicalBaseUnitsString, isZeroBaseUnits } from "../payments/amount";
 import { computeExpectedUserOperationHash } from "../payments/hash";
 import { parsePreparedFieldsFromWire, type PreparedUserOperationFields, type WirePreparedFields } from "../payments/prepared-operation";
-import { dispatchPreparedPayment, verifyPreparedPaymentSignature } from "../payments/submit";
+import { computeExpectedSafeOpDigest, dispatchPreparedPayment, verifyPreparedPaymentSignature } from "../payments/submit";
+import { splitSafeOpSignature } from "../payments/safe-op-preflight";
+import { credentialIdsEqual } from "../credential-id";
 import { classifyReceipt } from "../payments/reconcile";
 import { computeValidUntil, hasEnoughValidityToDispatch } from "../payments/validity";
 import { readLatestBlockClock, readUserOperationChainState, type EntryPointReader } from "../chain/entry-point";
 import { fetchUserOperationReceipt, prepareCashTransferUserOperation, sendPreparedUserOperation } from "./pimlico";
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "../constants";
-import type { PaymentAttempt, PaymentAttemptPatch, PaymentAttemptState, PaymentAttemptStore } from "./payment-attempts";
+import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore } from "./payment-attempts";
+import { isWellFormedActivityId, verifyPaymentAuthorization } from "./payment-authorization";
+import type { RealServerConfig } from "./config";
 
 /**
  * Pre-2f hardening: fixed, safe messages for every failure path in this
@@ -30,6 +34,9 @@ const SAFE_INTERNAL_ERROR = "Something went wrong while sending this payment. It
 const SAFE_EXPIRED_BEFORE_SEND = "This payment expired before it could be sent. Nothing was sent — start a new payment.";
 const SAFE_EXPIRED_UNINCLUDED = "This payment expired before it was included on-chain. No money moved.";
 const SAFE_REVERTED = "The bundler reported the operation reverted on-chain.";
+const SAFE_UNATTRIBUTED = "This payment was started before a security update and can't be sent. Nothing was sent — start a new payment.";
+const SAFE_AUTHORIZATION_REJECTED = "This payment's passkey approval could not be verified. Nothing was sent — start a new payment.";
+const SAFE_AUTHORIZER_NOT_ACTIVE = "The passkey that approved this payment was removed before it could be sent. Nothing was sent.";
 
 /**
  * The wire/public shape of a prepared UserOperation's fields — everything a
@@ -156,7 +163,7 @@ export type PreparePaymentOutcome =
   | { outcome: "quota_exceeded" }
   | { outcome: "payment_in_progress" }
   | { outcome: "prepare_failed"; reason: string }
-  | { outcome: "ready"; attempt: PublicPaymentAttempt; subOrganizationId: string };
+  | { outcome: "ready"; attempt: PublicPaymentAttempt; subOrganizationId: string; authorizingCredentialId: string };
 
 /**
  * The one place a payment intent is validated and turned into a sponsored,
@@ -172,6 +179,11 @@ export type PreparePaymentOutcome =
  * external) Pimlico prepareUserOperation call happens AFTER a successful
  * reserve(), so a failed external prepare still consumes the intended
  * attempt (and its quota slot) rather than leaving no trace.
+ *
+ * Slice S1: the attempt is bound, at creation, to the ONE passkey that may
+ * approve it — the app session's own credential, just re-checked active and
+ * owned by this account (readAuthenticatedRealAccount). Never a
+ * client-supplied id; never changed afterwards.
  */
 export async function resolvePreparePayment(input: {
   cookieValue: string | undefined | null;
@@ -234,6 +246,7 @@ export async function resolvePreparePayment(input: {
     amountBaseUnits,
     chainId: BASE_SEPOLIA_CHAIN_ID,
     tokenAddress: REAL_CASH_TOKEN.address,
+    authorizingCredentialId: authenticated.passkey.credentialId,
   });
   if (!reserved.ok) return { outcome: reserved.reason };
 
@@ -290,7 +303,7 @@ export async function resolvePreparePayment(input: {
     return { outcome: "prepare_failed", reason: "Could not persist the prepared payment." };
   }
 
-  return { outcome: "ready", attempt: toPublicAttempt(updated), subOrganizationId: authenticated.account.subOrganizationId };
+  return { outcome: "ready", attempt: toPublicAttempt(updated), subOrganizationId: authenticated.account.subOrganizationId, authorizingCredentialId: authenticated.passkey.credentialId };
 }
 
 export type SubmitPaymentOutcome =
@@ -298,6 +311,10 @@ export type SubmitPaymentOutcome =
   | { outcome: "not_found" }
   | { outcome: "invalid_signature" }
   | { outcome: "wrong_state"; state: PaymentAttemptState }
+  /** The session's passkey is not the one this payment is bound to. Nothing changes; the payment can only be cancelled (or approved from its own passkey's session). */
+  | { outcome: "wrong_passkey" }
+  /** Turnkey couldn't confirm the approval right now. Nothing changes and nothing is sent; the SAME signature may be retried — no new passkey prompt needed. */
+  | { outcome: "authorization_unavailable" }
   | { outcome: "submitted"; attempt: PublicPaymentAttempt }
   | { outcome: "failed"; attempt: PublicPaymentAttempt }
   | { outcome: "unknown"; attempt: PublicPaymentAttempt };
@@ -308,6 +325,14 @@ function isWellFormedHexSignature(value: string): boolean {
   return HEX_SIGNATURE_PATTERN.test(value) && (value.length - 2) % 2 === 0;
 }
 
+/** A definitive refusal found before the row is claimed: awaiting_authorization -> failed, nothing sent. A lost CAS (concurrent cancel/submit/expiry) reports the true current state. */
+async function failBeforeClaim(store: PaymentAttemptStore, attempt: PaymentAttempt, reason: string): Promise<SubmitPaymentOutcome> {
+  const updated = await store.transition({ id: attempt.id, from: "awaiting_authorization", to: "failed", patch: { failureReason: reason } });
+  if (updated) return { outcome: "failed", attempt: toPublicAttempt(updated) };
+  const current = await store.findById(attempt.id);
+  return { outcome: "wrong_state", state: current?.state ?? attempt.state };
+}
+
 /**
  * A valid app session alone is never enough to reach here successfully: the
  * caller must also supply a signature that independently verifies (via
@@ -315,19 +340,36 @@ function isWellFormedHexSignature(value: string): boolean {
  * owner — nothing about the HttpOnly cookie itself produces or approves a
  * signature.
  *
- * Ordering, in one line: structural hex-format validation
- * (isWellFormedHexSignature, above) happens before transition 1 below
- * (awaiting_authorization -> signed); cryptographic signature verification
- * happens after transition 1 and before transition 2 (signed -> submitting).
+ * Slice S1 — credential attribution, BEFORE the row is claimed:
+ *   - the attempt must be bound (authorizingCredentialId; legacy unbound
+ *     rows fail closed and are never back-filled);
+ *   - the session's own credential must BE that binding (compared as
+ *     decoded bytes) — another passkey's session is refused without
+ *     touching the row, so a payment is never silently re-bound;
+ *   - verifyPaymentAuthorization must prove, from Turnkey's records, that
+ *     the bound passkey approved signing exactly this row's SafeOp digest
+ *     and that the submitted owner signature is that activity's signature.
+ *     "unavailable" changes nothing (the same signature may be retried);
+ *     "rejected" fails the attempt, nothing sent.
+ * The verified activity id is recorded (write-once, unique across payments)
+ * by transition 1 itself, so a claimed row always names its approval.
  *
- * Two separate CAS transitions guard this function, not one:
+ * Ordering: structural checks (hex signature, activity-id shape) -> the
+ * attribution above (Turnkey reads) -> transition 1 (awaiting_authorization
+ * -> signed) -> expiry + SafeOp preflight -> transition 2 (signed ->
+ * submitting, atomically only while the bound passkey is still active —
+ * PaymentAttemptStore.beginDispatch) -> dispatch. Expiry is checked AFTER
+ * the Turnkey reads, so time spent verifying can't carry a stale payment
+ * past the dispatch margin.
  *
- *  1. awaiting_authorization -> signed, before the signature is even
- *     inspected — the first duplicate-submit guard: a second concurrent
- *     call for the same attempt id finds it no longer
- *     "awaiting_authorization" and backs off immediately.
- *  2. signed -> submitting, AFTER the signature has independently verified
- *     (preflight + recomputed-hash check) but BEFORE
+ * Two separate CAS transitions guard dispatch, not one:
+ *
+ *  1. awaiting_authorization -> signed — the duplicate-submit guard: a second
+ *     concurrent call for the same attempt id finds it no longer
+ *     "awaiting_authorization" and backs off.
+ *  2. signed -> submitting (beginDispatch: also requires the bound passkey
+ *     still active, in the same serialized step), AFTER the signature has
+ *     independently verified (preflight + recomputed-hash check) but BEFORE
  *     dispatchPreparedPayment is ever called. This is what closes the
  *     crash window between "we're about to call eth_sendUserOperation" and
  *     "we know what happened": if the process dies anywhere from here
@@ -340,20 +382,11 @@ function isWellFormedHexSignature(value: string): boolean {
  * Only the caller that wins transition 2 may ever call
  * dispatchPreparedPayment for this attempt.
  *
- * Pre-2f hardening: everything between transition 1 and transition 2 —
- * `toPreparedFields` (unguarded BigInt parsing of the stored row) and
- * `verifyPreparedPaymentSignature` (can re-throw a non-preflight error) —
- * used to run outside any try/catch here. A throw in that window left the
- * row stranded at "signed" forever: not resendable (CAS source no longer
- * "awaiting_authorization"), not reconcilable (RECONCILABLE_STATES below is
- * submitting/submitted/unknown, never "signed"), and — since cancel only
- * accepted "awaiting_authorization" — not cancellable either, permanently
- * blocking the account's one-active-attempt slot. Two things now close
- * this: a pre-CAS hex-format check on the signature (so structurally
- * malformed input never even claims the row), and wrapping the whole
- * signed-window in try/catch (so anything else that throws still reaches a
- * durable, terminal "failed" — see the catch below). Cancel separately now
- * accepts "signed" too (resolveCancelPayment) as the last line of defense.
+ * Pre-2f hardening: everything that can throw on a stored row or a
+ * signature (toPreparedFields' BigInt parsing, signature recovery) runs
+ * inside a try/catch that ends in a durable, terminal "failed" — never a
+ * raw exception and never a row stranded at "signed". Cancel also accepts
+ * "signed" (resolveCancelPayment) as the last line of defense.
  */
 export async function resolveSubmitPayment(input: {
   cookieValue: string | undefined | null;
@@ -361,8 +394,12 @@ export async function resolveSubmitPayment(input: {
   registry: RealAccountRegistry;
   paymentStore: PaymentAttemptStore;
   pimlicoApiKey: string;
+  /** Parent-key, read-only Turnkey access for the attribution proof. */
+  config: RealServerConfig;
   attemptId: unknown;
   signature: unknown;
+  /** The Turnkey signRawPayload activity id the browser got back — a locator only; verified server-side before anything is trusted. */
+  activityId: unknown;
   /** Unix ms. Injectable for tests; the dispatch-margin check is safe under clock skew in both directions (see validity.ts). */
   now?: () => number;
 }): Promise<SubmitPaymentOutcome> {
@@ -376,15 +413,63 @@ export async function resolveSubmitPayment(input: {
   if (typeof input.attemptId !== "string" || typeof input.signature !== "string") return { outcome: "not_found" };
   if (!isValidUuid(input.attemptId)) return { outcome: "not_found" };
   if (!isWellFormedHexSignature(input.signature)) return { outcome: "invalid_signature" };
+  if (!isWellFormedActivityId(input.activityId)) return { outcome: "invalid_signature" };
+  const activityId = input.activityId;
 
   const attempt = await input.paymentStore.findById(input.attemptId);
   if (!attempt || attempt.appUserId !== authenticated.account.appUserId) return { outcome: "not_found" };
   if (attempt.state !== "awaiting_authorization") return { outcome: "wrong_state", state: attempt.state };
 
-  const claimed = await input.paymentStore.transition({ id: attempt.id, from: "awaiting_authorization", to: "signed" });
-  if (!claimed) return { outcome: "wrong_state", state: attempt.state };
+  if (!attempt.authorizingCredentialId) return failBeforeClaim(input.paymentStore, attempt, SAFE_UNATTRIBUTED);
+  // The session credential was just re-checked active and owned by this
+  // account, so on a byte match its registry row IS the bound passkey's.
+  if (!credentialIdsEqual(authenticated.passkey.credentialId, attempt.authorizingCredentialId)) return { outcome: "wrong_passkey" };
 
   let fields: PreparedUserOperationFields;
+  let expectedDigest: Hex;
+  let ownerSignature: Hex;
+  try {
+    if (attempt.validUntil === null) return failBeforeClaim(input.paymentStore, attempt, SAFE_EXPIRED_BEFORE_SEND);
+    fields = toPreparedFields(attempt);
+    expectedDigest = computeExpectedSafeOpDigest(fields, attempt.validUntil);
+    const split = splitSafeOpSignature(input.signature as Hex);
+    if (!split || split.byteLength !== 65) return failBeforeClaim(input.paymentStore, attempt, SAFE_SIGNATURE_INVALID);
+    ownerSignature = split.ownerSignature;
+  } catch {
+    return failBeforeClaim(input.paymentStore, attempt, SAFE_INTERNAL_ERROR);
+  }
+
+  const authorization = await verifyPaymentAuthorization({
+    config: input.config,
+    account: authenticated.account,
+    passkey: authenticated.passkey,
+    activityId,
+    expectedDigest,
+    ownerSignature,
+  });
+  if (authorization.outcome === "unavailable") return { outcome: "authorization_unavailable" };
+  if (authorization.outcome === "rejected") return failBeforeClaim(input.paymentStore, attempt, SAFE_AUTHORIZATION_REJECTED);
+
+  let claimed: PaymentAttempt | null;
+  try {
+    claimed = await input.paymentStore.transition({
+      id: attempt.id,
+      from: "awaiting_authorization",
+      to: "signed",
+      patch: { turnkeySignActivityId: activityId, authorizationVerifiedAt: new Date().toISOString() },
+    });
+  } catch (error) {
+    // Already recorded as another payment's approval — never twice. Nothing was written.
+    if (error instanceof DuplicateSignActivityError) return failBeforeClaim(input.paymentStore, attempt, SAFE_AUTHORIZATION_REJECTED);
+    throw error;
+  }
+  if (!claimed) {
+    // Lost to a concurrent submit/cancel/expiry — report the row's actual
+    // durable state now, never the stale pre-claim one.
+    const current = await input.paymentStore.findById(attempt.id);
+    return { outcome: "wrong_state", state: current?.state ?? attempt.state };
+  }
+
   let submitting: PaymentAttempt | null;
   try {
     const ownerAddress = validateAddressCasePreserving(authenticated.account.ownerAddress);
@@ -398,18 +483,16 @@ export async function resolveSubmitPayment(input: {
       return { outcome: "failed", attempt: toPublicAttempt(updated ?? claimed) };
     }
 
-    // A finite window with enough left to be sent, or nothing is dispatched —
-    // this also refuses legacy rows that have no window at all. Only local
-    // work (signature recovery) sits between here and the pre-dispatch CAS,
-    // far inside the dispatch margin. Refusing sends nothing; the signature
-    // is discarded with the request.
+    // A finite window with enough left to be sent, or nothing is dispatched.
+    // Only local work and one registry read sit between here and the
+    // pre-dispatch CAS, far inside the dispatch margin. Refusing sends
+    // nothing; the signature is discarded with the request.
     const nowSeconds = Math.floor((input.now ?? Date.now)() / 1000);
     if (!hasEnoughValidityToDispatch(claimed.validUntil, nowSeconds)) {
       const updated = await input.paymentStore.transition({ id: claimed.id, from: "signed", to: "failed", patch: { failureReason: SAFE_EXPIRED_BEFORE_SEND } });
       return { outcome: "failed", attempt: toPublicAttempt(updated ?? claimed) };
     }
 
-    fields = toPreparedFields(claimed);
     const verification = await verifyPreparedPaymentSignature({
       fields,
       expectedOwner: ownerAddress as Address,
@@ -425,8 +508,23 @@ export async function resolveSubmitPayment(input: {
     }
 
     // The signature independently verified. Durably record "we are about to
-    // dispatch" BEFORE ever calling the bundler — see the doc comment above.
-    submitting = await input.paymentStore.transition({ id: claimed.id, from: "signed", to: "submitting" });
+    // dispatch" BEFORE ever calling the bundler — see the doc comment above —
+    // in ONE atomic step with the revocation-after-signing policy: the claim
+    // succeeds only while the approving passkey is still `active`, serialized
+    // against passkey removal (PaymentAttemptStore.beginDispatch). A removal
+    // that commits first stops our dispatch; one that commits after the claim
+    // doesn't retroactively unsend it. (Neither revokes the signature itself:
+    // the owner key is shared by every passkey and the SafeOp stays valid
+    // until validUntil for anyone holding it.)
+    submitting = await input.paymentStore.beginDispatch({ id: claimed.id });
+    if (!submitting) {
+      const current = await input.paymentStore.findById(claimed.id);
+      if (current?.state === "signed") {
+        // Still ours to resolve: the claim failed only because the passkey is no longer active.
+        const updated = await input.paymentStore.transition({ id: claimed.id, from: "signed", to: "failed", patch: { failureReason: SAFE_AUTHORIZER_NOT_ACTIVE } });
+        if (updated) return { outcome: "failed", attempt: toPublicAttempt(updated) };
+      }
+    }
   } catch {
     // Anything unexpected in this window (a corrupted stored row, an
     // unrecognized signature-recovery failure, ...) becomes a terminal,
@@ -595,14 +693,16 @@ async function reconcileAgainstEntryPoint(client: EntryPointReader, attempt: Pay
 export type LatestPaymentOutcome =
   | { outcome: "unauthenticated" }
   | { outcome: "none" }
-  | { outcome: "ok"; attempt: PublicPaymentAttempt; subOrganizationId: string | null };
+  | { outcome: "ok"; attempt: PublicPaymentAttempt; subOrganizationId: string | null; authorizingCredentialId: string | null };
 
 /**
  * Reload/restore: returns the most recent attempt (any state) for the
  * authenticated account with no side effects — never signs, never submits,
- * never resends. subOrganizationId is only included when the attempt is
- * still awaiting a signature (the only state whose UI has a signing action
- * to resume).
+ * never resends. subOrganizationId/authorizingCredentialId (the signing
+ * context) are only included when the attempt is still awaiting a signature
+ * AND is bound to this session's own passkey — the only case whose UI may
+ * resume signing. An unbound (legacy) attempt, or one bound to another
+ * passkey, comes back with no signing context: cancel-only, never re-bound.
  */
 export async function resolveLatestPayment(input: {
   cookieValue: string | undefined | null;
@@ -620,8 +720,14 @@ export async function resolveLatestPayment(input: {
   const attempt = await input.paymentStore.findLatestByAppUserId(authenticated.account.appUserId);
   if (!attempt) return { outcome: "none" };
 
-  const subOrganizationId = attempt.state === "awaiting_authorization" ? authenticated.account.subOrganizationId : null;
-  return { outcome: "ok", attempt: toPublicAttempt(attempt), subOrganizationId };
+  const resumable =
+    attempt.state === "awaiting_authorization" && attempt.authorizingCredentialId !== null && credentialIdsEqual(attempt.authorizingCredentialId, authenticated.passkey.credentialId);
+  return {
+    outcome: "ok",
+    attempt: toPublicAttempt(attempt),
+    subOrganizationId: resumable ? authenticated.account.subOrganizationId : null,
+    authorizingCredentialId: resumable ? attempt.authorizingCredentialId : null,
+  };
 }
 
 export type CancelPaymentOutcome =

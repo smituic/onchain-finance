@@ -14,13 +14,13 @@ export const REQUIRED_USER_VERIFICATION = "required" as const;
  * WebauthnStamper's own `allowCredentials` — it scopes the browser's
  * credential picker to that ONE credential rather than letting the
  * platform authenticator offer whichever synced passkey it has for this RP
- * ID. raw-sign.ts's ordinary payment-signing call never passes it (today
- * there is only ever one primary credential to choose from); backup-passkey
- * enrollment/revocation (lib/real/signing/enroll-authenticator.ts) always
- * does, because those flows depend on cryptographically proving a SPECIFIC
- * credential — the existing one authorizing a new enrollment, the new one
- * proving itself during verification, or a surviving one authorizing a
- * revocation — not just "some credential this RP ID recognizes".
+ * ID. Every caller that depends on proving a SPECIFIC credential passes it:
+ * backup-passkey enrollment/revocation (the existing one authorizing a new
+ * enrollment, the new one proving itself, a surviving one authorizing a
+ * revocation) and, since Slice S1, every Real Pay signature (the payment's
+ * server-bound credential) — never just "some credential this RP ID
+ * recognizes". The server still proves the credential from Turnkey's own
+ * record; this only keeps the prompt from offering any other passkey.
  */
 export function createRequiredWebauthnStamper(rpId: string, options?: { allowCredentialId?: string }): WebauthnStamper {
   return new WebauthnStamper({

@@ -1,12 +1,27 @@
-import type { Address, Hash, Hex } from "viem";
+import { hashTypedData, type Address, type Hash, type Hex } from "viem";
 import { BASE_SEPOLIA_CHAIN_ID, REAL_SAFE } from "../constants";
-import { assertSafeOpPreflightOrThrow, verifySafeOpSignature, SafeOpPreflightError } from "./safe-op-preflight";
+import { assertSafeOpPreflightOrThrow, buildSafeOpTypedData, verifySafeOpSignature, SafeOpPreflightError } from "./safe-op-preflight";
 import { computeExpectedUserOperationHash } from "./hash";
 import { toSafeOpOperation, type PreparedUserOperationFields } from "./prepared-operation";
 import { classifySendError } from "./classify-send-error";
 import { SAFE_OP_VALID_AFTER } from "./validity";
 
 export type SignatureVerificationOutcome = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Slice S1: the exact 32-byte digest the owner must sign for THIS prepared
+ * payment — the SafeOp EIP-712 hash over the durable fields, the server's
+ * own validUntil and validAfter = SAFE_OP_VALID_AFTER. It is what the
+ * browser hands Turnkey's signRawPayload (verified-account.ts hashes the
+ * same typed data), so a Turnkey activity whose intent payload equals this
+ * signed this payment and nothing else. Pure; no I/O.
+ */
+export function computeExpectedSafeOpDigest(fields: PreparedUserOperationFields, validUntil: number): Hex {
+  const operation = toSafeOpOperation(fields, { safe: fields.sender, entryPoint: REAL_SAFE.entryPoint.address });
+  return hashTypedData(
+    buildSafeOpTypedData({ chainId: BASE_SEPOLIA_CHAIN_ID, safe4337ModuleAddress: REAL_SAFE.module.address, operation, validAfter: SAFE_OP_VALID_AFTER, validUntil }),
+  );
+}
 
 /**
  * Independently verifies a SafeOp signature offline (the same "single gate

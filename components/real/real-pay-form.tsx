@@ -210,6 +210,7 @@ export function RealPayForm() {
           <p className="text-sm font-medium">This payment didn&apos;t go through</p>
           <p className="text-sm text-muted-foreground">It was never sent. You can safely cancel it and try again.</p>
         </div>
+        {error ? <p className="text-sm text-destructive">{error}</p> : null}
         <Button variant="outline" className="h-11 w-full" onClick={() => void cancel()}>
           Cancel payment
         </Button>

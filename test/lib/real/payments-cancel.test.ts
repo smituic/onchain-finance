@@ -47,6 +47,7 @@ async function reserveAttempt(paymentStore: PaymentAttemptStore): Promise<Paymen
     amountBaseUnits: "1000000",
     chainId: 84532,
     tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    authorizingCredentialId: "credential-1",
   });
   if (!reserved.ok) throw new Error("expected reservation to succeed");
   return reserved.attempt;
@@ -143,6 +144,7 @@ describe("resolveCancelPayment — cancellable state matrix (pre-2f hardening)",
       amountBaseUnits: "1000000",
       chainId: 84532,
       tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      authorizingCredentialId: "credential-1",
     });
     expect(reserved.ok).toBe(true);
   });

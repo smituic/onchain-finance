@@ -120,6 +120,11 @@ export function matchAuthenticatorByCredentialId(authenticators: TurnkeyUserAuth
   return { outcome: "found", authenticator: matches[0]! };
 }
 
+/** The one comparison form for Turnkey public keys (a vote's `publicKey` vs an authenticator's `credential.publicKey`) — both are Turnkey-reported strings; anything else is "". */
+export function normalizeTurnkeyPublicKey(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
 /** SERVER-ONLY, parent-key-stamped, READ-ONLY poll of one child activity — never a resubmission of the mutation it describes. Returns null on any read failure (the caller stays pending). */
 export async function readTurnkeyActivity(input: { config: RealServerConfig; subOrganizationId: string; activityId: string }): Promise<TurnkeyActivitySummary | null> {
   try {

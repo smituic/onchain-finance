@@ -108,6 +108,7 @@ async function seedSubmittedAttempt(options: { state?: "awaiting_authorization" 
     amountBaseUnits: "1000000",
     chainId: 84532,
     tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    authorizingCredentialId: "credential-1",
   });
   if (!reserved.ok) throw new Error("expected reservation to succeed");
   await paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization", patch: { expectedUserOperationHash: EXPECTED_HASH, ...options.window } });
@@ -241,7 +242,7 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
       const ctx = await seedSubmittedAttempt({ state: "submitting", window });
       const outcome = await status(ctx, createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0) }).reader);
       expect(outcome.outcome === "ok" && outcome.attempt).toMatchObject({ state: "failed", failureReason: expect.stringMatching(/expired before it was included.*No money moved/) });
-      const next = await ctx.paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SENDER, recipient: "0x4444444444444444444444444444444444444444", amountBaseUnits: "1", chainId: 84532, tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e" });
+      const next = await ctx.paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SENDER, recipient: "0x4444444444444444444444444444444444444444", amountBaseUnits: "1", chainId: 84532, tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", authorizingCredentialId: "credential-1" });
       expect(next.ok).toBe(true);
     });
 
@@ -292,7 +293,7 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
           const ctx = await seedSubmittedAttempt({ state, window });
           const outcome = await statusAt(ctx, createFakeEntryPoint({ ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0) }).reader, VALID_UNTIL + 3_000);
           expect(outcome.outcome === "ok" && outcome.attempt).toMatchObject({ state: "failed", transactionHash: null, failureReason: expect.stringMatching(/No money moved/) });
-          const next = await ctx.paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SENDER, recipient: "0x4444444444444444444444444444444444444444", amountBaseUnits: "1", chainId: 84532, tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e" });
+          const next = await ctx.paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SENDER, recipient: "0x4444444444444444444444444444444444444444", amountBaseUnits: "1", chainId: 84532, tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", authorizingCredentialId: "credential-1" });
           expect(next.ok).toBe(true);
         }
       });

@@ -56,7 +56,9 @@ export type RealPaymentStatus =
    * signature" case (that's "awaiting_authorization"). Never reachable via
    * a fresh confirmAndSend/resumeAuthorization flow — only via init()
    * restoring an attempt a crash left mid-flight. The only action offered
-   * is cancel; no resend/retry.
+   * is cancel; no resend/retry. Slice S1: also an awaiting_authorization
+   * attempt this session can't approve (bound to another passkey, or
+   * prepared before binding existed).
    */
   | "stranded";
 
@@ -66,6 +68,16 @@ export type RealPaymentStore = {
   amountInput: string;
   attempt: RealPaymentAttempt | null;
   subOrganizationId: string | null;
+  /** The ONE passkey the server bound this payment to (from /prepare or /latest) — the only credential the signing prompt may offer. Null means this session can't approve the attempt. */
+  authorizingCredentialId: string | null;
+  /**
+   * A signature + Turnkey activity already produced for `attemptId` but not
+   * yet accepted by /submit (the server couldn't confirm the approval yet,
+   * or the request never got a definitive answer). "Continue" re-sends THIS
+   * instead of prompting for the passkey again — the server's CAS still
+   * allows at most one dispatch. Memory only; gone on reload.
+   */
+  pendingSubmission: { attemptId: string; signature: string; activityId: string } | null;
   error: string | null;
   /** True only while a WebAuthn ceremony is actually in flight — distinct from status "awaiting_authorization", which is also the state a reload-restored, not-yet-resumed attempt sits in without ever having triggered a prompt. The UI uses this to tell "the passkey sheet is open right now" apart from "tap Continue to open it". */
   isAuthorizing: boolean;
@@ -85,16 +97,27 @@ export type RealPaymentStore = {
   reset: () => void;
 };
 
-/** Mirrors lib/stores/real-account-store.ts's own `api` helper: throws Error(message) on a non-2xx response so call sites use ordinary try/catch. */
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+  }
+}
+
+/** Mirrors lib/stores/real-account-store.ts's own `api` helper: throws Error(message) on a non-2xx response so call sites use ordinary try/catch. `retryable` marks the server's "nothing changed, try the same request again" answer. */
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
   });
-  const json = (await response.json()) as T & { error?: string };
-  if (!response.ok) throw new Error(json.error ?? `Request failed (${response.status}).`);
+  const json = (await response.json()) as T & { error?: string; retryable?: boolean };
+  if (!response.ok) throw new ApiError(json.error ?? `Request failed (${response.status}).`, json.retryable === true);
   return json;
 }
+
+const OTHER_PASSKEY_MESSAGE = "This payment was started with a different passkey. Cancel it and start a new payment.";
 
 function mapAttemptStateToStatus(state: RealPaymentAttemptState): RealPaymentStatus {
   switch (state) {
@@ -137,47 +160,64 @@ function mapAttemptStateToStatus(state: RealPaymentAttemptState): RealPaymentSta
 }
 
 async function authorizeAndSubmit(set: (partial: Partial<RealPaymentStore>) => void, get: () => RealPaymentStore): Promise<void> {
-  const { attempt, subOrganizationId } = get();
+  const { attempt, subOrganizationId, authorizingCredentialId, pendingSubmission } = get();
   const account = useRealAccountStore.getState().account;
   if (!attempt?.prepared || !subOrganizationId || !account) {
     set({ status: "editing", error: "You're signed out." });
     return;
   }
-
-  set({ isAuthorizing: true, error: null });
-  let signature: string;
-  try {
-    signature = await signPreparedPayment({
-      fields: attempt.prepared,
-      rpId: process.env.NEXT_PUBLIC_REAL_RP_ID ?? "localhost",
-      subOrganizationId,
-      ownerAddress: account.ownerAddress,
-      rpcUrl: process.env.NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL ?? "https://sepolia.base.org",
-    });
-  } catch (error) {
-    if (isWebAuthnCancellation(error)) {
-      // No signature, no submission, no balance mutation — clean return to
-      // an editable state, exactly as the product spec requires.
-      set({ status: "reviewing", isAuthorizing: false, error: null });
-      return;
-    }
-    set({ status: "awaiting_authorization", isAuthorizing: false, error: error instanceof Error ? error.message : "Could not authorize the payment." });
+  if (!authorizingCredentialId) {
+    set({ status: "stranded", error: OTHER_PASSKEY_MESSAGE });
     return;
   }
 
-  set({ status: "submitting", isAuthorizing: false, error: null });
+  let signed = pendingSubmission?.attemptId === attempt.id ? pendingSubmission : null;
+  if (!signed) {
+    set({ isAuthorizing: true, error: null });
+    try {
+      const result = await signPreparedPayment({
+        fields: attempt.prepared,
+        rpId: process.env.NEXT_PUBLIC_REAL_RP_ID ?? "localhost",
+        subOrganizationId,
+        ownerAddress: account.ownerAddress,
+        rpcUrl: process.env.NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL ?? "https://sepolia.base.org",
+        authorizingCredentialId,
+      });
+      signed = { attemptId: attempt.id, ...result };
+    } catch (error) {
+      if (isWebAuthnCancellation(error)) {
+        // No signature, no submission, no balance mutation — clean return to
+        // an editable state, exactly as the product spec requires.
+        set({ status: "reviewing", isAuthorizing: false, error: null });
+        return;
+      }
+      set({ status: "awaiting_authorization", isAuthorizing: false, error: error instanceof Error ? error.message : "Could not authorize the payment." });
+      return;
+    }
+  }
+
+  set({ status: "submitting", isAuthorizing: false, pendingSubmission: signed, error: null });
   try {
     const result = await api<{ attempt: RealPaymentAttempt }>("/api/real/payments/submit", {
       method: "POST",
-      body: JSON.stringify({ attemptId: attempt.id, signature }),
+      body: JSON.stringify({ attemptId: signed.attemptId, signature: signed.signature, activityId: signed.activityId }),
     });
-    set({ status: mapAttemptStateToStatus(result.attempt.state), attempt: result.attempt, error: null });
+    set({ status: mapAttemptStateToStatus(result.attempt.state), attempt: result.attempt, pendingSubmission: null, error: null });
     if (result.attempt.state === "confirmed") void useRealBalanceStore.getState().fetchBalance();
   } catch (error) {
+    if (error instanceof ApiError && error.retryable) {
+      // The server changed nothing and sent nothing. Keep the same approval
+      // so "Continue" re-sends it — no second passkey prompt.
+      set({ status: "awaiting_authorization", error: error.message });
+      return;
+    }
     // A thrown error here means either a definitive HTTP-level refusal or a
     // network failure after a signature exists (the request may have
     // reached the server, or even the bundler, before failing) — either way
     // this is genuinely ambiguous and must never unlock an automatic resend.
+    // The approval stays in memory: if a status check later shows the
+    // attempt still awaiting, "Continue" re-sends it (the server's CAS keeps
+    // that to at most one dispatch) rather than asking for a new signature.
     set({ status: "unknown", error: error instanceof Error ? error.message : "Lost connection while sending the payment." });
   }
 }
@@ -197,6 +237,8 @@ export function createRealPaymentStore() {
     amountInput: "",
     attempt: null,
     subOrganizationId: null,
+    authorizingCredentialId: null,
+    pendingSubmission: null,
     isAuthorizing: false,
     error: null,
 
@@ -208,23 +250,29 @@ export function createRealPaymentStore() {
       // this (see components/real/real-pay-form.tsx's account-change
       // effect). Without this, a stale recipient/amount typed under one
       // account could survive into a different signed-in account.
-      set({ status: "idle", recipientInput: "", amountInput: "", attempt: null, subOrganizationId: null, isAuthorizing: false, error: null });
+      set({ status: "idle", recipientInput: "", amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, error: null });
       try {
         const response = await fetch("/api/real/payments/latest");
         if (response.status === 401) {
           if (myGeneration === generation) set({ status: "editing", attempt: null, subOrganizationId: null });
           return;
         }
-        const json = (await response.json()) as { attempt: RealPaymentAttempt | null; subOrganizationId?: string | null; error?: string };
+        const json = (await response.json()) as { attempt: RealPaymentAttempt | null; subOrganizationId?: string | null; authorizingCredentialId?: string | null; error?: string };
         if (!response.ok || !json.attempt) {
           if (myGeneration === generation) set({ status: "editing", attempt: null, subOrganizationId: null });
           return;
         }
         if (myGeneration === generation) {
+          // Slice S1: awaiting a signature but with no signing context means
+          // this session's passkey isn't the one the payment is bound to (or
+          // it predates binding) — cancel-only, never re-bound here.
+          const notResumable = json.attempt.state === "awaiting_authorization" && (!json.subOrganizationId || !json.authorizingCredentialId);
           set({
-            status: mapAttemptStateToStatus(json.attempt.state),
+            status: notResumable ? "stranded" : mapAttemptStateToStatus(json.attempt.state),
             attempt: json.attempt,
             subOrganizationId: json.subOrganizationId ?? null,
+            authorizingCredentialId: json.authorizingCredentialId ?? null,
+            error: notResumable ? OTHER_PASSKEY_MESSAGE : null,
           });
         }
       } catch {
@@ -272,11 +320,18 @@ export function createRealPaymentStore() {
 
       set({ status: "preparing", error: null });
       try {
-        const result = await api<{ attempt: RealPaymentAttempt; subOrganizationId: string }>("/api/real/payments/prepare", {
+        const result = await api<{ attempt: RealPaymentAttempt; subOrganizationId: string; authorizingCredentialId: string }>("/api/real/payments/prepare", {
           method: "POST",
           body: JSON.stringify({ recipient, amountBaseUnits }),
         });
-        set({ status: "awaiting_authorization", attempt: result.attempt, subOrganizationId: result.subOrganizationId, error: null });
+        set({
+          status: "awaiting_authorization",
+          attempt: result.attempt,
+          subOrganizationId: result.subOrganizationId,
+          authorizingCredentialId: result.authorizingCredentialId,
+          pendingSubmission: null,
+          error: null,
+        });
       } catch (error) {
         set({ status: "editing", error: error instanceof Error ? error.message : "Could not prepare the payment." });
         return;
@@ -303,7 +358,7 @@ export function createRealPaymentStore() {
         // (e.g. it resolved between the last read and this call); either
         // way, the client returns to a fresh editable state.
       }
-      set({ status: "editing", attempt: null, subOrganizationId: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
+      set({ status: "editing", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
     },
 
     checkStatus: async () => {
@@ -320,7 +375,7 @@ export function createRealPaymentStore() {
 
     reset: () => {
       generation++;
-      set({ status: "editing", attempt: null, subOrganizationId: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
+      set({ status: "editing", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
     },
   }));
 }

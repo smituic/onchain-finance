@@ -10,7 +10,7 @@ import { DuplicateCredentialError, type RealAccountRecord, type RealAccountRegis
 import { isAbandonable, type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { RealServerConfig } from "./config";
 import { buildLoginOptions, buildRegistrationOptions, verifyLogin, verifyRegistration } from "./webauthn";
-import { listTurnkeyUserAuthenticators, matchAuthenticatorByCredentialId, readTurnkeyActivity } from "./turnkey-discovery";
+import { listTurnkeyUserAuthenticators, matchAuthenticatorByCredentialId, normalizeTurnkeyPublicKey, readTurnkeyActivity } from "./turnkey-discovery";
 import {
   COMPLETED_STATUS,
   TERMINAL_FAILURE_STATUSES,
@@ -802,10 +802,6 @@ export async function prepareSigningProof(input: {
 
 export type ConfirmSigningProofResult = { outcome: "active" } | { outcome: "rejected"; reason: string };
 
-function normalizePublicKey(value: unknown): string {
-  return typeof value === "string" ? value.trim().toLowerCase() : "";
-}
-
 /**
  * Proof B, attributed to the NEW authenticator specifically. Owner-address
  * recovery alone can't tell the backup from the primary (both authorize the
@@ -855,7 +851,7 @@ export async function confirmSigningProof(input: {
     return { outcome: "rejected", reason: "The authorization proof signed something other than this setup's challenge." };
   }
 
-  const expectedKey = normalizePublicKey(enrollment.turnkeyAuthenticatorPublicKey);
+  const expectedKey = normalizeTurnkeyPublicKey(enrollment.turnkeyAuthenticatorPublicKey);
   const votes = Array.isArray(activity.raw.votes) ? (activity.raw.votes as Array<Record<string, unknown>>) : [];
   const attributed = votes.some(
     (vote) =>
@@ -863,7 +859,7 @@ export async function confirmSigningProof(input: {
       vote.activityId === activity.id &&
       vote.userId === account.turnkeyUserId &&
       expectedKey !== "" &&
-      normalizePublicKey(vote.publicKey) === expectedKey,
+      normalizeTurnkeyPublicKey(vote.publicKey) === expectedKey,
   );
   if (!attributed) return { outcome: "rejected", reason: "The authorization wasn't approved by the new backup passkey." };
 

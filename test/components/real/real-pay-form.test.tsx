@@ -73,6 +73,8 @@ describe("RealPayForm", () => {
       amountInput: "",
       attempt: null,
       subOrganizationId: null,
+      authorizingCredentialId: null,
+      pendingSubmission: null,
       isAuthorizing: false,
       error: null,
     });
@@ -103,7 +105,7 @@ describe("RealPayForm", () => {
     useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
     routeFetch((url, method) => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") {
-        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1" });
+        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" });
       }
       return null;
     });
@@ -122,7 +124,7 @@ describe("RealPayForm", () => {
     routeFetch((url, method, body) => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
-        return jsonResponse(200, { attempt: attemptFixture({ recipient: (body as { recipient: string }).recipient }), subOrganizationId: "sub-org-1" });
+        return jsonResponse(200, { attempt: attemptFixture({ recipient: (body as { recipient: string }).recipient }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" });
       }
       if (url.endsWith("/api/real/payments/submit") && method === "POST") {
         submitCalled = true;
@@ -154,7 +156,7 @@ describe("RealPayForm", () => {
     routeFetch((url, method) => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
-        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1" });
+        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" });
       }
       if (url.endsWith("/api/real/payments/submit") && method === "POST") {
         return jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123" }) });
@@ -165,7 +167,7 @@ describe("RealPayForm", () => {
       }
       return null;
     });
-    signPreparedPaymentMock.mockResolvedValueOnce("0xsignature");
+    signPreparedPaymentMock.mockResolvedValueOnce({ signature: "0xsignature", activityId: "activity-1" });
 
     render(<RealPayForm />);
     await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
@@ -188,7 +190,7 @@ describe("RealPayForm", () => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
         prepareCallCount += 1;
-        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1" });
+        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" });
       }
       return null;
     });
@@ -251,5 +253,106 @@ describe("RealPayForm", () => {
     await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "Continue" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Cancel payment" })).toBeInTheDocument();
+  });
+
+  it("Slice S1: the server-bound passkey reaches the signing call, and the Turnkey activity id reaches /submit", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    const submitBodies: unknown[] = [];
+    routeFetch((url, method, body) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
+      if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
+        // A client-typed credential is never sent: prepare's body is recipient + amount only.
+        expect(Object.keys(body as object).sort()).toEqual(["amountBaseUnits", "recipient"]);
+        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-P" });
+      }
+      if (url.endsWith("/api/real/payments/submit") && method === "POST") {
+        submitBodies.push(body);
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }) });
+      }
+      return null;
+    });
+    signPreparedPaymentMock.mockResolvedValueOnce({ signature: "0xsignature", activityId: "activity-P-1" });
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("Recipient"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await waitFor(() => expect(submitBodies).toHaveLength(1));
+    expect(signPreparedPaymentMock).toHaveBeenCalledWith(expect.objectContaining({ authorizingCredentialId: "credential-P" }));
+    expect(submitBodies[0]).toEqual({ attemptId: "payment-attempt-1", signature: "0xsignature", activityId: "activity-P-1" });
+  });
+
+  it("Slice S1: a payment bound to a different passkey restores as cancel-only with an explanation — never a Continue that would sign", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    routeFetch((url, method) => {
+      // What /latest returns when the session's passkey isn't the payment's bound one.
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: null, authorizingCredentialId: null });
+      return null;
+    });
+
+    render(<RealPayForm />);
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+    expect(screen.getByText(/started with a different passkey/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue" })).not.toBeInTheDocument();
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
+
+  it("Slice S1: when the server can't confirm the approval yet, Continue re-sends the SAME approval — no second passkey prompt", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    const submitBodies: unknown[] = [];
+    routeFetch((url, method, body) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
+      if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
+        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-P" });
+      }
+      if (url.endsWith("/api/real/payments/submit") && method === "POST") {
+        submitBodies.push(body);
+        if (submitBodies.length === 1) return jsonResponse(503, { error: "We couldn't confirm your passkey approval yet. Try again in a moment.", retryable: true });
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }) });
+      }
+      return null;
+    });
+    signPreparedPaymentMock.mockResolvedValueOnce({ signature: "0xsignature", activityId: "activity-P-1" });
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("Recipient"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    expect(screen.getByText(/couldn't confirm your passkey approval yet/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+    await waitFor(() => expect(submitBodies).toHaveLength(2));
+    expect(submitBodies[1]).toEqual(submitBodies[0]);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("Slice S1: a prepare response with no bound passkey never reaches the signing call — cancel-only", async () => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
+      if (url.endsWith("/api/real/payments/prepare") && method === "POST") return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1" });
+      return null;
+    });
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("Recipient"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
   });
 });

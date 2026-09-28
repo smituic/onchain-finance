@@ -25,7 +25,7 @@ export async function GET() {
 
     if (outcome.outcome === "unauthenticated") return jsonError("Not authenticated.", 401);
     if (outcome.outcome === "none") return Response.json({ attempt: null });
-    return Response.json({ attempt: outcome.attempt, subOrganizationId: outcome.subOrganizationId });
+    return Response.json({ attempt: outcome.attempt, subOrganizationId: outcome.subOrganizationId, authorizingCredentialId: outcome.authorizingCredentialId });
   } catch {
     return jsonInternalError();
   }

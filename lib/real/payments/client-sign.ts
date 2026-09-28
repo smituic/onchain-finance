@@ -17,6 +17,14 @@ export type SignPreparedPaymentInput = {
   subOrganizationId: string;
   ownerAddress: string;
   rpcUrl: string;
+  /** Slice S1: the server-bound passkey for this payment (from /prepare or /latest) — the only credential the prompt may offer. */
+  authorizingCredentialId: string;
+};
+
+export type SignedPreparedPayment = {
+  signature: Hex;
+  /** Turnkey's activity for the one passkey approval — sent to /submit as a locator the server verifies. */
+  activityId: string;
 };
 
 /**
@@ -40,8 +48,14 @@ export type SignPreparedPaymentInput = {
  * a cheap, local consistency check before ever asking for a signature — a
  * mismatch here means the server's prepared fields don't belong to this
  * owner, and signing must not proceed.
+ *
+ * Slice S1: the ceremony is pinned to `authorizingCredentialId` (no chooser
+ * offering another passkey), and exactly one Turnkey approval must have
+ * produced the signature — its activity id is returned for /submit. Still a
+ * fresh WebAuthn ceremony per payment; nothing is kept or stored.
  */
-export async function signPreparedPayment(input: SignPreparedPaymentInput): Promise<Hex> {
+export async function signPreparedPayment(input: SignPreparedPaymentInput): Promise<SignedPreparedPayment> {
+  if (!input.authorizingCredentialId) throw new Error("This payment has no approving passkey — refusing to sign.");
   // UX only (the server re-checks authoritatively): never spend a passkey
   // ceremony on a payment whose signed window would be too short to send.
   if (!hasEnoughValidityToDispatch(input.fields.validUntil, Math.floor(Date.now() / 1000))) {
@@ -49,10 +63,13 @@ export async function signPreparedPayment(input: SignPreparedPaymentInput): Prom
   }
   const fields = parsePreparedFieldsFromWire(input.fields);
   const publicClient = createRealPublicClient(input.rpcUrl);
+  const activityIds: string[] = [];
   const owner = createVerifiedTurnkeyOwnerAccount({
     rpId: input.rpId,
     subOrganizationId: input.subOrganizationId,
     ownerAddress: input.ownerAddress,
+    authorizingCredentialId: input.authorizingCredentialId,
+    onTurnkeyActivity: (activityId) => activityIds.push(activityId),
   });
   // The window is server-chosen and signed exactly — never computed here.
   const account = await createRealSafeAccount({ owner, publicClient, validity: { validAfter: SAFE_OP_VALID_AFTER, validUntil: input.fields.validUntil } });
@@ -61,7 +78,7 @@ export async function signPreparedPayment(input: SignPreparedPaymentInput): Prom
     throw new Error("The locally-derived Safe address does not match the prepared payment's sender — refusing to sign.");
   }
 
-  return account.signUserOperation({
+  const signature = await account.signUserOperation({
     sender: account.address as Address,
     nonce: fields.nonce,
     factory: fields.factory,
@@ -81,4 +98,6 @@ export async function signPreparedPayment(input: SignPreparedPaymentInput): Prom
     // signing-chain.test.ts's preparedOperation.signature.
     signature: "0x" as Hex,
   });
+  if (activityIds.length !== 1) throw new Error("Expected exactly one passkey approval for this payment — refusing to submit.");
+  return { signature, activityId: activityIds[0]! };
 }

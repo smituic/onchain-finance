@@ -4,7 +4,7 @@ import { serializeTurnkeyRawSignature } from "./raw-signature";
 
 export type TurnkeyRawSignResult = {
   signature: Hex;
-  /** Turnkey's activity id — Batch 2g's Proof B reads the activity's votes back by this id. Unused by the payment path. */
+  /** Turnkey's activity id — a locator the server reads back (read-only) to prove which passkey approved it: Batch 2g's Proof B, and every Real Pay payment (server/payment-authorization.ts). */
   activityId: string;
 };
 
@@ -23,7 +23,7 @@ export async function signDigestViaTurnkeyRaw(input: {
   subOrganizationId: string;
   ownerAddress: string;
   digest: Hex;
-  /** Batch 2g only: scopes the WebAuthn ceremony to one specific credential — see createRequiredWebauthnStamper's doc comment. The ordinary payment-signing call site never passes this. */
+  /** Scopes the WebAuthn ceremony to one specific credential — see createRequiredWebauthnStamper's doc comment. Real Pay always passes the payment's bound credential. */
   authorizingCredentialId?: string;
 }): Promise<TurnkeyRawSignResult> {
   const client = createPasskeyTurnkeyClient(input.rpId, input.authorizingCredentialId ? { allowCredentialId: input.authorizingCredentialId } : undefined);

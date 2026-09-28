@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { getInMemoryRegistryInternals, type RealAccountRegistry } from "./registry";
 
 /**
  * The durable Real Pay state machine (Batch 2d):
@@ -80,6 +81,17 @@ export type PaymentAttempt = {
   validUntil: number | null;
   /** Decimal string (uint64 block number) — lower bound of on-chain reconciliation's event search. */
   prepareBlockNumber: string | null;
+  /**
+   * Slice S1: the ONE passkey that may authorize this payment — the app
+   * session credential at prepare, set by reserve() and never patched. Null
+   * only on pre-attribution legacy rows, which are never signed or
+   * dispatched and never back-filled.
+   */
+  authorizingCredentialId: string | null;
+  /** The Turnkey signRawPayload activity proven (server-side read) to be this payment's approval by authorizingCredentialId. Write-once; unique across payments. */
+  turnkeySignActivityId: string | null;
+  /** ISO time that proof passed. Write-once. */
+  authorizationVerifiedAt: string | null;
   transactionHash: string | null;
   failureReason: string | null;
   createdAt: string;
@@ -105,10 +117,20 @@ export type PaymentAttemptPatch = Partial<
     | "expectedUserOperationHash"
     | "validUntil"
     | "prepareBlockNumber"
+    | "turnkeySignActivityId"
+    | "authorizationVerifiedAt"
     | "transactionHash"
     | "failureReason"
   >
 >;
+
+/** Thrown by transition() when a patch would record a Turnkey signing activity already recorded on ANOTHER attempt — one approval never authorizes two payments. The write is not applied. */
+export class DuplicateSignActivityError extends Error {
+  constructor() {
+    super("This Turnkey signing activity is already recorded on another payment.");
+    this.name = "DuplicateSignActivityError";
+  }
+}
 
 export type ReserveResult = { ok: true; attempt: PaymentAttempt } | { ok: false; reason: "quota_exceeded" | "payment_in_progress" };
 
@@ -128,7 +150,7 @@ export interface PaymentAttemptStore {
    * `prepareUserOperation` that follows a successful reservation succeeds —
    * that call happens after reserve(), never before.
    */
-  reserve(input: { appUserId: string; safeAddress: string; recipient: string; amountBaseUnits: string; chainId: number; tokenAddress: string }): Promise<ReserveResult>;
+  reserve(input: { appUserId: string; safeAddress: string; recipient: string; amountBaseUnits: string; chainId: number; tokenAddress: string; authorizingCredentialId: string }): Promise<ReserveResult>;
 
   findById(id: string): Promise<PaymentAttempt | null>;
 
@@ -148,12 +170,39 @@ export interface PaymentAttemptStore {
    * concurrent caller already moved it — this is also the duplicate-submit
    * guard (a second concurrent /submit for the same attempt id finds the
    * row no longer in `awaiting_authorization`/`signed` and backs off).
+   *
+   * turnkeySignActivityId/authorizationVerifiedAt are write-once (an
+   * existing value is never overwritten); recording an activity id already
+   * on another attempt throws DuplicateSignActivityError and applies nothing.
    */
   transition(input: { id: string; from: PaymentAttemptState; to: PaymentAttemptState; patch?: PaymentAttemptPatch }): Promise<PaymentAttempt | null>;
+
+  /**
+   * Slice S1 — the ONE atomic claim of the right to dispatch: `signed ->
+   * submitting` only if, in the same serialized step, the attempt's bound
+   * credential is still an `active` passkey of the same account. Returns
+   * null (never throws for a lost race) when the row isn't `signed` or the
+   * passkey isn't active; the caller re-reads to tell which.
+   *
+   * Serialization (Neon): the account row is locked FOR UPDATE first — the
+   * same first lock every Batch 2g passkey transaction (removal dispatch,
+   * removal confirmation, enrollment activation) takes before touching
+   * real_passkeys — so a removal that commits first is seen here, and one
+   * that starts later waits for this claim to commit. Never held across any
+   * network call: the caller dispatches only after this returns.
+   */
+  beginDispatch(input: { id: string }): Promise<PaymentAttempt | null>;
 }
 
-export function createInMemoryPaymentAttemptStore(): PaymentAttemptStore {
+/**
+ * `registry` must be the in-memory registry this adapter's attempts are
+ * bound against — beginDispatch reads its passkey map synchronously (the
+ * in-memory equivalent of the Neon account lock). Without one, beginDispatch
+ * always refuses: dispatch is never claimed on unverifiable passkey state.
+ */
+export function createInMemoryPaymentAttemptStore(registry?: RealAccountRegistry): PaymentAttemptStore {
   const attempts = new Map<string, PaymentAttempt>();
+  const passkeys = registry ? getInMemoryRegistryInternals(registry).passkeysByCredentialId : null;
 
   function forAccount(appUserId: string): PaymentAttempt[] {
     return [...attempts.values()].filter((attempt) => attempt.appUserId === appUserId);
@@ -210,6 +259,9 @@ export function createInMemoryPaymentAttemptStore(): PaymentAttemptStore {
         expectedUserOperationHash: null,
         validUntil: null,
         prepareBlockNumber: null,
+        authorizingCredentialId: input.authorizingCredentialId,
+        turnkeySignActivityId: null,
+        authorizationVerifiedAt: null,
         transactionHash: null,
         failureReason: null,
         createdAt: nowIso,
@@ -237,7 +289,30 @@ export function createInMemoryPaymentAttemptStore(): PaymentAttemptStore {
     async transition({ id, from, to, patch }) {
       const current = attempts.get(id);
       if (!current || current.state !== from) return null;
-      const next: PaymentAttempt = { ...current, ...patch, state: to, updatedAt: new Date().toISOString() };
+      const activityId = patch?.turnkeySignActivityId;
+      if (activityId && [...attempts.values()].some((other) => other.id !== id && other.turnkeySignActivityId === activityId)) {
+        throw new DuplicateSignActivityError();
+      }
+      const next: PaymentAttempt = {
+        ...current,
+        ...patch,
+        turnkeySignActivityId: current.turnkeySignActivityId ?? patch?.turnkeySignActivityId ?? null,
+        authorizationVerifiedAt: current.authorizationVerifiedAt ?? patch?.authorizationVerifiedAt ?? null,
+        state: to,
+        updatedAt: new Date().toISOString(),
+      };
+      attempts.set(id, next);
+      return next;
+    },
+
+    async beginDispatch({ id }) {
+      // Synchronous from read to write (no await) — atomic under the event
+      // loop against any registry status change, like the 2g stores.
+      const current = attempts.get(id);
+      if (!current || current.state !== "signed" || !current.authorizingCredentialId || !passkeys) return null;
+      const bound = passkeys.get(current.authorizingCredentialId);
+      if (!bound || bound.appUserId !== current.appUserId || bound.status !== "active") return null;
+      const next: PaymentAttempt = { ...current, state: "submitting", updatedAt: new Date().toISOString() };
       attempts.set(id, next);
       return next;
     },

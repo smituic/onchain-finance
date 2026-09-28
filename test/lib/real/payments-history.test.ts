@@ -48,6 +48,7 @@ async function reserveAndAdvance(
     amountBaseUnits: "1000000",
     chainId: 84532,
     tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    authorizingCredentialId: "credential-1",
   });
   if (!reserved.ok) throw new Error("expected reservation to succeed");
   if (finalState === "prepared") return reserved.attempt;
@@ -114,6 +115,7 @@ describe("resolvePaymentHistory", () => {
       findById: async () => null,
       findLatestByAppUserId: async () => null,
       transition: async () => null,
+      beginDispatch: async () => null,
       findRecentByAppUserId: async ({ limit }) => {
         recorded.limit = limit;
         return [];
@@ -225,6 +227,9 @@ describe("toPaymentHistoryEntry — data minimization", () => {
       expectedUserOperationHash: "0xexpectedhash",
       validUntil: 1_900_000_600,
       prepareBlockNumber: "47000000",
+      authorizingCredentialId: "credential-1",
+      turnkeySignActivityId: "turnkey-activity-1",
+      authorizationVerifiedAt: "2026-01-01T00:00:03.000Z",
       transactionHash: "0xtxhash",
       failureReason: "internal bundler diagnostic text",
       createdAt: "2026-01-01T00:00:00.000Z",

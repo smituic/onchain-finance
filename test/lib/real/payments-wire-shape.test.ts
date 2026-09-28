@@ -30,6 +30,8 @@ import { splitSafeOpSignature } from "@/lib/real/payments/safe-op-preflight";
 const owner = privateKeyToAccount("0x119bb329df425b685a3f3483fba01deeb1db47d608cfb051da9ad4a12995238a");
 
 let signWithKey = owner;
+/** allowCredentials (as base64url) of the stamper behind each TurnkeyClient the signing path built. */
+const stamperAllowCredentials: string[][] = [];
 const signRawPayloadMock = vi.fn(async (activity: unknown) => {
   const parameters = (activity as { parameters: { payload: Hex } }).parameters;
   const signature = await signWithKey.sign({ hash: parameters.payload });
@@ -46,11 +48,15 @@ const signRawPayloadMock = vi.fn(async (activity: unknown) => {
     },
   };
 });
-vi.mock("@turnkey/http", () => ({
-  TurnkeyClient: vi.fn().mockImplementation(function TurnkeyClientMock() {
-    return { signRawPayload: signRawPayloadMock };
-  }),
-}));
+vi.mock("@turnkey/http", async () => {
+  const { bytesToBase64Url } = await import("@/lib/real/bytes");
+  return {
+    TurnkeyClient: vi.fn().mockImplementation(function TurnkeyClientMock(_config: unknown, stamper: { allowCredentials?: Array<{ id: BufferSource }> }) {
+      stamperAllowCredentials.push((stamper?.allowCredentials ?? []).map((c) => bytesToBase64Url(new Uint8Array(c.id as ArrayBuffer))));
+      return { signRawPayload: signRawPayloadMock };
+    }),
+  };
+});
 
 const DUMMY_BYTES_RETURN = encodeAbiParameters([{ type: "bytes" }], ["0x600a600c600039600a6000f3" as Hex]);
 const BALANCE_OF_SELECTOR = "0x70a08231";
@@ -196,14 +202,24 @@ describe("live incident regression: prepared-fields wire shape must survive the 
     expect(wireAttempt.prepared?.sender).toBeTruthy();
     expect(wireAttempt.prepared?.sender.toLowerCase()).toBe(SAFE_ADDRESS.toLowerCase());
 
-    const signature = await signPreparedPayment({
+    // The server-bound credential crosses the wire too, and it is the session's own.
+    const wireSigning = throughJson({ authorizingCredentialId: prepared.authorizingCredentialId });
+    expect(wireSigning.authorizingCredentialId).toBe("credential-1");
+    stamperAllowCredentials.length = 0;
+
+    const { signature, activityId } = await signPreparedPayment({
       fields: wireAttempt.prepared!,
       rpId: "localhost",
       subOrganizationId: prepared.subOrganizationId,
       ownerAddress: owner.address,
       rpcUrl: "http://unused.invalid",
+      authorizingCredentialId: wireSigning.authorizingCredentialId,
     });
     expect(signature).toMatch(/^0x[0-9a-f]+$/i);
+    // Slice S1: the one passkey ceremony was pinned to exactly the bound credential, and its activity id comes back for /submit.
+    expect(signRawPayloadMock).toHaveBeenCalledTimes(1);
+    expect(stamperAllowCredentials).toEqual([["credential-1"]]);
+    expect(activityId).toBe("activity-1");
     // The browser signed EXACTLY the server-chosen finite window — never 0 (= never expires).
     expect(wireAttempt.prepared!.validUntil).toBeGreaterThan(0);
     expect(splitSafeOpSignature(signature)).toMatchObject({ validAfter: 0, validUntil: wireAttempt.prepared!.validUntil });
@@ -237,19 +253,23 @@ describe("live incident regression: prepared-fields wire shape must survive the 
     if (latest.outcome !== "ok") return;
     expect(latest.attempt.state).toBe("awaiting_authorization");
     expect(latest.subOrganizationId).toBe("sub-org-1");
+    expect(latest.authorizingCredentialId).toBe("credential-1");
 
     const wireAttempt = throughJson(latest.attempt);
     expect(wireAttempt.prepared?.sender).toBeTruthy();
 
     // The user's "Continue" tap — a real signing attempt, still no /submit call.
-    const signature = await signPreparedPayment({
+    stamperAllowCredentials.length = 0;
+    const { signature } = await signPreparedPayment({
       fields: wireAttempt.prepared!,
       rpId: "localhost",
       subOrganizationId: latest.subOrganizationId!,
       ownerAddress: owner.address,
       rpcUrl: "http://unused.invalid",
+      authorizingCredentialId: latest.authorizingCredentialId!,
     });
     expect(signature).toMatch(/^0x[0-9a-f]+$/i);
+    expect(stamperAllowCredentials).toEqual([["credential-1"]]);
   });
 
   it("reproduces the exact live crash when `sender` is missing from the wire object — proving what the fix closed", async () => {
@@ -280,6 +300,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
         subOrganizationId: "sub-org-1",
         ownerAddress: owner.address,
         rpcUrl: "http://unused.invalid",
+        authorizingCredentialId: "credential-1",
       }),
     ).rejects.toThrow(/reading 'toLowerCase'|Cannot read propert/);
   });
@@ -301,11 +322,37 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       paymasterVerificationGasLimit: null,
       paymasterPostOpGasLimit: null,
     };
-    const sign = (fields: unknown) => signPreparedPayment({ fields: fields as never, rpId: "localhost", subOrganizationId: "sub-org-1", ownerAddress: owner.address, rpcUrl: "http://unused.invalid" });
+    const sign = (fields: unknown) =>
+      signPreparedPayment({ fields: fields as never, rpId: "localhost", subOrganizationId: "sub-org-1", ownerAddress: owner.address, rpcUrl: "http://unused.invalid", authorizingCredentialId: "credential-1" });
     signRawPayloadMock.mockClear();
 
     await expect(sign(base)).rejects.toThrow(PAYMENT_EXPIRED_BEFORE_APPROVAL);
     await expect(sign({ ...base, validUntil: Math.floor(Date.now() / 1000) + 30 })).rejects.toThrow(PAYMENT_EXPIRED_BEFORE_APPROVAL);
+    expect(signRawPayloadMock).not.toHaveBeenCalled();
+  });
+
+  it("Slice S1: with no bound credential the client refuses BEFORE any passkey ceremony — it never signs unpinned", async () => {
+    signRawPayloadMock.mockClear();
+    const fields = {
+      sender: SAFE_ADDRESS,
+      nonce: "0",
+      factory: null,
+      factoryData: null,
+      callData: "0x1234",
+      callGasLimit: "80000",
+      verificationGasLimit: "150000",
+      preVerificationGas: "60000",
+      maxFeePerGas: "2000000",
+      maxPriorityFeePerGas: "1000000",
+      paymaster: null,
+      paymasterData: null,
+      paymasterVerificationGasLimit: null,
+      paymasterPostOpGasLimit: null,
+      validUntil: Math.floor(Date.now() / 1000) + 600,
+    };
+    await expect(
+      signPreparedPayment({ fields, rpId: "localhost", subOrganizationId: "sub-org-1", ownerAddress: owner.address, rpcUrl: "http://unused.invalid", authorizingCredentialId: "" }),
+    ).rejects.toThrow(/no approving passkey/);
     expect(signRawPayloadMock).not.toHaveBeenCalled();
   });
 });

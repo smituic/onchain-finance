@@ -4,7 +4,7 @@ import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRecord
 import { type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentPatch, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { PasskeyRevocationAttempt, PasskeyRevocationStore, RevocationAttemptPatch, RevocationAttemptState } from "./passkey-revocation-attempts";
 import type { ExternalProvisioningOutcome, RegistrationAttempt, RegistrationAttemptState, RegistrationAttemptStore } from "./registration-attempts";
-import type { PaymentAttempt, PaymentAttemptState, PaymentAttemptStore, ReserveResult } from "./payment-attempts";
+import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptState, type PaymentAttemptStore, type ReserveResult } from "./payment-attempts";
 
 /**
  * SERVER-ONLY durable adapters for the vendor-neutral interfaces
@@ -187,6 +187,9 @@ function toPaymentAttempt(row: Row): PaymentAttempt {
     expectedUserOperationHash: (row.expected_user_operation_hash as string | null) ?? null,
     validUntil: row.valid_until === null || row.valid_until === undefined ? null : Number(row.valid_until),
     prepareBlockNumber: row.prepare_block_number === null || row.prepare_block_number === undefined ? null : String(row.prepare_block_number),
+    authorizingCredentialId: (row.authorizing_credential_id as string | null) ?? null,
+    turnkeySignActivityId: (row.turnkey_sign_activity_id as string | null) ?? null,
+    authorizationVerifiedAt: row.authorization_verified_at ? new Date(row.authorization_verified_at as string).toISOString() : null,
     transactionHash: (row.transaction_hash as string | null) ?? null,
     failureReason: (row.failure_reason as string | null) ?? null,
     createdAt: new Date(row.created_at as string).toISOString(),
@@ -933,8 +936,8 @@ export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, fals
             FROM payment_attempts, _lock
             WHERE app_user_id = ${input.appUserId}
           )
-          INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state)
-          SELECT ${input.appUserId}, ${input.safeAddress}, ${input.recipient}, ${input.amountBaseUnits}, ${input.chainId}, ${input.tokenAddress}, 'prepared'
+          INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state, authorizing_credential_id)
+          SELECT ${input.appUserId}, ${input.safeAddress}, ${input.recipient}, ${input.amountBaseUnits}, ${input.chainId}, ${input.tokenAddress}, 'prepared', ${input.authorizingCredentialId}
           FROM _counts
           WHERE hourly < 10 AND daily < 30 AND active = 0
           RETURNING *
@@ -996,33 +999,65 @@ export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, fals
       return rows.map(toPaymentAttempt);
     },
 
+    // turnkey_sign_activity_id / authorization_verified_at are write-once:
+    // COALESCE(existing, patch) never overwrites a recorded value.
     async transition({ id, from, to, patch }) {
-      const rows = (await sql`
-        UPDATE payment_attempts
-        SET
-          state = ${to},
-          nonce = COALESCE(${patch?.nonce ?? null}, nonce),
-          call_data = COALESCE(${patch?.callData ?? null}, call_data),
-          factory = COALESCE(${patch?.factory ?? null}, factory),
-          factory_data = COALESCE(${patch?.factoryData ?? null}, factory_data),
-          call_gas_limit = COALESCE(${patch?.callGasLimit ?? null}, call_gas_limit),
-          verification_gas_limit = COALESCE(${patch?.verificationGasLimit ?? null}, verification_gas_limit),
-          pre_verification_gas = COALESCE(${patch?.preVerificationGas ?? null}, pre_verification_gas),
-          max_fee_per_gas = COALESCE(${patch?.maxFeePerGas ?? null}, max_fee_per_gas),
-          max_priority_fee_per_gas = COALESCE(${patch?.maxPriorityFeePerGas ?? null}, max_priority_fee_per_gas),
-          paymaster = COALESCE(${patch?.paymaster ?? null}, paymaster),
-          paymaster_data = COALESCE(${patch?.paymasterData ?? null}, paymaster_data),
-          paymaster_verification_gas_limit = COALESCE(${patch?.paymasterVerificationGasLimit ?? null}, paymaster_verification_gas_limit),
-          paymaster_post_op_gas_limit = COALESCE(${patch?.paymasterPostOpGasLimit ?? null}, paymaster_post_op_gas_limit),
-          expected_user_operation_hash = COALESCE(${patch?.expectedUserOperationHash ?? null}, expected_user_operation_hash),
-          valid_until = COALESCE(${patch?.validUntil ?? null}::bigint, valid_until),
-          prepare_block_number = COALESCE(${patch?.prepareBlockNumber ?? null}::bigint, prepare_block_number),
-          transaction_hash = COALESCE(${patch?.transactionHash ?? null}, transaction_hash),
-          failure_reason = COALESCE(${patch?.failureReason ?? null}, failure_reason),
-          updated_at = now()
-        WHERE id = ${id} AND state = ${from}
-        RETURNING *
-      `) as Row[];
+      let rows: Row[];
+      try {
+        rows = (await sql`
+          UPDATE payment_attempts
+          SET
+            state = ${to},
+            nonce = COALESCE(${patch?.nonce ?? null}, nonce),
+            call_data = COALESCE(${patch?.callData ?? null}, call_data),
+            factory = COALESCE(${patch?.factory ?? null}, factory),
+            factory_data = COALESCE(${patch?.factoryData ?? null}, factory_data),
+            call_gas_limit = COALESCE(${patch?.callGasLimit ?? null}, call_gas_limit),
+            verification_gas_limit = COALESCE(${patch?.verificationGasLimit ?? null}, verification_gas_limit),
+            pre_verification_gas = COALESCE(${patch?.preVerificationGas ?? null}, pre_verification_gas),
+            max_fee_per_gas = COALESCE(${patch?.maxFeePerGas ?? null}, max_fee_per_gas),
+            max_priority_fee_per_gas = COALESCE(${patch?.maxPriorityFeePerGas ?? null}, max_priority_fee_per_gas),
+            paymaster = COALESCE(${patch?.paymaster ?? null}, paymaster),
+            paymaster_data = COALESCE(${patch?.paymasterData ?? null}, paymaster_data),
+            paymaster_verification_gas_limit = COALESCE(${patch?.paymasterVerificationGasLimit ?? null}, paymaster_verification_gas_limit),
+            paymaster_post_op_gas_limit = COALESCE(${patch?.paymasterPostOpGasLimit ?? null}, paymaster_post_op_gas_limit),
+            expected_user_operation_hash = COALESCE(${patch?.expectedUserOperationHash ?? null}, expected_user_operation_hash),
+            valid_until = COALESCE(${patch?.validUntil ?? null}::bigint, valid_until),
+            prepare_block_number = COALESCE(${patch?.prepareBlockNumber ?? null}::bigint, prepare_block_number),
+            turnkey_sign_activity_id = COALESCE(turnkey_sign_activity_id, ${patch?.turnkeySignActivityId ?? null}),
+            authorization_verified_at = COALESCE(authorization_verified_at, ${patch?.authorizationVerifiedAt ?? null}::timestamptz),
+            transaction_hash = COALESCE(${patch?.transactionHash ?? null}, transaction_hash),
+            failure_reason = COALESCE(${patch?.failureReason ?? null}, failure_reason),
+            updated_at = now()
+          WHERE id = ${id} AND state = ${from}
+          RETURNING *
+        `) as Row[];
+      } catch (error) {
+        if (isUniqueViolation(error, "payment_attempts_turnkey_sign_activity_id_key")) throw new DuplicateSignActivityError();
+        throw error;
+      }
+      return rows[0] ? toPaymentAttempt(rows[0]) : null;
+    },
+
+    // Slice S1: see PaymentAttemptStore.beginDispatch. Lock order = the 2g
+    // passkey transactions' (account row first, then per-account rows), so it
+    // can't deadlock against a removal; READ COMMITTED gives the UPDATE a
+    // fresh snapshot after the lock, so a removal that committed first is
+    // seen. One conditional write — no guard SELECT needed.
+    async beginDispatch({ id }) {
+      const results = await sql.transaction([
+        sql`SELECT app_user_id FROM real_accounts WHERE app_user_id = (SELECT app_user_id FROM payment_attempts WHERE id = ${id}) FOR UPDATE`,
+        sql`
+          UPDATE payment_attempts p SET state = 'submitting', updated_at = now()
+          WHERE p.id = ${id} AND p.state = 'signed'
+            AND EXISTS (
+              SELECT 1 FROM real_passkeys k
+              WHERE k.credential_id = p.authorizing_credential_id AND k.app_user_id = p.app_user_id AND k.status = 'active'
+            )
+          RETURNING *
+        `,
+      ]);
+      const rows = results[1] as Row[];
       return rows[0] ? toPaymentAttempt(rows[0]) : null;
     },
   };

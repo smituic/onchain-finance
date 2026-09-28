@@ -286,9 +286,13 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
     const sql = neon(databaseUrl);
     for (const id of cleanupAppUserIds) {
       await sql`DELETE FROM payment_attempts WHERE app_user_id = ${id}`;
+      await sql`DELETE FROM real_passkeys WHERE app_user_id = ${id}`;
       await sql`DELETE FROM real_accounts WHERE app_user_id = ${id}`;
     }
   });
+
+  /** Slice S1: every attempt is bound (FK) to a real passkey row. */
+  const credentialFor = (userId: string) => `${userId}-credential`;
 
   async function seedRealAccount(userId: string) {
     const { neon } = await import("@neondatabase/serverless");
@@ -297,10 +301,14 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
       INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
       VALUES (${userId}, 'smoke-sub-org', 'smoke-turnkey-user', 'smoke-wallet', 'smoke-wallet-account', '0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF', ${SAFE_ADDRESS}, 1)
     `;
+    await sql`
+      INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter)
+      VALUES (${credentialFor(userId)}, ${userId}, 'smoke-cose', 'smoke-handle', 0)
+    `;
   }
 
   function reserveInput(userId: string) {
-    return { appUserId: userId, safeAddress: SAFE_ADDRESS, recipient: RECIPIENT, amountBaseUnits: "1000000", chainId: CHAIN_ID, tokenAddress: TOKEN_ADDRESS };
+    return { appUserId: userId, safeAddress: SAFE_ADDRESS, recipient: RECIPIENT, amountBaseUnits: "1000000", chainId: CHAIN_ID, tokenAddress: TOKEN_ADDRESS, authorizingCredentialId: credentialFor(userId) };
   }
 
   it("A: the payment_attempts table exists", async () => {
@@ -520,6 +528,91 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
     // payment_attempts + real_accounts by app_user_id) — nothing extra
     // needed here, and no existing live payment row (outside these two
     // smoke-prefixed app_user_ids) is ever touched.
+  }, 30_000);
+
+  it("S1: the bound credential persists; the signing activity id is write-once and never recorded on two payments; a revoked passkey keeps its attribution", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { DuplicateSignActivityError } = await import("@/lib/real/server/payment-attempts");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("attribution");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+    const activityId = `smoke-activity-${runId}`;
+
+    const first = await store.reserve(reserveInput(userId));
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.attempt).toMatchObject({ authorizingCredentialId: credentialFor(userId), turnkeySignActivityId: null, authorizationVerifiedAt: null });
+    await store.transition({ id: first.attempt.id, from: "prepared", to: "awaiting_authorization" });
+    const claimed = await store.transition({ id: first.attempt.id, from: "awaiting_authorization", to: "signed", patch: { turnkeySignActivityId: activityId, authorizationVerifiedAt: new Date().toISOString() } });
+    expect(claimed?.turnkeySignActivityId).toBe(activityId);
+    expect(claimed?.authorizationVerifiedAt).toBeTruthy();
+    const kept = await store.transition({ id: first.attempt.id, from: "signed", to: "failed", patch: { turnkeySignActivityId: "overwrite-attempt" } });
+    expect(kept?.turnkeySignActivityId).toBe(activityId); // write-once
+
+    const second = await store.reserve(reserveInput(userId));
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    await store.transition({ id: second.attempt.id, from: "prepared", to: "awaiting_authorization" });
+    await expect(store.transition({ id: second.attempt.id, from: "awaiting_authorization", to: "signed", patch: { turnkeySignActivityId: activityId } })).rejects.toBeInstanceOf(DuplicateSignActivityError);
+    expect((await store.findById(second.attempt.id))?.state).toBe("awaiting_authorization"); // nothing applied
+    await store.transition({ id: second.attempt.id, from: "awaiting_authorization", to: "cancelled" });
+
+    await sql`UPDATE real_passkeys SET status = 'revoked' WHERE credential_id = ${credentialFor(userId)}`;
+    expect((await store.findById(first.attempt.id))?.authorizingCredentialId).toBe(credentialFor(userId));
+  }, 30_000);
+
+  async function signedAttempt(store: import("@/lib/real/server/payment-attempts").PaymentAttemptStore, userId: string) {
+    const reserved = await store.reserve(reserveInput(userId));
+    if (!reserved.ok) throw new Error("expected a reservation");
+    await store.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization" });
+    await store.transition({ id: reserved.attempt.id, from: "awaiting_authorization", to: "signed" });
+    return reserved.attempt.id;
+  }
+
+  it("S1: beginDispatch claims signed -> submitting only while the bound passkey is active", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("dispatch-claim");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+
+    const first = await signedAttempt(store, userId);
+    expect((await store.beginDispatch({ id: first }))?.state).toBe("submitting");
+    expect(await store.beginDispatch({ id: first })).toBeNull();
+    await store.transition({ id: first, from: "submitting", to: "failed" });
+
+    await sql`UPDATE real_passkeys SET status = 'revoking' WHERE credential_id = ${credentialFor(userId)}`;
+    const second = await signedAttempt(store, userId);
+    expect(await store.beginDispatch({ id: second })).toBeNull();
+    expect((await store.findById(second))?.state).toBe("signed");
+  }, 30_000);
+
+  it("S1: a removal holding the account lock is serialized BEFORE a concurrent beginDispatch — which then sees 'revoking' and refuses", async () => {
+    const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const store = createNeonPaymentAttemptStore(sql);
+    const userId = appUserId("dispatch-lock");
+    cleanupAppUserIds.add(userId);
+    await seedRealAccount(userId);
+    const id = await signedAttempt(store, userId);
+
+    // Same first lock as the 2g removal transactions, held ~2 s with the passkey already revoking (uncommitted).
+    const removal = sql.transaction([
+      sql`SELECT app_user_id FROM real_accounts WHERE app_user_id = ${userId} FOR UPDATE`,
+      sql`UPDATE real_passkeys SET status = 'revoking' WHERE credential_id = ${credentialFor(userId)}`,
+      sql`SELECT pg_sleep(2)`,
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const [, claimed] = await Promise.all([removal, store.beginDispatch({ id })]);
+
+    expect(claimed).toBeNull();
+    expect((await store.findById(id))?.state).toBe("signed");
   }, 30_000);
 });
 

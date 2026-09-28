@@ -484,3 +484,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS payment_attempts_one_active_per_account
 -- The nonce (key = nonce >> 64, sequence = low 64 bits) is already stored.
 ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS valid_until BIGINT;
 ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS prepare_block_number BIGINT;
+
+-- Slice S1 hand-applied migration: Real Pay credential attribution.
+-- Idempotent; all nullable, so every pre-existing row stays valid. A row
+-- with NULL authorizing_credential_id predates attribution: it is never
+-- signed or dispatched (server/payments.ts) and is never back-filled.
+--   authorizing_credential_id    the app session credential at prepare —
+--                                written once by reserve(), never patched.
+--                                Plain FK, no ON DELETE action: passkeys are
+--                                revoked by status, never deleted, so a
+--                                revoked passkey stays as attribution evidence.
+--   turnkey_sign_activity_id     the signRawPayload activity the server read
+--                                back from Turnkey and verified before dispatch
+--                                (server/payment-authorization.ts). A locator
+--                                the client supplied, trusted only after that
+--                                read. Written once, never overwritten.
+--   authorization_verified_at    when that verification passed.
+-- Pre-live check (read-only): SELECT count(*) FROM payment_attempts
+--   WHERE turnkey_sign_activity_id IS NOT NULL;  -- expect 0 before first use
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS authorizing_credential_id TEXT REFERENCES real_passkeys (credential_id);
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS turnkey_sign_activity_id TEXT;
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS authorization_verified_at TIMESTAMPTZ;
+-- One Turnkey signing activity authorizes at most one payment.
+CREATE UNIQUE INDEX IF NOT EXISTS payment_attempts_turnkey_sign_activity_id_key
+  ON payment_attempts (turnkey_sign_activity_id) WHERE turnkey_sign_activity_id IS NOT NULL;

@@ -11,6 +11,7 @@ function reserveInput(appUserId = "app-user-1") {
     amountBaseUnits: "1000000",
     chainId: 84532,
     tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    authorizingCredentialId: "credential-1",
   };
 }
 
