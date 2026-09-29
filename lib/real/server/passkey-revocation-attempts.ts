@@ -131,6 +131,15 @@ function applyPatch(current: PasskeyRevocationAttempt, patch: RevocationAttemptP
   return next as PasskeyRevocationAttempt;
 }
 
+const inMemoryRevocationInternals = new WeakMap<PasskeyRevocationStore, { attempts: Map<string, PasskeyRevocationAttempt> }>();
+
+/** Lets the in-memory operator resolution store (S3) run its multi-row commit synchronously, like getInMemoryRegistryInternals. */
+export function getInMemoryRevocationInternals(store: PasskeyRevocationStore): { attempts: Map<string, PasskeyRevocationAttempt> } {
+  const internals = inMemoryRevocationInternals.get(store);
+  if (!internals) throw new Error("The in-memory resolution store requires the in-memory revocation store.");
+  return internals;
+}
+
 /** Every multi-row operation runs synchronously end to end — atomic (and per-account serialized) in this single-threaded adapter. */
 export function createInMemoryPasskeyRevocationStore(registry: RealAccountRegistry): PasskeyRevocationStore {
   const attempts = new Map<string, PasskeyRevocationAttempt>();
@@ -195,7 +204,7 @@ export function createInMemoryPasskeyRevocationStore(registry: RealAccountRegist
     return saved;
   }
 
-  return {
+  const store: PasskeyRevocationStore = {
     async prepare({ appUserId, targetCredentialId, authorizerCredentialId }) {
       if (targetCredentialId === authorizerCredentialId) return { ok: false, reason: "same_credential" };
       if (!eligible(appUserId, authorizerCredentialId)) return { ok: false, reason: "authorizer_not_eligible" };
@@ -275,4 +284,6 @@ export function createInMemoryPasskeyRevocationStore(registry: RealAccountRegist
       return save({ ...current, state: "confirmed", turnkeyActivityStatus, turnkeyRequestStamp: null });
     },
   };
+  inMemoryRevocationInternals.set(store, { attempts });
+  return store;
 }

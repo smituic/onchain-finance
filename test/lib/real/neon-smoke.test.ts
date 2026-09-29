@@ -1078,3 +1078,172 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
     await expect(sql`UPDATE real_passkeys SET display_name = '' WHERE credential_id = ${a}`).rejects.toThrow();
   });
 });
+
+/**
+ * Slice S3 — the operator resolution store's SQL (passkey-revocation-
+ * resolution-store.ts). Same DATABASE_URL gate as above; NOT yet run live.
+ * Needs schema.sql's passkey_revocation_resolutions table applied first.
+ * Covers only the Neon adapter (the account-locked commit batch, its CAS
+ * predicates, its rollback guards, the audit uniqueness) — the resolver's
+ * evidence logic is covered offline by passkey-revocation-resolver.test.ts.
+ */
+describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Slice S3 blocked-removal resolution (live database)", () => {
+  const databaseUrl = process.env.DATABASE_URL;
+  const runId = randomUUID().slice(0, 8);
+  const users = new Set<string>();
+  const id = (kind: string, n: string) => `smokeS3-${runId}-${kind}-${n}`;
+
+  async function sqlFn() {
+    const { neon } = await import("@neondatabase/serverless");
+    return neon(databaseUrl!);
+  }
+
+  async function stores() {
+    const { createNeonDurableStores } = await import("@/lib/real/server/neon-store");
+    const { createNeonRevocationResolutionStore } = await import("@/lib/real/server/passkey-revocation-resolution-store");
+    return { ...createNeonDurableStores(databaseUrl!), resolution: createNeonRevocationResolutionStore(await sqlFn()) };
+  }
+
+  const sha = async (body: string) => (await import("@/lib/real/server/turnkey-signed-request")).sha256Hex(body);
+
+  /** Primary (active, mapped) + a pending-but-mapped backup whose removal is dispatched and then BLOCKED (slot held). */
+  const STAMP_SENTINEL = "SMOKE-STAMP-SENTINEL";
+
+  /** `keepStamp`: leave the sentinel stamp on the blocked row (normal blocking clears it) so a test can prove loadSnapshot never reads it. */
+  async function blockedPendingRemoval(purpose: string, opts: { keepStamp?: boolean } = {}) {
+    const s = await stores();
+    const sql = await sqlFn();
+    const appUserId = id("user", purpose);
+    users.add(appUserId);
+    const primary = id("cred", `${purpose}-primary`);
+    const pending = id("cred", `${purpose}-pending`);
+    await sql`
+      INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
+      VALUES (${appUserId}, 'smoke-sub-org', 'smoke-turnkey-user', 'smoke-wallet', 'smoke-wallet-account', '0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF', '0xd9a4c22fb34dc74317edc8006140d66c8fa03266', 1)
+    `;
+    await sql`
+      INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter, status, role, turnkey_authenticator_id)
+      VALUES (${primary}, ${appUserId}, 'pk', 'uh', 0, 'active', 'primary', ${id("auth", `${purpose}-primary`)})
+    `;
+    const enrollment = (await s.backupEnrollments.createStarted({ appUserId }))!;
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "started", to: "started", patch: { registrationMintId: "smoke-mint" } });
+    await s.backupEnrollments.registerCredential({
+      id: enrollment.id,
+      credential: { credentialId: pending, userHandle: "uh", credentialPublicKey: "pk", counter: 0, transports: null, credentialDeviceType: null, credentialBackedUp: null, registrationChallenge: "c", rawClientDataJson: "d", rawAttestationObject: "a", stepUpCredentialId: primary, registrationMintId: "smoke-mint" },
+    });
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "credential_registered", to: "turnkey_enrollment_in_flight", patch: { externalOutcome: "unknown" } });
+    const targetAuth = id("auth", `${purpose}-pending`);
+    if (!(await s.backupEnrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: targetAuth, turnkeyAuthenticatorPublicKey: "02ab", turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" }))) throw new Error("setup");
+
+    const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary });
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared));
+    const body = JSON.stringify({ type: "ACTIVITY_TYPE_DELETE_AUTHENTICATORS", timestampMs: String(Date.now()), organizationId: "smoke-sub-org", parameters: { userId: "smoke-turnkey-user", authenticatorIds: [targetAuth] } });
+    const bodySha = await sha(body);
+    if (!(await s.revocations.beginDispatch({ id: prepared.attempt.id, patch: { turnkeyRequestBody: body, turnkeyRequestBodySha256: bodySha, turnkeyRequestTimestampMs: Date.now(), turnkeyRequestStamp: STAMP_SENTINEL, externalAttemptedAt: new Date().toISOString() } }))) throw new Error("setup");
+    await s.revocations.transition({ id: prepared.attempt.id, from: "dispatch_in_flight", to: "blocked", patch: { failureReason: "no_activity_receipt", ...(opts.keepStamp ? {} : { turnkeyRequestStamp: null }) } });
+    return { s, sql, appUserId, primary, pending, targetAuth, enrollmentId: enrollment.id, attemptId: prepared.attempt.id, bodySha };
+  }
+
+  const commitInput = (w: Awaited<ReturnType<typeof blockedPendingRemoval>>, overrides: { failureReason?: string; bodySha?: string; receiptActivityId?: string } = {}) => ({
+    appUserId: w.appUserId,
+    attemptId: w.attemptId,
+    targetCredentialId: w.pending,
+    targetTurnkeyAuthenticatorId: w.targetAuth,
+    expected: { turnkeyActivityId: null, turnkeyActivityStatus: null, failureReason: overrides.failureReason ?? "no_activity_receipt" },
+    receipt: { activityId: overrides.receiptActivityId ?? id("activity", w.attemptId), source: "stored_attempt_body" as const, bodyAttemptId: w.attemptId, bodySha256: overrides.bodySha ?? w.bodySha, turnkeyCreatedAt: new Date().toISOString() },
+    activityLogHeadId: "smoke-head",
+    absenceFirstObservedAt: new Date().toISOString(),
+    absenceLastObservedAt: new Date().toISOString(),
+    survivorAuthenticatorIds: ["smoke-survivor"],
+    resolverVersion: 1,
+  });
+
+  async function state(w: Awaited<ReturnType<typeof blockedPendingRemoval>>) {
+    return {
+      attempt: await w.s.revocations.findById(w.attemptId),
+      target: (await w.s.registry.findPasskeyByCredentialId(w.pending))?.status,
+      enrollment: (await w.s.backupEnrollments.findById(w.enrollmentId))?.state,
+      rows: ((await w.sql`SELECT count(*)::int AS n FROM passkey_revocation_resolutions WHERE revocation_attempt_id = ${w.attemptId}`) as Array<{ n: number }>)[0]!.n,
+    };
+  }
+
+  afterAll(async () => {
+    if (!databaseUrl) return;
+    const sql = await sqlFn();
+    for (const appUserId of users) {
+      await sql`DELETE FROM passkey_revocation_resolutions WHERE app_user_id = ${appUserId}`;
+      await sql`DELETE FROM passkey_revocation_attempts WHERE app_user_id = ${appUserId}`;
+      await sql`DELETE FROM backup_passkey_enrollments WHERE app_user_id = ${appUserId}`;
+      await sql`DELETE FROM real_passkeys WHERE app_user_id = ${appUserId}`;
+      await sql`DELETE FROM real_accounts WHERE app_user_id = ${appUserId}`;
+    }
+  });
+
+  it("S3: loadSnapshot reads one consistent READ ONLY snapshot and never selects the stamp", async () => {
+    const w = await blockedPendingRemoval("snapshot", { keepStamp: true });
+    // Precondition: the sentinel really is in the row, so its absence below is meaningful.
+    expect(((await w.sql`SELECT turnkey_request_stamp FROM passkey_revocation_attempts WHERE id = ${w.attemptId}`) as Array<{ turnkey_request_stamp: string }>)[0]!.turnkey_request_stamp).toBe(STAMP_SENTINEL);
+    const snapshot = await w.s.resolution.loadSnapshot({ appUserId: w.appUserId, attemptId: w.attemptId });
+    expect(snapshot).toMatchObject({ attempt: { state: "blocked", failureReason: "no_activity_receipt" }, hasNewerNonCancelledAttempt: false, targetPasskey: { status: "revoking" }, targetEnrollments: [{ state: "removal_in_progress" }], existingResolutionId: null });
+    // 1. The stamp's value never reaches the snapshot.
+    expect(JSON.stringify(snapshot)).not.toContain(STAMP_SENTINEL);
+    // 2. No attempt row in the snapshot even has a stamp field.
+    for (const row of [snapshot!.attempt, ...snapshot!.targetAttempts]) expect(Object.keys(row)).not.toContain("turnkeyRequestStamp");
+  });
+
+  it("S3: the commit — attempt blocked -> confirmed (own fields untouched), target revoked, enrollment removed (slot freed), one audit row; a second commit changes nothing", async () => {
+    const w = await blockedPendingRemoval("commit");
+    expect(await w.s.backupEnrollments.createStarted({ appUserId: w.appUserId })).toBeNull();
+    const committed = await w.s.resolution.commitResolution(commitInput(w));
+    expect(committed).toMatchObject({ outcome: "committed" });
+    const after = await state(w);
+    expect(after).toMatchObject({ attempt: { state: "confirmed", turnkeyActivityId: null, turnkeyActivityStatus: null, failureReason: "no_activity_receipt", turnkeyRequestBodySha256: w.bodySha }, target: "revoked", enrollment: "removed", rows: 1 });
+    expect(await w.s.backupEnrollments.createStarted({ appUserId: w.appUserId })).toMatchObject({ state: "started" });
+    expect(await w.s.resolution.commitResolution(commitInput(w))).toEqual({ outcome: "lost_race" });
+    expect((await state(w)).rows).toBe(1);
+  });
+
+  it("S3: a lost CAS (own field changed, body hash wrong, newer attempt) rolls back COMPLETELY", async () => {
+    for (const [label, tamper] of [
+      ["failure reason", { failureReason: "tampered" }],
+      ["body hash", { bodySha: "0".repeat(64) }],
+    ] as const) {
+      const w = await blockedPendingRemoval(`lost-${label.replace(/\s/g, "-")}`);
+      const before = await state(w);
+      expect(await w.s.resolution.commitResolution(commitInput(w, tamper)), label).toEqual({ outcome: "lost_race" });
+      expect(await state(w), label).toEqual(before);
+    }
+    const w = await blockedPendingRemoval("lost-newer");
+    await w.s.revocations.prepare({ appUserId: w.appUserId, targetCredentialId: w.pending, authorizerCredentialId: w.primary });
+    const before = await state(w);
+    expect(await w.s.resolution.commitResolution(commitInput(w))).toEqual({ outcome: "lost_race" });
+    expect(await state(w)).toEqual(before);
+  });
+
+  it("S3: two concurrent operator commits under the real account lock => exactly one committed, one audit row", async () => {
+    const w = await blockedPendingRemoval("double");
+    const results = await Promise.all([w.s.resolution.commitResolution(commitInput(w)), w.s.resolution.commitResolution(commitInput(w))]);
+    expect(results.map((r) => r.outcome).sort()).toEqual(["committed", "lost_race"]);
+    expect((await state(w)).rows).toBe(1);
+  });
+
+  it("S3: a user retry's prepare racing the commit on the real account row => one consistent winner", async () => {
+    const w = await blockedPendingRemoval("retry-race");
+    const retry = await w.s.revocations.prepare({ appUserId: w.appUserId, targetCredentialId: w.pending, authorizerCredentialId: w.primary });
+    if (!retry.ok) throw new Error("setup");
+    // The prepared retry alone already blocks resolution (newer non-cancelled attempt):
+    expect(await w.s.resolution.commitResolution(commitInput(w))).toEqual({ outcome: "lost_race" });
+    await w.s.revocations.transition({ id: retry.attempt.id, from: "authorization_needed", to: "cancelled" });
+    const [committed, retried] = await Promise.all([
+      w.s.resolution.commitResolution(commitInput(w)),
+      w.s.revocations.prepare({ appUserId: w.appUserId, targetCredentialId: w.pending, authorizerCredentialId: w.primary }),
+    ]);
+    const after = await state(w);
+    if (committed.outcome === "committed") {
+      expect(after).toMatchObject({ target: "revoked", enrollment: "removed", rows: 1 });
+    } else {
+      expect(retried.ok).toBe(true);
+      expect(after).toMatchObject({ target: "revoking", enrollment: "removal_in_progress", rows: 0 });
+    }
+  });
+});

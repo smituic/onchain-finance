@@ -364,6 +364,8 @@ END $$;
 --              credential that owns it — the target never left 'active'),
 --              blocked (after dispatch: every outcome other than a confirmed
 --              deletion; target stays 'revoking').
+--   S3: 'blocked' -> 'confirmed' exists ONLY through the operator resolver,
+--   with the R2a evidence described at passkey_revocation_resolutions below.
 --
 -- RETRY (2g-H): a 'revoking' target with a 'blocked' attempt and NO attempt
 -- 'dispatch_in_flight' may get a NEW attempt — a fresh survivor stamp over a
@@ -419,6 +421,50 @@ CREATE INDEX IF NOT EXISTS passkey_revocation_attempts_app_user_id_idx ON passke
 CREATE UNIQUE INDEX IF NOT EXISTS passkey_revocation_attempts_one_dispatch_per_target
   ON passkey_revocation_attempts (target_credential_id)
   WHERE state = 'dispatch_in_flight';
+
+-- Slice S3 hand-applied migration: operator resolution of a BLOCKED removal
+-- (lib/real/server/passkey-revocation-resolver.ts; run only through the
+-- env-gated admin runner test/admin/resolve-passkey-revocation.admin.test.ts).
+-- The one extra exit from 'blocked' — to 'confirmed' — exists ONLY with this
+-- evidence (R2a): a COMPLETED DELETE naming exactly the target, bound by
+-- fingerprint to a DELETE body THIS app stored for that target, re-read by id,
+-- no later activity re-granting the target's authority, and two full absence
+-- reads. Absence alone is never enough; an external/dashboard delete with no
+-- stored body (R2b) is never accepted. The resolved attempt keeps its own
+-- turnkey_activity_id / turnkey_activity_status / failure_reason untouched;
+-- the recovery receipt lives ONLY here.
+--
+-- Append-only by construction: the resolver's commit batch only INSERTs; no
+-- code path updates or deletes a row. No request body, stamp, assertion, key,
+-- or operator identity is stored — receipt_body_sha256 is a hash only.
+--   revocation_attempt_id  UNIQUE: an attempt is resolved at most once (two
+--                          racing operator commits can't both succeed).
+--   receipt_activity_id    UNIQUE: a receipt names exactly one authenticator
+--                          id, which maps to at most one passkey
+--                          (real_passkeys_turnkey_authenticator_id_key), and a
+--                          resolved target is 'revoked' (never resolvable
+--                          again) — so one receipt can truthfully resolve at
+--                          most one attempt.
+-- Pre-live check (read-only): SELECT to_regclass('passkey_revocation_resolutions');
+CREATE TABLE IF NOT EXISTS passkey_revocation_resolutions (
+  id                                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  revocation_attempt_id                UUID NOT NULL UNIQUE REFERENCES passkey_revocation_attempts (id),
+  app_user_id                          TEXT NOT NULL REFERENCES real_accounts (app_user_id),
+  target_credential_id                 TEXT NOT NULL REFERENCES real_passkeys (credential_id),
+  target_turnkey_authenticator_id      TEXT NOT NULL,
+  original_failure_reason              TEXT,
+  receipt_activity_id                  TEXT NOT NULL UNIQUE,
+  receipt_source                       TEXT NOT NULL CHECK (receipt_source IN ('own_attempt', 'stored_attempt_body')),
+  receipt_body_attempt_id              UUID NOT NULL REFERENCES passkey_revocation_attempts (id),
+  receipt_body_sha256                  TEXT NOT NULL CHECK (receipt_body_sha256 ~ '^[0-9a-f]{64}$'),
+  receipt_turnkey_created_at           TIMESTAMPTZ NOT NULL,
+  activity_log_head_id                 TEXT NOT NULL,
+  absence_first_observed_at            TIMESTAMPTZ NOT NULL,
+  absence_last_observed_at             TIMESTAMPTZ NOT NULL,
+  observed_survivor_authenticator_ids  TEXT[] NOT NULL,
+  resolver_version                     INT NOT NULL,
+  created_at                           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- Batch 2d: durable Real Pay attempts. No signing material is ever written
 -- here — the UserOperation signature is used only in-process during

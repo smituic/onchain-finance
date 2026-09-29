@@ -321,3 +321,56 @@ describe("real-account-store.ts localStorage — public account metadata only", 
     expect(raw).not.toMatch(/private|seed|sessionKey|stamper|signingKey|subOrganization|walletId|credentialId|credentialPublicKey/i);
   });
 });
+
+describe("Slice S3 boundary — the blocked-removal operator resolver is unreachable at runtime and has no mutation path", () => {
+  const ROOT = process.cwd();
+  const RESOLVER_FILES = ["lib/real/server/passkey-revocation-resolver.ts", "lib/real/server/passkey-revocation-resolution-store.ts"];
+  const RESOLVER_SPECIFIER = /["'][^"']*passkey-revocation-resol(ver|ution-store)["']/;
+  const runtimeSources = ["app", "components", "lib", "simulation"]
+    .flatMap((dir) => listFilesRecursive(path.join(ROOT, dir)))
+    .filter((file) => /\.(ts|tsx)$/.test(file))
+    .map((file) => path.relative(ROOT, file))
+    .filter((file) => !RESOLVER_FILES.includes(file));
+
+  it.each(runtimeSources.map((file) => [file] as const))("%s never imports the operator resolver or its store", (file) => {
+    expect(readFileSync(path.join(ROOT, file), "utf8")).not.toMatch(RESOLVER_SPECIFIER);
+  });
+
+  it("runtime.ts (the only place routes get stores from) is among the files checked and wires no resolution store", () => {
+    expect(runtimeSources).toContain("lib/real/server/runtime.ts");
+    const runtime = readFileSync(path.join(ROOT, "lib/real/server/runtime.ts"), "utf8");
+    expect(runtime).not.toMatch(/Resolution|resolveBlockedRevocation|ReadOnlyTurnkeyLedger/);
+  });
+
+  it("the resolver's Turnkey port declares EXACTLY the four read-only queries", () => {
+    const source = readFileSync(path.join(ROOT, RESOLVER_FILES[0]!), "utf8");
+    const port = /export interface TurnkeyReadOnlyLedger \{([\s\S]*?)\n\}/.exec(source)?.[1] ?? "";
+    const methods = [...port.matchAll(/^\s+(\w+)\(/gm)].map((m) => m[1]).sort();
+    expect(methods).toEqual(["getActivities", "getActivity", "getAuthenticators", "getUsers"]);
+  });
+
+  it.each(RESOLVER_FILES.map((file) => [file] as const))("%s contains no forwarding, signing, or Turnkey mutation path", (file) => {
+    const source = readFileSync(path.join(ROOT, file), "utf8");
+    for (const forbidden of [
+      /\bforwardSignedRequest\b/,
+      /\bturnkeyEndpointUrl\b/,
+      /\bfetch\s*\(/,
+      /\/public\/v1\/submit/,
+      /\bcreateActivityPoller\b/,
+      /\bstamp[A-Z]\w*\s*\(/,
+      /\bsign[A-Z]\w*\s*\(/,
+      /\bconfirmDeleted\s*\(/,
+      /\bbeginDispatch\s*\(/,
+    ]) {
+      expect(source).not.toMatch(forbidden);
+    }
+    // The only parent-client calls are the four reads.
+    const clientCalls = [...source.matchAll(/\bclient\.(\w+)\s*\(/g)].map((m) => m[1]);
+    expect(clientCalls.every((name) => ["getActivity", "getActivities", "getUsers", "getAuthenticators"].includes(name!))).toBe(true);
+  });
+
+  it("the resolution store never talks to Turnkey at all", () => {
+    const store = readFileSync(path.join(ROOT, RESOLVER_FILES[1]!), "utf8");
+    expect(store).not.toMatch(/@turnkey\/|turnkey-provisioning|turnkey-discovery|createParentTurnkeyClient/);
+  });
+});

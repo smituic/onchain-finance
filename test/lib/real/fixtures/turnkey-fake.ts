@@ -70,6 +70,8 @@ export class FakeTurnkey {
   deviceCredentials: string[] = [];
   /** The allowCredentials (as base64url) of every signRawPayload ceremony, in order. */
   signCeremonies: Array<{ allowCredentials: string[] }> = [];
+  /** Server clock for activity createdAt (whole seconds, like the live API); each new activity advances it by 10 s unless a test pins it. */
+  clockSeconds = 1_790_000_000;
   private seq = 0;
 
   constructor(
@@ -100,7 +102,12 @@ export class FakeTurnkey {
     this.ghosts = [];
   }
 
+  /** Appends (newest last). An activity without createdAt gets the next server-clock second. */
   addActivity(activity: FakeActivity): void {
+    if (!activity.createdAt) {
+      this.clockSeconds += 10;
+      activity.createdAt = { seconds: String(this.clockSeconds), nanos: "0" };
+    }
     this.activities.set(activity.id, activity);
   }
 
@@ -154,6 +161,23 @@ export class FakeTurnkey {
     return { activity: structuredClone(activity) };
   };
 
+  /** Read-only list, newest first; `after: id` continues with OLDER rows (the live API's observed behavior). */
+  getActivities = async ({ organizationId, paginationOptions }: { organizationId: string; paginationOptions?: { limit?: string; after?: string } }) => {
+    if (organizationId !== this.organizationId) return { activities: [] };
+    let rows = [...this.activities.values()].reverse();
+    if (paginationOptions?.after !== undefined) {
+      const index = rows.findIndex((a) => a.id === paginationOptions.after);
+      rows = index === -1 ? [] : rows.slice(index + 1);
+    }
+    return { activities: structuredClone(rows.slice(0, Number(paginationOptions?.limit ?? "10"))) };
+  };
+
+  /** Read-only: the same (lag-aware) view getUsers gives of one user. */
+  getAuthenticators = async ({ organizationId, userId }: { organizationId: string; userId: string }) => {
+    const user = (await this.getUsers({ organizationId })).users.find((u) => u.userId === userId);
+    return { authenticators: user ? user.authenticators : [] };
+  };
+
   fetchImpl = (async (url: string, init: { body: string; headers: Record<string, string> }) => {
     this.forwarded.push({ url, body: init.body, headers: init.headers });
     await this.onForward?.();
@@ -166,6 +190,10 @@ export class FakeTurnkey {
       activityId = `activity-${++this.seq}`;
       let result: Record<string, unknown> = {};
       let status = "ACTIVITY_STATUS_COMPLETED";
+      // Like the live API: the intent echoes the request parameters.
+      const intent = url.endsWith("/delete_authenticators")
+        ? { deleteAuthenticatorsIntent: { userId: parsed.parameters.userId, authenticatorIds: parsed.parameters.authenticatorIds } }
+        : { createAuthenticatorsIntentV2: { userId: parsed.parameters.userId, authenticators: parsed.parameters.authenticators } };
       if (mode === "fail_activity") status = "ACTIVITY_STATUS_FAILED";
       else if (mode === "pending_activity") status = "ACTIVITY_STATUS_PENDING";
       else if (url.endsWith("/create_authenticators")) {
@@ -179,7 +207,9 @@ export class FakeTurnkey {
         this.users.set(this.userId, this.authenticators().filter((a) => !ids.includes(a.authenticatorId)));
         result = { deleteAuthenticatorsResult: { authenticatorIds: ids } };
       }
-      this.addActivity({ id: activityId, status, organizationId: parsed.organizationId, type: parsed.type, result, votes: [], intent: {} });
+      // Live-observed (not a documented guarantee): fingerprint = "sha256:" + sha256 of the exact submitted body.
+      const fingerprint = `sha256:${createHash("sha256").update(init.body, "utf8").digest("hex")}`;
+      this.addActivity({ id: activityId, status, organizationId: parsed.organizationId, type: parsed.type, result, votes: [], intent, fingerprint });
       this.byBody.set(init.body, activityId);
     }
     if (mode === "lose_response_after_apply") throw new Error("response lost");

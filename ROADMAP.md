@@ -43,6 +43,8 @@ Two rounds of post-completion product-quality polish followed: Batch A (Home rec
 
 **Security closeout slice S1 — Real Pay credential attribution:** every payment is bound at prepare to the session's passkey, its passkey prompt is pinned to that credential, and the server proves from Turnkey's own activity record that exactly that passkey approved exactly that payment's digest before anything is sent. Built and tested offline; pending live verification (see ARCHITECTURE.md's "Slice S1").
 
+**Security closeout slice S3 — blocked passkey-removal operator recovery:** an operator-only, dry-run-by-default admin runner that can move a stuck `blocked` removal to Removed only when Turnkey's read-only ledger proves the deletion against a DELETE this app itself stored (never a dashboard delete, never absence alone), with nothing re-adding that authority since and the target absent in two full reads. It sends nothing to Turnkey and adds no user-facing surface. Blocked setup (CREATE) recovery stays out. Built, tested offline, and live-verified on a genuine blocked removal (see ARCHITECTURE.md's "Slice S3").
+
 **Goal:** Introduce Real Mode, backed by real (testnet) infrastructure, one area at a time, while Practice Mode remains fully available for everything — including areas Real Mode doesn't support yet. Prove one real end-to-end path before broadening.
 
 ### Sequencing decision (September 2026)

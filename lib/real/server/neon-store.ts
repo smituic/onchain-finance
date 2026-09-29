@@ -206,7 +206,7 @@ function toPaymentAttempt(row: Row): PaymentAttempt {
  * back the WHOLE transaction. The cast operand always references a column,
  * so the planner can never constant-fold it into an unconditional error.
  */
-function isGuardAbort(error: unknown, sentinel: string): boolean {
+export function isGuardAbort(error: unknown, sentinel: string): boolean {
   if (!error || typeof error !== "object") return false;
   const code = "code" in error ? String((error as { code: unknown }).code) : "";
   const message = "message" in error ? String((error as { message: unknown }).message) : "";
@@ -217,7 +217,7 @@ function has<T extends object>(patch: T | undefined, key: keyof T): boolean {
   return patch !== undefined && patch[key] !== undefined;
 }
 
-function isUniqueViolation(error: unknown, constraintHint?: string): boolean {
+export function isUniqueViolation(error: unknown, constraintHint?: string): boolean {
   if (!error || typeof error !== "object") return false;
   const code = "code" in error ? String((error as { code: unknown }).code) : "";
   if (code !== "23505") return false;
