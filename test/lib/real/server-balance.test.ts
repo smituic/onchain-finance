@@ -68,7 +68,7 @@ function buildPublicClient(balance: bigint, decimals = 6) {
 describe("resolveAuthenticatedCashBalance", () => {
   it("an authenticated session reads the balance for its durable SAFE address, never the Turnkey owner address", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const publicClient = buildPublicClient(BigInt(20_000_000));
 
     const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
@@ -78,7 +78,7 @@ describe("resolveAuthenticatedCashBalance", () => {
 
   it("a client-supplied safeAddress has no effect — there is no input parameter for it at all", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const publicClient = buildPublicClient(BigInt(5_000_000));
 
     // resolveAuthenticatedCashBalance's input type has no address field to
@@ -91,7 +91,7 @@ describe("resolveAuthenticatedCashBalance", () => {
 
   it("zero balance resolves to a genuine zero, not an error", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const publicClient = buildPublicClient(BigInt(0));
 
     const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
@@ -122,7 +122,7 @@ describe("resolveAuthenticatedCashBalance", () => {
 
   it("an RPC/network read failure is reported distinctly — never silently reported as a zero balance", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const publicClient = createPublicClient({
       chain: baseSepolia,
       transport: custom({
@@ -139,7 +139,7 @@ describe("resolveAuthenticatedCashBalance", () => {
 
   it("pre-2f hardening: never returns a raw upstream RPC error — even one carrying the provider URL/API key", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const secretBearingMessage = "HTTP request failed. URL: https://base-sepolia.g.alchemy.com/v2/SECRET_ALCHEMY_KEY Version: viem@2.0.0";
     const publicClient = createPublicClient({
       chain: baseSepolia,
@@ -161,7 +161,7 @@ describe("resolveAuthenticatedCashBalance", () => {
 
   it("a wrong-chain RPC is reported as a read failure, never a balance", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const publicClient = createPublicClient({
       chain: baseSepolia,
       transport: custom({

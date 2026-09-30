@@ -121,7 +121,7 @@ describe("resolvePreparePayment", () => {
 
   it("derives the sender from the authenticated Safe address, never anything the client could supply", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
 
     const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue }));
 
@@ -133,7 +133,7 @@ describe("resolvePreparePayment", () => {
 
   it("Part E (S2): returns serverNowSeconds from the server's own wall clock — the same clock resolveSubmitPayment's dispatch-margin check uses, not the chain's block timestamp", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const fixedNowMs = 1_950_000_000_000;
 
     const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, now: () => fixedNowMs }));
@@ -154,7 +154,7 @@ describe("resolvePreparePayment", () => {
     for (const credentialId of ["credential-1", "credential-backup"]) {
       const paymentStore = createInMemoryPaymentAttemptStore();
       const reserveSpy = vi.spyOn(paymentStore, "reserve");
-      const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId }), SECRET);
+      const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId, sessionEpoch: 0 }), SECRET);
 
       const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
 
@@ -169,7 +169,7 @@ describe("resolvePreparePayment", () => {
     await registry.transitionPasskeyStatus({ credentialId: "credential-1", from: "active", to: "revoking" });
     const paymentStore = createInMemoryPaymentAttemptStore();
     const reserveSpy = vi.spyOn(paymentStore, "reserve");
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
 
     expect((await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }))).outcome).toBe("unauthenticated");
     expect(reserveSpy).not.toHaveBeenCalled();
@@ -177,7 +177,7 @@ describe("resolvePreparePayment", () => {
 
   it("always reserves against the canonical USDC token and Base Sepolia chain id", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
     const reserveSpy = vi.spyOn(paymentStore, "reserve");
 
@@ -195,7 +195,7 @@ describe("resolvePreparePayment", () => {
 
   it("rejects a malformed recipient before ever touching the payment store", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
     const reserveSpy = vi.spyOn(paymentStore, "reserve");
 
@@ -212,7 +212,7 @@ describe("resolvePreparePayment", () => {
     ["not-a-number", "malformed"],
   ])("rejects an invalid amount (%s: %s)", async (amountBaseUnitsInput) => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
     const reserveSpy = vi.spyOn(paymentStore, "reserve");
 
@@ -224,7 +224,7 @@ describe("resolvePreparePayment", () => {
 
   it("rejects an amount over the $50 ceiling", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, amountBaseUnitsInput: "50000001" }));
     expect(outcome).toEqual({ outcome: "invalid_amount" });
   });
@@ -232,7 +232,7 @@ describe("resolvePreparePayment", () => {
   it("rejects an amount greater than the live on-chain balance without ever calling Pimlico or reserving", async () => {
     prepareCashTransferUserOperationMock.mockClear();
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
     const reserveSpy = vi.spyOn(paymentStore, "reserve");
 
@@ -248,7 +248,7 @@ describe("resolvePreparePayment", () => {
   it("quota_exceeded and payment_in_progress propagate directly from the store, before ever calling Pimlico", async () => {
     prepareCashTransferUserOperationMock.mockClear();
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
     vi.spyOn(paymentStore, "reserve").mockResolvedValueOnce({ ok: false, reason: "quota_exceeded" });
 
@@ -261,7 +261,7 @@ describe("resolvePreparePayment", () => {
   it("a failed external Pimlico prepare still consumes the reserved attempt (transitions it to failed)", async () => {
     prepareCashTransferUserOperationMock.mockRejectedValueOnce(new Error("Pimlico is unreachable"));
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
 
     const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
@@ -280,7 +280,7 @@ describe("resolvePreparePayment", () => {
       "HTTP request failed. URL: https://api.pimlico.io/v2/84532/rpc?apikey=SECRET_TEST_KEY Details: rate limited Version: viem@2.0.0";
     prepareCashTransferUserOperationMock.mockRejectedValueOnce(new Error(secretBearingMessage));
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
 
     const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
@@ -301,7 +301,7 @@ describe("resolvePreparePayment", () => {
   it("pre-2f hardening: never persists or returns a raw upstream balance-check error — even one carrying the RPC URL", async () => {
     const secretBearingMessage = "HTTP request failed. URL: https://base-sepolia.g.alchemy.com/v2/SECRET_ALCHEMY_KEY Version: viem@2.0.0";
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const throwingPublicClient = {
       chain: baseSepolia,
       getChainId: async () => {
@@ -324,7 +324,7 @@ describe("resolvePreparePayment", () => {
       sender: "0x9999999999999999999999999999999999999999",
     } as unknown as typeof preparedFields);
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
 
     const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
@@ -339,7 +339,7 @@ describe("resolvePreparePayment", () => {
 
   it("computes and persists the expected UserOperation hash BEFORE ever calling the bundler — durable even if the send response is later lost", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
 
     const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
@@ -356,7 +356,7 @@ describe("resolvePreparePayment", () => {
 
   it("finite expiry: validUntil = the chain's latest block timestamp + the window, persisted with its block number and returned for signing", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
 
     const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore }));
@@ -371,7 +371,7 @@ describe("resolvePreparePayment", () => {
 
   it("finite expiry: if the chain clock can't be read, nothing is reserved or prepared and no upstream text leaks", async () => {
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
     const reserveSpy = vi.spyOn(paymentStore, "reserve");
 

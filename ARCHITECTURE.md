@@ -334,6 +334,64 @@ A liveness slice on 2g-H removal. A `blocked` removal has no exit of its own. If
     - Turnkey's backend and ledger are trusted as one source.
   - **Operator note.** The runner's report prints only with `--reporter=verbose --silent false`, because Vitest 4 hides console output from passing tests.
 
+### Slice S4 — Session / Account Security Hygiene
+
+A hardening slice on the app session and the `/api/real/**` request surface. No change to payment signing, Safe ownership, Turnkey authority, the S3 resolver, or Practice Mode.
+
+- **Account session epoch (server-side revocation).** `real_accounts.session_epoch BIGINT NOT NULL DEFAULT 0`. Every session token carries the epoch it was minted at; `readAuthenticatedRealAccount` requires, in order: a valid HMAC, the current token version, an unexpired `exp`, an existing, `active` credential owned by the token's `appUserId`, an existing account, and `token.sessionEpoch === account.sessionEpoch` (exact equality). Login and registration mint at the account's current epoch and never change it, so signing in on one device never signs out another. No per-session table and no denylist.
+- **"Sign out everywhere."** The only sign-out, and account-wide: `DELETE /api/real/session` authenticates the current session, increments the epoch in one `UPDATE … SET session_epoch = session_epoch + 1` (unconditional: a concurrent increment only raises it further), and only then clears this browser's cookie. After the increment every previously issued session for the account is dead server-side, even if the cookie clear never reaches the browser. If the increment fails, the cookie is left alone and the caller gets a 500, never a false success. A request without a valid session gets a 401. The UI button says "Sign out everywhere", with a line saying it covers every device.
+- **Token v2, forced re-login.** The session payload is `{ v: 2, appUserId, credentialId, exp, sid, sessionEpoch }`. A v1 token has no epoch and is refused by version. There is no legacy fallback, so every pre-S4 session signs in again once. Parsing accepts exactly `<base64url payload>.<43-char base64url MAC>` (extra or empty segments, padding, and stray characters are refused before the MAC is computed); the MAC compare stays `timingSafeEqual`.
+- **Session secret format policy.** `REAL_SESSION_SECRET` is still used verbatim (its UTF-8 bytes) as the HMAC key, but config now fails closed unless the value is an *encoding* that decodes to ≥ 32 bytes (`decodeSessionSecret`, `lib/real/server/session.ts`):
+  - **Hex:** hex digits only, even length, so at least 64 characters. A string made only of hex digits is judged as hex and never re-read as base64 (63 hex characters would otherwise decode as 47 bytes of base64).
+  - **Base64 or base64url:** one alphabet (never mixed), padding optional but correct if present, never a `4n + 1` length, and canonical: re-encoding the decoded bytes must reproduce the input, which rejects non-zero trailing bits that Node's lenient decoder would silently drop.
+  - **Anything else is refused:** passphrases and raw text of any length (e.g. `correct horse battery staple!!!!`, eight 🔒 emoji). There is no byte-length fallback.
+
+  `openssl rand -hex 32` passes, as does the existing 64-hex local secret. The error names the variable, never the value. This is a format policy, not an entropy measurement: a hand-typed string that happens to be a canonical encoding still passes. Cookie attributes are unchanged: `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`, `Secure` in production, 7-day `exp`. The `__Host-` prefix is deferred until production host/cookie details are settled.
+- **Origin gate (`proxy.ts` → `lib/real/server/request-gate.ts`).** One Next 16 proxy (Node.js runtime) matched to `/api/real/:path*`, so the two cookie-issuing routes (`register/verify`, `login/verify`) and every authenticated mutation are covered without per-route code. Safe methods (`GET`/`HEAD`/`OPTIONS`) pass. For every other method:
+  - `Sec-Fetch-Site: cross-site` → 403.
+  - An `Origin` header, when present, must exactly equal one of `NEXT_PUBLIC_REAL_ORIGIN`'s origins (the same list WebAuthn verifies against), so same-site-but-cross-origin callers and `Origin: null` get 403; with no origins configured, any `Origin` is refused.
+  - **No `Origin` header is allowed through, deliberately:** browsers attach `Origin` to every non-`GET`/`HEAD` request, so only non-browser callers (server tools, tests) omit it, and they carry no victim's cookie. They still face the Fetch Metadata rule, the content-type rule, and each route's own auth.
+  - `Content-Type` must be `application/json` (parameters allowed) → otherwise 415, which is what keeps the CORS-"simple" `text/plain`/form shapes away from JSON-parsing routes. The exemption is an explicit list of the six body-less routes (`register/options`, `login/options`, `backup/step-up/options`, `[credentialId]/revoke/options`, `payments/[id]/cancel`, `DELETE session`), checked against the real client calls. A new route is JSON-only by default.
+  - No CSRF tokens. With Real Mode disabled the gate steps aside (every route already 404s).
+- **Challenge cleanup.** `ChallengeStore.create` purges `webauthn_challenges` rows with `expires_at` before now in the same statement as the insert (`WITH purged AS (DELETE …) INSERT …`, a range scan on `webauthn_challenges_expires_at_idx`). The cutoff uses the server clock that wrote `expires_at` and that `consume` checks, so nothing still consumable is purged. No scheduled job, no schema change; challenge entropy, single-use `DELETE … RETURNING`, purpose binding, and TTLs are unchanged.
+- **Static headers.** `next.config.ts` sets `Content-Security-Policy: frame-ancestors 'none'`, `X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff` on every path. Nothing else: no script/style CSP and no HSTS (left to the hosting layer until production deployment is verified).
+- **Client state hygiene.**
+  - Sign-out shows the signed-out screen only after the server confirms. On a 500 or network error the account stays, with an error. On a 401, this browser is shown signed out, with a note that other devices were *not* signed out from here.
+  - `real-account-store` now has the same generation guard as the balance/history/payment stores: a late session-check, login, or sign-out answer can't overwrite a newer transition.
+  - `real-passkeys-store` gains `reset()` and `bindAccount(appUserId)`. Switching accounts (or signing out) bumps its generation; every action captures it, applies nothing once it is stale, and stops before its next server call, so a half-finished setup or removal for account A never continues under B's cookie. Rebinding the same account is a no-op, so remounting mid-flow is safe. List loads are also latest-wins within one account.
+  - `GET /api/real/session` clears a cookie that no longer grants access (legacy, expired, revoked credential, old epoch, tampered). A registry error is a 500 and clears nothing.
+- **Offline proof.** Unit and route tests against the actual `route.ts` code:
+  - the token/version/epoch/segment rules and the secret format policy (its hex-first, canonical-round-trip, and no-raw-text guards mutation-tested);
+  - sign-out-everywhere invalidating a second browser and another passkey's session, but not another account's; the increment-failure and cookie-clear-failure orders;
+  - a 401 matrix over all 26 session-requiring routes for no cookie, v1, old-epoch, revoked-credential, and revoking-credential tokens, with registration/login left public;
+  - foreign-account payment, enrollment, credential, and removal-attempt ids answering exactly like missing ones;
+  - login replay, concurrent completion of one assertion (one winner), and independent sessions at the same epoch;
+  - the gate's allow/deny cases and the proxy matcher (Next's `unstable_doesMiddlewareMatch`);
+  - the header set via `unstable_getResponseFromNextConfig`;
+  - the challenge purge;
+  - and the client-store and component account-switch, stale-response, and sign-out-failure cases.
+
+  The production build's manifests show the proxy as `nodejs` on `/api/real/:path*` and the three headers on `/:path*`. A local `next start` smoke returned 403/403/415/403 for foreign-origin, cross-site, `text/plain`, and foreign-origin `DELETE` requests, and the three headers on pages and API responses.
+- **Live-verified (real Neon, local dev server, two real browser sessions on the Base Sepolia test account; no Turnkey mutation, no chain write).**
+  - **Migration.** Only `ALTER TABLE real_accounts ADD COLUMN IF NOT EXISTS session_epoch BIGINT NOT NULL DEFAULT 0` was applied, before any S4 code touched the database. The column is `bigint`, `NOT NULL`, default `0`; both existing accounts are at 0 and no other value changed. A whole-schema fingerprint diff showed only the column and its NOT NULL constraint entry. Re-running it changed nothing.
+  - **Real-Neon smoke.** 44/44 passed, including the three S4 cases: column shape, five concurrent increments over real HTTP requests with no lost update (final epoch 5), and the purge dropping expired rows while keeping live ones. Zero scratch residue in any table.
+  - **Challenge purge through the app.** One normal `POST login/options` removed all six genuine expired rows (which predated S4) and kept its new live challenge. Every other table was byte-identical.
+  - **Secret policy.** The configured secret classifies as hex decoding to 32 bytes and passes the parser; the value itself was never printed.
+  - **v1 → v2.** A browser still holding its pre-S4 session was shown signed out, not authenticated. Signing in with the primary passkey then worked, and the list showed the primary and the backup.
+  - **Sign out everywhere, across two browsers.** Browser B held an independently issued session for the same account. Browser A's "Sign out everywhere" incremented the epoch exactly once (0 → 1; the server log shows exactly one `DELETE /api/real/session`, 200) and signed A out. B, which never clicked anything, was signed out on reload and its session cookie was gone. B then signed in again normally; the epoch stayed 1, since login never moves it.
+  - **Failed sign-out stays honest.** With Browser A offline (DevTools), the click failed (`ERR_INTERNET_DISCONNECTED`). The account and passkeys stayed on screen with "Couldn't sign out everywhere, so you're still signed in. Try again." No request reached the server and the epoch did not move.
+  - **Gate, live.** Allowed-origin JSON and no-Origin JSON reach the handler. Foreign Origin, `Sec-Fetch-Site: cross-site` (even with an allowed Origin), `Origin: null`, and `localhost:3001` → 403. `text/plain`, form-encoded, and no-Content-Type requests to JSON routes → 415. Body-less `login/options` → 200 and `DELETE /session` without a cookie → 401, both through the gate. Safe methods pass untouched. With `NEXT_PUBLIC_REAL_MODE_ENABLED=false` on a separate built server, every probe returned 404.
+  - **Headers.** `frame-ancestors 'none'`, `DENY`, and `nosniff` are present on pages and `/api/real/*`, on both the dev server and the production build. No `Strict-Transport-Security` is sent by the app, and no deployed S4 host exists yet, so HSTS ownership is still pending.
+  - **Invariants unchanged.** Primary and backup are both active; epoch 1. D is still `revoked` with its enrollment `removed`, and its attempt is still `confirmed` with the original `no_activity_receipt` evidence. The S3 resolution row is intact. Turnkey (read-only) is identical before and after: 19 activities, the head is still S3's completed DELETE, the authenticators are exactly the two, and there is one user. The Safe's address, sole owner, and threshold 1 are unchanged.
+  - **Not exercised live.** A second account's passkey switch and a real stale-response race; both are covered by the mutation-sensitive store and component tests.
+- **Residuals.**
+  - No platform rate limiting on the auth routes.
+  - No dedicated security-event log (sign-outs, refused origins) yet.
+  - The secret's *randomness* is an operational requirement, not something the format parser can infer: it only proves the value is a canonical hex/base64 encoding of ≥ 32 bytes.
+  - One session key with no rotation: rotating `REAL_SESSION_SECRET` signs everyone out, and there is no dual-key window.
+  - CSP beyond `frame-ancestors` is deferred.
+  - HSTS ownership and the host-only (`__Host-`) cookie decision are pending until a real deployment exists.
+
 ## Explicitly Not Yet Decided
 
 - How authentication and accounts work beyond a testnet account identity (Phase 2/3)

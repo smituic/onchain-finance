@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS real_accounts (
   owner_address             TEXT NOT NULL,
   safe_address              TEXT NOT NULL,
   account_config_version    INT NOT NULL,
+  -- S4: account-wide session generation — see the S4 migration at the end.
+  session_epoch             BIGINT NOT NULL DEFAULT 0,
   created_at                TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -554,3 +556,15 @@ ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS authorization_verified_at 
 -- One Turnkey signing activity authorizes at most one payment.
 CREATE UNIQUE INDEX IF NOT EXISTS payment_attempts_turnkey_sign_activity_id_key
   ON payment_attempts (turnkey_sign_activity_id) WHERE turnkey_sign_activity_id IS NOT NULL;
+
+-- Slice S4 hand-applied migration: account-wide session revocation.
+-- Idempotent. Every session token carries the session_epoch it was minted at
+-- and is accepted only while it EQUALS this column (lib/real/server/auth.ts).
+-- "Sign out everywhere" increments it in one statement, invalidating every
+-- session issued for the account; normal login reads it and never changes it.
+-- Existing rows start at 0. (Pre-S4 v1 tokens carry no epoch and are refused
+-- by version regardless, so every existing session signs in again once.)
+-- Pre-live check (read-only):
+--   SELECT column_name FROM information_schema.columns
+--   WHERE table_name = 'real_accounts' AND column_name = 'session_epoch';  -- expect 0 rows before
+ALTER TABLE real_accounts ADD COLUMN IF NOT EXISTS session_epoch BIGINT NOT NULL DEFAULT 0;

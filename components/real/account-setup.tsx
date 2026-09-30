@@ -6,6 +6,7 @@ import { Expander } from "@/components/shell/expander";
 import { Note } from "@/components/shell/note";
 import { RealPasskeysManager } from "@/components/real/real-passkeys-manager";
 import { useHasRealAccountHydrated, useRealAccountStore } from "@/lib/stores/real-account-store";
+import { useRealPasskeysStore } from "@/lib/stores/real-passkeys-store";
 
 /**
  * The one place Real Mode's account create/restore UX lives — reused by
@@ -23,6 +24,7 @@ export function AccountSetup() {
   const register = useRealAccountStore((s) => s.register);
   const login = useRealAccountStore((s) => s.login);
   const logout = useRealAccountStore((s) => s.logout);
+  const bindPasskeysAccount = useRealPasskeysStore((s) => s.bindAccount);
 
   useEffect(() => {
     if (hasHydrated) void checkSession();
@@ -30,7 +32,13 @@ export function AccountSetup() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasHydrated]);
 
-  const busy = status === "checking-session" || status === "registering" || status === "logging-in";
+  useEffect(() => {
+    // Signed out: RealPasskeysManager unmounts, so the passkey list is
+    // cleared here (the manager itself binds the next account on mount).
+    if (!account) bindPasskeysAccount(null);
+  }, [account, bindPasskeysAccount]);
+
+  const busy = status === "checking-session" || status === "registering" || status === "logging-in" || status === "signing-out";
 
   if (!hasHydrated || status === "checking-session" || status === "idle") {
     return <div aria-busy="true" aria-label="Loading" className="h-24 animate-pulse rounded-xl bg-muted/60" />;
@@ -47,9 +55,13 @@ export function AccountSetup() {
           <p>Safe address: {account.safeAddress}</p>
         </Expander>
         <RealPasskeysManager />
-        <Button variant="outline" className="h-11 w-full" disabled={busy} onClick={() => void logout()}>
-          Sign out
-        </Button>
+        <div className="flex flex-col gap-2">
+          <Button variant="outline" className="h-11 w-full" disabled={busy} onClick={() => void logout()}>
+            {status === "signing-out" ? "Signing out everywhere…" : "Sign out everywhere"}
+          </Button>
+          <p className="text-xs text-muted-foreground">Signs this account out on this device and on every other device where it&apos;s signed in.</p>
+          {error ? <p className="text-sm text-destructive">{error}</p> : null}
+        </div>
       </div>
     );
   }

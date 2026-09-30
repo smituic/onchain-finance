@@ -117,7 +117,7 @@ async function seedSubmittedAttempt(options: { state?: "awaiting_authorization" 
   if (target !== "awaiting_authorization" && target !== "signed") await paymentStore.transition({ id: reserved.attempt.id, from: "signed", to: "submitting" });
   if (target === "submitted" || target === "unknown") await paymentStore.transition({ id: reserved.attempt.id, from: "submitting", to: target });
 
-  const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+  const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
   return { registry, paymentStore, attemptId: reserved.attempt.id, cookieValue };
 }
 

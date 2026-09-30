@@ -20,7 +20,7 @@ export type OnboardingOutcome =
   | { outcome: "rejected"; reason: string };
 
 function issueSession(account: RealAccountRecord, credentialId: string, config: RealServerConfig): string {
-  return serializeSession(createSessionPayload({ appUserId: account.appUserId, credentialId }), config.sessionSecret);
+  return serializeSession(createSessionPayload({ appUserId: account.appUserId, credentialId, sessionEpoch: account.sessionEpoch }), config.sessionSecret);
 }
 
 /** Reconstructs the RegistrationResponseJSON shape provisionTurnkeyChildAccount needs, from durable public ceremony artifacts — never from anything re-derived or guessed. */

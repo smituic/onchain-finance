@@ -16,6 +16,9 @@ export type AuthenticatedRealAccount = {
  * (Batch 2g: 'revoking' or 'revoked') immediately invalidates every session
  * that credential ever issued, with no separate session-revocation list to
  * maintain — and must still belong to the same appUserId the session names.
+ * S4: the session's epoch must also EQUAL the account's current
+ * session_epoch — "Sign out everywhere" increments it, so every session
+ * minted before that is refused here (no per-session table or denylist).
  * None of this ever authorizes wallet signing; it only identifies which
  * account's public state the caller may read.
  */
@@ -32,6 +35,7 @@ export async function readAuthenticatedRealAccount(input: {
 
   const account = await input.registry.findAccountByAppUserId(session.appUserId);
   if (!account) return null;
+  if (session.sessionEpoch !== account.sessionEpoch) return null;
 
   return { session, account, passkey };
 }

@@ -32,7 +32,7 @@ async function seedAccount(registry: ReturnType<typeof createInMemoryRealAccount
 }
 
 function cookieFor(appUserId: string, credentialId: string) {
-  return serializeSession(createSessionPayload({ appUserId, credentialId }), SECRET);
+  return serializeSession(createSessionPayload({ appUserId, credentialId, sessionEpoch: 0 }), SECRET);
 }
 
 async function reserveAndAdvance(

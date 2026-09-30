@@ -23,6 +23,7 @@ export type RealAccountStatus =
   | "checking-session"
   | "registering"
   | "logging-in"
+  | "signing-out"
   | "ready"
   | "signed-out"
   | "error";
@@ -36,10 +37,19 @@ export type RealAccountStore = {
   checkSession: () => Promise<void>;
   register: () => Promise<void>;
   login: () => Promise<void>;
+  /**
+   * "Sign out everywhere" (S4): ends every session for this account, on every
+   * device. Local state flips to signed-out only once the server confirms;
+   * on failure the account stays shown, with an error.
+   */
   logout: () => Promise<void>;
 };
 
 export const REAL_ACCOUNT_STORE_NAME = "onchain-finance:real-account";
+
+export const SIGN_OUT_EVERYWHERE_FAILED_MESSAGE = "Couldn't sign out everywhere, so you're still signed in. Try again.";
+export const ALREADY_SIGNED_OUT_MESSAGE =
+  "This device was already signed out, so your other devices weren't signed out from here. To sign them out, sign in again and choose Sign out everywhere.";
 
 type PersistedRealAccountState = { account: RealAccountPublicState | null };
 
@@ -63,18 +73,27 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export function createRealAccountStore() {
+  // S4: same generation-token guard as the balance/history/payment stores.
+  // Every session transition (check, register, login, sign-out) takes a new
+  // generation; a response that lands after a newer transition started is
+  // dropped, so a slow answer about one account can never overwrite the
+  // state of the account (or signed-out state) that replaced it.
+  let generation = 0;
+
   const store = create<RealAccountStore>()(
     persist(
-      (set) => ({
+      (set, get) => ({
         account: null,
         status: "idle",
         error: null,
         hasHydrated: false,
 
         checkSession: async () => {
+          const myGeneration = ++generation;
           set({ status: "checking-session", error: null });
           try {
             const result = await api<SessionResponse>("/api/real/session");
+            if (myGeneration !== generation) return;
             if (result.authenticated && result.appUserId && result.ownerAddress && result.safeAddress) {
               set({
                 account: { appUserId: result.appUserId, ownerAddress: result.ownerAddress, safeAddress: result.safeAddress },
@@ -84,11 +103,13 @@ export function createRealAccountStore() {
               set({ account: null, status: "signed-out" });
             }
           } catch (error) {
+            if (myGeneration !== generation) return;
             set({ status: "error", error: error instanceof Error ? error.message : "Could not check session." });
           }
         },
 
         register: async () => {
+          const myGeneration = ++generation;
           set({ status: "registering", error: null });
           try {
             const { optionsJSON } = await api<{ optionsJSON: PublicKeyCredentialCreationOptionsJSON }>(
@@ -100,8 +121,10 @@ export function createRealAccountStore() {
               method: "POST",
               body: JSON.stringify({ response }),
             });
+            if (myGeneration !== generation) return;
             set({ account, status: "ready" });
           } catch (error) {
+            if (myGeneration !== generation) return;
             if (isWebAuthnCancellation(error)) {
               set({ status: "signed-out", error: null });
               return;
@@ -111,6 +134,7 @@ export function createRealAccountStore() {
         },
 
         login: async () => {
+          const myGeneration = ++generation;
           set({ status: "logging-in", error: null });
           try {
             const { optionsJSON } = await api<{ optionsJSON: PublicKeyCredentialRequestOptionsJSON }>(
@@ -122,8 +146,10 @@ export function createRealAccountStore() {
               method: "POST",
               body: JSON.stringify({ response }),
             });
+            if (myGeneration !== generation) return;
             set({ account, status: "ready" });
           } catch (error) {
+            if (myGeneration !== generation) return;
             if (isWebAuthnCancellation(error)) {
               set({ status: "signed-out", error: null });
               return;
@@ -133,10 +159,25 @@ export function createRealAccountStore() {
         },
 
         logout: async () => {
+          const myGeneration = ++generation;
+          const previousStatus = get().status;
+          set({ status: "signing-out", error: null });
+          let response: Response;
           try {
-            await api("/api/real/session", { method: "DELETE" });
-          } finally {
+            response = await fetch("/api/real/session", { method: "DELETE" });
+          } catch {
+            if (myGeneration === generation) set({ status: previousStatus, error: SIGN_OUT_EVERYWHERE_FAILED_MESSAGE });
+            return;
+          }
+          if (myGeneration !== generation) return;
+          if (response.ok) {
             set({ account: null, status: "signed-out", error: null });
+          } else if (response.status === 401) {
+            // This browser's session was already invalid, so nothing could be
+            // revoked from here — signed out locally, and told so honestly.
+            set({ account: null, status: "signed-out", error: ALREADY_SIGNED_OUT_MESSAGE });
+          } else {
+            set({ status: previousStatus, error: SIGN_OUT_EVERYWHERE_FAILED_MESSAGE });
           }
         },
       }),

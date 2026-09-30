@@ -8,7 +8,7 @@ import {
   type RealPasskeyRecord,
 } from "@/lib/real/server/registry";
 
-function accountInput(overrides: Partial<Omit<RealAccountRecord, "createdAt">> = {}): Omit<RealAccountRecord, "createdAt"> {
+function accountInput(overrides: Partial<Omit<RealAccountRecord, "createdAt" | "sessionEpoch">> = {}): Omit<RealAccountRecord, "createdAt" | "sessionEpoch"> {
   return {
     appUserId: "app-user-1",
     subOrganizationId: "sub-org-1",

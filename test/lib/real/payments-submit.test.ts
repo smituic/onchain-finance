@@ -203,7 +203,7 @@ async function setup(options: SetupOptions = {}) {
   };
   await paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization", patch });
 
-  const cookieFor = (credentialId: string) => serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId }), SECRET);
+  const cookieFor = (credentialId: string) => serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId, sessionEpoch: 0 }), SECRET);
   const cookieValue = cookieFor(options.session ?? P);
   currentActivityId = activityId;
   return { registry, paymentStore, attemptId: reserved.attempt.id, signature, activityId, cookieValue, cookieFor, expectedUserOperationHash, fake, safeAddress, validUntil: storedValidUntil, patch };

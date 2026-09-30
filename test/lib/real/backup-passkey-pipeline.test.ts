@@ -618,7 +618,7 @@ describe("backup enrollment — end-to-end invariants", () => {
     expect(login.outcome).toBe("verified");
     if (login.outcome !== "verified") return;
     expect(login.account).toEqual(before);
-    const cookie = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: backup.credentialIdBase64Url }), config.sessionSecret);
+    const cookie = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: backup.credentialIdBase64Url, sessionEpoch: 0 }), config.sessionSecret);
     expect((await readAuthenticatedRealAccount({ cookieValue: cookie, sessionSecret: config.sessionSecret, registry: w.registry }))?.account.safeAddress).toBe(SAFE);
   });
 });

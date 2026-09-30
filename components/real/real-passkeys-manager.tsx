@@ -18,6 +18,7 @@ import {
   passkeyRoleLabel,
   passkeyStateLabel,
 } from "@/lib/real/display/passkey-status";
+import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import { useRealPasskeysStore, type RealPasskeySummary } from "@/lib/stores/real-passkeys-store";
 
 /**
@@ -28,6 +29,8 @@ import { useRealPasskeysStore, type RealPasskeySummary } from "@/lib/stores/real
  * visual-identity decisions.
  */
 export function RealPasskeysManager() {
+  const appUserId = useRealAccountStore((s) => s.account?.appUserId ?? null);
+  const bindAccount = useRealPasskeysStore((s) => s.bindAccount);
   const allPasskeys = useRealPasskeysStore((s) => s.passkeys);
   const enrollment = useRealPasskeysStore((s) => s.enrollment);
   const listStatus = useRealPasskeysStore((s) => s.listStatus);
@@ -63,10 +66,14 @@ export function RealPasskeysManager() {
   }
 
   useEffect(() => {
+    // S4: bind first — a different account resets the store (dropping any
+    // late response or in-flight flow from the previous one) before loading.
+    // Re-runs only when the signed-in account changes; the store's own
+    // actions refresh after they complete.
+    bindAccount(appUserId);
     void refresh();
-    // Only on mount — the store's own actions refresh after they complete.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [appUserId]);
 
   // The server already omits revoked (history-only) passkeys; filtered here too so they can never render.
   const passkeys = allPasskeys.filter((p) => p.status !== "revoked");

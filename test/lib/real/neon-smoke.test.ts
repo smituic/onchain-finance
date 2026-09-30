@@ -228,6 +228,53 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
     expect(await stores.attempts.finalize({ credentialId: credId, registry: stores.registry, safeAddress: "0x", accountConfigVersion: 1 })).toBeNull();
   });
 
+  it("S4: real_accounts.session_epoch is BIGINT NOT NULL DEFAULT 0 (migration applied)", async () => {
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const rows = (await sql`
+      SELECT data_type, is_nullable, column_default FROM information_schema.columns
+      WHERE table_name = 'real_accounts' AND column_name = 'session_epoch'
+    `) as { data_type: string; is_nullable: string; column_default: string | null }[];
+    expect(rows, "real_accounts.session_epoch is missing — apply lib/real/server/schema.sql's S4 migration").toHaveLength(1);
+    expect(rows[0]).toMatchObject({ data_type: "bigint", is_nullable: "NO" });
+    expect(rows[0]?.column_default).toMatch(/^0/);
+  });
+
+  it("S4: a new account starts at epoch 0; concurrent increments over real HTTP requests never lose an update; an unknown account is null", async () => {
+    const { createNeonRealAccountRegistry } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const registry = createNeonRealAccountRegistry(neon(databaseUrl!));
+    const credId = credentialId("epoch");
+    const userId = appUserId("epoch");
+    cleanupCredentialIds.add(credId);
+    cleanupAppUserIds.add(userId);
+    const { account } = await registry.createAccountWithPasskey({
+      account: { appUserId: userId, subOrganizationId: "smoke-sub-org", turnkeyUserId: "smoke-turnkey-user", walletId: "smoke-wallet", walletAccountId: "smoke-wallet-account", ownerAddress: "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF", safeAddress: "0xd9a4c22fb34dc74317edc8006140d66c8fa03266", accountConfigVersion: 1 },
+      passkey: { credentialId: credId, appUserId: userId, credentialPublicKey: "smoke-public-key", userHandle: "smoke-user-handle", counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false },
+    });
+    expect(account.sessionEpoch).toBe(0);
+
+    const results = await Promise.all(Array.from({ length: 5 }, () => registry.incrementSessionEpoch(userId)));
+    expect([...results].sort()).toEqual([1, 2, 3, 4, 5]);
+    expect((await registry.findAccountByAppUserId(userId))?.sessionEpoch).toBe(5);
+    expect(await registry.incrementSessionEpoch(appUserId("no-such-account"))).toBeNull();
+  });
+
+  it("S4: challenge create purges already-expired rows and keeps live ones", async () => {
+    const { createNeonChallengeStore } = await import("@/lib/real/server/neon-store");
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(databaseUrl!);
+    const [expired, live, trigger] = [challenge("purge-expired"), challenge("purge-live"), challenge("purge-trigger")];
+    for (const value of [expired, live, trigger]) cleanupChallenges.add(value);
+    await sql`INSERT INTO webauthn_challenges (challenge, purpose, expires_at) VALUES (${expired}, 'login', now() - interval '1 hour')`;
+    await sql`INSERT INTO webauthn_challenges (challenge, purpose, expires_at) VALUES (${live}, 'login', now() + interval '1 hour')`;
+
+    await createNeonChallengeStore(sql).create({ challenge: trigger, purpose: "login", ttlMs: 60_000 });
+
+    const rows = (await sql`SELECT challenge FROM webauthn_challenges WHERE challenge IN (${expired}, ${live}, ${trigger}) ORDER BY challenge`) as { challenge: string }[];
+    expect(rows.map((r) => r.challenge).sort()).toEqual([live, trigger].sort());
+  });
+
   it("the database layer never stores signing/private material — a direct row read contains no such fields", async () => {
     const { neon } = await import("@neondatabase/serverless");
     const sql = neon(databaseUrl!);

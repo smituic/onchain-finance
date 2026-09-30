@@ -180,7 +180,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
     prepareCashTransferUserOperationMock.mockClear();
     signRawPayloadMock.mockClear();
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
 
     const prepared = await resolvePreparePayment({
@@ -230,7 +230,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
     prepareCashTransferUserOperationMock.mockClear();
     signRawPayloadMock.mockClear();
     const registry = await seedAccount();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const paymentStore = createInMemoryPaymentAttemptStore();
 
     const prepared = await resolvePreparePayment({

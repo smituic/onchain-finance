@@ -24,6 +24,8 @@ export type RealAccountRecord = {
   safeAddress: string;
   /** Ties this record to the Safe/module/version config it was derived under (see lib/real/constants.ts), so a future config change can be detected rather than silently mismatched. */
   accountConfigVersion: number;
+  /** S4: account-wide session generation. Every session token carries the epoch it was minted at and is valid only while it equals this value; incrementSessionEpoch ("Sign out everywhere") invalidates all of them at once. Starts at 0. */
+  sessionEpoch: number;
   createdAt: string;
 };
 
@@ -89,7 +91,7 @@ export interface RealAccountRegistry {
    * overwriting an existing credential or account.
    */
   createAccountWithPasskey(input: {
-    account: Omit<RealAccountRecord, "createdAt">;
+    account: Omit<RealAccountRecord, "createdAt" | "sessionEpoch">;
     /** Always creates the passkey as role="primary", status="active" — backups go through backup-passkey-enrollment.ts. */
     passkey: Omit<RealPasskeyRecord, "createdAt" | "status" | "role" | "turnkeyAuthenticatorId" | "displayName">;
   }): Promise<{ account: RealAccountRecord; passkey: RealPasskeyRecord }>;
@@ -120,6 +122,16 @@ export interface RealAccountRegistry {
    * `displayName` must already be validated (validatePasskeyDisplayName).
    */
   renamePasskey(input: { appUserId: string; credentialId: string; displayName: string }): Promise<RenamePasskeyResult>;
+
+  /**
+   * S4 "Sign out everywhere": atomically increments the account's
+   * session_epoch (one UPDATE ... SET session_epoch = session_epoch + 1) and
+   * returns the new value, or null when the account doesn't exist. Every
+   * session minted at an earlier epoch fails auth.ts from then on.
+   * Unconditional on purpose: a concurrent increment only makes the result
+   * larger, which can never revive an older session.
+   */
+  incrementSessionEpoch(appUserId: string): Promise<number | null>;
 }
 
 /**
@@ -163,7 +175,7 @@ export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
       }
 
       const createdAt = new Date().toISOString();
-      const accountRecord: RealAccountRecord = { ...account, createdAt };
+      const accountRecord: RealAccountRecord = { ...account, sessionEpoch: 0, createdAt };
       const passkeyRecord: RealPasskeyRecord = {
         ...passkey,
         status: "active",
@@ -214,6 +226,14 @@ export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
       const next: RealPasskeyRecord = { ...current, displayName };
       passkeysByCredentialId.set(credentialId, next);
       return { outcome: "renamed", passkey: next };
+    },
+
+    async incrementSessionEpoch(appUserId) {
+      const current = accountsByAppUserId.get(appUserId);
+      if (!current) return null;
+      const next: RealAccountRecord = { ...current, sessionEpoch: current.sessionEpoch + 1 };
+      accountsByAppUserId.set(appUserId, next);
+      return next.sessionEpoch;
     },
   };
   inMemoryInternals.set(registry, { accountsByAppUserId, passkeysByCredentialId, backupEnrollmentMaps: [] });

@@ -36,7 +36,7 @@ export type StoredChallenge = {
  * returned by the library, captured after the fact.
  */
 export interface ChallengeStore {
-  /** Records an already-minted challenge (with context, if any) with a TTL. */
+  /** Records an already-minted challenge (with context, if any) with a TTL. S4: also purges every challenge already past its expiry — no scheduled cleanup job exists. */
   create(input: { challenge: string; purpose: ChallengePurpose; ttlMs: number; context?: unknown }): Promise<StoredChallenge>;
   /**
    * Atomically looks up and removes a challenge. Returns null (never
@@ -54,6 +54,11 @@ export function createInMemoryChallengeStore(): ChallengeStore {
   return {
     async create({ challenge, purpose, ttlMs, context }) {
       const now = Date.now();
+      // Same opportunistic purge as the Neon adapter: anything already past
+      // expiry (and therefore never consumable) is dropped on every create.
+      for (const [key, record] of challenges) {
+        if (record.expiresAt < now) challenges.delete(key);
+      }
       const record: StoredChallenge = { challenge, purpose, createdAt: now, expiresAt: now + ttlMs, context };
       challenges.set(challenge, record);
       return record;

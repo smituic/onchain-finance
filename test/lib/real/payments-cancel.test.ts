@@ -36,7 +36,7 @@ async function seedAccount() {
 }
 
 function cookieFor() {
-  return serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), SECRET);
+  return serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
 }
 
 async function reserveAttempt(paymentStore: PaymentAttemptStore): Promise<PaymentAttempt> {

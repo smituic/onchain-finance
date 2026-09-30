@@ -19,7 +19,8 @@ import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
  * generic-500 proof — not all twelve routes.
  */
 
-const REAL_SESSION_SECRET_VALUE = "route-handler-test-secret";
+// 32 random-looking bytes, hex — REAL_SESSION_SECRET must pass the S4 strength check.
+const REAL_SESSION_SECRET_VALUE = "7f3c9a1e5b2d4f60a8c7e9b1d3f5a7c90e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f";
 const OWNER_ADDRESS = "0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF";
 const SAFE_ADDRESS = "0xd9a4c22fb34dc74317edc8006140d66c8fa03266";
 
@@ -121,7 +122,7 @@ describe("route handlers — pre-2f hardening (actual route.ts code, not resolve
     vi.resetModules();
     stubRequiredConfigEnv();
     const registry = await seedRegistry();
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), REAL_SESSION_SECRET_VALUE);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), REAL_SESSION_SECRET_VALUE);
     const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
     vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar({ [REAL_SESSION_COOKIE_NAME]: cookieValue }) }));
     const trapStore = createTrapPaymentAttemptStore();
@@ -200,7 +201,7 @@ describe("POST /api/real/payments/submit — Slice S1 attribution contract (actu
       patch: { nonce: "0", callData: "0x1234", callGasLimit: "80000", verificationGasLimit: "150000", preVerificationGas: "60000", maxFeePerGas: "2000000", maxPriorityFeePerGas: "1000000", expectedUserOperationHash: `0x${"ab".repeat(32)}`, validUntil: Math.floor(Date.now() / 1000) + 600, prepareBlockNumber: "1" },
     });
     const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: sessionCredentialId }), REAL_SESSION_SECRET_VALUE);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: sessionCredentialId, sessionEpoch: 0 }), REAL_SESSION_SECRET_VALUE);
     vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar({ [REAL_SESSION_COOKIE_NAME]: cookieValue }) }));
     vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => registry, getPaymentAttemptStore: () => paymentStore }));
     // Turnkey is unreachable: the parent-key read-back throws.
@@ -260,7 +261,7 @@ describe("PATCH /api/real/account/passkeys/[credentialId] — rename (actual rou
       passkey: { credentialId: "credential-2", appUserId: "app-user-2", credentialPublicKey: "cose-key-2", userHandle: "user-handle-2", counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false },
     });
     const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), REAL_SESSION_SECRET_VALUE);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), REAL_SESSION_SECRET_VALUE);
     vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar(signedIn ? { [REAL_SESSION_COOKIE_NAME]: cookieValue } : {}) }));
     const revocations = createInMemoryPasskeyRevocationStore(registry);
     const enrollments = createInMemoryBackupPasskeyEnrollmentStore(registry);
@@ -358,7 +359,7 @@ describe("2g-H: backup setup routes require a fresh step-up by the session crede
     };
     const enrollments = createInMemoryBackupPasskeyEnrollmentStore(registry);
     const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
-    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1" }), REAL_SESSION_SECRET_VALUE);
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), REAL_SESSION_SECRET_VALUE);
     vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar(signedIn ? { [REAL_SESSION_COOKIE_NAME]: cookieValue } : {}) }));
     vi.doMock("@/lib/real/server/runtime", () => ({
       getRealAccountRegistry: () => registry,

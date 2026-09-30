@@ -60,6 +60,13 @@ function toAttempt(row: Row): RegistrationAttempt {
   };
 }
 
+/** BIGINT arrives as a string. A missing column means schema.sql's S4 migration hasn't been applied — fail loudly rather than mint or accept sessions against an undefined epoch. */
+function toSessionEpoch(value: unknown): number {
+  const epoch = typeof value === "string" || typeof value === "number" ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(epoch) || epoch < 0) throw new Error("real_accounts.session_epoch is missing or invalid (apply schema.sql's S4 migration).");
+  return epoch;
+}
+
 function toAccount(row: Row): RealAccountRecord {
   return {
     appUserId: row.app_user_id as string,
@@ -70,6 +77,7 @@ function toAccount(row: Row): RealAccountRecord {
     ownerAddress: row.owner_address as string,
     safeAddress: row.safe_address as string,
     accountConfigVersion: Number(row.account_config_version),
+    sessionEpoch: toSessionEpoch(row.session_epoch),
     createdAt: new Date(row.created_at as string).toISOString(),
   };
 }
@@ -229,8 +237,18 @@ export function isUniqueViolation(error: unknown, constraintHint?: string): bool
 export function createNeonChallengeStore(sql: NeonQueryFunction<false, false>): ChallengeStore {
   return {
     async create({ challenge, purpose, ttlMs, context }) {
-      const expiresAt = new Date(Date.now() + ttlMs);
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + ttlMs);
+      // S4: opportunistic cleanup in the same statement — every create also
+      // purges challenges that are already past expiry (range scan on
+      // webauthn_challenges_expires_at_idx). Compared against this server's
+      // clock, the same one that wrote expires_at and that consume() checks,
+      // so a challenge consume() would still accept is never purged. No
+      // scheduled job; the table stays bounded by the create rate x TTL.
       await sql`
+        WITH purged AS (
+          DELETE FROM webauthn_challenges WHERE expires_at < ${now.toISOString()}
+        )
         INSERT INTO webauthn_challenges (challenge, purpose, context, expires_at)
         VALUES (${challenge}, ${purpose}, ${context === undefined ? null : JSON.stringify(context)}, ${expiresAt.toISOString()})
       `;
@@ -320,6 +338,14 @@ export function createNeonRealAccountRegistry(sql: NeonQueryFunction<false, fals
       // Only to pick the right refusal — scoped to the same account, so another account's credential stays "not_found".
       const existing = (await sql`SELECT 1 FROM real_passkeys WHERE credential_id = ${credentialId} AND app_user_id = ${appUserId}`) as Row[];
       return { outcome: existing.length > 0 ? "not_active" : "not_found" };
+    },
+
+    async incrementSessionEpoch(appUserId) {
+      // One statement: the increment is atomic under concurrent callers.
+      const rows = (await sql`
+        UPDATE real_accounts SET session_epoch = session_epoch + 1 WHERE app_user_id = ${appUserId} RETURNING session_epoch
+      `) as Row[];
+      return rows[0] ? toSessionEpoch(rows[0].session_epoch) : null;
     },
   };
 }

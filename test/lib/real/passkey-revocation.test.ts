@@ -154,7 +154,7 @@ describe("revocation — authority", () => {
 
   it("H1: prepare/options with only an app cookie records an undispatched attempt and leaves the target fully ACTIVE", async () => {
     const w = await world();
-    const session = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.b.credentialIdBase64Url }), config.sessionSecret);
+    const session = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.b.credentialIdBase64Url, sessionEpoch: 0 }), config.sessionSecret);
     const prepared = await prepare(w, w.b, w.a);
     expect(prepared.outcome).toBe("ready");
     expect(await status(w, w.b)).toBe("active");
@@ -264,8 +264,8 @@ describe("revocation — confirmation standard (completed delete activity AND co
 
   it("completed delete + confirmed absence => Removed; the removed credential can't sign in and its old sessions are rejected; the survivor still works", async () => {
     const w = await world();
-    const oldSession = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.b.credentialIdBase64Url }), config.sessionSecret);
-    const survivorSession = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.a.credentialIdBase64Url }), config.sessionSecret);
+    const oldSession = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.b.credentialIdBase64Url, sessionEpoch: 0 }), config.sessionSecret);
+    const survivorSession = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.a.credentialIdBase64Url, sessionEpoch: 0 }), config.sessionSecret);
     const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
     expect((await submit(w, w.b, w.a, attemptId, signed)).outcome).toBe("revoked");
     expect(await status(w, w.b)).toBe("revoked");
@@ -285,7 +285,7 @@ describe("revocation — confirmation standard (completed delete activity AND co
 
   it("once a verified removal is dispatched ('revoking'), the target's sessions are rejected — but it is NOT reported as removed", async () => {
     const w = await world();
-    const session = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.b.credentialIdBase64Url }), config.sessionSecret);
+    const session = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.b.credentialIdBase64Url, sessionEpoch: 0 }), config.sessionSecret);
     const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
     w.fake.nextMode = "pending_activity";
     await submit(w, w.b, w.a, attemptId, signed);
@@ -438,7 +438,7 @@ describe("revocation — one-way after dispatch: a dispatched target is never au
     "first-forward %s with the target observed PRESENT => blocked, target stays revoking (the browser could have sent the same signed bytes itself)",
     async (terminal) => {
       const w = await world();
-      const session = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.b.credentialIdBase64Url }), config.sessionSecret);
+      const session = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: w.b.credentialIdBase64Url, sessionEpoch: 0 }), config.sessionSecret);
       const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
       w.fake.nextMode = "pending_activity";
       await submit(w, w.b, w.a, attemptId, signed);

@@ -1,3 +1,5 @@
+import { MIN_SESSION_SECRET_BYTES, isStrongSessionSecret } from "./session";
+
 /**
  * Server-only Real Mode configuration. Every secret-holding field here
  * (Turnkey parent API key, session HMAC secret) must never be imported by
@@ -41,6 +43,11 @@ export function readRealServerConfig(
   if (missing.length > 0) {
     return { error: `Missing server configuration: ${missing.join(", ")}.` };
   }
+  // Fail closed: a guessable HMAC key would let anyone forge a session. The
+  // message names the variable, never its value.
+  if (!isStrongSessionSecret(sessionSecret!)) {
+    return { error: `REAL_SESSION_SECRET is too weak or malformed: it must be hex or base64/base64url encoding at least ${MIN_SESSION_SECRET_BYTES} random bytes (e.g. \`openssl rand -hex 32\`).` };
+  }
 
   return {
     turnkeyApiBaseUrl: env.TURNKEY_API_BASE_URL?.trim() || "https://api.turnkey.com",
@@ -50,10 +57,21 @@ export function readRealServerConfig(
     sessionSecret: sessionSecret!,
     rpId: rpId!,
     rpName: env.NEXT_PUBLIC_REAL_RP_NAME?.trim() || "onchain-finance",
-    expectedOrigins: originsRaw!.split(",").map((origin) => origin.trim()).filter(Boolean),
+    expectedOrigins: readExpectedOrigins(env),
     rpcUrl: env.BASE_SEPOLIA_RPC_URL?.trim() || env.NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL?.trim() || "https://sepolia.base.org",
     pimlicoApiKey: pimlicoApiKey!,
   };
+}
+
+/**
+ * The exact origins Real Mode is served from (NEXT_PUBLIC_REAL_ORIGIN,
+ * comma-separated). One list, two uses: WebAuthn's expectedOrigin and the
+ * /api/real/** request gate (request-gate.ts), so the two can never disagree.
+ */
+export function readExpectedOrigins(env: Record<string, string | undefined> = process.env): string[] {
+  const raw = env.NEXT_PUBLIC_REAL_ORIGIN?.trim();
+  if (!raw) return [];
+  return raw.split(",").map((origin) => origin.trim()).filter(Boolean);
 }
 
 export function isRealServerConfig(value: RealServerConfig | { error: string }): value is RealServerConfig {

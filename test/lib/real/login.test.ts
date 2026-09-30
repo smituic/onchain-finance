@@ -6,6 +6,7 @@ import { createInMemoryChallengeStore } from "@/lib/real/server/challenge-store"
 import { createInMemoryRealAccountRegistry, type RealAccountRegistry } from "@/lib/real/server/registry";
 import { createInMemoryRegistrationAttemptStore, type RegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
 import { parseSession } from "@/lib/real/server/session";
+import { readAuthenticatedRealAccount } from "@/lib/real/server/auth";
 import { bytesToBase64Url } from "@/lib/real/bytes";
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
 
@@ -335,6 +336,61 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
     expect(secondResult.outcome).toBe("verified");
     if (firstResult.outcome !== "verified" || secondResult.outcome !== "verified") return;
     expect(firstResult.sessionCookie).not.toBe(secondResult.sessionCookie);
+  });
+});
+
+describe("S4: login and the account session epoch", () => {
+  async function loginOnce(authenticator: FixtureAuthenticator, registry: RealAccountRegistry, challengeStore = createInMemoryChallengeStore()) {
+    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
+    return completeLogin({ config, challengeStore, registry, attempts: newAttempts(), response });
+  }
+  const authed = (registry: RealAccountRegistry, cookieValue: string) => readAuthenticatedRealAccount({ cookieValue, sessionSecret: config.sessionSecret, registry });
+
+  it("concurrent completion of the SAME assertion: exactly one session is issued (single-use challenge consumption)", async () => {
+    const authenticator = createFixtureAuthenticator();
+    const registry = await seedRegistry(authenticator);
+    const challengeStore = createInMemoryChallengeStore();
+    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
+
+    const results = await Promise.all([
+      completeLogin({ config, challengeStore, registry, attempts: newAttempts(), response }),
+      completeLogin({ config, challengeStore, registry, attempts: newAttempts(), response }),
+      completeLogin({ config, challengeStore, registry, attempts: newAttempts(), response }),
+    ]);
+    expect(results.filter((r) => r.outcome === "verified")).toHaveLength(1);
+    expect(results.filter((r) => r.outcome === "rejected")).toHaveLength(2);
+  });
+
+  it("distinct valid login assertions create independent sessions at the same epoch — logging in never signs anyone else out", async () => {
+    const authenticator = createFixtureAuthenticator();
+    const registry = await seedRegistry(authenticator);
+    const first = await loginOnce(authenticator, registry);
+    const second = await loginOnce(authenticator, registry);
+    if (first.outcome !== "verified" || second.outcome !== "verified") throw new Error("expected two verified logins");
+
+    const a = await authed(registry, first.sessionCookie);
+    const b = await authed(registry, second.sessionCookie);
+    expect(a?.session.sessionEpoch).toBe(0);
+    expect(b?.session.sessionEpoch).toBe(0);
+    expect(a?.session.sid).not.toBe(b?.session.sid);
+    expect((await registry.findAccountByAppUserId("app-user-1"))?.sessionEpoch).toBe(0);
+  });
+
+  it("after an epoch increment, old sessions fail and a new login is minted at the new epoch and works", async () => {
+    const authenticator = createFixtureAuthenticator();
+    const registry = await seedRegistry(authenticator);
+    const before = await loginOnce(authenticator, registry);
+    if (before.outcome !== "verified") throw new Error("expected a verified login");
+
+    await registry.incrementSessionEpoch("app-user-1");
+    expect(await authed(registry, before.sessionCookie)).toBeNull();
+
+    const after = await loginOnce(authenticator, registry);
+    if (after.outcome !== "verified") throw new Error("expected a verified login");
+    expect(parseSession(after.sessionCookie, config.sessionSecret)?.sessionEpoch).toBe(1);
+    expect((await authed(registry, after.sessionCookie))?.account.appUserId).toBe("app-user-1");
   });
 });
 

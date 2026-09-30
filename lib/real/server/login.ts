@@ -107,8 +107,10 @@ export async function completeLogin(input: {
     if (!account) return { outcome: "rejected", reason: "No account is associated with this passkey." };
 
     // Rotate: always mint a brand-new session on successful login, never
-    // extend or reuse a prior one.
-    const sessionPayload = createSessionPayload({ appUserId: account.appUserId, credentialId: passkey.credentialId });
+    // extend or reuse a prior one. Minted at the account's CURRENT epoch
+    // (just read) — logging in never invalidates other sessions; only
+    // "Sign out everywhere" moves the epoch.
+    const sessionPayload = createSessionPayload({ appUserId: account.appUserId, credentialId: passkey.credentialId, sessionEpoch: account.sessionEpoch });
     const sessionCookie = serializeSession(sessionPayload, input.config.sessionSecret);
     return { outcome: "verified", sessionCookie, account };
   }
