@@ -5,8 +5,8 @@ type Lane = { latest: bigint; finalized: bigint };
 
 /**
  * An in-process stand-in for the read-only EntryPoint calls
- * chain/entry-point.ts makes (getBlock latest/finalized, getNonce at a block
- * tag, getLogs). Latest and finalized nonce state are fully independent —
+ * chain/entry-point.ts makes (getChainId, getBlock latest/finalized, getNonce
+ * at a block tag, getLogs). Latest and finalized nonce state are fully independent —
  * neither defaults to the other — so tests can make them disagree. The key
  * half of the nonce is echoed back from the request, exactly like
  * NonceManager.getNonce, unless `rawNonce` overrides the whole packed value.
@@ -27,12 +27,21 @@ export function createFakeEntryPoint(state: {
   failNumberedReads?: boolean;
   /** Throws only on getNonce at blockTag "finalized" (e.g. a provider that doesn't support it). */
   failFinalizedStateReads?: boolean;
+  /** What eth_chainId reports. Defaults to Base Sepolia (84532); anything else simulates a misconfigured RPC URL. */
+  chainId?: number;
+  /** Throws only on getChainId. */
+  failChainId?: boolean;
 }) {
   const latest = state.latest ?? { number: BigInt(47_000_100), timestamp: BigInt(Math.floor(Date.now() / 1000)) };
   const finalized = state.finalized ?? { number: latest.number - BigInt(645), timestamp: latest.timestamp - BigInt(1290) };
   const calls: { method: string; args: unknown }[] = [];
 
   const reader = {
+    async getChainId() {
+      calls.push({ method: "getChainId", args: undefined });
+      if (state.fail || state.failChainId) throw new Error("RPC unavailable");
+      return state.chainId ?? 84532;
+    },
     async getBlock(args: { blockTag?: string }) {
       calls.push({ method: "getBlock", args });
       if (state.fail) throw new Error("RPC unavailable");

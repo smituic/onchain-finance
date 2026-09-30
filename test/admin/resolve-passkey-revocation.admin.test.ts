@@ -43,14 +43,15 @@ const enabled = process.env.REAL_ADMIN_RESOLVE_PASSKEY_REVOCATION === "1" && Boo
 
 describe.skipIf(!enabled)("ADMIN: resolve ONE blocked passkey removal (R2a, read-only Turnkey, dry run unless REAL_ADMIN_RESOLVE_COMMIT=1)", () => {
   it("terminalizes the attempt only on complete R2a evidence; otherwise changes nothing", async () => {
-    const { neon } = await import("@neondatabase/serverless");
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
     const { requireRealServerConfig } = await import("@/lib/real/server/config");
     const { createReadOnlyTurnkeyLedger, redactReport, resolveBlockedRevocation } = await import("@/lib/real/server/passkey-revocation-resolver");
     const { createNeonRevocationResolutionStore } = await import("@/lib/real/server/passkey-revocation-resolution-store");
 
     const commit = process.env.REAL_ADMIN_RESOLVE_COMMIT === "1";
     const report = await resolveBlockedRevocation({
-      store: createNeonRevocationResolutionStore(neon(process.env.DATABASE_URL!)),
+      // S5 (L4): the commit's account lock relies on READ COMMITTED — pinned by createNeonSqlClient.
+      store: createNeonRevocationResolutionStore(createNeonSqlClient(process.env.DATABASE_URL!)),
       ledger: createReadOnlyTurnkeyLedger(requireRealServerConfig()),
       appUserId: process.env.REAL_ADMIN_APP_USER_ID ?? "",
       revocationAttemptId: process.env.REAL_ADMIN_REVOCATION_ATTEMPT_ID ?? "",

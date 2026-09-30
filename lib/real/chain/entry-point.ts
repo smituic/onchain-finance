@@ -1,5 +1,5 @@
 import type { Address, Hash } from "viem";
-import { REAL_SAFE } from "../constants";
+import { BASE_SEPOLIA_CHAIN_ID, REAL_SAFE } from "../constants";
 import { SAFE_OP_VALIDITY_SECONDS, splitUserOperationNonce } from "../payments/validity";
 import type { RealPublicClient } from "./client";
 
@@ -31,7 +31,7 @@ const ENTRY_POINT_ABI = [
   },
 ] as const;
 
-export type EntryPointReader = Pick<RealPublicClient, "getBlock" | "readContract" | "getLogs">;
+export type EntryPointReader = Pick<RealPublicClient, "getChainId" | "getBlock" | "readContract" | "getLogs">;
 
 /** The chain's own clock — the clock the EntryPoint enforces validUntil against. */
 export async function readLatestBlockClock(client: Pick<RealPublicClient, "getBlock">): Promise<{ number: bigint; timestamp: bigint }> {
@@ -73,12 +73,28 @@ export type UserOperationChainState =
  * whose key is exactly the one requested before its sequence is trusted; a
  * wrong key, a non-bigint, or an out-of-range value is unresolved.
  *
- * Any RPC error propagates; callers treat a throw as unresolved.
+ * S5 (M1): the RPC must first prove it IS Base Sepolia. The canonical
+ * EntryPoint v0.7 exists at the same address on most chains, and on a chain
+ * where this Safe never used this nonce key getNonce returns exactly
+ * `key << 64 | 0` — so a misconfigured RPC URL would otherwise "prove"
+ * expired_unincluded ("No money moved") for an operation that landed on
+ * Base Sepolia. A different chain id, or a failed chain-id read, is
+ * unresolved before any other read.
+ *
+ * Any other RPC error propagates; callers treat a throw as unresolved.
  */
 export async function readUserOperationChainState(
   client: EntryPointReader,
   input: { sender: Address; nonce: bigint; userOperationHash: Hash; prepareBlockNumber: bigint; validUntil: number },
 ): Promise<UserOperationChainState> {
+  let chainId: number;
+  try {
+    chainId = await client.getChainId();
+  } catch {
+    return { kind: "unresolved" };
+  }
+  if (chainId !== BASE_SEPOLIA_CHAIN_ID) return { kind: "unresolved" };
+
   const { key, sequence } = splitUserOperationNonce(input.nonce);
   const readSequence = async (blockTag: "latest" | "finalized"): Promise<bigint | null> => {
     const onChain: unknown = await client.readContract({ address: REAL_SAFE.entryPoint.address, abi: ENTRY_POINT_ABI, functionName: "getNonce", args: [input.sender, key], blockTag });

@@ -446,4 +446,79 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
       expect(fake.calls).toHaveLength(0);
     });
   });
+
+  // S5 (M1): the canonical EntryPoint v0.7 exists at the same address on most
+  // chains, so a misconfigured RPC URL can serve evidence that is internally
+  // consistent but about the wrong chain. Each wrong-chain case below reuses
+  // the exact fixture state that its Base Sepolia control proves conclusive.
+  describe("S5 M1: the RPC must prove it is Base Sepolia before any reconciliation evidence is trusted", () => {
+    const WRONG_CHAINS = [8453, 11155111, 1]; // Base mainnet, Ethereum Sepolia, Ethereum mainnet
+    const includedLooking = { latestSequence: BigInt(1), logs: [matchingLog(true)] };
+    const expiredLooking = { ...afterExpiry, latestSequence: BigInt(0), finalizedSequence: BigInt(0) };
+    const evidenceReads = (fake: ReturnType<typeof createFakeEntryPoint>) => fake.calls.filter((c) => c.method !== "getChainId");
+
+    it("control — Base Sepolia: the included proof still holds, and the chain id is read before anything else", async () => {
+      const fake = createFakeEntryPoint({ ...includedLooking, chainId: 84532 });
+      expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "included", success: true, transactionHash: TX });
+      expect(fake.calls[0]?.method).toBe("getChainId");
+    });
+
+    it("control — Base Sepolia: the finalized expired_unincluded proof still holds", async () => {
+      const fake = createFakeEntryPoint({ ...expiredLooking, chainId: 84532 });
+      expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "expired_unincluded" });
+    });
+
+    it("wrong chain: an otherwise-valid included-looking nonce + matching event is unresolved, and no evidence is even read", async () => {
+      for (const chainId of WRONG_CHAINS) {
+        const fake = createFakeEntryPoint({ ...includedLooking, chainId });
+        expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "unresolved" });
+        expect(evidenceReads(fake)).toHaveLength(0);
+      }
+    });
+
+    it("wrong chain: an otherwise-valid finalized unconsumed nonce past validUntil is unresolved, never expired_unincluded", async () => {
+      for (const chainId of WRONG_CHAINS) {
+        const fake = createFakeEntryPoint({ ...expiredLooking, chainId });
+        expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "unresolved" });
+        expect(evidenceReads(fake)).toHaveLength(0);
+      }
+    });
+
+    it("a failed chain-id read is unresolved (not a throw), and no evidence is read", async () => {
+      for (const state of [includedLooking, expiredLooking]) {
+        const fake = createFakeEntryPoint({ ...state, failChainId: true });
+        expect(await readUserOperationChainState(fake.reader, chainInput)).toEqual({ kind: "unresolved" });
+        expect(evidenceReads(fake)).toHaveLength(0);
+      }
+    });
+
+    it("resolvePaymentStatus writes no terminal state from wrong-chain evidence — dispatched rows with no bundler receipt stay put and keep the slot", async () => {
+      for (const state of ["submitting", "submitted", "unknown"] as const) {
+        for (const evidence of [includedLooking, expiredLooking]) {
+          for (const reader of [createFakeEntryPoint({ ...evidence, chainId: 8453 }).reader, createFakeEntryPoint({ ...evidence, failChainId: true }).reader]) {
+            fetchUserOperationReceiptMock.mockReset().mockResolvedValue(null);
+            const ctx = await seedSubmittedAttempt({ state, window });
+            const outcome = await resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", publicClient: reader, attemptId: ctx.attemptId });
+            expect(outcome.outcome === "ok" && outcome.attempt).toMatchObject({ state, transactionHash: null, failureReason: null });
+            expect(await ctx.paymentStore.findById(ctx.attemptId)).toMatchObject({ state, transactionHash: null, failureReason: null });
+            const next = await ctx.paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SENDER, recipient: "0x4444444444444444444444444444444444444444", amountBaseUnits: "1", chainId: 84532, tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", authorizingCredentialId: "credential-1" });
+            expect(next).toEqual({ ok: false, reason: "payment_in_progress" });
+          }
+        }
+      }
+    });
+
+    it("resolvePaymentStatus writes no terminal state from wrong-chain evidence — expired never-dispatched rows are never 'No money moved'", async () => {
+      for (const state of ["awaiting_authorization", "signed"] as const) {
+        for (const evidence of [includedLooking, expiredLooking]) {
+          for (const reader of [createFakeEntryPoint({ ...evidence, chainId: 11155111 }).reader, createFakeEntryPoint({ ...evidence, failChainId: true }).reader]) {
+            const ctx = await seedSubmittedAttempt({ state, window });
+            const outcome = await resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", publicClient: reader, attemptId: ctx.attemptId, now: () => (VALID_UNTIL + 3_000) * 1000 });
+            expect(outcome.outcome === "ok" && outcome.attempt).toMatchObject({ state, transactionHash: null, failureReason: null });
+            expect((await ctx.paymentStore.findById(ctx.attemptId))?.state).toBe(state);
+          }
+        }
+      }
+    });
+  });
 });

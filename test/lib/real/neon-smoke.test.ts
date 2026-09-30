@@ -42,8 +42,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
   afterAll(async () => {
     if (!databaseUrl) return;
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl);
     for (const id of cleanupCredentialIds) {
       await sql`DELETE FROM real_passkeys WHERE credential_id = ${id}`;
       await sql`DELETE FROM registration_attempts WHERE credential_id = ${id}`;
@@ -57,8 +57,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   });
 
   it("schema applies: all core tables exist", async () => {
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     for (const table of ["webauthn_challenges", "registration_attempts", "real_accounts", "real_passkeys", "backup_passkey_enrollments", "passkey_revocation_attempts"]) {
       const rows = (await sql`SELECT to_regclass(${table}) AS exists`) as { exists: string | null }[];
       expect(rows[0]?.exists, `table "${table}" is missing — apply lib/real/server/schema.sql first`).toBe(table);
@@ -67,8 +67,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
   it("challenge create + atomic consume works against the real database, including under real concurrent requests", async () => {
     const { createNeonChallengeStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonChallengeStore(sql);
     const value = challenge("consume");
     cleanupChallenges.add(value);
@@ -90,8 +90,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   it("real_accounts + real_passkeys are created together atomically, and the unique credential constraint is enforced", async () => {
     const { createNeonRealAccountRegistry } = await import("@/lib/real/server/neon-store");
     const { DuplicateCredentialError } = await import("@/lib/real/server/registry");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const registry = createNeonRealAccountRegistry(sql);
 
     const credId = credentialId("account");
@@ -229,8 +229,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   });
 
   it("S4: real_accounts.session_epoch is BIGINT NOT NULL DEFAULT 0 (migration applied)", async () => {
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const rows = (await sql`
       SELECT data_type, is_nullable, column_default FROM information_schema.columns
       WHERE table_name = 'real_accounts' AND column_name = 'session_epoch'
@@ -242,8 +242,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
   it("S4: a new account starts at epoch 0; concurrent increments over real HTTP requests never lose an update; an unknown account is null", async () => {
     const { createNeonRealAccountRegistry } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const registry = createNeonRealAccountRegistry(neon(databaseUrl!));
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const registry = createNeonRealAccountRegistry(createNeonSqlClient(databaseUrl!));
     const credId = credentialId("epoch");
     const userId = appUserId("epoch");
     cleanupCredentialIds.add(credId);
@@ -262,8 +262,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
   it("S4: challenge create purges already-expired rows and keeps live ones", async () => {
     const { createNeonChallengeStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const [expired, live, trigger] = [challenge("purge-expired"), challenge("purge-live"), challenge("purge-trigger")];
     for (const value of [expired, live, trigger]) cleanupChallenges.add(value);
     await sql`INSERT INTO webauthn_challenges (challenge, purpose, expires_at) VALUES (${expired}, 'login', now() - interval '1 hour')`;
@@ -276,8 +276,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   });
 
   it("the database layer never stores signing/private material — a direct row read contains no such fields", async () => {
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const credId = credentialId("boundary");
     const userId = appUserId("boundary");
     cleanupCredentialIds.add(credId);
@@ -329,8 +329,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   afterAll(async () => {
     if (!databaseUrl) return;
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl);
     for (const id of cleanupAppUserIds) {
       await sql`DELETE FROM payment_attempts WHERE app_user_id = ${id}`;
       await sql`DELETE FROM real_passkeys WHERE app_user_id = ${id}`;
@@ -342,8 +342,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   const credentialFor = (userId: string) => `${userId}-credential`;
 
   async function seedRealAccount(userId: string) {
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     await sql`
       INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
       VALUES (${userId}, 'smoke-sub-org', 'smoke-turnkey-user', 'smoke-wallet', 'smoke-wallet-account', '0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF', ${SAFE_ADDRESS}, 1)
@@ -359,16 +359,16 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   }
 
   it("A: the payment_attempts table exists", async () => {
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const rows = (await sql`SELECT to_regclass('payment_attempts') AS exists`) as { exists: string | null }[];
     expect(rows[0]?.exists, "table payment_attempts is missing — apply the Batch 2d schema addition first").toBe("payment_attempts");
   });
 
   it("B/F: several concurrent reserve() calls for the same account — exactly one succeeds under real concurrent HTTP requests, atomically", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("concurrency");
     cleanupAppUserIds.add(userId);
@@ -382,8 +382,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   }, 30_000);
 
   it("C: the partial unique index itself — independent of reserve()'s advisory lock — prevents two active attempts for one account", async () => {
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const userId = appUserId("unique-index");
     cleanupAppUserIds.add(userId);
     await seedRealAccount(userId);
@@ -407,8 +407,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("D: a cancelled (terminal) attempt frees the slot for a later reservation", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("terminal");
     cleanupAppUserIds.add(userId);
@@ -430,8 +430,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("E: the hourly quota (10/hour) is enforced by the real database, not merely in-process logic", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("quota");
     cleanupAppUserIds.add(userId);
@@ -450,8 +450,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("K: finite expiry — valid_until / prepare_block_number persist as numbers, survive later transitions, and a full uint256 nonce round-trips exactly", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("expiry");
     cleanupAppUserIds.add(userId);
@@ -472,8 +472,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("S2: an explicit failureReason: null clears a stale failure_reason on unknown -> confirmed; an omitted key leaves it alone", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("clear-reason");
     cleanupAppUserIds.add(userId);
@@ -498,8 +498,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("G/H: CAS state transitions and expected_user_operation_hash persistence work against the real database", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("cas");
     cleanupAppUserIds.add(userId);
@@ -540,8 +540,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   });
 
   it("I: the database row never contains signing/private material — direct read, not just the mapped type", async () => {
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const userId = appUserId("no-secrets");
     cleanupAppUserIds.add(userId);
     await seedRealAccount(userId);
@@ -562,8 +562,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("J: findRecentByAppUserId (Batch 2e history read) — newest-first, limit honored, scoped to the requesting account, against the real database", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("history");
     const otherUserId = appUserId("history-other");
@@ -606,8 +606,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("S1: the bound credential persists; the signing activity id is write-once and never recorded on two payments; a revoked passkey keeps its attribution", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { DuplicateSignActivityError } = await import("@/lib/real/server/payment-attempts");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("attribution");
     cleanupAppUserIds.add(userId);
@@ -647,8 +647,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("S1: beginDispatch claims signed -> submitting only while the bound passkey is active", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("dispatch-claim");
     cleanupAppUserIds.add(userId);
@@ -667,8 +667,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("S1: a removal holding the account lock is serialized BEFORE a concurrent beginDispatch — which then sees 'revoking' and refuses", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
-    const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const sql = createNeonSqlClient(databaseUrl!);
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("dispatch-lock");
     cleanupAppUserIds.add(userId);
@@ -705,8 +705,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
   const id = (kind: string, n: number | string) => `smoke2g-${runId}-${kind}-${n}`;
 
   async function sqlFn() {
-    const { neon } = await import("@neondatabase/serverless");
-    return neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    return createNeonSqlClient(databaseUrl!);
   }
 
   async function stores() {
@@ -1141,8 +1141,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Slice S3
   const id = (kind: string, n: string) => `smokeS3-${runId}-${kind}-${n}`;
 
   async function sqlFn() {
-    const { neon } = await import("@neondatabase/serverless");
-    return neon(databaseUrl!);
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    return createNeonSqlClient(databaseUrl!);
   }
 
   async function stores() {

@@ -1107,9 +1107,31 @@ export type NeonDurableStores = {
   revocations: PasskeyRevocationStore;
 };
 
+/**
+ * S5 (L4): every lock-then-read transaction here (beginDispatch for payments
+ * and removals, confirmDeleted, activate, and the S3 resolution commit)
+ * relies on READ COMMITTED: the statement after `SELECT ... FOR UPDATE` must
+ * take a FRESH snapshot so it sees what the lock holder committed. Under
+ * REPEATABLE READ the snapshot is taken before the lock wait, and e.g.
+ * payment beginDispatch would read a just-revoked passkey as still 'active'.
+ * So this is pinned in code rather than left to the database default.
+ *
+ * @neondatabase/serverless 1.1.0: `neon(url, { isolationLevel })` is the
+ * client default for `sql.transaction()` batches (sent as the
+ * Neon-Batch-Isolation-Level header); a per-call `isolationLevel` still
+ * overrides it (the S3 resolver's read-only RepeatableRead snapshot does).
+ * Single statements carry no isolation header and are unaffected.
+ */
+export const NEON_TRANSACTION_ISOLATION_LEVEL = "ReadCommitted" as const;
+
+/** The one way production code (and the S3 admin runner) builds a Neon query function. */
+export function createNeonSqlClient(databaseUrl: string): NeonQueryFunction<false, false> {
+  return neon(databaseUrl, { isolationLevel: NEON_TRANSACTION_ISOLATION_LEVEL });
+}
+
 /** One connection (Neon's HTTP query function is stateless/per-request-safe), six adapters. */
 export function createNeonDurableStores(databaseUrl: string): NeonDurableStores {
-  const sql = neon(databaseUrl);
+  const sql = createNeonSqlClient(databaseUrl);
   return {
     challengeStore: createNeonChallengeStore(sql),
     registry: createNeonRealAccountRegistry(sql),
