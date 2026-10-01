@@ -56,7 +56,11 @@ Two rounds of post-completion product-quality polish followed: Batch A (Home rec
 
 See ARCHITECTURE.md's "S5".
 
-**Next — Turnkey dashboard / account recovery / migration investigation.** Its first security tasks, before anything else in that workstream: cross-account mapping hardening (unique account↔sub-org/Safe mappings, a public-key check in discovery, the WebAuthn response id equal to the attested credential id) and a guarded onboarding finalize (ARCHITECTURE.md's "S5", L2/L3).
+**Next — Turnkey dashboard / account recovery / migration investigation.** Its first security tasks, before anything else in that workstream:
+- **Guarded onboarding finalize (L3) — done.** It is live-verified against Neon.
+- **Cross-account mapping hardening (L2) — still open.** This covers unique account↔sub-org/Safe mappings, a public-key check in discovery, and the WebAuthn response id equal to the attested credential id. Its unique indexes are not applied, and identity-conflict blocking is not implemented. Recovery work stays blocked until it is done.
+
+See ARCHITECTURE.md's "S5".
 
 **Goal:** Introduce Real Mode, backed by real (testnet) infrastructure, one area at a time, while Practice Mode remains fully available for everything — including areas Real Mode doesn't support yet. Prove one real end-to-end path before broadening.
 

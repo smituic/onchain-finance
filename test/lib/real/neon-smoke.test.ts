@@ -1,5 +1,24 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
+
+/**
+ * Deterministic, per-fixture account identity derived from a run-specific
+ * app user id: accounts that exist at the same time never share a sub-org,
+ * Turnkey user, wallet, owner, or Safe (the planned real_accounts uniqueness
+ * indexes would reject that). Ids keep the `smoke` prefix, so residue stays
+ * detectable by `LIKE 'smoke%'`; addresses are 20 bytes of sha256(userId:label).
+ */
+function smokeIdentity(userId: string) {
+  const address = (label: string) => `0x${createHash("sha256").update(`${userId}:${label}`).digest("hex").slice(0, 40)}`;
+  return {
+    subOrganizationId: `${userId}-sub-org`,
+    turnkeyUserId: `${userId}-turnkey-user`,
+    walletId: `${userId}-wallet`,
+    walletAccountId: `${userId}-wallet-account`,
+    ownerAddress: address("owner"),
+    safeAddress: address("safe"),
+  };
+}
 
 /**
  * MANUAL, LIVE-DATABASE SMOKE TEST — never runs in normal `pnpm test` /
@@ -102,12 +121,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
     const created = await registry.createAccountWithPasskey({
       account: {
         appUserId: userId,
-        subOrganizationId: "smoke-sub-org",
-        turnkeyUserId: "smoke-turnkey-user",
-        walletId: "smoke-wallet",
-        walletAccountId: "smoke-wallet-account",
-        ownerAddress: "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF",
-        safeAddress: "0xd9a4c22fb34dc74317edc8006140d66c8fa03266",
+        ...smokeIdentity(userId),
         accountConfigVersion: 1,
       },
       passkey: {
@@ -134,12 +148,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
       registry.createAccountWithPasskey({
         account: {
           appUserId: otherUserId,
-          subOrganizationId: "smoke-sub-org-2",
-          turnkeyUserId: "smoke-turnkey-user-2",
-          walletId: "smoke-wallet-2",
-          walletAccountId: "smoke-wallet-account-2",
-          ownerAddress: "0x1111111111111111111111111111111111111111",
-          safeAddress: "0x2222222222222222222222222222222222222222",
+          ...smokeIdentity(otherUserId),
           accountConfigVersion: 1,
         },
         passkey: {
@@ -199,21 +208,14 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
       credentialId: credId,
       from: "provisioning_in_flight",
       to: "turnkey_created",
-      patch: {
-        subOrganizationId: "smoke-sub-org",
-        turnkeyUserId: "smoke-turnkey-user",
-        walletId: "smoke-wallet",
-        walletAccountId: "smoke-wallet-account",
-        ownerAddress: "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF",
-        externalOutcome: "confirmed_created",
-      },
+      patch: { ...turnkeyPatch(userId), externalOutcome: "confirmed_created" },
     });
     expect(created2?.state).toBe("turnkey_created");
 
     const finalized = await stores.attempts.finalize({
       credentialId: credId,
       registry: stores.registry,
-      safeAddress: "0xd9a4c22fb34dc74317edc8006140d66c8fa03266",
+      safeAddress: smokeIdentity(userId).safeAddress,
       accountConfigVersion: 1,
     });
     expect(finalized?.account.appUserId).toBe(userId);
@@ -226,6 +228,144 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
     // finalize() is itself a CAS: calling it again must not double-create.
     expect(await stores.attempts.finalize({ credentialId: credId, registry: stores.registry, safeAddress: "0x", accountConfigVersion: 1 })).toBeNull();
+  });
+
+  // ---- S5 L3: finalize atomicity against real Postgres ----
+
+  function turnkeyPatch(userId: string) {
+    const { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress } = smokeIdentity(userId);
+    return { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress };
+  }
+
+  /** A durable attempt walked to turnkey_created through the adapter's own CAS transitions, registered for cleanup. */
+  async function seedTurnkeyCreated(suffix: string) {
+    const { createNeonDurableStores, createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const stores = createNeonDurableStores(databaseUrl!);
+    const sql = createNeonSqlClient(databaseUrl!);
+    // Canonical base64url (accountMatchesAttempt compares decoded bytes and
+    // fails closed on anything undecodable): "smokeL3A" decodes to exactly 6
+    // bytes, so the id keeps that prefix for cleanup/residue detection.
+    const credId = Buffer.concat([Buffer.from("smokeL3A", "base64url"), createHash("sha256").update(`${runId}:${suffix}`).digest()]).toString("base64url");
+    const userId = appUserId(suffix);
+    cleanupCredentialIds.add(credId);
+    cleanupAppUserIds.add(userId);
+    await stores.attempts.createVerified({
+      credentialId: credId,
+      appUserId: userId,
+      userHandle: `${userId}-handle`,
+      credentialPublicKey: `${userId}-cose`,
+      counter: 0,
+      transports: ["internal"],
+      credentialDeviceType: "singleDevice",
+      credentialBackedUp: false,
+      registrationChallenge: `${userId}-challenge`,
+      rawClientDataJson: "smoke-client-data",
+      rawAttestationObject: "smoke-attestation-object",
+    });
+    await stores.attempts.transition({ credentialId: credId, from: "verified", to: "provisioning_in_flight", patch: { externalOutcome: "unknown" } });
+    await stores.attempts.transition({ credentialId: credId, from: "provisioning_in_flight", to: "turnkey_created", patch: { ...turnkeyPatch(userId), externalOutcome: "confirmed_created" } });
+    const finalizeInput = { credentialId: credId, registry: stores.registry, safeAddress: smokeIdentity(userId).safeAddress, accountConfigVersion: 1 };
+    const counts = async () => {
+      const [row] = (await sql`
+        SELECT (SELECT count(*) FROM real_accounts WHERE app_user_id = ${userId})::int AS accounts,
+               (SELECT count(*) FROM real_passkeys WHERE credential_id = ${credId})::int AS passkeys
+      `) as { accounts: number; passkeys: number }[];
+      return row!;
+    };
+    return { stores, sql, credId, userId, finalizeInput, counts };
+  }
+
+  it("S5 L3: a LOST CAS writes nothing even when the account/passkey ids are free (attempt moved off turnkey_created with every field still set)", async () => {
+    const { stores, credId, finalizeInput, counts } = await seedTurnkeyCreated("l3-lost-cas");
+    expect(await stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "provisioning_in_flight" })).not.toBeNull();
+
+    expect(await stores.attempts.finalize(finalizeInput)).toBeNull();
+    expect(await counts()).toEqual({ accounts: 0, passkeys: 0 });
+    expect((await stores.attempts.findByCredentialId(credId))?.state).toBe("provisioning_in_flight");
+  });
+
+  it("S5 L3: a blocked attempt finalizes to null with no rows", async () => {
+    const { stores, credId, finalizeInput, counts } = await seedTurnkeyCreated("l3-blocked");
+    await stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "blocked", patch: { blockReason: "smoke review" } });
+
+    expect(await stores.attempts.finalize(finalizeInput)).toBeNull();
+    expect(await counts()).toEqual({ accounts: 0, passkeys: 0 });
+    expect((await stores.attempts.findByCredentialId(credId))?.state).toBe("blocked");
+  });
+
+  it("S5 L3: five concurrent finalizes over real HTTP -> exactly one valid pair; the same-statement account+passkey INSERT satisfies the real FK; a replay reuses nothing and changes nothing", async () => {
+    const { accountMatchesAttempt } = await import("@/lib/real/server/registration-attempts");
+    const { stores, sql, credId, userId, finalizeInput, counts } = await seedTurnkeyCreated("l3-concurrent");
+
+    const results = await Promise.all(Array.from({ length: 5 }, () => stores.attempts.finalize(finalizeInput)));
+    const winners = results.filter((result) => result !== null);
+    expect(winners).toHaveLength(1);
+    expect(await counts()).toEqual({ accounts: 1, passkeys: 1 });
+
+    const active = (await stores.attempts.findByCredentialId(credId))!;
+    const account = (await stores.registry.findAccountByAppUserId(userId))!;
+    const passkey = (await stores.registry.findPasskeyByCredentialId(credId))!;
+    expect(accountMatchesAttempt(active, account, passkey)).toBe(true);
+    expect(winners[0]).toEqual({ account, passkey });
+
+    // The FK real_passkeys.app_user_id -> real_accounts really exists, so the
+    // single-statement parent+child insert above was checked against it.
+    const [fk] = (await sql`
+      SELECT count(*)::int AS n FROM pg_constraint
+      WHERE conrelid = 'real_passkeys'::regclass AND confrelid = 'real_accounts'::regclass AND contype = 'f'
+    `) as { n: number }[];
+    expect(fk!.n).toBeGreaterThanOrEqual(1);
+
+    expect(await stores.attempts.finalize(finalizeInput)).toBeNull();
+    expect(await counts()).toEqual({ accounts: 1, passkeys: 1 });
+    expect(await stores.registry.findAccountByAppUserId(userId)).toEqual(account);
+  });
+
+  it("S5 L3: a conflicting existing row rolls back the WHOLE transaction — the CAS too: the attempt stays turnkey_created, no account, the other row untouched", async () => {
+    const { stores, credId, userId, finalizeInput, counts } = await seedTurnkeyCreated("l3-conflict");
+    const holderId = appUserId("l3-conflict-holder");
+    cleanupAppUserIds.add(holderId);
+    // Another account already holds this attempt's credential id.
+    await stores.registry.createAccountWithPasskey({
+      account: { appUserId: holderId, ...smokeIdentity(holderId), accountConfigVersion: 1 },
+      passkey: { credentialId: credId, appUserId: holderId, credentialPublicKey: "holder-cose", userHandle: "holder-handle", counter: 0, transports: null, credentialDeviceType: null, credentialBackedUp: null },
+    });
+
+    expect(await stores.attempts.finalize(finalizeInput)).toBeNull();
+    expect((await stores.attempts.findByCredentialId(credId))?.state).toBe("turnkey_created");
+    expect((await counts()).accounts).toBe(0);
+    expect((await stores.registry.findPasskeyByCredentialId(credId))?.appUserId).toBe(holderId);
+    expect(await stores.registry.findAccountByAppUserId(userId)).toBeNull();
+  });
+
+  it("S5 L3: an active attempt whose account or passkey no longer matches is NOT resumed by onboarding (fails closed)", async () => {
+    const { runProvisioningPipeline } = await import("@/lib/real/server/onboarding");
+    const smokeConfig = {
+      turnkeyApiBaseUrl: "https://api.turnkey.com",
+      turnkeyParentOrganizationId: "unused",
+      turnkeyApiPublicKey: "unused",
+      turnkeyApiPrivateKey: "unused",
+      sessionSecret: "smoke-session-secret",
+      rpId: "localhost",
+      rpName: "Smoke",
+      expectedOrigins: ["http://localhost:3000"],
+      rpcUrl: "https://sepolia.base.org",
+      pimlicoApiKey: "unused",
+    };
+    const tamperings: Array<[string, (sql: Awaited<ReturnType<typeof seedTurnkeyCreated>>["sql"], userId: string, credId: string) => Promise<unknown>]> = [
+      ["account", (sql, userId) => sql`UPDATE real_accounts SET safe_address = '0x000000000000000000000000000000000000dead' WHERE app_user_id = ${userId}`],
+      ["passkey", (sql, _userId, credId) => sql`UPDATE real_passkeys SET credential_public_key = 'tampered' WHERE credential_id = ${credId}`],
+    ];
+    for (const [name, tamper] of tamperings) {
+      const { stores, sql, credId, userId, finalizeInput } = await seedTurnkeyCreated(`l3-tamper-${name}`);
+      expect(await stores.attempts.finalize(finalizeInput)).not.toBeNull();
+      const active = (await stores.attempts.findByCredentialId(credId))!;
+      expect((await runProvisioningPipeline({ config: smokeConfig, registry: stores.registry, attempts: stores.attempts, attempt: active })).outcome, name).toBe("verified");
+
+      await tamper(sql, userId, credId);
+      const result = await runProvisioningPipeline({ config: smokeConfig, registry: stores.registry, attempts: stores.attempts, attempt: active });
+      expect(result.outcome, name).toBe("rejected");
+    }
   });
 
   it("S4: real_accounts.session_epoch is BIGINT NOT NULL DEFAULT 0 (migration applied)", async () => {
@@ -249,7 +389,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
     cleanupCredentialIds.add(credId);
     cleanupAppUserIds.add(userId);
     const { account } = await registry.createAccountWithPasskey({
-      account: { appUserId: userId, subOrganizationId: "smoke-sub-org", turnkeyUserId: "smoke-turnkey-user", walletId: "smoke-wallet", walletAccountId: "smoke-wallet-account", ownerAddress: "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF", safeAddress: "0xd9a4c22fb34dc74317edc8006140d66c8fa03266", accountConfigVersion: 1 },
+      account: { appUserId: userId, ...smokeIdentity(userId), accountConfigVersion: 1 },
       passkey: { credentialId: credId, appUserId: userId, credentialPublicKey: "smoke-public-key", userHandle: "smoke-user-handle", counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false },
     });
     expect(account.sessionEpoch).toBe(0);
@@ -320,7 +460,6 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   const databaseUrl = process.env.DATABASE_URL;
   const runId = randomUUID().slice(0, 8);
   const appUserId = (suffix: string) => `smoke-pay-${runId}-user-${suffix}`;
-  const SAFE_ADDRESS = "0xd9a4c22fb34dc74317edc8006140d66c8fa03266";
   const RECIPIENT = "0x2222222222222222222222222222222222222222";
   const TOKEN_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
   const CHAIN_ID = 84532;
@@ -344,9 +483,10 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   async function seedRealAccount(userId: string) {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
     const sql = createNeonSqlClient(databaseUrl!);
+    const identity = smokeIdentity(userId);
     await sql`
       INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
-      VALUES (${userId}, 'smoke-sub-org', 'smoke-turnkey-user', 'smoke-wallet', 'smoke-wallet-account', '0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF', ${SAFE_ADDRESS}, 1)
+      VALUES (${userId}, ${identity.subOrganizationId}, ${identity.turnkeyUserId}, ${identity.walletId}, ${identity.walletAccountId}, ${identity.ownerAddress}, ${identity.safeAddress}, 1)
     `;
     await sql`
       INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter)
@@ -355,7 +495,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   }
 
   function reserveInput(userId: string) {
-    return { appUserId: userId, safeAddress: SAFE_ADDRESS, recipient: RECIPIENT, amountBaseUnits: "1000000", chainId: CHAIN_ID, tokenAddress: TOKEN_ADDRESS, authorizingCredentialId: credentialFor(userId) };
+    return { appUserId: userId, safeAddress: smokeIdentity(userId).safeAddress, recipient: RECIPIENT, amountBaseUnits: "1000000", chainId: CHAIN_ID, tokenAddress: TOKEN_ADDRESS, authorizingCredentialId: credentialFor(userId) };
   }
 
   it("A: the payment_attempts table exists", async () => {
@@ -393,7 +533,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
     // backstop, not merely a restatement of the lock's own guarantee.
     const insertOne = () => sql`
       INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state)
-      VALUES (${userId}, ${SAFE_ADDRESS}, ${RECIPIENT}, '1000000', ${CHAIN_ID}, ${TOKEN_ADDRESS}, 'prepared')
+      VALUES (${userId}, ${smokeIdentity(userId).safeAddress}, ${RECIPIENT}, '1000000', ${CHAIN_ID}, ${TOKEN_ADDRESS}, 'prepared')
       RETURNING id
     `;
 
@@ -548,7 +688,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
     const rows = (await sql`
       INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state, expected_user_operation_hash)
-      VALUES (${userId}, ${SAFE_ADDRESS}, ${RECIPIENT}, '1000000', ${CHAIN_ID}, ${TOKEN_ADDRESS}, 'awaiting_authorization', '0xsmokehash')
+      VALUES (${userId}, ${smokeIdentity(userId).safeAddress}, ${RECIPIENT}, '1000000', ${CHAIN_ID}, ${TOKEN_ADDRESS}, 'awaiting_authorization', '0xsmokehash')
       RETURNING *
     `) as Record<string, unknown>[];
     const row = rows[0]!;
@@ -730,7 +870,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
     users.add(appUserId);
     await sql`
       INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
-      VALUES (${appUserId}, 'smoke-sub-org', 'smoke-turnkey-user', 'smoke-wallet', 'smoke-wallet-account', '0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF', '0xd9a4c22fb34dc74317edc8006140d66c8fa03266', 1)
+      VALUES (${appUserId}, ${smokeIdentity(appUserId).subOrganizationId}, ${smokeIdentity(appUserId).turnkeyUserId}, ${smokeIdentity(appUserId).walletId}, ${smokeIdentity(appUserId).walletAccountId}, ${smokeIdentity(appUserId).ownerAddress}, ${smokeIdentity(appUserId).safeAddress}, 1)
     `;
     for (const p of passkeys) {
       await sql`
@@ -1166,7 +1306,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Slice S3
     const pending = id("cred", `${purpose}-pending`);
     await sql`
       INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
-      VALUES (${appUserId}, 'smoke-sub-org', 'smoke-turnkey-user', 'smoke-wallet', 'smoke-wallet-account', '0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF', '0xd9a4c22fb34dc74317edc8006140d66c8fa03266', 1)
+      VALUES (${appUserId}, ${smokeIdentity(appUserId).subOrganizationId}, ${smokeIdentity(appUserId).turnkeyUserId}, ${smokeIdentity(appUserId).walletId}, ${smokeIdentity(appUserId).walletAccountId}, ${smokeIdentity(appUserId).ownerAddress}, ${smokeIdentity(appUserId).safeAddress}, 1)
     `;
     await sql`
       INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter, status, role, turnkey_authenticator_id)
@@ -1184,7 +1324,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Slice S3
 
     const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary });
     if (!prepared.ok) throw new Error(JSON.stringify(prepared));
-    const body = JSON.stringify({ type: "ACTIVITY_TYPE_DELETE_AUTHENTICATORS", timestampMs: String(Date.now()), organizationId: "smoke-sub-org", parameters: { userId: "smoke-turnkey-user", authenticatorIds: [targetAuth] } });
+    const body = JSON.stringify({ type: "ACTIVITY_TYPE_DELETE_AUTHENTICATORS", timestampMs: String(Date.now()), organizationId: smokeIdentity(appUserId).subOrganizationId, parameters: { userId: smokeIdentity(appUserId).turnkeyUserId, authenticatorIds: [targetAuth] } });
     const bodySha = await sha(body);
     if (!(await s.revocations.beginDispatch({ id: prepared.attempt.id, patch: { turnkeyRequestBody: body, turnkeyRequestBodySha256: bodySha, turnkeyRequestTimestampMs: Date.now(), turnkeyRequestStamp: STAMP_SENTINEL, externalAttemptedAt: new Date().toISOString() } }))) throw new Error("setup");
     await s.revocations.transition({ id: prepared.attempt.id, from: "dispatch_in_flight", to: "blocked", patch: { failureReason: "no_activity_receipt", ...(opts.keepStamp ? {} : { turnkeyRequestStamp: null }) } });

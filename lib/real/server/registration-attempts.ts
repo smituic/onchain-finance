@@ -1,4 +1,12 @@
-import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
+import { credentialIdsEqual } from "../credential-id";
+import {
+  DuplicateAccountError,
+  DuplicateCredentialError,
+  getInMemoryRegistryInternals,
+  type RealAccountRecord,
+  type RealAccountRegistry,
+  type RealPasskeyRecord,
+} from "./registry";
 
 /**
  * The durable onboarding workflow. A row is written the instant a WebAuthn
@@ -7,7 +15,7 @@ import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRecord
  * recoverable (see server/onboarding.ts's runProvisioningPipeline, shared
  * by registration and login-recovery).
  *
- *   verified -> provisioning_in_flight -> turnkey_created -> active
+ *   verified -> provisioning_in_flight -> turnkey_created -> active (finalize only)
  *        ^               \-> blocked (ambiguous Turnkey discovery; manual review)
  *        \_______________/  (only on a Turnkey-CONFIRMED definitive failure —
  *                             see externalOutcome below)
@@ -140,13 +148,14 @@ export interface RegistrationAttemptStore {
   updateCounter(input: { credentialId: string; counter: number }): Promise<void>;
 
   /**
-   * The one atomic activation step: requires the attempt to currently be
-   * "turnkey_created" (CAS), writes real_accounts + real_passkeys via the
-   * given registry, and marks the attempt "active" — all together where
-   * the adapter can make that transactional (the Neon adapter wraps both
-   * in one SQL transaction). Returns null if the attempt wasn't in the
-   * expected state (lost race / already finalized elsewhere) rather than
-   * throwing — the caller re-reads.
+   * The one atomic activation step (S5 L3): the attempt's "turnkey_created"
+   * -> "active" CAS and the real_accounts + real_passkeys writes commit
+   * together or not at all, and an invocation that does NOT win that CAS
+   * can never write either row — structurally, not because some other
+   * constraint happens to conflict. Returns records only to the invocation
+   * that won; null otherwise (lost race, already finalized, blocked, or a
+   * conflicting existing row) — never an existing account found by
+   * appUserId. The caller re-reads and checks accountMatchesAttempt.
    */
   finalize(input: {
     credentialId: string;
@@ -155,6 +164,37 @@ export interface RegistrationAttemptStore {
     accountConfigVersion: number;
   }): Promise<{ account: RealAccountRecord; passkey: RealPasskeyRecord } | null>;
 }
+
+/**
+ * S5 L3: the ONLY condition under which an existing account/passkey pair may
+ * be reused for a registration attempt (onboarding.ts — an "active" attempt,
+ * or a re-read after finalize returned null). Every identity field finalize
+ * copies from the attempt must match exactly; the passkey must be this
+ * attempt's own credential (decoded-byte equality), still the active primary
+ * finalize created. Anything else fails closed — a row merely sharing the
+ * appUserId is never enough.
+ */
+export function accountMatchesAttempt(attempt: RegistrationAttempt, account: RealAccountRecord, passkey: RealPasskeyRecord): boolean {
+  return (
+    attempt.state === "active" &&
+    account.appUserId === attempt.appUserId &&
+    account.subOrganizationId === attempt.subOrganizationId &&
+    account.turnkeyUserId === attempt.turnkeyUserId &&
+    account.walletId === attempt.walletId &&
+    account.walletAccountId === attempt.walletAccountId &&
+    account.ownerAddress === attempt.ownerAddress &&
+    account.safeAddress === attempt.safeAddress &&
+    account.accountConfigVersion === attempt.accountConfigVersion &&
+    credentialIdsEqual(passkey.credentialId, attempt.credentialId) &&
+    passkey.appUserId === attempt.appUserId &&
+    passkey.credentialPublicKey === attempt.credentialPublicKey &&
+    passkey.userHandle === attempt.userHandle &&
+    passkey.status === "active" &&
+    passkey.role === "primary"
+  );
+}
+
+const lowerOrNull = (value: string | null) => value?.toLowerCase() ?? null;
 
 export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptStore {
   const attempts = new Map<string, RegistrationAttempt>();
@@ -222,45 +262,67 @@ export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptSto
     },
 
     async finalize({ credentialId, registry, safeAddress, accountConfigVersion }) {
+      // Everything up to the claim is synchronous (no await), so no other
+      // call can interleave between these checks and the claim — the
+      // in-memory equivalent of the Neon adapter's row lock.
       const current = attempts.get(credentialId);
       if (!current || current.state !== "turnkey_created") return null;
-      if (!current.subOrganizationId || !current.turnkeyUserId || !current.walletId || !current.walletAccountId || !current.ownerAddress) return null;
+      const { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress } = current;
+      if (!subOrganizationId || !turnkeyUserId || !walletId || !walletAccountId || !ownerAddress) return null;
 
-      // Claim the transition synchronously before the first await, so a
-      // concurrent finalize() call for the same credentialId sees
-      // state !== "turnkey_created" and returns null instead of racing.
-      const claimed: RegistrationAttempt = {
-        ...current,
-        state: "active",
-        safeAddress,
-        accountConfigVersion,
-        updatedAt: new Date().toISOString(),
-      };
+      const { accountsByAppUserId, passkeysByCredentialId } = getInMemoryRegistryInternals(registry);
+      if (accountsByAppUserId.has(current.appUserId) || passkeysByCredentialId.has(current.credentialId)) return null;
+      for (const other of accountsByAppUserId.values()) {
+        if (
+          lowerOrNull(other.subOrganizationId) === lowerOrNull(subOrganizationId) ||
+          lowerOrNull(other.ownerAddress) === lowerOrNull(ownerAddress) ||
+          lowerOrNull(other.safeAddress) === lowerOrNull(safeAddress)
+        ) {
+          return null;
+        }
+      }
+
+      // Claimed synchronously, so a concurrent finalize() for the same
+      // credentialId sees state !== "turnkey_created" and returns null.
+      const claimed: RegistrationAttempt = { ...current, state: "active", safeAddress, accountConfigVersion, updatedAt: new Date().toISOString() };
       attempts.set(credentialId, claimed);
 
-      const created = await registry.createAccountWithPasskey({
-        account: {
-          appUserId: current.appUserId,
-          subOrganizationId: current.subOrganizationId,
-          turnkeyUserId: current.turnkeyUserId,
-          walletId: current.walletId,
-          walletAccountId: current.walletAccountId,
-          ownerAddress: current.ownerAddress,
-          safeAddress,
-          accountConfigVersion,
-        },
-        passkey: {
-          credentialId: current.credentialId,
-          appUserId: current.appUserId,
-          credentialPublicKey: current.credentialPublicKey,
-          userHandle: current.userHandle,
-          counter: current.counter,
-          transports: current.transports,
-          credentialDeviceType: current.credentialDeviceType,
-          credentialBackedUp: current.credentialBackedUp,
-        },
-      });
-      return created;
+      const account = { appUserId: current.appUserId, subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress, safeAddress, accountConfigVersion };
+      const passkey = {
+        credentialId: current.credentialId,
+        appUserId: current.appUserId,
+        credentialPublicKey: current.credentialPublicKey,
+        userHandle: current.userHandle,
+        counter: current.counter,
+        transports: current.transports,
+        credentialDeviceType: current.credentialDeviceType,
+        credentialBackedUp: current.credentialBackedUp,
+      };
+      try {
+        return await registry.createAccountWithPasskey({ account, passkey });
+      } catch (error) {
+        // Compensate synchronously: never "active" without its rows, never a
+        // partial row. Both keys were proven absent before the claim, so a
+        // row now present that carries this invocation's exact values is one
+        // this invocation wrote; anything else belongs to another operation
+        // and is left alone. The attempt is restored only if it is still the
+        // exact object this invocation claimed.
+        const writtenAccount = accountsByAppUserId.get(account.appUserId);
+        if (
+          writtenAccount &&
+          writtenAccount.subOrganizationId === account.subOrganizationId &&
+          writtenAccount.ownerAddress === account.ownerAddress &&
+          writtenAccount.safeAddress === account.safeAddress
+        ) {
+          accountsByAppUserId.delete(account.appUserId);
+        }
+        const writtenPasskey = passkeysByCredentialId.get(passkey.credentialId);
+        if (writtenPasskey && writtenPasskey.appUserId === passkey.appUserId && writtenPasskey.credentialPublicKey === passkey.credentialPublicKey) {
+          passkeysByCredentialId.delete(passkey.credentialId);
+        }
+        if (attempts.get(credentialId) === claimed) attempts.set(credentialId, current);
+        throw error;
+      }
     },
   };
 }

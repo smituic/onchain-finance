@@ -4,7 +4,7 @@ import { createRealPublicClient } from "../chain/client";
 import { createRealSafeAccount, type SafeAccountPublicClient } from "../account/safe";
 import { createVerifiedTurnkeyOwnerAccount } from "../signing/verified-account";
 import type { RealAccountRecord, RealAccountRegistry } from "./registry";
-import type { RegistrationAttempt, RegistrationAttemptStore } from "./registration-attempts";
+import { accountMatchesAttempt, type RegistrationAttempt, type RegistrationAttemptStore } from "./registration-attempts";
 import type { RealServerConfig } from "./config";
 import { isDefinitiveProvisioningFailure, provisionTurnkeyChildAccount } from "./turnkey-provisioning";
 import { discoverAccountByCredentialId } from "./turnkey-discovery";
@@ -21,6 +21,19 @@ export type OnboardingOutcome =
 
 function issueSession(account: RealAccountRecord, credentialId: string, config: RealServerConfig): string {
   return serializeSession(createSessionPayload({ appUserId: account.appUserId, credentialId, sessionEpoch: account.sessionEpoch }), config.sessionSecret);
+}
+
+/**
+ * S5 L3: an "active" attempt resumes ONLY onto the exact account + passkey
+ * finalize wrote for it (accountMatchesAttempt). Missing or mismatched rows
+ * fail closed — no session, never "whatever account has this appUserId".
+ */
+async function resumeActiveAttempt(registry: RealAccountRegistry, attempt: RegistrationAttempt, config: RealServerConfig): Promise<OnboardingOutcome> {
+  const [account, passkey] = await Promise.all([registry.findAccountByAppUserId(attempt.appUserId), registry.findPasskeyByCredentialId(attempt.credentialId)]);
+  if (!account || !passkey || !accountMatchesAttempt(attempt, account, passkey)) {
+    return { outcome: "rejected", reason: "This registration's account records are missing or don't match it." };
+  }
+  return { outcome: "verified", sessionCookie: issueSession(account, passkey.credentialId, config), account };
 }
 
 /** Reconstructs the RegistrationResponseJSON shape provisionTurnkeyChildAccount needs, from durable public ceremony artifacts — never from anything re-derived or guessed. */
@@ -67,11 +80,7 @@ export async function runProvisioningPipeline(input: {
     return { outcome: "blocked", reason: attempt.blockReason ?? "This registration requires manual review." };
   }
 
-  if (attempt.state === "active") {
-    const account = await input.registry.findAccountByAppUserId(attempt.appUserId);
-    if (!account) return { outcome: "rejected", reason: "Account record is missing despite an active registration attempt." };
-    return { outcome: "verified", sessionCookie: issueSession(account, attempt.credentialId, input.config), account };
-  }
+  if (attempt.state === "active") return resumeActiveAttempt(input.registry, attempt, input.config);
 
   if (attempt.state === "provisioning_in_flight") {
     // The earlier external call's outcome is unknown. Discovery is the
@@ -210,10 +219,11 @@ export async function runProvisioningPipeline(input: {
   });
 
   if (!finalized) {
-    // Lost the finalize race, or the attempt moved under us — someone else
-    // may have already finished it.
-    const account = await input.registry.findAccountByAppUserId(attempt.appUserId);
-    if (account) return { outcome: "verified", sessionCookie: issueSession(account, attempt.credentialId, input.config), account };
+    // Nothing was written by this call. Re-read the ATTEMPT (not the
+    // account): another call may have finished it, or it may have moved.
+    const fresh = await input.attempts.findByCredentialId(attempt.credentialId);
+    if (fresh?.state === "active") return resumeActiveAttempt(input.registry, fresh, input.config);
+    if (fresh?.state === "blocked") return { outcome: "blocked", reason: fresh.blockReason ?? "This registration requires manual review." };
     return { outcome: "pending", reason: "Account setup is still finishing. Try again shortly." };
   }
 

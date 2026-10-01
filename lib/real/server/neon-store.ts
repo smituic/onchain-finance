@@ -847,55 +847,103 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
       await sql`UPDATE registration_attempts SET counter = ${counter}, updated_at = now() WHERE credential_id = ${credentialId}`;
     },
 
-    // Deliberately does NOT call registry.createAccountWithPasskey — the
-    // passed-in `registry` param is kept for interface parity with the
-    // in-memory adapter, but here it's the CALLER's registry (which may or
-    // may not share this connection). To guarantee real cross-table
-    // atomicity (registration_attempts + real_accounts + real_passkeys all
-    // committing together or not at all), this performs the full write as
-    // one sql.transaction() against the SAME connection this store itself
-    // holds, then re-reads through the caller's registry so the returned
-    // records reflect whatever that registry's own read path produces.
-    async finalize({ credentialId, registry, safeAddress, accountConfigVersion }) {
-      const attemptRows = (await sql`SELECT * FROM registration_attempts WHERE credential_id = ${credentialId}`) as Row[];
-      const attempt = attemptRows[0] ? toAttempt(attemptRows[0]) : null;
-      if (!attempt || attempt.state !== "turnkey_created") return null;
-      if (!attempt.subOrganizationId || !attempt.turnkeyUserId || !attempt.walletId || !attempt.walletAccountId || !attempt.ownerAddress) return null;
-
+    // S5 L3. ONE transaction, no read before it, no network inside it
+    // (createRealSafeAccount and every Turnkey call happen before finalize
+    // is ever called). READ COMMITTED is pinned (createNeonSqlClient).
+    //
+    //  1. Lock the attempt row, so the statements below read one settled row
+    //     and concurrent finalizers / transitions / counter updates queue.
+    //  2. ONE statement: the turnkey_created -> active CAS is the `claimed`
+    //     CTE, and BOTH inserts select FROM claimed — the row THIS statement
+    //     changed, with its current values. A lost CAS leaves `claimed`
+    //     empty, so there is nothing for either INSERT to insert: it can't
+    //     persist a row, whatever other constraints do or don't exist. The
+    //     passkey is joined to account_insert, and the statement aborts
+    //     (guard sentinel) if a won CAS didn't produce exactly one of each.
+    //     ON CONFLICT DO NOTHING turns any conflicting existing row into
+    //     "not inserted" -> that abort, never a 23505 to reinterpret.
+    //  3. Integrity guards on the committed-to-be state: an active attempt
+    //     must have an account + passkey matching it field for field; a
+    //     non-active attempt must have neither.
+    //  4. Read back this attempt's rows (same transaction) for the winner.
+    //
+    // A 23505 is never mapped to "someone else finished — reuse their rows":
+    // only the CAS winner gets records back; everyone else gets null and
+    // onboarding re-reads under accountMatchesAttempt. `registry` is unused
+    // here (interface parity with the in-memory adapter).
+    async finalize({ credentialId, safeAddress, accountConfigVersion }) {
       try {
         const results = await sql.transaction([
+          sql`SELECT credential_id FROM registration_attempts WHERE credential_id = ${credentialId} FOR UPDATE`,
           sql`
-            UPDATE registration_attempts
-            SET state = 'active', safe_address = ${safeAddress}, account_config_version = ${accountConfigVersion}, updated_at = now()
-            WHERE credential_id = ${credentialId} AND state = 'turnkey_created'
-            RETURNING credential_id
+            WITH claimed AS (
+              UPDATE registration_attempts
+              SET state = 'active', safe_address = ${safeAddress}, account_config_version = ${accountConfigVersion}, updated_at = now()
+              WHERE credential_id = ${credentialId} AND state = 'turnkey_created'
+                AND sub_organization_id IS NOT NULL AND turnkey_user_id IS NOT NULL AND wallet_id IS NOT NULL
+                AND wallet_account_id IS NOT NULL AND owner_address IS NOT NULL
+              RETURNING *
+            ),
+            account_insert AS (
+              INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
+              SELECT c.app_user_id, c.sub_organization_id, c.turnkey_user_id, c.wallet_id, c.wallet_account_id, c.owner_address, c.safe_address, c.account_config_version
+              FROM claimed c
+              ON CONFLICT DO NOTHING
+              RETURNING app_user_id
+            ),
+            passkey_insert AS (
+              INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter, transports, credential_device_type, credential_backed_up, status, role)
+              SELECT c.credential_id, c.app_user_id, c.credential_public_key, c.user_handle, c.counter, c.transports, c.credential_device_type, c.credential_backed_up, 'active', 'primary'
+              FROM claimed c JOIN account_insert a ON a.app_user_id = c.app_user_id
+              ON CONFLICT DO NOTHING
+              RETURNING credential_id
+            )
+            SELECT
+              (SELECT count(*) FROM claimed)::int AS claimed,
+              (SELECT (c.state || ':registration_finalize_mismatch')::int FROM claimed c
+                WHERE (SELECT count(*) FROM account_insert) <> 1 OR (SELECT count(*) FROM passkey_insert) <> 1) AS guard
           `,
           sql`
-            INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
-            VALUES (${attempt.appUserId}, ${attempt.subOrganizationId}, ${attempt.turnkeyUserId}, ${attempt.walletId}, ${attempt.walletAccountId}, ${attempt.ownerAddress}, ${safeAddress}, ${accountConfigVersion})
-            RETURNING *
+            SELECT (a.state || ':registration_finalize_mismatch')::int FROM registration_attempts a
+            WHERE a.credential_id = ${credentialId} AND a.state = 'active' AND (
+              NOT EXISTS (
+                SELECT 1 FROM real_accounts x
+                WHERE x.app_user_id = a.app_user_id AND x.sub_organization_id = a.sub_organization_id AND x.turnkey_user_id = a.turnkey_user_id
+                  AND x.wallet_id = a.wallet_id AND x.wallet_account_id = a.wallet_account_id AND x.owner_address = a.owner_address
+                  AND x.safe_address = a.safe_address AND x.account_config_version = a.account_config_version
+              )
+              OR NOT EXISTS (
+                SELECT 1 FROM real_passkeys p
+                WHERE p.credential_id = a.credential_id AND p.app_user_id = a.app_user_id
+                  AND p.credential_public_key = a.credential_public_key AND p.user_handle = a.user_handle
+              )
+            )
           `,
           sql`
-            INSERT INTO real_passkeys (credential_id, app_user_id, credential_public_key, user_handle, counter, transports, credential_device_type, credential_backed_up, status)
-            VALUES (${attempt.credentialId}, ${attempt.appUserId}, ${attempt.credentialPublicKey}, ${attempt.userHandle}, ${attempt.counter}, ${attempt.transports}, ${attempt.credentialDeviceType}, ${attempt.credentialBackedUp}, 'active')
-            RETURNING *
+            SELECT (a.state || ':registration_finalize_mismatch')::int FROM registration_attempts a
+            WHERE a.credential_id = ${credentialId} AND a.state <> 'active' AND (
+              EXISTS (SELECT 1 FROM real_accounts x WHERE x.app_user_id = a.app_user_id)
+              OR EXISTS (SELECT 1 FROM real_passkeys p WHERE p.credential_id = a.credential_id AND p.app_user_id = a.app_user_id)
+            )
+          `,
+          sql`
+            SELECT x.* FROM real_accounts x JOIN registration_attempts a ON a.app_user_id = x.app_user_id
+            WHERE a.credential_id = ${credentialId} AND a.state = 'active'
+          `,
+          sql`
+            SELECT p.* FROM real_passkeys p JOIN registration_attempts a ON a.credential_id = p.credential_id AND a.app_user_id = p.app_user_id
+            WHERE a.credential_id = ${credentialId} AND a.state = 'active'
           `,
         ]);
-        const attemptUpdateRows = results[0] as Row[];
-        if (attemptUpdateRows.length === 0) return null; // lost the CAS race
-        const account = toAccount((results[1] as Row[])[0]!);
-        const passkey = toPasskey((results[2] as Row[])[0]!);
-        return { account, passkey };
+        const summary = (results[1] as Row[])[0];
+        if (!summary || Number(summary.claimed) !== 1) return null; // lost the CAS: nothing was written
+        const accountRow = (results[4] as Row[])[0];
+        const passkeyRow = (results[5] as Row[])[0];
+        // Unreachable while the guards above hold; never paper over it.
+        if (!accountRow || !passkeyRow) throw new Error("Registration finalize committed without its account/passkey rows.");
+        return { account: toAccount(accountRow), passkey: toPasskey(passkeyRow) };
       } catch (error) {
-        if (isUniqueViolation(error)) {
-          // Another concurrent finalize already created the account/passkey
-          // — re-read via the caller's registry rather than treating this
-          // as a hard failure.
-          const account = await registry.findAccountByAppUserId(attempt.appUserId);
-          const existingPasskey = await registry.findPasskeyByCredentialId(attempt.credentialId);
-          if (account && existingPasskey) return { account, passkey: existingPasskey };
-          return null;
-        }
+        if (isGuardAbort(error, "registration_finalize_mismatch")) return null;
         throw error;
       }
     },
