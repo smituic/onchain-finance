@@ -1,78 +1,21 @@
+import { base64UrlToBytes, bytesToBase64Url } from "../bytes";
 import { credentialIdsEqual } from "../credential-id";
 import { createParentTurnkeyClient } from "./turnkey-provisioning";
 import { summarizeActivity, type TurnkeyActivitySummary } from "./turnkey-signed-request";
 import type { RealServerConfig } from "./config";
 
-export type TurnkeyDiscoveryMatch = {
-  subOrganizationId: string;
-  userId: string | null;
-  walletId: string | null;
-  walletAccountId: string | null;
-  ownerAddress: string | null;
-};
-
-export type TurnkeyDiscoveryResult =
-  | { outcome: "no_match" }
-  | { outcome: "ambiguous_suborg"; subOrganizationIds: string[] }
-  | { outcome: "ambiguous_wallet_account"; subOrganizationId: string; candidateAddresses: string[] }
-  | { outcome: "match"; match: TurnkeyDiscoveryMatch };
-
 /**
- * SERVER-ONLY, parent-key-stamped, read-only. This is reconciliation and
- * migration-sanity tooling — "does Turnkey's own record of this credential
- * agree with our registry" — never a login path. It must never be sufficient
- * by itself to mint an app session: nothing in server/session.ts or the
- * login route calls this. It never assumes exactly one match at any level
- * (sub-org or wallet account) and never picks "the first" when there is
- * more than one — ambiguity is reported, not resolved silently.
+ * SERVER-ONLY, parent-key-stamped, READ-ONLY Turnkey reads shared by S1
+ * payment attribution, 2g backup enrollment / Proof B, S3 removal resolution,
+ * and the authenticator-id backfill.
+ *
+ * S5 L2 (Option 3): there is deliberately NO sub-organization discovery or
+ * adoption here. Finding a sub-org that contains a credential (getSubOrgIds +
+ * current shape) proves membership, not that our own CREATE_SUB_ORGANIZATION
+ * made it, nor that nobody else holds authority in it — so an uncertain
+ * create is never resolved automatically (onboarding.ts). A future
+ * operator-only resolver must first capture exact dispatch evidence.
  */
-export async function discoverAccountByCredentialId(input: {
-  config: RealServerConfig;
-  credentialId: string;
-}): Promise<TurnkeyDiscoveryResult> {
-  const client = createParentTurnkeyClient(input.config);
-  const { organizationIds } = await client.getSubOrgIds({
-    organizationId: input.config.turnkeyParentOrganizationId,
-    filterType: "CREDENTIAL_ID",
-    filterValue: input.credentialId,
-  });
-
-  if (organizationIds.length === 0) return { outcome: "no_match" };
-  if (organizationIds.length > 1) return { outcome: "ambiguous_suborg", subOrganizationIds: organizationIds };
-
-  const subOrganizationId = organizationIds[0]!;
-  const [users, walletAccounts] = await Promise.all([
-    client.getUsers({ organizationId: subOrganizationId }),
-    client.getWalletAccounts({ organizationId: subOrganizationId }),
-  ]);
-
-  const userId = users.users?.[0]?.userId ?? null;
-  const accounts = walletAccounts.accounts ?? [];
-
-  if (accounts.length === 0) {
-    return { outcome: "match", match: { subOrganizationId, userId, walletId: null, walletAccountId: null, ownerAddress: null } };
-  }
-  if (accounts.length > 1) {
-    return {
-      outcome: "ambiguous_wallet_account",
-      subOrganizationId,
-      candidateAddresses: accounts.flatMap((account) => (account.address ? [account.address] : [])),
-    };
-  }
-
-  const account = accounts[0]!;
-  return {
-    outcome: "match",
-    match: {
-      subOrganizationId,
-      userId,
-      walletId: account.walletId ?? null,
-      walletAccountId: account.walletAccountId ?? null,
-      ownerAddress: account.address ?? null,
-    },
-  };
-}
-
 export type TurnkeyUserAuthenticator = { authenticatorId: string; credentialId: string; publicKey: string };
 
 /**
@@ -120,9 +63,31 @@ export function matchAuthenticatorByCredentialId(authenticators: TurnkeyUserAuth
   return { outcome: "found", authenticator: matches[0]! };
 }
 
-/** The one comparison form for Turnkey public keys (a vote's `publicKey` vs an authenticator's `credential.publicKey`) — both are Turnkey-reported strings; anything else is "". */
-export function normalizeTurnkeyPublicKey(value: unknown): string {
-  return typeof value === "string" ? value.trim().toLowerCase() : "";
+/**
+ * Turnkey reports a WebAuthn authenticator's credential.publicKey (and an
+ * approving vote's publicKey) as canonical unpadded base64url of the raw
+ * COSE_Key bytes — live-verified for a CREATE_SUB_ORGANIZATION primary and
+ * CREATE_AUTHENTICATORS_V2 backups, byte-identical to our stored
+ * credential_public_key. Base64url is case-sensitive, so the only accepted
+ * spelling is exactly that one: a string, base64url alphabet only, no
+ * padding, no whitespace, and decode -> re-encode must reproduce the input
+ * (rejects non-zero spare bits, i.e. a second spelling of the same bytes).
+ * Anything else is null — never trimmed, case-folded, or re-padded.
+ */
+export function strictCanonicalTurnkeyPublicKeyBytes(value: unknown): Uint8Array | null {
+  if (typeof value !== "string" || !CANONICAL_BASE64URL.test(value) || value.length % 4 === 1) return null;
+  const bytes = base64UrlToBytes(value);
+  if (bytes.length === 0 || bytesToBase64Url(bytes) !== value) return null;
+  return bytes;
+}
+
+const CANONICAL_BASE64URL = /^[A-Za-z0-9_-]+$/;
+
+/** The one comparison for Turnkey/WebAuthn public keys: exact decoded-byte equality of two strictly canonical spellings. Either side undecodable is NO MATCH. Public data, so no constant-time compare. */
+export function turnkeyPublicKeysEqual(a: unknown, b: unknown): boolean {
+  const left = strictCanonicalTurnkeyPublicKeyBytes(a);
+  const right = strictCanonicalTurnkeyPublicKeyBytes(b);
+  return left !== null && right !== null && left.length === right.length && left.every((byte, i) => byte === right[i]);
 }
 
 /** SERVER-ONLY, parent-key-stamped, READ-ONLY poll of one child activity — never a resubmission of the mutation it describes. Returns null on any read failure (the caller stays pending). */

@@ -798,7 +798,8 @@ describe("Slice S1 — payment credential attribution", () => {
   const recorded = (ctx: Ctx) => ctx.fake.activities.get(ctx.activityId) as unknown as MutableActivity;
 
   describe("independent adversarial activity fixtures — one field changed, everything else genuine", () => {
-    const WRONG_KEY = `02${"11".repeat(32)}`;
+    // Canonical base64url like the live keys, so these exercise "different bytes", not "malformed".
+    const WRONG_KEY = bytesToBase64Url(new Uint8Array(32).fill(0x11));
     const sKey = (fake: FakeTurnkey) => fake.authenticators().find((a) => a.authenticatorId === "authenticator-s")!.credential.publicKey;
     const cases: Array<[string, (activity: MutableActivity, fake: FakeTurnkey) => void]> = [
       ["organizationId is another org's", (a) => (a.organizationId = "other-sub-org")],
@@ -827,13 +828,32 @@ describe("Slice S1 — payment credential attribution", () => {
       await expectRejectedNothingSent(ctx, await submitAs(ctx));
     });
 
-    it("the SAME genuine activity with only case/whitespace changes to the vote key is still accepted (Proof B's normalization)", async () => {
+    it("S5 L2: the genuine vote key, unmodified, is accepted (exact bytes)", async () => {
+      const ctx = await setup();
+      sendOk(ctx);
+      expect(recorded(ctx).votes[0]!.publicKey).toBe(ctx.fake.authenticators().find((a) => a.authenticatorId === "authenticator-p")!.credential.publicKey);
+
+      expect((await submitAs(ctx)).outcome).toBe("submitted");
+    });
+
+    // Base64url is case-sensitive: a case-folded spelling is DIFFERENT bytes,
+    // never "the same key". No trimming, no re-padding, no other spelling.
+    it.each<[string, (key: string) => string]>([
+      ["letter case changed (upper)", (key) => key.toUpperCase()],
+      ["letter case changed (lower)", (key) => key.toLowerCase()],
+      ["one letter's case flipped", (key) => { const i = key.search(/[A-Za-z]/); const c = key[i]!; return key.slice(0, i) + (c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase()) + key.slice(i + 1); }],
+      ["surrounding whitespace", (key) => ` ${key} `],
+      ["padded spelling", (key) => `${key}=`],
+      ["malformed (not base64url)", () => "not a key!"],
+    ])("S5 L2: vote key with %s → rejected, nothing sent", async (_label, respell) => {
       const ctx = await setup();
       sendOk(ctx);
       const vote = recorded(ctx).votes[0]!;
-      vote.publicKey = ` ${vote.publicKey.toUpperCase()} `;
+      const respelled = respell(vote.publicKey);
+      expect(respelled).not.toBe(vote.publicKey);
+      vote.publicKey = respelled;
 
-      expect((await submitAs(ctx)).outcome).toBe("submitted");
+      await expectRejectedNothingSent(ctx, await submitAs(ctx));
     });
 
     it.each([
@@ -861,7 +881,7 @@ describe("Slice S1 — payment credential attribution", () => {
     const intentOf = (a: MutableActivity) => a.intent.signRawPayloadIntentV2!;
     const resultOf = (a: MutableActivity) => a.result.signRawPayloadResult!;
     const pAuthenticator = (fake: FakeTurnkey) => fake.authenticators().find((x) => x.authenticatorId === "authenticator-p")!;
-    const OTHER_KEY = `03${"42".repeat(32)}`;
+    const OTHER_KEY = bytesToBase64Url(new Uint8Array(32).fill(0x42));
     const matrix: Array<[string, Edit, Edit]> = [
       ["activity organizationId", (a) => delete (a as Partial<MutableActivity>).organizationId, (a) => (a.organizationId = "other-sub-org")],
       ["activity type", (a) => delete (a as Partial<MutableActivity>).type, (a) => (a.type = "ACTIVITY_TYPE_SIGN_TRANSACTION_V2")],
@@ -942,8 +962,22 @@ describe("Slice S1 — payment credential attribution", () => {
       const ctx = await setup();
       sendOk(ctx);
       const [p, sAuth] = [ctx.fake.authenticators().find((a) => a.authenticatorId === "authenticator-p")!, ctx.fake.authenticators().find((a) => a.authenticatorId === "authenticator-s")!];
-      sAuth.credential.publicKey = p.credential.publicKey.toUpperCase(); // same key, different spelling
+      sAuth.credential.publicKey = p.credential.publicKey; // the exact same key bytes
       expect(p.credentialId).not.toBe(sAuth.credentialId);
+
+      await expectRejectedNothingSent(ctx, await submitAs(ctx));
+    });
+
+    it.each([
+      ["hex (SEC1-looking)", `02${"ab".repeat(32)}`],
+      ["padded", "AAAA=="],
+      ["non-canonical spare bits", "AB"],
+      ["whitespace-wrapped", " AAAA "],
+    ])("S5 L2: the bound authenticator's Turnkey key is malformed (%s) — even when the vote carries the identical string — rejected, zero sends", async (_label, malformed) => {
+      const ctx = await setup();
+      sendOk(ctx);
+      ctx.fake.authenticators().find((a) => a.authenticatorId === "authenticator-p")!.credential.publicKey = malformed;
+      recorded(ctx).votes[0]!.publicKey = malformed;
 
       await expectRejectedNothingSent(ctx, await submitAs(ctx));
     });

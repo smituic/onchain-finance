@@ -3,8 +3,9 @@ import { createPublicClient, custom, encodeAbiParameters, getAddress, type Hex }
 import { baseSepolia } from "viem/chains";
 import { bytesToBase64Url, randomBytes } from "@/lib/real/bytes";
 import type { RealServerConfig } from "@/lib/real/server/config";
-import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "@/lib/real/server/registry";
+import { DuplicateAccountError, IdentityConflictError, createInMemoryRealAccountRegistry, getInMemoryRegistryInternals, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "@/lib/real/server/registry";
 import {
+  REGISTRATION_IDENTITY_CONFLICT_REASON,
   accountMatchesAttempt,
   createInMemoryRegistrationAttemptStore,
   type RegistrationAttempt,
@@ -91,7 +92,7 @@ function world() {
 }
 
 function finalizeInput(registry: RealAccountRegistry, attempt: RegistrationAttempt, safeAddress = hex40(Number(attempt.appUserId.split("-").pop()), "5")) {
-  return { credentialId: attempt.credentialId, registry, safeAddress, accountConfigVersion: 1 };
+  return { credentialId: attempt.credentialId, registry, safeAddress, safeOwnerAddress: attempt.ownerAddress!, accountConfigVersion: 1 };
 }
 
 afterEach(() => {
@@ -130,7 +131,7 @@ describe("in-memory finalize: never 'active' without its rows, never a partial r
     expect(internals.passkeysByCredentialId.has(attempt.credentialId)).toBe(false);
   });
 
-  it("compensation only touches what THIS invocation wrote: a row another operation wrote meanwhile, and an attempt another operation moved, are left alone", async () => {
+  it("compensation only touches what THIS invocation wrote: a row another operation wrote meanwhile is left alone; a counter update made meanwhile survives the restore", async () => {
     const { registry, attempts, internals } = world();
     const attempt = await seedTurnkeyCreated(attempts);
     const foreignPasskey: RealPasskeyRecord = {
@@ -150,14 +151,16 @@ describe("in-memory finalize: never 'active' without its rows, never a partial r
     };
     vi.spyOn(registry, "createAccountWithPasskey").mockImplementationOnce(async () => {
       internals.passkeysByCredentialId.set(attempt.credentialId, foreignPasskey);
-      await attempts.transition({ credentialId: attempt.credentialId, from: "active", to: "blocked", patch: { blockReason: "moved elsewhere" } });
+      // "active" is finalize-only (S5 L2): the only other write that can touch
+      // the claimed attempt is a counter update (login recovery).
+      await attempts.updateCounter({ credentialId: attempt.credentialId, counter: 7 });
       throw new Error("injected");
     });
 
     await expect(attempts.finalize(finalizeInput(registry, attempt))).rejects.toThrow("injected");
 
     expect(internals.passkeysByCredentialId.get(attempt.credentialId)).toBe(foreignPasskey);
-    expect((await attempts.findByCredentialId(attempt.credentialId))?.state).toBe("blocked");
+    expect(await attempts.findByCredentialId(attempt.credentialId)).toMatchObject({ state: "turnkey_created", counter: 7, safeAddress: null, accountConfigVersion: null });
   });
 
   it("a clean finalize after either failure succeeds", async () => {
@@ -216,24 +219,158 @@ describe("in-memory finalize: never 'active' without its rows, never a partial r
     expect(internals.passkeysByCredentialId.size).toBe(0);
   });
 
-  it("refuses (null, attempt untouched, nothing written) when an existing account already holds the sub-org, owner, or Safe — case-insensitively — or the credential is taken", async () => {
+  it("S5 L2: another account already holding the sub-org, owner, or Safe — in any letter case — BLOCKS the attempt (turnkey_created -> blocked); zero new rows", async () => {
     const cases: Array<[string, (holder: RegistrationAttempt, target: RegistrationAttempt, registry: RealAccountRegistry) => Promise<void>]> = [
-      ["sub-org", async (holder, target, registry) => void (await registry.createAccountWithPasskey(holderRecords(holder, { subOrganizationId: target.subOrganizationId!.toUpperCase() })))],
-      ["owner", async (holder, target, registry) => void (await registry.createAccountWithPasskey(holderRecords(holder, { ownerAddress: target.ownerAddress!.toLowerCase() })))],
-      ["safe", async (holder, _target, registry) => void (await registry.createAccountWithPasskey(holderRecords(holder, { safeAddress: "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD" })))],
-      ["credential", async (holder, target, registry) => void (await registry.createAccountWithPasskey({ ...holderRecords(holder, {}), passkey: { ...holderRecords(holder, {}).passkey, credentialId: target.credentialId } }))],
+      ["sub-org (upper-cased)", async (holder, target, registry) => void (await registry.createAccountWithPasskey(holderRecords(holder, { subOrganizationId: target.subOrganizationId!.toUpperCase() })))],
+      ["sub-org (exact)", async (holder, target, registry) => void (await registry.createAccountWithPasskey(holderRecords(holder, { subOrganizationId: target.subOrganizationId! })))],
+      ["owner (lower-cased)", async (holder, target, registry) => void (await registry.createAccountWithPasskey(holderRecords(holder, { ownerAddress: target.ownerAddress!.toLowerCase() })))],
+      ["owner (upper-cased hex)", async (holder, target, registry) => void (await registry.createAccountWithPasskey(holderRecords(holder, { ownerAddress: `0x${target.ownerAddress!.slice(2).toUpperCase()}` })))],
+      ["safe (upper-cased)", async (holder, _target, registry) => void (await registry.createAccountWithPasskey(holderRecords(holder, { safeAddress: "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD" })))],
     ];
     for (const [name, seedConflict] of cases) {
       const { registry, attempts, internals } = world();
       const holder = await seedTurnkeyCreated(attempts);
       const target = await seedTurnkeyCreated(attempts);
       await seedConflict(holder, target, registry);
+      // A COMMITTED conflict is caught before the claim — no write is even attempted (Neon: the block statement precedes the CAS).
+      const write = vi.spyOn(registry, "createAccountWithPasskey");
 
       expect(await attempts.finalize(finalizeInput(registry, target, "0xdddddddddddddddddddddddddddddddddddddddd")), name).toBeNull();
-      expect((await attempts.findByCredentialId(target.credentialId))?.state, name).toBe("turnkey_created");
+      expect(write, name).not.toHaveBeenCalled();
+      write.mockRestore();
+      expect(await attempts.findByCredentialId(target.credentialId), name).toMatchObject({ state: "blocked", blockReason: REGISTRATION_IDENTITY_CONFLICT_REASON, safeAddress: null });
       expect(internals.accountsByAppUserId.has(target.appUserId), name).toBe(false);
+      expect(internals.passkeysByCredentialId.has(target.credentialId), name).toBe(false);
+      expect(internals.accountsByAppUserId.size, name).toBe(1);
+      // Blocked is terminal for finalize: a retry writes nothing.
+      expect(await attempts.finalize(finalizeInput(registry, target, "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")), name).toBeNull();
       expect(internals.accountsByAppUserId.size, name).toBe(1);
     }
+  });
+
+  it("the credential already being taken is NOT an identity conflict: null, attempt untouched (turnkey_created), nothing written", async () => {
+    const { registry, attempts, internals } = world();
+    const holder = await seedTurnkeyCreated(attempts);
+    const target = await seedTurnkeyCreated(attempts);
+    await registry.createAccountWithPasskey({ ...holderRecords(holder, {}), passkey: { ...holderRecords(holder, {}).passkey, credentialId: target.credentialId } });
+
+    expect(await attempts.finalize(finalizeInput(registry, target))).toBeNull();
+    expect((await attempts.findByCredentialId(target.credentialId))?.state).toBe("turnkey_created");
+    expect(internals.accountsByAppUserId.size).toBe(1);
+  });
+
+  it("S5 L2: a concurrent identity conflict the pre-check could not see (the registry — the unique indexes' twin — refuses) blocks the attempt; zero rows", async () => {
+    const { registry, attempts, internals } = world();
+    const attempt = await seedTurnkeyCreated(attempts);
+    vi.spyOn(registry, "createAccountWithPasskey").mockRejectedValueOnce(new IdentityConflictError(attempt.appUserId));
+
+    expect(await attempts.finalize(finalizeInput(registry, attempt))).toBeNull();
+
+    expect(await attempts.findByCredentialId(attempt.credentialId)).toMatchObject({ state: "blocked", blockReason: REGISTRATION_IDENTITY_CONFLICT_REASON });
+    expect(internals.accountsByAppUserId.size).toBe(0);
+    expect(internals.passkeysByCredentialId.size).toBe(0);
+  });
+
+  it("S5 L2: an unrelated store error is NOT mislabeled as an identity conflict — thrown, attempt restored to turnkey_created, not blocked", async () => {
+    for (const error of [new DuplicateAccountError("x"), new Error("connection reset")]) {
+      const { registry, attempts } = world();
+      const attempt = await seedTurnkeyCreated(attempts);
+      vi.spyOn(registry, "createAccountWithPasskey").mockRejectedValueOnce(error);
+
+      await expect(attempts.finalize(finalizeInput(registry, attempt))).rejects.toBe(error);
+      expect((await attempts.findByCredentialId(attempt.credentialId))?.state).toBe("turnkey_created");
+    }
+  });
+});
+
+describe("S5 L2: the Safe is bound to the owner it was derived from", () => {
+  it("Safe derived from owner A, attempt owner still A (any letter case) -> finalize works", async () => {
+    for (const spell of [(a: string) => a, (a: string) => a.toLowerCase(), (a: string) => `0x${a.slice(2).toUpperCase()}`]) {
+      const { registry, attempts } = world();
+      const attempt = await seedTurnkeyCreated(attempts);
+      expect(await attempts.finalize({ ...finalizeInput(registry, attempt), safeOwnerAddress: spell(attempt.ownerAddress!) })).not.toBeNull();
+    }
+  });
+
+  it("Safe derived from owner A, but the locked attempt's owner is now B -> the CAS loses: null, zero rows, attempt untouched", async () => {
+    const { registry, attempts, internals } = world();
+    const attempt = await seedTurnkeyCreated(attempts);
+    const ownerA = getAddress(`0x${"a".repeat(39)}1`);
+    expect(ownerA.toLowerCase()).not.toBe(attempt.ownerAddress!.toLowerCase());
+
+    expect(await attempts.finalize({ ...finalizeInput(registry, attempt), safeOwnerAddress: ownerA })).toBeNull();
+
+    expect(await attempts.findByCredentialId(attempt.credentialId)).toMatchObject({ state: "turnkey_created", safeAddress: null });
+    expect(internals.accountsByAppUserId.size).toBe(0);
+    expect(internals.passkeysByCredentialId.size).toBe(0);
+  });
+
+  it("a stale owner never blocks on an identity conflict either (the Safe comparison would be about the wrong owner)", async () => {
+    const { registry, attempts, internals } = world();
+    const holder = await seedTurnkeyCreated(attempts);
+    const target = await seedTurnkeyCreated(attempts);
+    await registry.createAccountWithPasskey(holderRecords(holder, { safeAddress: "0xdddddddddddddddddddddddddddddddddddddddd" }));
+
+    expect(await attempts.finalize({ ...finalizeInput(registry, target, "0xdddddddddddddddddddddddddddddddddddddddd"), safeOwnerAddress: getAddress(`0x${"a".repeat(39)}1`) })).toBeNull();
+    expect((await attempts.findByCredentialId(target.credentialId))?.state).toBe("turnkey_created");
+    expect(internals.accountsByAppUserId.size).toBe(1);
+  });
+
+  it("onboarding: the owner changes WHILE the Safe is being derived -> finalize is bound to the owner it derived from: no rows, 'pending', never a session", async () => {
+    const { registry, attempts, internals } = world();
+    const attempt = await seedTurnkeyCreated(attempts);
+    const ownerB = getAddress(`0x${"b".repeat(39)}2`);
+    let moved = false;
+    const publicClient = createPublicClient({
+      chain: baseSepolia,
+      transport: custom({
+        request: async ({ method }: { method: string }) => {
+          // Mid-derivation (network reads), the attempt's owner moves.
+          if (!moved) {
+            moved = true;
+            await attempts.transition({ credentialId: attempt.credentialId, from: "turnkey_created", to: "turnkey_created", patch: { ownerAddress: ownerB } });
+          }
+          if (method === "eth_getCode") return "0x";
+          if (method === "eth_chainId") return `0x${baseSepolia.id.toString(16)}`;
+          if (method === "eth_call") return DUMMY_BYTES_RETURN;
+          throw new Error(`Unexpected public RPC call in an offline test: ${method}`);
+        },
+      }),
+    });
+
+    const result = await runProvisioningPipeline({ config, registry, attempts, attempt, publicClient });
+    expect(moved).toBe(true);
+
+    expect(result.outcome).toBe("pending");
+    expect(internals.accountsByAppUserId.size).toBe(0);
+    expect(internals.passkeysByCredentialId.size).toBe(0);
+  });
+});
+
+describe("S5 L2: 'active' is finalize-only", () => {
+  it("generic transition() cannot move turnkey_created -> active (throws; attempt unchanged; no rows)", async () => {
+    const { attempts, internals } = world();
+    const attempt = await seedTurnkeyCreated(attempts);
+    await expect(attempts.transition({ credentialId: attempt.credentialId, from: "turnkey_created", to: "active" })).rejects.toThrow(/only through finalize/);
+    expect((await attempts.findByCredentialId(attempt.credentialId))?.state).toBe("turnkey_created");
+    expect(internals.accountsByAppUserId.size).toBe(0);
+  });
+
+  it("generic transition() cannot move an active attempt anywhere", async () => {
+    const { registry, attempts } = world();
+    const attempt = await seedTurnkeyCreated(attempts);
+    expect(await attempts.finalize(finalizeInput(registry, attempt))).not.toBeNull();
+    for (const to of ["verified", "provisioning_in_flight", "turnkey_created", "blocked", "active"] as const) {
+      await expect(attempts.transition({ credentialId: attempt.credentialId, from: "active", to }), to).rejects.toThrow(/only through finalize/);
+    }
+    expect((await attempts.findByCredentialId(attempt.credentialId))?.state).toBe("active");
+  });
+
+  it("finalize remains the route to active", async () => {
+    const { registry, attempts } = world();
+    const attempt = await seedTurnkeyCreated(attempts);
+    expect(await attempts.finalize(finalizeInput(registry, attempt))).not.toBeNull();
+    expect((await attempts.findByCredentialId(attempt.credentialId))?.state).toBe("active");
   });
 });
 
@@ -408,6 +545,22 @@ describe("onboarding reuse: only an exactly matching account is ever resumed (S5
 
     const result = await runProvisioningPipeline({ config, registry, attempts: store, attempt, publicClient: buildPublicClient() });
     expect(result.outcome).toBe("rejected");
+  });
+
+  it("S5 L2: an identity conflict at finalize -> 'blocked' with the conflict reason; no account, no passkey, no session", async () => {
+    const { registry, attempts, internals } = world();
+    const holder = await seedTurnkeyCreated(attempts);
+    const attempt = await seedTurnkeyCreated(attempts);
+    await registry.createAccountWithPasskey(holderRecords(holder, { subOrganizationId: attempt.subOrganizationId! }));
+
+    const result = await runProvisioningPipeline({ config, registry, attempts, attempt, publicClient: buildPublicClient() });
+
+    expect(result).toEqual({ outcome: "blocked", reason: REGISTRATION_IDENTITY_CONFLICT_REASON });
+    expect(internals.accountsByAppUserId.has(attempt.appUserId)).toBe(false);
+    expect(internals.passkeysByCredentialId.has(attempt.credentialId)).toBe(false);
+    // And it stays blocked on every later call.
+    const blocked = (await attempts.findByCredentialId(attempt.credentialId))!;
+    expect((await runProvisioningPipeline({ config, registry, attempts, attempt: blocked, publicClient: buildPublicClient() })).outcome).toBe("blocked");
   });
 
   it("finalize returns null and the attempt is still turnkey_created -> pending (unchanged semantics)", async () => {

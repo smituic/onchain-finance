@@ -3,6 +3,7 @@ import {
   createInMemoryRealAccountRegistry,
   DuplicateAccountError,
   DuplicateCredentialError,
+  IdentityConflictError,
   getInMemoryRegistryInternals,
   type RealAccountRecord,
   type RealPasskeyRecord,
@@ -78,6 +79,28 @@ describe("createInMemoryRealAccountRegistry", () => {
     expect(await registry.findPasskeyByCredentialId("credential-2")).toBeNull();
   });
 
+  // S5 L2: mirrors the Neon lower(...) unique indexes on real_accounts.
+  it.each<[string, Partial<Omit<RealAccountRecord, "createdAt" | "sessionEpoch">>]>([
+    ["the same sub-org", { subOrganizationId: "sub-org-1" }],
+    ["the same sub-org in another letter case", { subOrganizationId: "SUB-ORG-1" }],
+    ["the same owner (lower-cased)", { ownerAddress: "0xf6c3fe6de636f0d8f421d5485d1a64ff3628cfaf" }],
+    ["the same owner (upper-cased hex)", { ownerAddress: "0xF6C3FE6DE636F0D8F421D5485D1A64FF3628CFAF" }],
+    ["the same Safe (upper-cased hex)", { safeAddress: "0xD9A4C22FB34DC74317EDC8006140D66C8FA03266" }],
+  ])("S5 L2: a second account with %s is refused (IdentityConflictError) and nothing is written", async (_label, clash) => {
+    const registry = createInMemoryRealAccountRegistry();
+    await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
+    const distinct = { appUserId: "app-user-2", subOrganizationId: "sub-org-2", ownerAddress: "0x2222222222222222222222222222222222222201", safeAddress: "0x2222222222222222222222222222222222222202" };
+
+    await expect(
+      registry.createAccountWithPasskey({ account: accountInput({ ...distinct, ...clash }), passkey: passkeyInput({ credentialId: "credential-2", appUserId: "app-user-2" }) }),
+    ).rejects.toBeInstanceOf(IdentityConflictError);
+    expect(await registry.findAccountByAppUserId("app-user-2")).toBeNull();
+    expect(await registry.findPasskeyByCredentialId("credential-2")).toBeNull();
+
+    // The fully distinct identity is fine.
+    await registry.createAccountWithPasskey({ account: accountInput(distinct), passkey: passkeyInput({ credentialId: "credential-2", appUserId: "app-user-2" }) });
+  });
+
   it("findAccountByAppUserId / findPasskeyByCredentialId return null for anything unknown", async () => {
     const registry = createInMemoryRealAccountRegistry();
     expect(await registry.findAccountByAppUserId("nobody")).toBeNull();
@@ -135,7 +158,7 @@ describe("createInMemoryRealAccountRegistry", () => {
     const registry = createInMemoryRealAccountRegistry();
     await registry.createAccountWithPasskey({ account: accountInput(), passkey: passkeyInput() });
     await registry.createAccountWithPasskey({
-      account: accountInput({ appUserId: "app-user-2" }),
+      account: accountInput({ appUserId: "app-user-2", subOrganizationId: "sub-org-2", ownerAddress: "0x2222222222222222222222222222222222222201", safeAddress: "0x2222222222222222222222222222222222222202" }),
       passkey: passkeyInput({ credentialId: "credential-2", appUserId: "app-user-2" }),
     });
 

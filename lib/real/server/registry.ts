@@ -4,8 +4,10 @@ import type { BackupPasskeyEnrollment } from "./backup-passkey-enrollment";
  * The account/passkey registry is the APP AUTHENTICATION boundary's source
  * of truth — deliberately separate from Turnkey. A row existing here is
  * what lets a credentialId become an app session; Turnkey is never asked
- * "who is this" during login (see server/turnkey-discovery.ts, which is
- * reconciliation-only and never mints a session).
+ * "who is this" during login. (server/turnkey-discovery.ts holds only
+ * read-only Turnkey helpers for payment attribution, backup enrollment,
+ * removal resolution, and the authenticator-id backfill; it never resolves
+ * or adopts an account and never mints a session.)
  *
  * Two record types, not one: an account can outlive/gain additional
  * passkeys (Batch 2g backup enrollment), so
@@ -76,6 +78,31 @@ export class DuplicateAccountError extends Error {
 }
 
 /**
+ * S5 L2: the account would alias another account's Turnkey sub-organization,
+ * owner address, or Safe address (compared case-insensitively — the
+ * lower(...) unique indexes on real_accounts). Never a retryable race:
+ * registration finalize turns it into a blocked attempt.
+ */
+export class IdentityConflictError extends Error {
+  constructor(readonly appUserId: string) {
+    super(`Another account already holds this account's sub-organization, owner, or Safe (appUserId ${appUserId}).`);
+    this.name = "IdentityConflictError";
+  }
+}
+
+/** S5 L2: case-insensitive identity equality, matching the lower(...) unique indexes on real_accounts. */
+export function accountIdentitiesConflict(
+  a: Pick<RealAccountRecord, "subOrganizationId" | "ownerAddress" | "safeAddress">,
+  b: Pick<RealAccountRecord, "subOrganizationId" | "ownerAddress" | "safeAddress">,
+): boolean {
+  return (
+    a.subOrganizationId.toLowerCase() === b.subOrganizationId.toLowerCase() ||
+    a.ownerAddress.toLowerCase() === b.ownerAddress.toLowerCase() ||
+    a.safeAddress.toLowerCase() === b.safeAddress.toLowerCase()
+  );
+}
+
+/**
  * Server-only, vendor-neutral. Route handlers and tests depend on this
  * interface — never on a specific database — so a durable backing store
  * can be swapped in later without touching call sites (see
@@ -87,8 +114,9 @@ export interface RealAccountRegistry {
    * WebAuthn registration verification AND Turnkey provisioning have
    * already succeeded, so a row here always represents a fully bound
    * app-identity + credential + Turnkey account. Rejects
-   * (DuplicateCredentialError / DuplicateAccountError) rather than
-   * overwriting an existing credential or account.
+   * (DuplicateCredentialError / DuplicateAccountError / IdentityConflictError)
+   * rather than overwriting an existing credential or account, or aliasing
+   * another account's sub-org/owner/Safe.
    */
   createAccountWithPasskey(input: {
     account: Omit<RealAccountRecord, "createdAt" | "sessionEpoch">;
@@ -172,6 +200,10 @@ export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
       }
       if (accountsByAppUserId.has(account.appUserId)) {
         throw new DuplicateAccountError(account.appUserId);
+      }
+      // Mirrors the Neon lower(...) unique indexes on real_accounts.
+      for (const other of accountsByAppUserId.values()) {
+        if (accountIdentitiesConflict(other, account)) throw new IdentityConflictError(account.appUserId);
       }
 
       const createdAt = new Date().toISOString();

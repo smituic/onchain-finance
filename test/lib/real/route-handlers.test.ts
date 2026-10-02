@@ -257,7 +257,7 @@ describe("PATCH /api/real/account/passkeys/[credentialId] — rename (actual rou
     stubRequiredConfigEnv();
     const registry = await seedRegistry();
     await registry.createAccountWithPasskey({
-      account: { appUserId: "app-user-2", subOrganizationId: "sub-org-2", turnkeyUserId: "turnkey-user-2", walletId: "wallet-2", walletAccountId: "wallet-account-2", ownerAddress: OWNER_ADDRESS, safeAddress: SAFE_ADDRESS, accountConfigVersion: 1 },
+      account: { appUserId: "app-user-2", subOrganizationId: "sub-org-2", turnkeyUserId: "turnkey-user-2", walletId: "wallet-2", walletAccountId: "wallet-account-2", ownerAddress: "0x2222222222222222222222222222222222222201", safeAddress: "0x2222222222222222222222222222222222222202", accountConfigVersion: 1 }, // S5 L2: distinct identity
       passkey: { credentialId: "credential-2", appUserId: "app-user-2", credentialPublicKey: "cose-key-2", userHandle: "user-handle-2", counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false },
     });
     const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");

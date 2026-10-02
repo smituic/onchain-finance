@@ -192,8 +192,10 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
     expect(created.externalOutcome).toBe("not_attempted");
 
     // A CAS transition from the WRONG state must be rejected (null), never
-    // silently applied.
-    expect(await stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "active" })).toBeNull();
+    // silently applied. (S5 L2: and "active" is finalize-only — a generic
+    // transition to it throws before any SQL is sent.)
+    expect(await stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "provisioning_in_flight" })).toBeNull();
+    await expect(stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "active" })).rejects.toThrow(/only through finalize/);
 
     const inFlight = await stores.attempts.transition({
       credentialId: credId,
@@ -216,6 +218,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
       credentialId: credId,
       registry: stores.registry,
       safeAddress: smokeIdentity(userId).safeAddress,
+      safeOwnerAddress: smokeIdentity(userId).ownerAddress,
       accountConfigVersion: 1,
     });
     expect(finalized?.account.appUserId).toBe(userId);
@@ -227,7 +230,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
     expect(await stores.registry.findPasskeyByCredentialId(credId)).not.toBeNull();
 
     // finalize() is itself a CAS: calling it again must not double-create.
-    expect(await stores.attempts.finalize({ credentialId: credId, registry: stores.registry, safeAddress: "0x", accountConfigVersion: 1 })).toBeNull();
+    expect(await stores.attempts.finalize({ credentialId: credId, registry: stores.registry, safeAddress: "0x", safeOwnerAddress: smokeIdentity(userId).ownerAddress, accountConfigVersion: 1 })).toBeNull();
   });
 
   // ---- S5 L3: finalize atomicity against real Postgres ----
@@ -238,7 +241,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   }
 
   /** A durable attempt walked to turnkey_created through the adapter's own CAS transitions, registered for cleanup. */
-  async function seedTurnkeyCreated(suffix: string) {
+  async function seedTurnkeyCreated(suffix: string, identityOf: (userId: string) => ReturnType<typeof smokeIdentity> = smokeIdentity) {
     const { createNeonDurableStores, createNeonSqlClient } = await import("@/lib/real/server/neon-store");
     const stores = createNeonDurableStores(databaseUrl!);
     const sql = createNeonSqlClient(databaseUrl!);
@@ -263,8 +266,10 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
       rawAttestationObject: "smoke-attestation-object",
     });
     await stores.attempts.transition({ credentialId: credId, from: "verified", to: "provisioning_in_flight", patch: { externalOutcome: "unknown" } });
-    await stores.attempts.transition({ credentialId: credId, from: "provisioning_in_flight", to: "turnkey_created", patch: { ...turnkeyPatch(userId), externalOutcome: "confirmed_created" } });
-    const finalizeInput = { credentialId: credId, registry: stores.registry, safeAddress: smokeIdentity(userId).safeAddress, accountConfigVersion: 1 };
+    const identity = identityOf(userId);
+    const { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress } = identity;
+    await stores.attempts.transition({ credentialId: credId, from: "provisioning_in_flight", to: "turnkey_created", patch: { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress, externalOutcome: "confirmed_created" } });
+    const finalizeInput = { credentialId: credId, registry: stores.registry, safeAddress: identity.safeAddress, safeOwnerAddress: identity.ownerAddress, accountConfigVersion: 1 };
     const counts = async () => {
       const [row] = (await sql`
         SELECT (SELECT count(*) FROM real_accounts WHERE app_user_id = ${userId})::int AS accounts,
@@ -366,6 +371,79 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
       const result = await runProvisioningPipeline({ config: smokeConfig, registry: stores.registry, attempts: stores.attempts, attempt: active });
       expect(result.outcome, name).toBe("rejected");
     }
+  });
+
+  // ---- S5 L2: identity conflicts and the Safe-owner binding against real Postgres (valid before AND after the identity indexes) ----
+
+  it.each<[string, (holderIdentity: ReturnType<typeof smokeIdentity>, targetIdentity: ReturnType<typeof smokeIdentity>) => Partial<ReturnType<typeof smokeIdentity>>]>([
+    ["sub-org (upper-cased)", (_h, t) => ({ subOrganizationId: t.subOrganizationId.toUpperCase() })],
+    ["owner (upper-cased hex)", (_h, t) => ({ ownerAddress: `0x${t.ownerAddress.slice(2).toUpperCase()}` })],
+    ["Safe (upper-cased hex)", (_h, t) => ({ safeAddress: `0x${t.safeAddress.slice(2).toUpperCase()}` })],
+  ])("S5 L2: another committed account holding this attempt's %s -> finalize blocks the attempt; zero rows for it", async (label, clash) => {
+    const suffix = `l2-conflict-${label.split(" ")[0]!.toLowerCase().replace(/\W/g, "")}`;
+    const { stores, credId, userId, finalizeInput, counts } = await seedTurnkeyCreated(suffix);
+    const { REGISTRATION_IDENTITY_CONFLICT_REASON } = await import("@/lib/real/server/registration-attempts");
+    const holderId = appUserId(`${suffix}-holder`);
+    const holderCred = credentialId(`${suffix}-holder`);
+    cleanupAppUserIds.add(holderId);
+    cleanupCredentialIds.add(holderCred);
+    await stores.registry.createAccountWithPasskey({
+      account: { appUserId: holderId, ...smokeIdentity(holderId), ...clash(smokeIdentity(holderId), smokeIdentity(userId)), accountConfigVersion: 1 },
+      passkey: { credentialId: holderCred, appUserId: holderId, credentialPublicKey: "holder-cose", userHandle: "holder-handle", counter: 0, transports: null, credentialDeviceType: null, credentialBackedUp: null },
+    });
+
+    expect(await stores.attempts.finalize(finalizeInput)).toBeNull();
+    expect(await stores.attempts.findByCredentialId(credId)).toMatchObject({ state: "blocked", blockReason: REGISTRATION_IDENTITY_CONFLICT_REASON, safeAddress: null });
+    expect(await counts()).toEqual({ accounts: 0, passkeys: 0 });
+    expect(await stores.attempts.finalize(finalizeInput)).toBeNull();
+    expect(await counts()).toEqual({ accounts: 0, passkeys: 0 });
+  });
+
+  it("S5 L2: a Safe derived for a stale owner -> the CAS loses; zero rows; attempt untouched (turnkey_created)", async () => {
+    const { stores, credId, finalizeInput, counts } = await seedTurnkeyCreated("l2-stale-owner");
+    expect(await stores.attempts.finalize({ ...finalizeInput, safeOwnerAddress: "0x000000000000000000000000000000000000beef" })).toBeNull();
+    expect(await stores.attempts.findByCredentialId(credId)).toMatchObject({ state: "turnkey_created", safeAddress: null });
+    expect(await counts()).toEqual({ accounts: 0, passkeys: 0 });
+    // The same attempt with the Safe derived for its real owner still finalizes.
+    expect(await stores.attempts.finalize(finalizeInput)).not.toBeNull();
+  });
+
+  // POST-INDEX ONLY: run with REAL_SMOKE_L2_INDEXES=1 after schema.sql's S5 L2 migration is applied.
+  it.skipIf(!process.env.REAL_SMOKE_L2_INDEXES)("S5 L2 post-index: exactly the three intended unique indexes exist, and the registry maps their 23505 to IdentityConflictError", async () => {
+    const { createNeonSqlClient, createNeonRealAccountRegistry, ACCOUNT_IDENTITY_UNIQUE_INDEXES } = await import("@/lib/real/server/neon-store");
+    const { IdentityConflictError } = await import("@/lib/real/server/registry");
+    const sql = createNeonSqlClient(databaseUrl!);
+    const rows = (await sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'real_accounts' AND indexname = ANY(${[...ACCOUNT_IDENTITY_UNIQUE_INDEXES]})`) as { indexname: string; indexdef: string }[];
+    expect(rows.map((r) => r.indexname).sort()).toEqual([...ACCOUNT_IDENTITY_UNIQUE_INDEXES].sort());
+    for (const row of rows) expect(row.indexdef).toMatch(/^CREATE UNIQUE INDEX \S+ ON public\.real_accounts USING btree \(lower\((sub_organization_id|owner_address|safe_address)\)\)$/);
+
+    const registry = createNeonRealAccountRegistry(sql);
+    const [first, second] = [appUserId("l2-index-first"), appUserId("l2-index-second")];
+    for (const id of [first, second]) {
+      cleanupAppUserIds.add(id);
+      cleanupCredentialIds.add(credentialId(id));
+    }
+    await registry.createAccountWithPasskey({ account: { appUserId: first, ...smokeIdentity(first), accountConfigVersion: 1 }, passkey: { credentialId: credentialId(first), appUserId: first, credentialPublicKey: "k", userHandle: "h", counter: 0, transports: null, credentialDeviceType: null, credentialBackedUp: null } });
+    await expect(
+      registry.createAccountWithPasskey({ account: { appUserId: second, ...smokeIdentity(second), ownerAddress: smokeIdentity(first).ownerAddress.toUpperCase().replace("0X", "0x"), accountConfigVersion: 1 }, passkey: { credentialId: credentialId(second), appUserId: second, credentialPublicKey: "k", userHandle: "h", counter: 0, transports: null, credentialDeviceType: null, credentialBackedUp: null } }),
+    ).rejects.toBeInstanceOf(IdentityConflictError);
+    expect(await registry.findAccountByAppUserId(second)).toBeNull();
+  });
+
+  it.skipIf(!process.env.REAL_SMOKE_L2_INDEXES)("S5 L2 post-index: two attempts racing to finalize the SAME sub-org over real HTTP -> exactly one account; the other attempt is blocked with zero rows", async () => {
+    const { REGISTRATION_IDENTITY_CONFLICT_REASON } = await import("@/lib/real/server/registration-attempts");
+    const shared = `smoke-${runId}-l2-race-shared-sub-org`;
+    const a = await seedTurnkeyCreated("l2-race-a", (id) => ({ ...smokeIdentity(id), subOrganizationId: shared }));
+    const b = await seedTurnkeyCreated("l2-race-b", (id) => ({ ...smokeIdentity(id), subOrganizationId: shared.toUpperCase() }));
+
+    const results = await Promise.all([a.stores.attempts.finalize(a.finalizeInput), b.stores.attempts.finalize(b.finalizeInput)]);
+
+    expect(results.filter((r) => r !== null)).toHaveLength(1);
+    const states = [(await a.stores.attempts.findByCredentialId(a.credId))!, (await b.stores.attempts.findByCredentialId(b.credId))!];
+    expect(states.map((x) => x.state).sort()).toEqual(["active", "blocked"]);
+    const loser = states.find((x) => x.state === "blocked")!;
+    expect(loser.blockReason).toBe(REGISTRATION_IDENTITY_CONFLICT_REASON);
+    expect(await (loser.credentialId === a.credId ? a : b).counts()).toEqual({ accounts: 0, passkeys: 0 });
   });
 
   it("S4: real_accounts.session_epoch is BIGINT NOT NULL DEFAULT 0 (migration applied)", async () => {

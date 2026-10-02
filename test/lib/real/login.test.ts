@@ -4,7 +4,7 @@ import { baseSepolia } from "viem/chains";
 import type { RealServerConfig } from "@/lib/real/server/config";
 import { createInMemoryChallengeStore } from "@/lib/real/server/challenge-store";
 import { createInMemoryRealAccountRegistry, type RealAccountRegistry } from "@/lib/real/server/registry";
-import { createInMemoryRegistrationAttemptStore, type RegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
+import { createInMemoryRegistrationAttemptStore, type RegistrationAttempt, type RegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
 import { parseSession } from "@/lib/real/server/session";
 import { readAuthenticatedRealAccount } from "@/lib/real/server/auth";
 import { bytesToBase64Url } from "@/lib/real/bytes";
@@ -32,6 +32,8 @@ vi.mock("@turnkey/http", async (importOriginal) => {
 
 const { beginRegistration, completeRegistration } = await import("@/lib/real/server/registration");
 const { beginLogin, completeLogin } = await import("@/lib/real/server/login");
+const { PROVISIONING_NEEDS_REVIEW_REASON } = await import("@/lib/real/server/onboarding");
+const { TurnkeyClient } = await import("@turnkey/http");
 
 const ORIGIN = "http://localhost:3000";
 const config: RealServerConfig = {
@@ -394,7 +396,7 @@ describe("S4: login and the account session epoch", () => {
   });
 });
 
-describe("login recovers a pending (not-yet-active) registration attempt", () => {
+describe("S5 L2 (Option 3): an uncertain Turnkey create is never adopted — login on it reports needs-review", () => {
   afterEach(() => {
     createSubOrganizationMock.mockReset();
     getWalletAccountsMock.mockReset();
@@ -402,126 +404,81 @@ describe("login recovers a pending (not-yet-active) registration attempt", () =>
     getUsersMock.mockReset();
   });
 
-  it("a valid app-WebAuthn login assertion for a credential stuck in 'provisioning' independently re-verifies, reconciles via Turnkey discovery, finalizes the account, and issues a session — without a second WebAuthn registration ceremony", async () => {
-    // Simulate the exact crash window: WebAuthn verified and durably
-    // pre-committed, Turnkey createSubOrganization failed/unknown, so the
-    // attempt is stuck in "provisioning_in_flight" with no active registry record.
+  const ownerAddress = "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF";
+  const turnkeyReads = () => getSubOrgIdsMock.mock.calls.length + getUsersMock.mock.calls.length + getWalletAccountsMock.mock.calls.length;
+
+  /** The exact crash window: verified + durably pre-committed, then the ONE create's response is lost. */
+  async function stuckAttempt() {
     createSubOrganizationMock.mockRejectedValue(new Error("Turnkey unreachable"));
     const registry = createInMemoryRealAccountRegistry();
     const challengeStore = createInMemoryChallengeStore();
     const attempts = newAttempts();
     const authenticator = createFixtureAuthenticator();
-
-    const { optionsJSON: regOptions } = await beginRegistration({ config, challengeStore });
-    const regResponse = buildRegistrationResponseJSON({ authenticator, challenge: regOptions.challenge, origin: ORIGIN, rpId: config.rpId });
-    const regResult = await completeRegistration({ config, challengeStore, registry, attempts, response: regResponse });
-    expect(regResult.outcome).toBe("pending");
-    const provisioningAttempt = await attempts.findByCredentialId(authenticator.credentialIdBase64Url);
-    expect(provisioningAttempt?.state).toBe("provisioning_in_flight");
-    expect(await registry.findPasskeyByCredentialId(authenticator.credentialIdBase64Url)).toBeNull();
-
-    // Now Turnkey discovery finds the (previously ambiguous/unknown) child
-    // was in fact created — recovery via a normal login assertion.
-    const ownerAddress = "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF";
-    getSubOrgIdsMock.mockResolvedValue({ organizationIds: ["sub-org-1"] });
-    getUsersMock.mockResolvedValue({ users: [{ userId: "turnkey-user-1", authenticators: [{ authenticatorId: "auth-1", credentialId: authenticator.credentialIdBase64Url }] }] });
-    getWalletAccountsMock.mockResolvedValue({ accounts: [{ address: ownerAddress, walletId: "wallet-1", walletAccountId: "wallet-account-1" }] });
-
-    const { optionsJSON: loginOptions } = await beginLogin({ config, challengeStore });
-    const loginResponse = buildAuthenticationResponseJSON({
-      authenticator,
-      challenge: loginOptions.challenge,
-      origin: ORIGIN,
-      rpId: config.rpId,
-      userHandle: provisioningAttempt!.userHandle,
-    });
-
-    const loginResult = await completeLogin({ config, challengeStore, registry, attempts, response: loginResponse, publicClient: buildPublicClient() });
-
-    expect(loginResult.outcome).toBe("verified");
-    if (loginResult.outcome !== "verified") return;
-    expect(loginResult.account.ownerAddress).toBe(ownerAddress);
-    expect(loginResult.sessionCookie).toBeTruthy();
-    expect((await attempts.findByCredentialId(authenticator.credentialIdBase64Url))?.state).toBe("active");
-    expect((await registry.findPasskeyByCredentialId(authenticator.credentialIdBase64Url))?.status).toBe("active");
-    // No second WebAuthn registration ceremony — createSubOrganization was
-    // never called a second time either (discovery found the existing child).
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("a zero-match Turnkey discovery after a lost response leaves the attempt unresolved — repeated recovery attempts never trigger a second createSubOrganization call, even after several zero-match reads", async () => {
-    createSubOrganizationMock.mockRejectedValue(new Error("Turnkey unreachable"));
-    const registry = createInMemoryRealAccountRegistry();
-    const challengeStore = createInMemoryChallengeStore();
-    const attempts = newAttempts();
-    const authenticator = createFixtureAuthenticator();
-
-    const { optionsJSON: regOptions } = await beginRegistration({ config, challengeStore });
-    const regResponse = buildRegistrationResponseJSON({ authenticator, challenge: regOptions.challenge, origin: ORIGIN, rpId: config.rpId });
-    const regResult = await completeRegistration({ config, challengeStore, registry, attempts, response: regResponse });
-    expect(regResult.outcome).toBe("pending");
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
-
-    // Discovery genuinely finds nothing yet — Turnkey's own consistency
-    // guarantee doesn't rule out this being stale, so this must NEVER be
-    // treated as proof the earlier call failed.
-    getSubOrgIdsMock.mockResolvedValue({ organizationIds: [] });
-
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const provisioningAttempt = await attempts.findByCredentialId(authenticator.credentialIdBase64Url);
+    const { optionsJSON } = await beginRegistration({ config, challengeStore });
+    const registered = await completeRegistration({ config, challengeStore, registry, attempts, response: buildRegistrationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId }) });
+    expect(registered).toEqual({ outcome: "pending", reason: PROVISIONING_NEEDS_REVIEW_REASON });
+    const attempt = (await attempts.findByCredentialId(authenticator.credentialIdBase64Url))!;
+    expect(attempt).toMatchObject({ state: "provisioning_in_flight", externalOutcome: "unknown" });
+    const login = async () => {
       const { optionsJSON: loginOptions } = await beginLogin({ config, challengeStore });
-      const loginResponse = buildAuthenticationResponseJSON({
-        authenticator,
-        challenge: loginOptions.challenge,
-        origin: ORIGIN,
-        rpId: config.rpId,
-        userHandle: provisioningAttempt!.userHandle,
-      });
+      const response = buildAuthenticationResponseJSON({ authenticator, challenge: loginOptions.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: attempt.userHandle });
+      return completeLogin({ config, challengeStore, registry, attempts, response, publicClient: buildPublicClient() });
+    };
+    return { registry, attempts, authenticator, attempt, login };
+  }
 
-      const loginResult = await completeLogin({ config, challengeStore, registry, attempts, response: loginResponse });
+  /** Nothing about the attempt (beyond login's own counter persistence) or the registry changed. */
+  async function expectUntouched(w: Awaited<ReturnType<typeof stuckAttempt>>) {
+    const withoutCounter = (attempt: RegistrationAttempt) => ({ ...attempt, counter: 0, updatedAt: "" });
+    expect(withoutCounter((await w.attempts.findByCredentialId(w.authenticator.credentialIdBase64Url))!)).toEqual(withoutCounter(w.attempt));
+    expect(await w.registry.findAccountByAppUserId(w.attempt.appUserId)).toBeNull();
+    expect(await w.registry.findPasskeyByCredentialId(w.authenticator.credentialIdBase64Url)).toBeNull();
+  }
 
-      expect(loginResult.outcome).toBe("pending");
-      const attemptAfter = await attempts.findByCredentialId(authenticator.credentialIdBase64Url);
-      expect(attemptAfter?.state).toBe("provisioning_in_flight");
-      expect(attemptAfter?.externalOutcome).toBe("unknown");
-    }
+  it("Turnkey holds an EXACT matching sub-org for the credential: still no read, no adoption, no account/passkey, no session — needs review", async () => {
+    const w = await stuckAttempt();
+    // Everything a discovery would have accepted, served if anyone asked.
+    getSubOrgIdsMock.mockResolvedValue({ organizationIds: ["sub-org-1"] });
+    getUsersMock.mockResolvedValue({ users: [{ userId: "turnkey-user-1", authenticators: [{ authenticatorId: "auth-1", credentialId: w.authenticator.credentialIdBase64Url, credential: { publicKey: w.attempt.credentialPublicKey } }], apiKeys: [], oauthProviders: [] }] });
+    getWalletAccountsMock.mockResolvedValue({ accounts: [{ address: ownerAddress, walletId: "wallet-1", walletAccountId: "wallet-account-1" }] });
+    const clientsBefore = vi.mocked(TurnkeyClient).mock.calls.length;
 
-    // Across every retry: exactly the ONE original createSubOrganization
-    // call, never a second — the invariant this fix exists to enforce.
+    const result = await w.login();
+
+    expect(result).toEqual({ outcome: "pending", reason: PROVISIONING_NEEDS_REVIEW_REASON });
+    expect("sessionCookie" in result).toBe(false);
+    expect(turnkeyReads()).toBe(0);
+    expect(vi.mocked(TurnkeyClient).mock.calls.length).toBe(clientsBefore); // no Turnkey client was even built
     expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
-    expect(getSubOrgIdsMock.mock.calls.length).toBeGreaterThanOrEqual(3);
-    expect(await registry.findPasskeyByCredentialId(authenticator.credentialIdBase64Url)).toBeNull();
+    await expectUntouched(w);
   });
 
-  it("does NOT issue a session for a pending attempt before Turnkey discovery is reconciled (ambiguous discovery blocks instead)", async () => {
-    createSubOrganizationMock.mockRejectedValue(new Error("Turnkey unreachable"));
-    const registry = createInMemoryRealAccountRegistry();
-    const challengeStore = createInMemoryChallengeStore();
-    const attempts = newAttempts();
-    const authenticator = createFixtureAuthenticator();
-
-    const { optionsJSON: regOptions } = await beginRegistration({ config, challengeStore });
-    const regResponse = buildRegistrationResponseJSON({ authenticator, challenge: regOptions.challenge, origin: ORIGIN, rpId: config.rpId });
-    await completeRegistration({ config, challengeStore, registry, attempts, response: regResponse });
-    const provisioningAttempt = await attempts.findByCredentialId(authenticator.credentialIdBase64Url);
-
-    // Discovery finds the credential registered under two sub-orgs — ambiguous.
+  it("conflicting external data (several sub-orgs, a foreign key) changes nothing: same needs-review outcome, still zero reads", async () => {
+    const w = await stuckAttempt();
     getSubOrgIdsMock.mockResolvedValue({ organizationIds: ["sub-org-1", "sub-org-2"] });
+    getUsersMock.mockResolvedValue({ users: [{ userId: "foreign", authenticators: [{ authenticatorId: "x", credentialId: w.authenticator.credentialIdBase64Url, credential: { publicKey: bytesToBase64Url(createFixtureAuthenticator().publicKeyCose) } }], apiKeys: [{}], oauthProviders: [] }] });
 
-    const { optionsJSON: loginOptions } = await beginLogin({ config, challengeStore });
-    const loginResponse = buildAuthenticationResponseJSON({
-      authenticator,
-      challenge: loginOptions.challenge,
-      origin: ORIGIN,
-      rpId: config.rpId,
-      userHandle: provisioningAttempt!.userHandle,
-    });
+    expect(await w.login()).toEqual({ outcome: "pending", reason: PROVISIONING_NEEDS_REVIEW_REASON });
+    expect(turnkeyReads()).toBe(0);
+    await expectUntouched(w);
+  });
 
-    const loginResult = await completeLogin({ config, challengeStore, registry, attempts, response: loginResponse });
+  it("repeated logins never dispatch another create, never read Turnkey, and never move the attempt", async () => {
+    const w = await stuckAttempt();
+    for (let i = 0; i < 3; i += 1) expect((await w.login()).outcome).toBe("pending");
+    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkeyReads()).toBe(0);
+    await expectUntouched(w);
+  });
 
-    expect(loginResult.outcome).toBe("blocked");
-    expect((await attempts.findByCredentialId(authenticator.credentialIdBase64Url))?.state).toBe("blocked");
-    expect(await registry.findPasskeyByCredentialId(authenticator.credentialIdBase64Url)).toBeNull();
+  it("a blocked registration stays blocked on login — no Turnkey call, no session", async () => {
+    const w = await stuckAttempt();
+    await w.attempts.transition({ credentialId: w.attempt.credentialId, from: "provisioning_in_flight", to: "blocked", patch: { blockReason: "operator review" } });
+
+    expect(await w.login()).toEqual({ outcome: "blocked", reason: "operator review" });
+    expect(turnkeyReads()).toBe(0);
+    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(await w.registry.findAccountByAppUserId(w.attempt.appUserId)).toBeNull();
   });
 });
 

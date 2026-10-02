@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createNeonDurableStores } from "@/lib/real/server/neon-store";
+import { ACCOUNT_IDENTITY_UNIQUE_INDEXES, createNeonDurableStores, isAccountIdentityUniqueViolation } from "@/lib/real/server/neon-store";
+import { REGISTRATION_IDENTITY_CONFLICT_REASON } from "@/lib/real/server/registration-attempts";
 import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 
 /**
@@ -15,6 +16,7 @@ import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 const DATABASE_URL = "postgresql://user:pass@ep-finalize-test-000000.us-east-2.aws.neon.tech/neondb";
 const CREDENTIAL_ID = "Y3JlZGVudGlhbC1pZA";
 const SAFE = "0x1111111111111111111111111111111111111111";
+const OWNER = "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF";
 
 type Sent = { queries: Array<{ query: string; params: unknown[] }> | null; single: { query: string; params: unknown[] } | null; isolation: string | null };
 let sent: Sent[] = [];
@@ -76,6 +78,7 @@ function batchResponse(claimed: 0 | 1, reads: { account: boolean; passkey: boole
   return Response.json({
     results: [
       result([{ credential_id: CREDENTIAL_ID }]),
+      result([]),
       result([{ claimed, guard: null }]),
       result([]),
       result([]),
@@ -92,7 +95,7 @@ function singleQueryRows(request: Sent): Response {
 
 function finalize() {
   const { attempts } = createNeonDurableStores(DATABASE_URL);
-  return attempts.finalize({ credentialId: CREDENTIAL_ID, registry: createInMemoryRealAccountRegistry(), safeAddress: SAFE, accountConfigVersion: 1 });
+  return attempts.finalize({ credentialId: CREDENTIAL_ID, registry: createInMemoryRealAccountRegistry(), safeAddress: SAFE, safeOwnerAddress: OWNER, accountConfigVersion: 1 });
 }
 
 describe("Neon registration finalize: one transaction whose INSERTs derive only from the CAS (S5 L3)", () => {
@@ -104,7 +107,7 @@ describe("Neon registration finalize: one transaction whose INSERTs derive only 
     expect(sent[0]!.single).toBeNull();
     expect(sent[0]!.isolation).toBe("ReadCommitted");
     const queries = sent[0]!.queries!;
-    expect(queries).toHaveLength(6);
+    expect(queries).toHaveLength(7);
     expect(queries[0]!.query).toMatch(/^\s*SELECT credential_id FROM registration_attempts WHERE credential_id = \$1 FOR UPDATE\s*$/);
   });
 
@@ -113,26 +116,29 @@ describe("Neon registration finalize: one transaction whose INSERTs derive only 
     await finalize();
     const queries = sent[0]!.queries!;
     const writing = queries.filter((q) => /\b(INSERT|DELETE)\b|(?<!FOR )\bUPDATE\b/i.test(q.query));
-    expect(writing).toEqual([queries[1]]);
+    expect(writing).toEqual([queries[1], queries[2]]); // the L2 conflict block, then the CAS statement
+    expect(queries[1]!.query).not.toMatch(/\bINSERT\b/i);
 
-    const statement = queries[1]!.query.replace(/\s+/g, " ");
+    const statement = queries[2]!.query.replace(/\s+/g, " ");
     expect(statement).toMatch(/^ ?WITH claimed AS \( UPDATE registration_attempts SET state = 'active'/);
-    expect(statement).toMatch(/WHERE credential_id = \$3 AND state = 'turnkey_created' AND sub_organization_id IS NOT NULL AND turnkey_user_id IS NOT NULL AND wallet_id IS NOT NULL AND wallet_account_id IS NOT NULL AND owner_address IS NOT NULL RETURNING \*/);
-    expect(statement).toMatch(/account_insert AS \( INSERT INTO real_accounts \([^)]*\) SELECT [^()]* FROM claimed c ON CONFLICT DO NOTHING RETURNING app_user_id \)/);
+    expect(statement).toMatch(/WHERE credential_id = \$3 AND state = 'turnkey_created' AND sub_organization_id IS NOT NULL AND turnkey_user_id IS NOT NULL AND wallet_id IS NOT NULL AND wallet_account_id IS NOT NULL AND owner_address IS NOT NULL AND pg_catalog\.lower\(owner_address\) = pg_catalog\.lower\(\$4\) RETURNING \*/);
+    // Only an app-user collision is "not inserted"; an identity-index collision raises (and blocks — below).
+    expect(statement).toMatch(/account_insert AS \( INSERT INTO real_accounts \([^)]*\) SELECT [^()]* FROM claimed c ON CONFLICT \(app_user_id\) DO NOTHING RETURNING app_user_id \)/);
     expect(statement).toMatch(/passkey_insert AS \( INSERT INTO real_passkeys \([^)]*\) SELECT [^()]* FROM claimed c JOIN account_insert a ON a\.app_user_id = c\.app_user_id ON CONFLICT DO NOTHING/);
     expect(statement).not.toMatch(/\bVALUES\b/i);
     // In-statement guard: a won CAS must have produced exactly one of each row.
     expect(statement).toMatch(/:registration_finalize_mismatch'\)::int FROM claimed c WHERE \(SELECT count\(\*\) FROM account_insert\) <> 1 OR \(SELECT count\(\*\) FROM passkey_insert\) <> 1/);
 
-    // The caller supplies ONLY the Safe, the config version, and which
-    // attempt — every identity value written comes from the locked row.
-    expect(queries[1]!.params).toEqual([SAFE, "1", CREDENTIAL_ID]);
+    // The caller supplies ONLY the Safe, the config version, which attempt,
+    // and the owner the Safe was derived from (checked, never written) —
+    // every identity value written comes from the locked row.
+    expect(queries[2]!.params).toEqual([SAFE, "1", CREDENTIAL_ID, OWNER]);
   });
 
   it("post-statement guards: an active attempt needs its exact account + passkey; a non-active attempt may have neither", async () => {
     respond = () => batchResponse(1, { account: true, passkey: true });
     await finalize();
-    const [activeGuard, inactiveGuard] = [sent[0]!.queries![2]!.query, sent[0]!.queries![3]!.query].map((q) => q.replace(/\s+/g, " "));
+    const [activeGuard, inactiveGuard] = [sent[0]!.queries![3]!.query, sent[0]!.queries![4]!.query].map((q) => q.replace(/\s+/g, " "));
     expect(activeGuard).toMatch(/registration_finalize_mismatch'\)::int FROM registration_attempts a WHERE a\.credential_id = \$1 AND a\.state = 'active'/);
     for (const column of ["sub_organization_id", "turnkey_user_id", "wallet_id", "wallet_account_id", "owner_address", "safe_address", "account_config_version"]) {
       expect(activeGuard, column).toContain(`x.${column} = a.${column}`);
@@ -159,6 +165,68 @@ describe("Neon registration finalize: one transaction whose INSERTs derive only 
   it("won CAS but a row is missing from the read-back -> throws; never a partial or substituted result", async () => {
     respond = () => batchResponse(1, { account: true, passkey: false });
     await expect(finalize()).rejects.toThrow(/without its account\/passkey rows/);
+  });
+
+  it("S5 L2: the conflict block runs after the lock and before the CAS, only for turnkey_created with the Safe's own owner, comparing lower(...) against OTHER accounts", async () => {
+    respond = () => batchResponse(1, { account: true, passkey: true });
+    await finalize();
+    const block = sent[0]!.queries![1]!;
+    const statement = block.query.replace(/\s+/g, " ");
+    expect(statement).toMatch(/^ ?UPDATE registration_attempts a SET state = 'blocked', block_reason = \$1, updated_at = now\(\) WHERE a\.credential_id = \$2 AND a\.state = 'turnkey_created'/);
+    expect(statement).toContain("pg_catalog.lower(a.owner_address) = pg_catalog.lower($3)");
+    expect(statement).toContain("x.app_user_id <> a.app_user_id");
+    expect(statement).toContain("pg_catalog.lower(x.sub_organization_id) = pg_catalog.lower(a.sub_organization_id)");
+    expect(statement).toContain("pg_catalog.lower(x.owner_address) = pg_catalog.lower(a.owner_address)");
+    expect(statement).toContain("pg_catalog.lower(x.safe_address) = pg_catalog.lower($4)");
+    // Every lower() here is the built-in, schema-qualified — never resolved through search_path.
+    expect(statement.match(/(?<!pg_catalog\.)\blower\(/g)).toBeNull();
+    expect(block.params).toEqual([REGISTRATION_IDENTITY_CONFLICT_REASON, CREDENTIAL_ID, OWNER, SAFE]);
+  });
+
+  it.each([
+    ["the constraint field", (name: string) => ({ message: `duplicate key value violates unique constraint "${name}"`, code: "23505", constraint: name })],
+    ["the message alone", (name: string) => ({ message: `duplicate key value violates unique constraint "${name}"`, code: "23505" })],
+  ])("S5 L2: a 23505 on an identity unique index (named by %s) -> one follow-up [lock, block] transaction, then null — never a re-read or reuse", async (_label, body) => {
+    for (const name of ACCOUNT_IDENTITY_UNIQUE_INDEXES) {
+      sent = [];
+      let batches = 0;
+      respond = (request) => {
+        if (!request.queries) return singleQueryRows(request);
+        batches += 1;
+        return batches === 1 ? new Response(JSON.stringify(body(name)), { status: 400 }) : Response.json({ results: [result([{ credential_id: CREDENTIAL_ID }]), result([])] });
+      };
+
+      expect(await finalize(), name).toBeNull();
+      expect(sent, name).toHaveLength(2);
+      expect(sent[1]!.isolation, name).toBe("ReadCommitted");
+      const followUp = sent[1]!.queries!;
+      expect(followUp, name).toHaveLength(2);
+      expect(followUp[0]!.query, name).toMatch(/FOR UPDATE/);
+      expect(followUp[1]!.query.replace(/\s+/g, " "), name).toMatch(/UPDATE registration_attempts a SET state = 'blocked'/);
+      expect(followUp[1]!.params, name).toEqual([REGISTRATION_IDENTITY_CONFLICT_REASON, CREDENTIAL_ID, OWNER, SAFE]);
+    }
+  });
+
+  it("S5 L2: no statement finalize sends (CAS, conflict block, guards, follow-up block) calls an unqualified lower()", async () => {
+    respond = () => batchResponse(1, { account: true, passkey: true });
+    await finalize();
+    for (const q of sent[0]!.queries!) expect(q.query.match(/(?<!pg_catalog\.)\blower\(/g), q.query.slice(0, 60)).toBeNull();
+    const source = (await import("node:fs")).readFileSync("lib/real/server/neon-store.ts", "utf8");
+    const store = source.slice(source.indexOf("export function createNeonRegistrationAttemptStore"), source.indexOf("export function createNeonPaymentAttemptStore"));
+    const sqlOnly = store.split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
+    expect(sqlOnly.match(/(?<!pg_catalog\.)\blower\(/g)).toBeNull();
+  });
+
+  it("S5 L2: isAccountIdentityUniqueViolation matches ONLY a 23505 naming exactly one of the three identity indexes", () => {
+    for (const name of ACCOUNT_IDENTITY_UNIQUE_INDEXES) expect(isAccountIdentityUniqueViolation({ code: "23505", constraint: name })).toBe(true);
+    expect(isAccountIdentityUniqueViolation({ code: "23505", constraint: "real_accounts_pkey" })).toBe(false);
+    expect(isAccountIdentityUniqueViolation({ code: "23505", constraint: "real_passkeys_pkey" })).toBe(false);
+    expect(isAccountIdentityUniqueViolation({ code: "23505", constraint: "real_accounts_owner_address_lower_key_old" })).toBe(false);
+    expect(isAccountIdentityUniqueViolation({ code: "23505", message: 'duplicate key value violates unique constraint "x_real_accounts_owner_address_lower_key"' })).toBe(false);
+    expect(isAccountIdentityUniqueViolation({ code: "23503", constraint: "real_accounts_owner_address_lower_key" })).toBe(false);
+    expect(isAccountIdentityUniqueViolation({ code: "40001", message: "real_accounts_owner_address_lower_key" })).toBe(false);
+    expect(isAccountIdentityUniqueViolation(new Error("real_accounts_owner_address_lower_key"))).toBe(false);
+    expect(isAccountIdentityUniqueViolation(null)).toBe(false);
   });
 
   it("a 23505 unique violation is thrown, never turned into a re-read that returns some existing account/passkey pair", async () => {

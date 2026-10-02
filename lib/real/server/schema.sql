@@ -568,3 +568,150 @@ CREATE UNIQUE INDEX IF NOT EXISTS payment_attempts_turnkey_sign_activity_id_key
 --   SELECT column_name FROM information_schema.columns
 --   WHERE table_name = 'real_accounts' AND column_name = 'session_epoch';  -- expect 0 rows before
 ALTER TABLE real_accounts ADD COLUMN IF NOT EXISTS session_epoch BIGINT NOT NULL DEFAULT 0;
+
+-- Slice S5 L2 hand-applied migration: one local account per Turnkey
+-- identity. No two real_accounts rows may share a sub_organization_id,
+-- owner_address, or safe_address, compared case-insensitively (lower(...),
+-- the same comparison registration finalize uses). Finalize already blocks a
+-- committed conflict; these indexes close the concurrent window, surfacing as
+-- a 23505 naming exactly one of these indexes (neon-store.ts's
+-- ACCOUNT_IDENTITY_UNIQUE_INDEXES), which finalize also turns into 'blocked'.
+--
+-- FAIL-SAFE, ONE DO block = ONE transaction, on EVERY run (never skipped
+-- because the names already exist):
+--   1. lock public.real_accounts against writes (SHARE ROW EXCLUSIVE);
+--   2. re-check duplicates per lower(identity) INSIDE the lock — any
+--      duplicate RAISEs; nothing is chosen, deleted, or merged;
+--   3. CREATE UNIQUE INDEX IF NOT EXISTS for each (a missing one is built);
+--   4. validate all three against the catalog, since IF NOT EXISTS trusts the
+--      NAME: each must be an index in this schema, on this table, UNIQUE,
+--      VALID, READY, immediate, not partial, btree, exactly one key that is
+--      an expression, that expression deparsing to exactly lower(<column>)
+--      over a pg_catalog.text column, depending on exactly that one column
+--      and on NOTHING else, with the default operator class and a
+--      deterministic collation. Anything else (a same-named table, a
+--      non-unique / partial / raw-column / wrong-column / invalid index, an
+--      index using a look-alike lower(), ...) RAISEs and rolls the whole block
+--      back. Wrong objects are never dropped or repaired here — that is an
+--      operator decision.
+-- WHICH lower(): the block first pins search_path to `pg_catalog, pg_temp`
+-- for its own transaction (set_config(..., true)), so no caller's
+-- search_path can shadow anything it resolves, and it requires
+-- pg_catalog.lower(pg_catalog.text) to be a built-in (OID below
+-- FirstNormalObjectId, 16384) that unqualified `lower(text)` resolves to.
+-- Under that pinned path Postgres deparses an index expression as the
+-- unqualified `lower(col)` ONLY if the function it calls is exactly what
+-- `lower` resolves to for that argument type — i.e. the built-in (functions
+-- are never looked up in pg_temp, and only superusers can add to pg_catalog);
+-- a look-alike prints schema-qualified and fails. Independently, built-in
+-- (pinned) objects are never recorded in pg_depend while any user-defined
+-- function, type, collation, or operator class an index uses is — so the
+-- index may depend on nothing but its own table and that one column.
+-- Rerunnable: with three correct indexes, steps 1-4 just re-confirm them.
+-- The schema is the single `target_schema` constant (the gated migration
+-- smoke runs this exact block against a scratch schema).
+-- Pre-live check (read-only; each must return 0 rows):
+--   SELECT lower(sub_organization_id), count(*) FROM real_accounts GROUP BY 1 HAVING count(*) > 1;
+--   SELECT lower(owner_address), count(*) FROM real_accounts GROUP BY 1 HAVING count(*) > 1;
+--   SELECT lower(safe_address), count(*) FROM real_accounts GROUP BY 1 HAVING count(*) > 1;
+--   SELECT relname, relkind FROM pg_class WHERE relname LIKE 'real_accounts_%_lower_key';  -- none yet
+-- BEGIN S5 L2 identity-index migration
+DO $$
+DECLARE
+  -- Declared types are resolved BEFORE the search_path pin below, so each is schema-qualified.
+  target_schema CONSTANT pg_catalog.text := 'public';
+  identities CONSTANT pg_catalog.text[] := ARRAY[
+    ['real_accounts_sub_organization_id_lower_key', 'sub_organization_id'],
+    ['real_accounts_owner_address_lower_key', 'owner_address'],
+    ['real_accounts_safe_address_lower_key', 'safe_address']
+  ];
+  tbl pg_catalog.regclass;
+  identity pg_catalog.text[];
+  duplicate pg_catalog.int4;
+  col_attnum pg_catalog.int2;
+  col_type pg_catalog.oid;
+  lower_fn pg_catalog.regprocedure;
+  ix pg_catalog.record;
+BEGIN
+  -- 0. Trusted name resolution for everything below, for this transaction only.
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+  lower_fn := pg_catalog.to_regprocedure('pg_catalog.lower(pg_catalog.text)');
+  IF lower_fn IS NULL OR lower_fn::pg_catalog.oid >= 16384::pg_catalog.oid
+    OR pg_catalog.to_regprocedure('lower(text)') IS DISTINCT FROM lower_fn THEN
+    RAISE EXCEPTION 'S5 L2 migration refused: lower(text) does not resolve to the built-in pg_catalog.lower(text).';
+  END IF;
+
+  tbl := to_regclass(format('%I.real_accounts', target_schema));
+  IF tbl IS NULL THEN
+    RAISE EXCEPTION 'S5 L2 migration refused: %.real_accounts does not exist.', target_schema;
+  END IF;
+
+  -- 1. Always lock first.
+  EXECUTE format('LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE', tbl);
+
+  -- 2. Duplicates, re-checked inside the lock.
+  FOREACH identity SLICE 1 IN ARRAY identities LOOP
+    duplicate := NULL;
+    EXECUTE format('SELECT 1 FROM %s GROUP BY pg_catalog.lower(%I) HAVING count(*) > 1 LIMIT 1', tbl, identity[2]) INTO duplicate;
+    IF duplicate IS NOT NULL THEN
+      RAISE EXCEPTION 'S5 L2 migration refused: two accounts share a % (case-insensitively). Resolve by hand; nothing was changed.', identity[2];
+    END IF;
+  END LOOP;
+
+  -- 3. Build what is missing (IF NOT EXISTS trusts the name — step 4 does not).
+  FOREACH identity SLICE 1 IN ARRAY identities LOOP
+    EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %s (pg_catalog.lower(%I))', identity[1], tbl, identity[2]);
+  END LOOP;
+
+  -- 4. Validate every expected index against the catalog.
+  FOREACH identity SLICE 1 IN ARRAY identities LOOP
+    col_attnum := NULL;
+    col_type := NULL;
+    SELECT a.attnum, a.atttypid INTO col_attnum, col_type FROM pg_catalog.pg_attribute a
+      WHERE a.attrelid = tbl AND a.attname = identity[2] AND NOT a.attisdropped;
+    SELECT c.oid, c.relkind, am.amname, i.indrelid, i.indisunique, i.indisvalid, i.indisready, i.indimmediate,
+           i.indisexclusion, i.indpred IS NULL AS not_partial, i.indnatts, i.indnkeyatts, i.indkey[0] AS key0,
+           pg_catalog.pg_get_expr(i.indexprs, i.indrelid) AS expr, opc.opcdefault, coll.collisdeterministic,
+           (SELECT count(*) FROM pg_catalog.pg_depend d
+             WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid
+               AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = tbl AND d.refobjsubid <> 0) AS column_deps,
+           (SELECT count(*) FROM pg_catalog.pg_depend d
+             WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid
+               AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = tbl AND d.refobjsubid = col_attnum) AS intended_column_deps,
+           (SELECT count(*) FROM pg_catalog.pg_depend d
+             WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid
+               AND NOT (d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = tbl)) AS foreign_deps
+      INTO ix
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+      LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+      LEFT JOIN pg_catalog.pg_opclass opc ON opc.oid = i.indclass[0]
+      LEFT JOIN pg_catalog.pg_collation coll ON coll.oid = i.indcollation[0]
+      WHERE n.nspname = target_schema AND c.relname = identity[1];
+    IF ix.oid IS NULL OR col_attnum IS NULL
+      OR col_type IS DISTINCT FROM 'pg_catalog.text'::pg_catalog.regtype
+      OR ix.relkind IS DISTINCT FROM 'i'
+      OR ix.indrelid IS DISTINCT FROM tbl
+      OR ix.amname IS DISTINCT FROM 'btree'
+      OR ix.indisunique IS NOT TRUE
+      OR ix.indisvalid IS NOT TRUE
+      OR ix.indisready IS NOT TRUE
+      OR ix.indimmediate IS NOT TRUE
+      OR ix.indisexclusion IS NOT FALSE
+      OR ix.not_partial IS NOT TRUE
+      OR ix.indnatts IS DISTINCT FROM 1
+      OR ix.indnkeyatts IS DISTINCT FROM 1
+      OR ix.key0 IS DISTINCT FROM 0
+      OR ix.expr IS DISTINCT FROM format('lower(%I)', identity[2])
+      OR ix.column_deps IS DISTINCT FROM 1
+      OR ix.intended_column_deps IS DISTINCT FROM 1
+      OR ix.foreign_deps IS DISTINCT FROM 0
+      OR ix.opcdefault IS NOT TRUE
+      OR ix.collisdeterministic IS NOT TRUE
+    THEN
+      RAISE EXCEPTION 'S5 L2 migration refused: %.% is not exactly UNIQUE (lower(%)) on %. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, identity[1], identity[2], tbl;
+    END IF;
+  END LOOP;
+END $$;
+-- END S5 L2 identity-index migration

@@ -138,20 +138,20 @@ async function world(opts: { pendingC?: boolean } = {}): Promise<World> {
   const b = createFixtureAuthenticator();
   const c = createFixtureAuthenticator();
   const other = createFixtureAuthenticator();
-  const account = (appUserId: string, org: string, user: string) => ({
+  const account = (appUserId: string, org: string, user: string, ownerAddress = "0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF", safeAddress = "0xd9a4c22fb34dc74317edc8006140d66c8fa03266") => ({
     appUserId,
     subOrganizationId: org,
     turnkeyUserId: user,
     walletId: "wallet",
     walletAccountId: "wallet-account",
-    ownerAddress: "0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF",
-    safeAddress: "0xd9a4c22fb34dc74317edc8006140d66c8fa03266",
+    ownerAddress,
+    safeAddress,
     accountConfigVersion: 1,
   });
   const passkey = (appUserId: string, who: FixtureAuthenticator) => ({ credentialId: who.credentialIdBase64Url, appUserId, credentialPublicKey: bytesToBase64Url(who.publicKeyCose), userHandle: "h", counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice" as const, credentialBackedUp: false });
   await registry.createAccountWithPasskey({ account: account(APP, "sub-org-1", "turnkey-user-1"), passkey: passkey(APP, a) });
   await registry.transitionPasskeyStatus({ credentialId: a.credentialIdBase64Url, from: "active", to: "active", patch: { turnkeyAuthenticatorId: "authenticator-a" } });
-  await registry.createAccountWithPasskey({ account: account(OTHER_APP, "sub-org-2", "turnkey-user-2"), passkey: passkey(OTHER_APP, other) });
+  await registry.createAccountWithPasskey({ account: account(OTHER_APP, "sub-org-2", "turnkey-user-2", "0x2222222222222222222222222222222222222201", "0x2222222222222222222222222222222222222202"), passkey: passkey(OTHER_APP, other) });
   await registry.transitionPasskeyStatus({ credentialId: other.credentialIdBase64Url, from: "active", to: "active", patch: { turnkeyAuthenticatorId: "authenticator-other" } });
 
   const fake = new FakeTurnkey("sub-org-1", "turnkey-user-1");

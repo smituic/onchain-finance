@@ -4,9 +4,11 @@ import { baseSepolia } from "viem/chains";
 import type { RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { RealServerConfig } from "@/lib/real/server/config";
 import { createInMemoryChallengeStore } from "@/lib/real/server/challenge-store";
-import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
+import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals } from "@/lib/real/server/registry";
+import { bytesToBase64Url } from "@/lib/real/bytes";
 import { createInMemoryRegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
 import { buildRegistrationResponseJSON, createFixtureAuthenticator } from "./fixtures/webauthn";
+import { toStdBase64 } from "./fixtures/turnkey-fake";
 
 const createSubOrganizationMock = vi.fn();
 const getWalletAccountsMock = vi.fn();
@@ -315,5 +317,100 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     if (result.outcome !== "verified") return;
 
     expect(result.sessionCookie).not.toMatch(/subOrganization|walletId|ownerAddress|safeAddress/i);
+  });
+});
+
+describe("S5 L2: the registration credential id is the ATTESTED one, bound to response.id by bytes", () => {
+  afterEach(() => {
+    createSubOrganizationMock.mockReset();
+    getWalletAccountsMock.mockReset();
+  });
+
+  /** A genuine response whose client-supplied id/rawId are replaced (the library only requires id === rawId). */
+  async function respond(stores: ReturnType<typeof newStores>, authenticator = createFixtureAuthenticator(), id?: string) {
+    const { optionsJSON } = await beginRegistration({ config, challengeStore: stores.challengeStore });
+    const response = buildRegistrationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId });
+    if (id !== undefined) Object.assign(response, { id, rawId: id });
+    return { response, authenticator };
+  }
+
+  it("response.id naming DIFFERENT bytes than the attested credential -> fixed 400-class rejection, no attempt under either id, no Turnkey call", async () => {
+    mockSuccessfulProvisioning();
+    const stores = newStores();
+    const otherId = bytesToBase64Url(new Uint8Array(32).fill(9));
+    const { response, authenticator } = await respond(stores, undefined, otherId);
+
+    const result = await completeRegistration({ ...stores, config, response, publicClient: buildPublicClient() });
+
+    expect(result).toEqual({ outcome: "rejected", reason: "Registration could not be verified." });
+    expect(await stores.attempts.findByCredentialId(authenticator.credentialIdBase64Url)).toBeNull();
+    expect(await stores.attempts.findByCredentialId(otherId)).toBeNull();
+    expect(await stores.registry.findPasskeyByCredentialId(authenticator.credentialIdBase64Url)).toBeNull();
+    expect(createSubOrganizationMock).not.toHaveBeenCalled();
+  });
+
+  it("response.id as another encoding of the SAME bytes (padded standard base64) is accepted; the durable id and Turnkey's are the canonical attested one", async () => {
+    mockSuccessfulProvisioning();
+    const stores = newStores();
+    const authenticator = createFixtureAuthenticator();
+    const { response } = await respond(stores, authenticator, toStdBase64(authenticator.credentialIdBase64Url));
+    expect(response.id).not.toBe(authenticator.credentialIdBase64Url);
+
+    const result = await completeRegistration({ ...stores, config, response, publicClient: buildPublicClient() });
+
+    expect(result.outcome).toBe("verified");
+    expect((await stores.attempts.findByCredentialId(authenticator.credentialIdBase64Url))?.state).toBe("active");
+    expect(await stores.attempts.findByCredentialId(response.id)).toBeNull();
+    const call = createSubOrganizationMock.mock.calls[0]![0] as { parameters: { rootUsers: Array<{ authenticators: Array<{ attestation: { credentialId: string } }> }> } };
+    expect(call.parameters.rootUsers[0]!.authenticators[0]!.attestation.credentialId).toBe(authenticator.credentialIdBase64Url);
+  });
+
+  it("an attested id that already belongs to a PRIMARY passkey is rejected before Turnkey — even when response.id spells it differently", async () => {
+    mockSuccessfulProvisioning();
+    const stores = newStores();
+    const authenticator = createFixtureAuthenticator();
+    expect((await completeRegistration({ ...stores, config, response: (await respond(stores, authenticator)).response, publicClient: buildPublicClient() })).outcome).toBe("verified");
+
+    const { response } = await respond(stores, authenticator, toStdBase64(authenticator.credentialIdBase64Url));
+    const result = await completeRegistration({ ...stores, config, response, publicClient: buildPublicClient() });
+
+    expect(result).toEqual({ outcome: "rejected", reason: 'This passkey is already registered. Use "I already have an account" instead.' });
+    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("an attested id that already belongs to a BACKUP passkey (any status) is rejected before Turnkey, with no attempt created", async () => {
+    mockSuccessfulProvisioning();
+    const stores = newStores();
+    const owner = createFixtureAuthenticator();
+    expect((await completeRegistration({ ...stores, config, response: (await respond(stores, owner)).response, publicClient: buildPublicClient() })).outcome).toBe("verified");
+    const ownerPasskey = (await stores.registry.findPasskeyByCredentialId(owner.credentialIdBase64Url))!;
+    const backup = createFixtureAuthenticator();
+    getInMemoryRegistryInternals(stores.registry).passkeysByCredentialId.set(backup.credentialIdBase64Url, {
+      ...ownerPasskey,
+      credentialId: backup.credentialIdBase64Url,
+      credentialPublicKey: bytesToBase64Url(backup.publicKeyCose),
+      role: "backup",
+      status: "pending",
+    });
+
+    const { response } = await respond(stores, backup, toStdBase64(backup.credentialIdBase64Url));
+    const result = await completeRegistration({ ...stores, config, response, publicClient: buildPublicClient() });
+
+    expect(result).toEqual({ outcome: "rejected", reason: 'This passkey is already registered. Use "I already have an account" instead.' });
+    expect(await stores.attempts.findByCredentialId(backup.credentialIdBase64Url)).toBeNull();
+    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a pending attempt is found by the ATTESTED id, not the raw response.id spelling", async () => {
+    createSubOrganizationMock.mockRejectedValue(new Error("Turnkey unreachable"));
+    const stores = newStores();
+    const authenticator = createFixtureAuthenticator();
+    expect((await completeRegistration({ ...stores, config, response: (await respond(stores, authenticator)).response, publicClient: buildPublicClient() })).outcome).toBe("pending");
+
+    const { response } = await respond(stores, authenticator, toStdBase64(authenticator.credentialIdBase64Url));
+    const result = await completeRegistration({ ...stores, config, response, publicClient: buildPublicClient() });
+
+    expect(result).toEqual({ outcome: "rejected", reason: 'A registration is already pending for this passkey. Use "I already have an account" to resume it.' });
+    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
   });
 });

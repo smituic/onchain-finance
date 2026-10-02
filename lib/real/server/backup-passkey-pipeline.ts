@@ -10,7 +10,7 @@ import { DuplicateCredentialError, type RealAccountRecord, type RealAccountRegis
 import { isAbandonable, type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { RealServerConfig } from "./config";
 import { buildLoginOptions, buildRegistrationOptions, verifyLogin, verifyRegistration } from "./webauthn";
-import { listTurnkeyUserAuthenticators, matchAuthenticatorByCredentialId, normalizeTurnkeyPublicKey, readTurnkeyActivity } from "./turnkey-discovery";
+import { listTurnkeyUserAuthenticators, matchAuthenticatorByCredentialId, readTurnkeyActivity, turnkeyPublicKeysEqual } from "./turnkey-discovery";
 import {
   COMPLETED_STATUS,
   TERMINAL_FAILURE_STATUSES,
@@ -851,15 +851,15 @@ export async function confirmSigningProof(input: {
     return { outcome: "rejected", reason: "The authorization proof signed something other than this setup's challenge." };
   }
 
-  const expectedKey = normalizeTurnkeyPublicKey(enrollment.turnkeyAuthenticatorPublicKey);
+  // Exact bytes of strictly canonical base64url on both sides — a malformed
+  // or case-altered key never attributes (turnkeyPublicKeysEqual).
   const votes = Array.isArray(activity.raw.votes) ? (activity.raw.votes as Array<Record<string, unknown>>) : [];
   const attributed = votes.some(
     (vote) =>
       vote.selection === "VOTE_SELECTION_APPROVED" &&
       vote.activityId === activity.id &&
       vote.userId === account.turnkeyUserId &&
-      expectedKey !== "" &&
-      normalizeTurnkeyPublicKey(vote.publicKey) === expectedKey,
+      turnkeyPublicKeysEqual(vote.publicKey, enrollment.turnkeyAuthenticatorPublicKey),
   );
   if (!attributed) return { outcome: "rejected", reason: "The authorization wasn't approved by the new backup passkey." };
 

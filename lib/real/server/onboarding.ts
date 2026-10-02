@@ -7,17 +7,24 @@ import type { RealAccountRecord, RealAccountRegistry } from "./registry";
 import { accountMatchesAttempt, type RegistrationAttempt, type RegistrationAttemptStore } from "./registration-attempts";
 import type { RealServerConfig } from "./config";
 import { isDefinitiveProvisioningFailure, provisionTurnkeyChildAccount } from "./turnkey-provisioning";
-import { discoverAccountByCredentialId } from "./turnkey-discovery";
 import { createSessionPayload, serializeSession } from "./session";
 
 export type OnboardingOutcome =
   | { outcome: "verified"; sessionCookie: string; account: RealAccountRecord }
-  /** Durable state exists and is recoverable, but not active yet — never "safe to blindly retry", never a session. */
+  /** Durable state exists but is not active — never "safe to blindly retry", never a session. Includes an uncertain create awaiting review (PROVISIONING_NEEDS_REVIEW_REASON). */
   | { outcome: "pending"; reason: string }
-  /** Turnkey discovery found more than one possible match — never guessed; needs manual review. */
+  /** Positively known not to be safely completable (an identity conflict at finalize) — never guessed; manual review. */
   | { outcome: "blocked"; reason: string }
   /** No durable onboarding state exists for this attempt (or it can never proceed) — distinct from "pending". */
   | { outcome: "rejected"; reason: string };
+
+/**
+ * S5 L2 (Option 3): the honest answer for an attempt whose
+ * CREATE_SUB_ORGANIZATION outcome is unknown. Nothing automatic can resolve
+ * it — not a retry, not a login — so it never says "try again shortly".
+ */
+export const PROVISIONING_NEEDS_REVIEW_REASON =
+  "Account setup couldn't be confirmed, so it needs review before it can continue. Trying again won't resolve it.";
 
 function issueSession(account: RealAccountRecord, credentialId: string, config: RealServerConfig): string {
   return serializeSession(createSessionPayload({ appUserId: account.appUserId, credentialId, sessionEpoch: account.sessionEpoch }), config.sessionSecret);
@@ -60,12 +67,18 @@ function rebuildRegistrationResponse(attempt: RegistrationAttempt): Registration
  * The critical safety property: once an attempt's externalOutcome becomes
  * "unknown" (state "provisioning_in_flight"), this function can NEVER reach
  * provisionTurnkeyChildAccount again for it automatically — see
- * registration-attempts.ts's state-machine doc comment. A zero-match
- * Turnkey discovery result is explicitly NOT treated as proof the earlier
- * call failed (discovery carries no read-after-write consistency
- * guarantee), so it leaves the attempt exactly where it was: unresolved,
- * reported as "pending", never retried automatically. This mirrors the
- * payment philosophy: uncertainty is reconciled, never blindly repeated.
+ * registration-attempts.ts's state-machine doc comment.
+ *
+ * S5 L2 (Option 3): nor does it ever ADOPT anything for such an attempt. An
+ * account is bound only from the response to OUR OWN create call. When that
+ * response was lost, finding a Turnkey sub-org that contains the credential
+ * proves membership — not that our request created it, nor that no other
+ * authority (imported/exported wallet, recovery, keys, policies) exists in
+ * it — so the attempt stays "provisioning_in_flight", reported as needing
+ * review, with no Turnkey call at all. Resolution is a future operator-only
+ * resolver, which first needs exact dispatch evidence.
+ *
+ * Finalize blocks an attempt whose sub-org/owner/Safe another account holds.
  */
 export async function runProvisioningPipeline(input: {
   config: RealServerConfig;
@@ -83,54 +96,9 @@ export async function runProvisioningPipeline(input: {
   if (attempt.state === "active") return resumeActiveAttempt(input.registry, attempt, input.config);
 
   if (attempt.state === "provisioning_in_flight") {
-    // The earlier external call's outcome is unknown. Discovery is the
-    // ONLY thing allowed to move this attempt forward from here — this
-    // branch never falls through into a fresh provisionTurnkeyChildAccount
-    // call, at zero-match or otherwise.
-    const discovery = await discoverAccountByCredentialId({ config: input.config, credentialId: attempt.credentialId });
-
-    if (discovery.outcome === "ambiguous_suborg" || discovery.outcome === "ambiguous_wallet_account") {
-      const reason = "Turnkey discovery found more than one possible match for this passkey; manual review is required.";
-      const blocked = await input.attempts.transition({
-        credentialId: attempt.credentialId,
-        from: "provisioning_in_flight",
-        to: "blocked",
-        patch: { blockReason: reason },
-      });
-      return { outcome: "blocked", reason: blocked?.blockReason ?? reason };
-    }
-
-    if (discovery.outcome === "match" && discovery.match.walletId && discovery.match.walletAccountId && discovery.match.ownerAddress) {
-      // Reconcile the already-created Turnkey account into this attempt —
-      // never provision again for it.
-      const patch: Parameters<RegistrationAttemptStore["transition"]>[0]["patch"] = {
-        subOrganizationId: discovery.match.subOrganizationId,
-        walletId: discovery.match.walletId,
-        walletAccountId: discovery.match.walletAccountId,
-        ownerAddress: discovery.match.ownerAddress,
-        externalOutcome: "confirmed_created",
-      };
-      if (discovery.match.userId) patch.turnkeyUserId = discovery.match.userId;
-      const advanced = await input.attempts.transition({
-        credentialId: attempt.credentialId,
-        from: "provisioning_in_flight",
-        to: "turnkey_created",
-        patch,
-      });
-      attempt = advanced ?? ((await input.attempts.findByCredentialId(attempt.credentialId)) ?? attempt);
-    } else {
-      // Zero matches (or an incomplete match): NOT proof the earlier call
-      // never landed — Turnkey's discovery read has no read-after-write
-      // consistency guarantee. The attempt stays "provisioning_in_flight",
-      // externalOutcome stays "unknown". Resolution is bounded retry (a
-      // later call re-runs this same discovery check) or a manual/admin
-      // decision, both outside Batch 2b's automatic path — never another
-      // createSubOrganization call from here.
-      return {
-        outcome: "pending",
-        reason: "Account setup could not yet be confirmed. This may resolve automatically — try again shortly, or use \"I already have an account\" later.",
-      };
-    }
+    // The earlier create's outcome is unknown. No Turnkey read, no adoption,
+    // no second create, no state change: review only (Option 3).
+    return { outcome: "pending", reason: PROVISIONING_NEEDS_REVIEW_REASON };
   }
 
   if (attempt.state === "verified") {
@@ -177,10 +145,9 @@ export async function runProvisioningPipeline(input: {
         return { outcome: "pending", reason: "Account setup failed and can be retried. Try again in a moment." };
       }
       // Outcome unknown — the attempt durably stays "provisioning_in_flight"
-      // / externalOutcome "unknown" (already recorded above). This is
-      // recoverable only via discovery-based reconciliation later, never
-      // reported as a definitive failure and never retried automatically.
-      return { outcome: "pending", reason: "Account setup is still in progress. Try again in a moment, or use \"I already have an account\" to resume." };
+      // / externalOutcome "unknown" (already recorded above): never reported
+      // as a definitive failure, never retried, never adopted (Option 3).
+      return { outcome: "pending", reason: PROVISIONING_NEEDS_REVIEW_REASON };
     }
 
     const advanced = await input.attempts.transition({
@@ -203,10 +170,14 @@ export async function runProvisioningPipeline(input: {
     return { outcome: "pending", reason: "Account setup is still in progress." };
   }
 
+  // The Safe is derived (network reads) BEFORE finalize, from this read of
+  // the owner. finalize's CAS re-checks the LOCKED attempt's owner against
+  // exactly this value, so a Safe derived for a stale owner never commits.
+  const safeOwnerAddress = attempt.ownerAddress;
   const owner = createVerifiedTurnkeyOwnerAccount({
     rpId: input.config.rpId,
     subOrganizationId: attempt.subOrganizationId,
-    ownerAddress: attempt.ownerAddress,
+    ownerAddress: safeOwnerAddress,
   });
   const publicClient = input.publicClient ?? createRealPublicClient(input.config.rpcUrl);
   const safeAccount = await createRealSafeAccount({ owner, publicClient });
@@ -215,12 +186,14 @@ export async function runProvisioningPipeline(input: {
     credentialId: attempt.credentialId,
     registry: input.registry,
     safeAddress: safeAccount.address,
+    safeOwnerAddress,
     accountConfigVersion: REAL_ACCOUNT_CONFIG_VERSION,
   });
 
   if (!finalized) {
     // Nothing was written by this call. Re-read the ATTEMPT (not the
-    // account): another call may have finished it, or it may have moved.
+    // account): another call may have finished it, it may have moved, or
+    // finalize itself blocked it on an identity conflict.
     const fresh = await input.attempts.findByCredentialId(attempt.credentialId);
     if (fresh?.state === "active") return resumeActiveAttempt(input.registry, fresh, input.config);
     if (fresh?.state === "blocked") return { outcome: "blocked", reason: fresh.blockReason ?? "This registration requires manual review." };

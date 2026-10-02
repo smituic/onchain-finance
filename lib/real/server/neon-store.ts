@@ -1,9 +1,9 @@
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import type { ChallengePurpose, ChallengeStore, StoredChallenge } from "./challenge-store";
-import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
+import { DuplicateAccountError, DuplicateCredentialError, IdentityConflictError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
 import { type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentPatch, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { PasskeyRevocationAttempt, PasskeyRevocationStore, RevocationAttemptPatch, RevocationAttemptState } from "./passkey-revocation-attempts";
-import type { ExternalProvisioningOutcome, RegistrationAttempt, RegistrationAttemptState, RegistrationAttemptStore } from "./registration-attempts";
+import { REGISTRATION_IDENTITY_CONFLICT_REASON, assertGenericTransition, type ExternalProvisioningOutcome, type RegistrationAttempt, type RegistrationAttemptState, type RegistrationAttemptStore } from "./registration-attempts";
 import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveResult } from "./payment-attempts";
 
 /**
@@ -234,6 +234,25 @@ export function isUniqueViolation(error: unknown, constraintHint?: string): bool
   return message.includes(constraintHint);
 }
 
+/**
+ * S5 L2: the case-insensitive identity unique indexes on real_accounts
+ * (schema.sql's L2 migration). A 23505 naming EXACTLY one of these is an
+ * identity conflict; any other database error is never relabeled as one.
+ */
+export const ACCOUNT_IDENTITY_UNIQUE_INDEXES = [
+  "real_accounts_sub_organization_id_lower_key",
+  "real_accounts_owner_address_lower_key",
+  "real_accounts_safe_address_lower_key",
+] as const;
+
+export function isAccountIdentityUniqueViolation(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { code, constraint, message } = error as { code?: unknown; constraint?: unknown; message?: unknown };
+  if (String(code) !== "23505") return false;
+  const name = typeof constraint === "string" && constraint ? constraint : /unique constraint "([^"]+)"/.exec(typeof message === "string" ? message : "")?.[1];
+  return name !== undefined && (ACCOUNT_IDENTITY_UNIQUE_INDEXES as readonly string[]).includes(name);
+}
+
 export function createNeonChallengeStore(sql: NeonQueryFunction<false, false>): ChallengeStore {
   return {
     async create({ challenge, purpose, ttlMs, context }) {
@@ -293,6 +312,7 @@ export function createNeonRealAccountRegistry(sql: NeonQueryFunction<false, fals
       } catch (error) {
         if (isUniqueViolation(error, "real_passkeys_pkey")) throw new DuplicateCredentialError(passkey.credentialId);
         if (isUniqueViolation(error, "real_accounts_pkey")) throw new DuplicateAccountError(account.appUserId);
+        if (isAccountIdentityUniqueViolation(error)) throw new IdentityConflictError(account.appUserId);
         throw error;
       }
     },
@@ -790,6 +810,28 @@ export function createNeonPasskeyRevocationStore(sql: NeonQueryFunction<false, f
 }
 
 export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false, false>): RegistrationAttemptStore {
+  // S5 L2: turnkey_created -> blocked when ANOTHER account already holds this
+  // attempt's sub-org or owner, or the Safe about to be written — compared
+  // with pg_catalog.lower(...) — schema-qualified, so no search_path can
+  // substitute another lower() — exactly like the identity unique indexes. Only when the
+  // Safe was derived for the attempt's current owner (otherwise the Safe
+  // comparison would be about a stale value; the caller re-derives).
+  const blockOnCommittedIdentityConflict = (credentialId: string, safeAddress: string, safeOwnerAddress: string) => sql`
+    UPDATE registration_attempts a
+    SET state = 'blocked', block_reason = ${REGISTRATION_IDENTITY_CONFLICT_REASON}, updated_at = now()
+    WHERE a.credential_id = ${credentialId} AND a.state = 'turnkey_created'
+      AND a.sub_organization_id IS NOT NULL AND a.owner_address IS NOT NULL
+      AND pg_catalog.lower(a.owner_address) = pg_catalog.lower(${safeOwnerAddress})
+      AND EXISTS (
+        SELECT 1 FROM real_accounts x
+        WHERE x.app_user_id <> a.app_user_id AND (
+          pg_catalog.lower(x.sub_organization_id) = pg_catalog.lower(a.sub_organization_id)
+          OR pg_catalog.lower(x.owner_address) = pg_catalog.lower(a.owner_address)
+          OR pg_catalog.lower(x.safe_address) = pg_catalog.lower(${safeAddress})
+        )
+      )
+  `;
+
   return {
     async createVerified(input) {
       try {
@@ -818,6 +860,7 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
     },
 
     async transition({ credentialId, from, to, patch }) {
+      assertGenericTransition(from, to);
       // A single UPDATE ... WHERE state = $from RETURNING * is the CAS: at
       // most one concurrent caller ever affects a row (Postgres row-level
       // locking), everyone else gets zero rows back and returns null.
@@ -853,6 +896,9 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
     //
     //  1. Lock the attempt row, so the statements below read one settled row
     //     and concurrent finalizers / transitions / counter updates queue.
+    //  1b. S5 L2: if another account already holds this attempt's sub-org,
+    //     owner, or Safe (lower(...)), turnkey_created -> blocked, committed
+    //     with the rest — so the CAS below finds nothing to claim.
     //  2. ONE statement: the turnkey_created -> active CAS is the `claimed`
     //     CTE, and BOTH inserts select FROM claimed — the row THIS statement
     //     changed, with its current values. A lost CAS leaves `claimed`
@@ -860,8 +906,13 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
     //     persist a row, whatever other constraints do or don't exist. The
     //     passkey is joined to account_insert, and the statement aborts
     //     (guard sentinel) if a won CAS didn't produce exactly one of each.
-    //     ON CONFLICT DO NOTHING turns any conflicting existing row into
-    //     "not inserted" -> that abort, never a 23505 to reinterpret.
+    //     The CAS also requires the locked owner to equal the owner the Safe
+    //     was derived from (S5 L2). ON CONFLICT (app_user_id) / DO NOTHING
+    //     turn a conflicting app-user or credential row into "not inserted"
+    //     -> that abort. A concurrent identity race the step-1b check could
+    //     not see surfaces as a 23505 on an identity unique index, which
+    //     blocks the attempt in a follow-up transaction (never relabeled
+    //     from any other error).
     //  3. Integrity guards on the committed-to-be state: an active attempt
     //     must have an account + passkey matching it field for field; a
     //     non-active attempt must have neither.
@@ -871,10 +922,12 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
     // only the CAS winner gets records back; everyone else gets null and
     // onboarding re-reads under accountMatchesAttempt. `registry` is unused
     // here (interface parity with the in-memory adapter).
-    async finalize({ credentialId, safeAddress, accountConfigVersion }) {
+    async finalize({ credentialId, safeAddress, safeOwnerAddress, accountConfigVersion }) {
+      const lockAttempt = () => sql`SELECT credential_id FROM registration_attempts WHERE credential_id = ${credentialId} FOR UPDATE`;
       try {
         const results = await sql.transaction([
-          sql`SELECT credential_id FROM registration_attempts WHERE credential_id = ${credentialId} FOR UPDATE`,
+          lockAttempt(),
+          blockOnCommittedIdentityConflict(credentialId, safeAddress, safeOwnerAddress),
           sql`
             WITH claimed AS (
               UPDATE registration_attempts
@@ -882,13 +935,14 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
               WHERE credential_id = ${credentialId} AND state = 'turnkey_created'
                 AND sub_organization_id IS NOT NULL AND turnkey_user_id IS NOT NULL AND wallet_id IS NOT NULL
                 AND wallet_account_id IS NOT NULL AND owner_address IS NOT NULL
+                AND pg_catalog.lower(owner_address) = pg_catalog.lower(${safeOwnerAddress})
               RETURNING *
             ),
             account_insert AS (
               INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
               SELECT c.app_user_id, c.sub_organization_id, c.turnkey_user_id, c.wallet_id, c.wallet_account_id, c.owner_address, c.safe_address, c.account_config_version
               FROM claimed c
-              ON CONFLICT DO NOTHING
+              ON CONFLICT (app_user_id) DO NOTHING
               RETURNING app_user_id
             ),
             passkey_insert AS (
@@ -935,15 +989,23 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
             WHERE a.credential_id = ${credentialId} AND a.state = 'active'
           `,
         ]);
-        const summary = (results[1] as Row[])[0];
-        if (!summary || Number(summary.claimed) !== 1) return null; // lost the CAS: nothing was written
-        const accountRow = (results[4] as Row[])[0];
-        const passkeyRow = (results[5] as Row[])[0];
+        const summary = (results[2] as Row[])[0];
+        if (!summary || Number(summary.claimed) !== 1) return null; // lost the CAS (or blocked): nothing was written
+        const accountRow = (results[5] as Row[])[0];
+        const passkeyRow = (results[6] as Row[])[0];
         // Unreachable while the guards above hold; never paper over it.
         if (!accountRow || !passkeyRow) throw new Error("Registration finalize committed without its account/passkey rows.");
         return { account: toAccount(accountRow), passkey: toPasskey(passkeyRow) };
       } catch (error) {
         if (isGuardAbort(error, "registration_finalize_mismatch")) return null;
+        if (isAccountIdentityUniqueViolation(error)) {
+          // The whole transaction rolled back. The conflicting row committed
+          // before our INSERT failed, so the same check now sees it; if that
+          // row was itself rolled back, nothing is blocked and the caller
+          // reports pending.
+          await sql.transaction([lockAttempt(), blockOnCommittedIdentityConflict(credentialId, safeAddress, safeOwnerAddress)]);
+          return null;
+        }
         throw error;
       }
     },

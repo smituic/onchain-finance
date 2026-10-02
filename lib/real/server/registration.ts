@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { decodeClientDataJSON } from "@simplewebauthn/server/helpers";
 import type { RegistrationResponseJSON } from "@simplewebauthn/server";
 import { bytesToBase64Url, randomBytes } from "../bytes";
+import { credentialIdsEqual } from "../credential-id";
 import type { SafeAccountPublicClient } from "../account/safe";
 import type { ChallengeStore } from "./challenge-store";
 import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRegistry } from "./registry";
@@ -82,16 +83,6 @@ export async function completeRegistration(input: {
   if (!stored) return { outcome: "rejected", reason: "Unknown, expired, or already-used registration challenge." };
   const { appUserId, userHandle } = stored.context as RegistrationContext;
 
-  if (await input.registry.findAccountByAppUserId(appUserId)) {
-    return { outcome: "rejected", reason: "An account already exists for this registration attempt." };
-  }
-  if (await input.registry.findPasskeyByCredentialId(input.response.id)) {
-    return { outcome: "rejected", reason: 'This passkey is already registered. Use "I already have an account" instead.' };
-  }
-  if (await input.attempts.findByCredentialId(input.response.id)) {
-    return { outcome: "rejected", reason: 'A registration is already pending for this passkey. Use "I already have an account" to resume it.' };
-  }
-
   let verified;
   try {
     verified = await verifyRegistration({ config: input.config, response: input.response, expectedChallenge: stored.challenge });
@@ -103,6 +94,24 @@ export async function completeRegistration(input: {
   if (!verified.verified) return { outcome: "rejected", reason: SAFE_REGISTRATION_VERIFICATION_FAILED };
   if (!verified.registrationInfo.userVerified) return { outcome: "rejected", reason: "User verification was not performed." };
 
+  // S5 L2: the durable credential id is the one the authenticator ATTESTED
+  // (registrationInfo.credential.id, from authData) — the library only checks
+  // response.id === rawId as strings, never against authData. Bind the
+  // client-supplied id to it by decoded bytes, then run every credential
+  // pre-check against the attested id only.
+  const credentialId = verified.registrationInfo.credential.id;
+  if (!credentialIdsEqual(input.response.id, credentialId)) return { outcome: "rejected", reason: SAFE_REGISTRATION_VERIFICATION_FAILED };
+
+  if (await input.registry.findAccountByAppUserId(appUserId)) {
+    return { outcome: "rejected", reason: "An account already exists for this registration attempt." };
+  }
+  if (await input.registry.findPasskeyByCredentialId(credentialId)) {
+    return { outcome: "rejected", reason: 'This passkey is already registered. Use "I already have an account" instead.' };
+  }
+  if (await input.attempts.findByCredentialId(credentialId)) {
+    return { outcome: "rejected", reason: 'A registration is already pending for this passkey. Use "I already have an account" to resume it.' };
+  }
+
   // Durable pre-commit — before Turnkey is ever called. If the process
   // dies at any point after this line, the attempt is recoverable (see
   // onboarding.ts's runProvisioningPipeline, reached again either later in
@@ -110,7 +119,7 @@ export async function completeRegistration(input: {
   let attempt;
   try {
     attempt = await input.attempts.createVerified({
-      credentialId: verified.registrationInfo.credential.id,
+      credentialId,
       appUserId,
       userHandle,
       credentialPublicKey: bytesToBase64Url(verified.registrationInfo.credential.publicKey),

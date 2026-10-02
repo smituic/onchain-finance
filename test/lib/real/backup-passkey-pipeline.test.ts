@@ -4,7 +4,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { bytesToBase64Url } from "@/lib/real/bytes";
 import type { RealServerConfig } from "@/lib/real/server/config";
 import { createInMemoryChallengeStore } from "@/lib/real/server/challenge-store";
-import { createInMemoryRealAccountRegistry, type RealAccountRegistry } from "@/lib/real/server/registry";
+import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals, type RealAccountRegistry } from "@/lib/real/server/registry";
 import { createInMemoryBackupPasskeyEnrollmentStore, type BackupPasskeyEnrollmentStore } from "@/lib/real/server/backup-passkey-enrollment";
 import { TURNKEY_STAMP_FRESHNESS_WINDOW_MS } from "@/lib/real/server/turnkey-signed-request";
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
@@ -585,6 +585,31 @@ describe("backup enrollment — Proof B (Turnkey authorization attributed to the
     const { w, enrollmentId, backup } = await toLoginVerified();
     const primaryKey = w.fake.authenticators().find((a) => a.authenticatorId === "authenticator-primary")!.credential.publicKey;
     expect((await proofB(w, enrollmentId, { votePublicKey: primaryKey })).outcome).toBe("rejected");
+    expect((await w.registry.findPasskeyByCredentialId(backup.credentialIdBase64Url))?.status).toBe("pending");
+  });
+
+  // S5 L2: exact bytes of the strictly canonical key — base64url is
+  // case-sensitive, so a case-folded spelling is a different key.
+  it.each<[string, (key: string) => string]>([
+    ["letter case changed (upper)", (key) => key.toUpperCase()],
+    ["letter case changed (lower)", (key) => key.toLowerCase()],
+    ["surrounding whitespace", (key) => ` ${key} `],
+    ["padded spelling", (key) => `${key}=`],
+    ["malformed (not base64url)", () => "not a key!"],
+  ])("S5 L2: a vote key with %s cannot satisfy Proof B; the backup stays pending", async (_label, respell) => {
+    const { w, enrollmentId, backup } = await toLoginVerified();
+    const enrolledKey = (await w.enrollments.findById(enrollmentId))!.turnkeyAuthenticatorPublicKey!;
+    expect(respell(enrolledKey)).not.toBe(enrolledKey);
+    expect((await proofB(w, enrollmentId, { votePublicKey: respell(enrolledKey) })).outcome).toBe("rejected");
+    expect((await w.registry.findPasskeyByCredentialId(backup.credentialIdBase64Url))?.status).toBe("pending");
+  });
+
+  it("S5 L2: a malformed enrolled key never attributes, even to a vote carrying the identical string", async () => {
+    const { w, enrollmentId, backup } = await toLoginVerified();
+    const malformed = `02${"ab".repeat(32)}`;
+    const [map] = getInMemoryRegistryInternals(w.registry).backupEnrollmentMaps;
+    map!.set(enrollmentId, { ...map!.get(enrollmentId)!, turnkeyAuthenticatorPublicKey: malformed });
+    expect((await proofB(w, enrollmentId, { votePublicKey: malformed })).outcome).toBe("rejected");
     expect((await w.registry.findPasskeyByCredentialId(backup.credentialIdBase64Url))?.status).toBe("pending");
   });
 

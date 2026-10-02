@@ -1,7 +1,10 @@
 import { credentialIdsEqual } from "../credential-id";
+import { addressesEqual } from "../identifiers";
 import {
   DuplicateAccountError,
   DuplicateCredentialError,
+  IdentityConflictError,
+  accountIdentitiesConflict,
   getInMemoryRegistryInternals,
   type RealAccountRecord,
   type RealAccountRegistry,
@@ -16,9 +19,13 @@ import {
  * by registration and login-recovery).
  *
  *   verified -> provisioning_in_flight -> turnkey_created -> active (finalize only)
- *        ^               \-> blocked (ambiguous Turnkey discovery; manual review)
+ *        ^               |                    \-> blocked (identity conflict, at finalize)
  *        \_______________/  (only on a Turnkey-CONFIRMED definitive failure —
  *                             see externalOutcome below)
+ *
+ * "active" is finalize-only (S5 L2): transition() never moves an attempt to
+ * or from it, so an attempt is active exactly when finalize committed its
+ * account + passkey rows.
  *
  * "provisioning_in_flight" means "an external createSubOrganization call for
  * this credential has begun and we do not yet have a definitive result" —
@@ -37,19 +44,17 @@ import {
  *
  * The critical invariant this state machine enforces: once externalOutcome
  * becomes "unknown", nothing may call provisionTurnkeyChildAccount again for
- * this attempt automatically — not even after a later Turnkey discovery
- * lookup comes back with zero matches (Turnkey's credential-discovery API
- * carries no read-after-write consistency guarantee, so a zero-match result
- * is not proof the earlier call never landed). The only ways out of
- * "provisioning_in_flight" are: discovery finding exactly one match
- * (reconcile -> turnkey_created), discovery finding more than one match
- * (-> blocked, manual review), or a Turnkey-confirmed definitive failure
+ * this attempt automatically, and (S5 L2, Option 3) nothing adopts a Turnkey
+ * resource for it either: a sub-org that merely contains this credential
+ * proves neither that our request created it nor that no other authority
+ * exists in it. The only automatic exits from "provisioning_in_flight" are
+ * the in-process outcomes of the ONE dispatch: Turnkey's own successful
+ * response (-> turnkey_created) or a Turnkey-confirmed definitive failure
  * (-> back to "verified", externalOutcome "definitive_failure", safe to
- * attempt again because Turnkey itself proved nothing was created). A zero
- * discovery match on its own leaves the attempt exactly where it was —
- * unresolved, retried only by a later discovery re-check (bounded by how
- * often a client calls back in, never an automatic loop) or a manual/admin
- * decision, both deferred past Batch 2b.
+ * attempt again because Turnkey itself proved nothing was created). A lost
+ * response leaves it "provisioning_in_flight" / "unknown", reported as
+ * needing review, until a future operator-only resolver (which first needs
+ * exact dispatch evidence) exists.
  */
 export type RegistrationAttemptState = "verified" | "provisioning_in_flight" | "turnkey_created" | "active" | "blocked";
 
@@ -134,9 +139,10 @@ export interface RegistrationAttemptStore {
 
   /**
    * Concurrency-safe compare-and-swap: applies only if the attempt is
-   * currently in `from` state. Returns null (never throws) if another
-   * concurrent caller already moved it — the caller re-reads and decides
-   * rather than assuming its own view is still current.
+   * currently in `from` state. Returns null if another concurrent caller
+   * already moved it — the caller re-reads and decides rather than assuming
+   * its own view is still current. Throws (assertGenericTransition) for any
+   * transition to or from "active": that state is finalize-only.
    */
   transition(input: {
     credentialId: string;
@@ -161,8 +167,26 @@ export interface RegistrationAttemptStore {
     credentialId: string;
     registry: RealAccountRegistry;
     safeAddress: string;
+    /**
+     * S5 L2: the owner `safeAddress` was derived from. The CAS wins only if
+     * the LOCKED attempt's owner still equals it (addressesEqual semantics);
+     * otherwise nothing is written and the caller re-derives.
+     */
+    safeOwnerAddress: string;
     accountConfigVersion: number;
   }): Promise<{ account: RealAccountRecord; passkey: RealPasskeyRecord } | null>;
+}
+
+/**
+ * S5 L2: written to block_reason when finalize finds that another account
+ * already holds this attempt's sub-org, owner, or Safe (case-insensitively).
+ * The attempt moves turnkey_created -> blocked; no automatic recovery.
+ */
+export const REGISTRATION_IDENTITY_CONFLICT_REASON = "This account's Turnkey identity is already linked to another account; manual review is required.";
+
+/** S5 L2: "active" is finalize-only — a generic transition() to or from it is a programming error, never a CAS miss. */
+export function assertGenericTransition(from: RegistrationAttemptState, to: RegistrationAttemptState): void {
+  if (from === "active" || to === "active") throw new Error("Registration attempts enter and leave 'active' only through finalize().");
 }
 
 /**
@@ -193,8 +217,6 @@ export function accountMatchesAttempt(attempt: RegistrationAttempt, account: Rea
     passkey.role === "primary"
   );
 }
-
-const lowerOrNull = (value: string | null) => value?.toLowerCase() ?? null;
 
 export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptStore {
   const attempts = new Map<string, RegistrationAttempt>();
@@ -245,6 +267,7 @@ export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptSto
     },
 
     async transition({ credentialId, from, to, patch }) {
+      assertGenericTransition(from, to);
       const current = attempts.get(credentialId);
       if (!current || current.state !== from) return null;
       // Claimed synchronously — a concurrent caller reading right after this
@@ -261,7 +284,7 @@ export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptSto
       attempts.set(credentialId, { ...current, counter, updatedAt: new Date().toISOString() });
     },
 
-    async finalize({ credentialId, registry, safeAddress, accountConfigVersion }) {
+    async finalize({ credentialId, registry, safeAddress, safeOwnerAddress, accountConfigVersion }) {
       // Everything up to the claim is synchronous (no await), so no other
       // call can interleave between these checks and the claim — the
       // in-memory equivalent of the Neon adapter's row lock.
@@ -269,15 +292,16 @@ export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptSto
       if (!current || current.state !== "turnkey_created") return null;
       const { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress } = current;
       if (!subOrganizationId || !turnkeyUserId || !walletId || !walletAccountId || !ownerAddress) return null;
+      // The Safe was derived for a different owner than the one now locked in.
+      if (!addressesEqual(ownerAddress, safeOwnerAddress)) return null;
 
       const { accountsByAppUserId, passkeysByCredentialId } = getInMemoryRegistryInternals(registry);
       if (accountsByAppUserId.has(current.appUserId) || passkeysByCredentialId.has(current.credentialId)) return null;
+      const block = (from: RegistrationAttempt) =>
+        attempts.set(credentialId, { ...from, state: "blocked", blockReason: REGISTRATION_IDENTITY_CONFLICT_REASON, updatedAt: new Date().toISOString() });
       for (const other of accountsByAppUserId.values()) {
-        if (
-          lowerOrNull(other.subOrganizationId) === lowerOrNull(subOrganizationId) ||
-          lowerOrNull(other.ownerAddress) === lowerOrNull(ownerAddress) ||
-          lowerOrNull(other.safeAddress) === lowerOrNull(safeAddress)
-        ) {
+        if (accountIdentitiesConflict(other, { subOrganizationId, ownerAddress, safeAddress })) {
+          block(current);
           return null;
         }
       }
@@ -305,8 +329,7 @@ export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptSto
         // partial row. Both keys were proven absent before the claim, so a
         // row now present that carries this invocation's exact values is one
         // this invocation wrote; anything else belongs to another operation
-        // and is left alone. The attempt is restored only if it is still the
-        // exact object this invocation claimed.
+        // and is left alone.
         const writtenAccount = accountsByAppUserId.get(account.appUserId);
         if (
           writtenAccount &&
@@ -320,7 +343,21 @@ export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptSto
         if (writtenPasskey && writtenPasskey.appUserId === passkey.appUserId && writtenPasskey.credentialPublicKey === passkey.credentialPublicKey) {
           passkeysByCredentialId.delete(passkey.credentialId);
         }
-        if (attempts.get(credentialId) === claimed) attempts.set(credentialId, current);
+        // "active" is finalize-only and this invocation holds the claim, so
+        // an active attempt here is ours — even if updateCounter replaced the
+        // object meanwhile (its counter is kept).
+        const latest = attempts.get(credentialId);
+        if (latest?.state === "active") {
+          const restored: RegistrationAttempt =
+            latest === claimed ? current : { ...latest, state: current.state, safeAddress: current.safeAddress, accountConfigVersion: current.accountConfigVersion };
+          attempts.set(credentialId, restored);
+          // The registry's identity uniqueness (the Neon indexes' twin) is a
+          // positively known conflict, not a retryable failure.
+          if (error instanceof IdentityConflictError) {
+            block(restored);
+            return null;
+          }
+        }
         throw error;
       }
     },

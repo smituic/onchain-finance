@@ -148,8 +148,9 @@ export async function completeLogin(input: {
 
   // Possession proven independently of Turnkey. Persist the counter
   // durably even though the account isn't active yet, then resume the
-  // SAME onboarding pipeline registration.ts uses — discovery-first,
-  // never a blind second createSubOrganization call.
+  // SAME onboarding pipeline registration.ts uses — never a blind second
+  // createSubOrganization call, and an uncertain create is never adopted
+  // (S5 L2 Option 3: it reports needs-review).
   await input.attempts.updateCounter({ credentialId: attempt.credentialId, counter: verified.authenticationInfo.newCounter });
 
   return runProvisioningPipeline({

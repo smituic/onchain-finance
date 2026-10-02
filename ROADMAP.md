@@ -58,7 +58,7 @@ See ARCHITECTURE.md's "S5".
 
 **Next — Turnkey dashboard / account recovery / migration investigation.** Its first security tasks, before anything else in that workstream:
 - **Guarded onboarding finalize (L3) — done.** It is live-verified against Neon.
-- **Cross-account mapping hardening (L2) — still open.** This covers unique account↔sub-org/Safe mappings, a public-key check in discovery, and the WebAuthn response id equal to the attested credential id. Its unique indexes are not applied, and identity-conflict blocking is not implemented. Recovery work stays blocked until it is done.
+- **Cross-account mapping hardening (L2) — done.** It is live-verified against Neon, and its three case-insensitive unique indexes on `real_accounts` (sub-org, owner, Safe) are applied. In code: the WebAuthn response id is bound to the attested credential id; identity conflicts block the attempt; the Safe is bound to its owner; `active` is finalize-only; Turnkey key comparison is exact (case-sensitive); and **automatic adoption of an uncertain Turnkey create is disabled**. Credential/key discovery can't prove our request created a sub-org or that nobody else has authority in it, so such an attempt now stays "needs review". **Next prerequisite** for any operator Turnkey-create recovery: exact CREATE dispatch evidence (request body + activity id).
 
 See ARCHITECTURE.md's "S5".
 

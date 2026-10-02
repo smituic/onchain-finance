@@ -86,7 +86,8 @@ export class FakeTurnkey {
       authenticatorId: authenticatorId ?? `authenticator-${++this.seq}`,
       credentialId: toStdBase64(credentialIdBase64Url),
       authenticatorName: "x",
-      credential: { publicKey: `02${createHash("sha256").update(credentialIdBase64Url).digest("hex")}` },
+      // Live format: canonical unpadded base64url of the key bytes (a stand-in digest here).
+      credential: { publicKey: bytesToBase64Url(createHash("sha256").update(credentialIdBase64Url).digest()) },
     };
     this.users.get(this.userId)!.push(authenticator);
     return authenticator;

@@ -18,6 +18,9 @@ import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
 const SECRET = "4be1c0d27a9f3e8d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928170605";
 const SAFE_ADDRESS = "0xd9a4c22fb34dc74317edc8006140d66c8fa03266";
 const OWNER_ADDRESS = "0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF";
+// S5 L2: a second account never shares the first's sub-org/owner/Safe.
+const OWNER_ADDRESS_2 = "0x2222222222222222222222222222222222222201";
+const SAFE_ADDRESS_2 = "0x2222222222222222222222222222222222222202";
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 
 function stubEnv() {
@@ -56,7 +59,7 @@ async function seed() {
   const registry = createInMemoryRealAccountRegistry();
   for (const n of [1, 2]) {
     await registry.createAccountWithPasskey({
-      account: { appUserId: `app-user-${n}`, subOrganizationId: `sub-org-${n}`, turnkeyUserId: `turnkey-user-${n}`, walletId: `wallet-${n}`, walletAccountId: `wallet-account-${n}`, ownerAddress: OWNER_ADDRESS, safeAddress: SAFE_ADDRESS, accountConfigVersion: 1 },
+      account: { appUserId: `app-user-${n}`, subOrganizationId: `sub-org-${n}`, turnkeyUserId: `turnkey-user-${n}`, walletId: `wallet-${n}`, walletAccountId: `wallet-account-${n}`, ownerAddress: n === 1 ? OWNER_ADDRESS : OWNER_ADDRESS_2, safeAddress: n === 1 ? SAFE_ADDRESS : SAFE_ADDRESS_2, accountConfigVersion: 1 },
       passkey: { credentialId: `credential-${n}`, appUserId: `app-user-${n}`, credentialPublicKey: `cose-${n}`, userHandle: `handle-${n}`, counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false },
     });
   }
@@ -330,7 +333,7 @@ describe("cross-account identifiers: another account's resource answers exactly 
 
   it("payments: status and cancel on account 2's payment", async () => {
     const stores = await seed();
-    const reserved = await stores.payments.reserve({ appUserId: "app-user-2", safeAddress: SAFE_ADDRESS, recipient: "0x2222222222222222222222222222222222222222", amountBaseUnits: "10000", chainId: 84532, tokenAddress: TOKEN, authorizingCredentialId: "credential-2" });
+    const reserved = await stores.payments.reserve({ appUserId: "app-user-2", safeAddress: SAFE_ADDRESS_2, recipient: "0x2222222222222222222222222222222222222222", amountBaseUnits: "10000", chainId: 84532, tokenAddress: TOKEN, authorizingCredentialId: "credential-2" });
     if (!reserved.ok) throw new Error("expected a reservation");
     const foreignId = reserved.attempt.id;
     for (const kind of ["status", "cancel"] as const) {

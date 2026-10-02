@@ -14,8 +14,9 @@ async function seedAccount(registry: ReturnType<typeof createInMemoryRealAccount
       turnkeyUserId: `turnkey-user-${appUserId}`,
       walletId: `wallet-${appUserId}`,
       walletAccountId: `wallet-account-${appUserId}`,
-      ownerAddress: "0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF",
-      safeAddress: "0xd9a4c22fb34dc74317edc8006140d66c8fa03266",
+      // S5 L2: every seeded account has its own owner/Safe (unique identity).
+      ownerAddress: appUserId === "app-user-1" ? "0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF" : "0x2222222222222222222222222222222222222201",
+      safeAddress: appUserId === "app-user-1" ? "0xd9a4c22fb34dc74317edc8006140d66c8fa03266" : "0x2222222222222222222222222222222222222202",
       accountConfigVersion: 1,
     },
     passkey: {

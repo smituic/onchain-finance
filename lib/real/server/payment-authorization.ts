@@ -4,7 +4,7 @@ import { addressesEqual } from "../identifiers";
 import { serializeTurnkeyRawSignature } from "../signing/raw-signature";
 import type { RealServerConfig } from "./config";
 import type { RealAccountRecord, RealPasskeyRecord } from "./registry";
-import { listTurnkeyUserAuthenticators, matchAuthenticatorByCredentialId, normalizeTurnkeyPublicKey, readTurnkeyActivity, type TurnkeyUserAuthenticator } from "./turnkey-discovery";
+import { listTurnkeyUserAuthenticators, matchAuthenticatorByCredentialId, readTurnkeyActivity, strictCanonicalTurnkeyPublicKeyBytes, turnkeyPublicKeysEqual, type TurnkeyUserAuthenticator } from "./turnkey-discovery";
 import { COMPLETED_STATUS, TERMINAL_FAILURE_STATUSES } from "./turnkey-signed-request";
 
 /** The exact activity raw-sign.ts creates for every payment signature. */
@@ -156,13 +156,16 @@ export async function verifyPaymentAuthorization(input: {
     else if (match.outcome !== "found") incomplete = true;
     else {
       if (passkey.turnkeyAuthenticatorId !== null && match.authenticator.authenticatorId !== passkey.turnkeyAuthenticatorId) reject("bound passkey's Turnkey authenticator mapping disagrees");
-      // listTurnkeyUserAuthenticators reports an absent credential.publicKey as "".
-      const expectedKey = normalizeTurnkeyPublicKey(match.authenticator.publicKey);
+      // listTurnkeyUserAuthenticators reports an absent credential.publicKey
+      // as "". Keys compare as exact bytes of strictly canonical base64url
+      // (turnkeyPublicKeysEqual) — never trimmed or case-folded.
+      const expectedKey = match.authenticator.publicKey;
       if (expectedKey === "") incomplete = true;
+      else if (!strictCanonicalTurnkeyPublicKeyBytes(expectedKey)) reject("bound passkey's Turnkey public key is malformed");
       else {
-        const shared = authenticators!.some((other) => !credentialIdsEqual(other.credentialId, passkey.credentialId) && normalizeTurnkeyPublicKey(other.publicKey) === expectedKey);
+        const shared = authenticators!.some((other) => !credentialIdsEqual(other.credentialId, passkey.credentialId) && turnkeyPublicKeysEqual(other.publicKey, expectedKey));
         if (shared) reject("bound passkey's public key is shared with another authenticator");
-        if (voteKey !== undefined && normalizeTurnkeyPublicKey(voteKey) !== expectedKey) reject("approved by a different passkey");
+        if (voteKey !== undefined && !turnkeyPublicKeysEqual(voteKey, expectedKey)) reject("approved by a different passkey");
       }
     }
   }
