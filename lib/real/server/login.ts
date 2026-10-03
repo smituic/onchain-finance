@@ -8,7 +8,7 @@ import type { RegistrationAttemptStore } from "./registration-attempts";
 import type { RealServerConfig } from "./config";
 import { buildLoginOptions, verifyLogin } from "./webauthn";
 import { createSessionPayload, serializeSession } from "./session";
-import { runProvisioningPipeline, type OnboardingOutcome } from "./onboarding";
+import { runProvisioningPipeline, type OnboardingOutcome, type ProvisioningDeps } from "./onboarding";
 
 const LOGIN_CHALLENGE_TTL_MS = 1000 * 60 * 5;
 
@@ -56,6 +56,7 @@ export async function completeLogin(input: {
   attempts: RegistrationAttemptStore;
   response: AuthenticationResponseJSON;
   publicClient?: SafeAccountPublicClient;
+  provisioningDeps?: ProvisioningDeps;
 }): Promise<CompleteLoginResult> {
   let clientData: ReturnType<typeof decodeClientDataJSON>;
   try {
@@ -159,5 +160,6 @@ export async function completeLogin(input: {
     attempts: input.attempts,
     attempt: { ...attempt, counter: verified.authenticationInfo.newCounter },
     publicClient: input.publicClient,
+    provisioningDeps: input.provisioningDeps,
   });
 }

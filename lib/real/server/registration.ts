@@ -9,7 +9,7 @@ import { DuplicateAccountError, DuplicateCredentialError, type RealAccountRegist
 import type { RegistrationAttemptStore } from "./registration-attempts";
 import type { RealServerConfig } from "./config";
 import { buildRegistrationOptions, verifyRegistration } from "./webauthn";
-import { runProvisioningPipeline, type OnboardingOutcome } from "./onboarding";
+import { runProvisioningPipeline, type OnboardingOutcome, type ProvisioningDeps } from "./onboarding";
 
 const REGISTRATION_CHALLENGE_TTL_MS = 1000 * 60 * 5;
 
@@ -71,6 +71,7 @@ export async function completeRegistration(input: {
   attempts: RegistrationAttemptStore;
   response: RegistrationResponseJSON;
   publicClient?: SafeAccountPublicClient;
+  provisioningDeps?: ProvisioningDeps;
 }): Promise<CompleteRegistrationResult> {
   let clientData: ReturnType<typeof decodeClientDataJSON>;
   try {
@@ -144,5 +145,6 @@ export async function completeRegistration(input: {
     attempts: input.attempts,
     attempt,
     publicClient: input.publicClient,
+    provisioningDeps: input.provisioningDeps,
   });
 }

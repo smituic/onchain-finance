@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { createPublicClient, custom, encodeAbiParameters, type Hex } from "viem";
 import { baseSepolia } from "viem/chains";
 import type { RegistrationResponseJSON } from "@simplewebauthn/server";
@@ -10,27 +10,19 @@ import { createInMemoryRegistrationAttemptStore } from "@/lib/real/server/regist
 import { buildRegistrationResponseJSON, createFixtureAuthenticator } from "./fixtures/webauthn";
 import { toStdBase64 } from "./fixtures/turnkey-fake";
 
-const createSubOrganizationMock = vi.fn();
-const getWalletAccountsMock = vi.fn();
-const getSubOrgIdsMock = vi.fn();
-const getUsersMock = vi.fn();
+import { FakeParentTurnkey } from "./fixtures/turnkey-parent-fake";
+import { beginRegistration, completeRegistration as completeRegistrationWithDeps } from "@/lib/real/server/registration";
 
-vi.mock("@turnkey/http", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@turnkey/http")>();
-  return {
-    ...actual,
-    TurnkeyClient: vi.fn().mockImplementation(function TurnkeyClientMock() {
-      return {
-        createSubOrganization: createSubOrganizationMock,
-        getWalletAccounts: getWalletAccountsMock,
-        getSubOrgIds: getSubOrgIdsMock,
-        getUsers: getUsersMock,
-      };
-    }),
-  };
+/** The parent-org side of Turnkey for this test (raw, parent-stamped POSTs) — fresh per test, nothing leaves the process. */
+let turnkey = new FakeParentTurnkey();
+beforeEach(() => {
+  turnkey = new FakeParentTurnkey();
 });
 
-const { beginRegistration, completeRegistration } = await import("@/lib/real/server/registration");
+/** completeRegistration with this test's fake Turnkey transport injected. */
+function completeRegistration(input: Omit<Parameters<typeof completeRegistrationWithDeps>[0], "provisioningDeps">) {
+  return completeRegistrationWithDeps({ ...input, provisioningDeps: turnkey.deps() });
+}
 
 const ORIGIN = "http://localhost:3000";
 const config: RealServerConfig = {
@@ -61,21 +53,8 @@ function buildPublicClient() {
   });
 }
 
-function completedActivity(result: unknown) {
-  return { activity: { id: "activity-1", status: "ACTIVITY_STATUS_COMPLETED", result } };
-}
-
-function mockSuccessfulProvisioning(ownerAddress = "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF") {
-  createSubOrganizationMock.mockResolvedValue(
-    completedActivity({
-      createSubOrganizationResultV8: {
-        subOrganizationId: "sub-org-1",
-        rootUserIds: ["turnkey-user-1"],
-        wallet: { walletId: "wallet-1", addresses: [ownerAddress] },
-      },
-    }),
-  );
-  getWalletAccountsMock.mockResolvedValue({ accounts: [{ address: ownerAddress, walletAccountId: "wallet-account-1" }] });
+function mockSuccessfulProvisioning() {
+  turnkey.submitMode = "completed";
 }
 
 function newStores() {
@@ -87,13 +66,6 @@ function newStores() {
 }
 
 describe("registration flow: beginRegistration -> completeRegistration", () => {
-  afterEach(() => {
-    createSubOrganizationMock.mockReset();
-    getWalletAccountsMock.mockReset();
-    getSubOrgIdsMock.mockReset();
-    getUsersMock.mockReset();
-  });
-
   it("completes end to end: independently verifies WebAuthn, provisions Turnkey from the SAME credential, activates the account", async () => {
     mockSuccessfulProvisioning();
     const { challengeStore, registry, attempts } = newStores();
@@ -118,7 +90,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     const attempt = await attempts.findByCredentialId(authenticator.credentialIdBase64Url);
     expect(attempt?.state).toBe("active");
 
-    const call = createSubOrganizationMock.mock.calls[0]![0] as {
+    const call = JSON.parse(turnkey.createRequests[0]!.body) as {
       parameters: { rootUsers: Array<{ authenticators: Array<{ attestation: { credentialId: string } }> }> };
     };
     expect(call.parameters.rootUsers[0]!.authenticators[0]!.attestation.credentialId).toBe(authenticator.credentialIdBase64Url);
@@ -137,7 +109,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     const result = await completeRegistration({ config, challengeStore, registry, attempts, response: malformed });
 
     expect(result.outcome).toBe("rejected");
-    expect(createSubOrganizationMock).not.toHaveBeenCalled();
+    expect(turnkey.requests).toHaveLength(0);
   });
 
   it("rejects an unknown challenge without calling Turnkey", async () => {
@@ -148,7 +120,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     const result = await completeRegistration({ config, challengeStore, registry, attempts, response });
 
     expect(result.outcome).toBe("rejected");
-    expect(createSubOrganizationMock).not.toHaveBeenCalled();
+    expect(turnkey.requests).toHaveLength(0);
   });
 
   it("a challenge cannot be replayed — the second completeRegistration for the same response is rejected and never re-provisions", async () => {
@@ -163,7 +135,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
 
     const second = await completeRegistration({ config, challengeStore, registry, attempts, response, publicClient: buildPublicClient() });
     expect(second.outcome).toBe("rejected");
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkey.createRequests).toHaveLength(1);
   });
 
   it("rejects a response signed for the wrong origin, without calling Turnkey", async () => {
@@ -175,7 +147,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     const result = await completeRegistration({ config, challengeStore, registry, attempts, response });
 
     expect(result.outcome).toBe("rejected");
-    expect(createSubOrganizationMock).not.toHaveBeenCalled();
+    expect(turnkey.requests).toHaveLength(0);
   });
 
   it("rejects a response computed for the wrong RP ID, without calling Turnkey", async () => {
@@ -187,7 +159,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     const result = await completeRegistration({ config, challengeStore, registry, attempts, response });
 
     expect(result.outcome).toBe("rejected");
-    expect(createSubOrganizationMock).not.toHaveBeenCalled();
+    expect(turnkey.requests).toHaveLength(0);
   });
 
   it("rejects when user verification was not performed, without calling Turnkey", async () => {
@@ -205,7 +177,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     const result = await completeRegistration({ config, challengeStore, registry, attempts, response });
 
     expect(result.outcome).toBe("rejected");
-    expect(createSubOrganizationMock).not.toHaveBeenCalled();
+    expect(turnkey.requests).toHaveLength(0);
   });
 
   it("rejects a duplicate credential registration and does not provision Turnkey a second time for it", async () => {
@@ -224,11 +196,11 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     const secondResult = await completeRegistration({ config, challengeStore, registry, attempts, response: secondResponse, publicClient: buildPublicClient() });
 
     expect(secondResult.outcome).toBe("rejected");
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkey.createRequests).toHaveLength(1);
   });
 
   it("a lost/uncertain Turnkey response durably leaves the attempt 'provisioning_in_flight' with externalOutcome 'unknown' (pending, not rejected-forever) and creates no active account", async () => {
-    createSubOrganizationMock.mockRejectedValue(new Error("Turnkey unreachable"));
+    turnkey.submitMode = "network_error_before_apply";
     const { challengeStore, registry, attempts } = newStores();
     const authenticator = createFixtureAuthenticator();
     const { optionsJSON } = await beginRegistration({ config, challengeStore });
@@ -248,7 +220,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
   });
 
   it("a Turnkey-CONFIRMED definitive pre-creation failure (activity resolved FAILED/REJECTED) reverts the attempt to 'verified' so a later call may retry — the one narrow condition under which a second create is ever allowed", async () => {
-    createSubOrganizationMock.mockResolvedValueOnce({ activity: { id: "activity-1", type: "ACTIVITY_TYPE_CREATE_SUB_ORGANIZATION_V8", status: "ACTIVITY_STATUS_REJECTED" } });
+    turnkey.submitQueue.push("rejected");
     const { challengeStore, registry, attempts } = newStores();
     const authenticator = createFixtureAuthenticator();
     const { optionsJSON } = await beginRegistration({ config, challengeStore });
@@ -260,7 +232,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     const attemptAfterFailure = await attempts.findByCredentialId(authenticator.credentialIdBase64Url);
     expect(attemptAfterFailure?.state).toBe("verified");
     expect(attemptAfterFailure?.externalOutcome).toBe("definitive_failure");
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkey.createRequests).toHaveLength(1);
 
     // A later resumed pipeline run (e.g. via login recovery) is now free to
     // attempt provisioning again — this time it succeeds.
@@ -272,10 +244,11 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
       attempts,
       attempt: attemptAfterFailure!,
       publicClient: buildPublicClient(),
+      provisioningDeps: turnkey.deps(),
     });
 
     expect(retryResult.outcome).toBe("verified");
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(2);
+    expect(turnkey.createRequests).toHaveLength(2);
     expect((await attempts.findByCredentialId(authenticator.credentialIdBase64Url))?.state).toBe("active");
   });
 
@@ -302,7 +275,7 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
     const attempt = await attempts.findByCredentialId(authenticator.credentialIdBase64Url);
     expect(attempt?.state).toBe("active");
     expect(await registry.findAccountByAppUserId(attempt!.appUserId)).not.toBeNull();
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkey.createRequests).toHaveLength(1);
   });
 
   it("issued session contains no Turnkey/signing-shaped data — app identity only", async () => {
@@ -321,11 +294,6 @@ describe("registration flow: beginRegistration -> completeRegistration", () => {
 });
 
 describe("S5 L2: the registration credential id is the ATTESTED one, bound to response.id by bytes", () => {
-  afterEach(() => {
-    createSubOrganizationMock.mockReset();
-    getWalletAccountsMock.mockReset();
-  });
-
   /** A genuine response whose client-supplied id/rawId are replaced (the library only requires id === rawId). */
   async function respond(stores: ReturnType<typeof newStores>, authenticator = createFixtureAuthenticator(), id?: string) {
     const { optionsJSON } = await beginRegistration({ config, challengeStore: stores.challengeStore });
@@ -346,7 +314,7 @@ describe("S5 L2: the registration credential id is the ATTESTED one, bound to re
     expect(await stores.attempts.findByCredentialId(authenticator.credentialIdBase64Url)).toBeNull();
     expect(await stores.attempts.findByCredentialId(otherId)).toBeNull();
     expect(await stores.registry.findPasskeyByCredentialId(authenticator.credentialIdBase64Url)).toBeNull();
-    expect(createSubOrganizationMock).not.toHaveBeenCalled();
+    expect(turnkey.requests).toHaveLength(0);
   });
 
   it("response.id as another encoding of the SAME bytes (padded standard base64) is accepted; the durable id and Turnkey's are the canonical attested one", async () => {
@@ -361,7 +329,7 @@ describe("S5 L2: the registration credential id is the ATTESTED one, bound to re
     expect(result.outcome).toBe("verified");
     expect((await stores.attempts.findByCredentialId(authenticator.credentialIdBase64Url))?.state).toBe("active");
     expect(await stores.attempts.findByCredentialId(response.id)).toBeNull();
-    const call = createSubOrganizationMock.mock.calls[0]![0] as { parameters: { rootUsers: Array<{ authenticators: Array<{ attestation: { credentialId: string } }> }> } };
+    const call = JSON.parse(turnkey.createRequests[0]!.body) as { parameters: { rootUsers: Array<{ authenticators: Array<{ attestation: { credentialId: string } }> }> } };
     expect(call.parameters.rootUsers[0]!.authenticators[0]!.attestation.credentialId).toBe(authenticator.credentialIdBase64Url);
   });
 
@@ -375,7 +343,7 @@ describe("S5 L2: the registration credential id is the ATTESTED one, bound to re
     const result = await completeRegistration({ ...stores, config, response, publicClient: buildPublicClient() });
 
     expect(result).toEqual({ outcome: "rejected", reason: 'This passkey is already registered. Use "I already have an account" instead.' });
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkey.createRequests).toHaveLength(1);
   });
 
   it("an attested id that already belongs to a BACKUP passkey (any status) is rejected before Turnkey, with no attempt created", async () => {
@@ -398,11 +366,11 @@ describe("S5 L2: the registration credential id is the ATTESTED one, bound to re
 
     expect(result).toEqual({ outcome: "rejected", reason: 'This passkey is already registered. Use "I already have an account" instead.' });
     expect(await stores.attempts.findByCredentialId(backup.credentialIdBase64Url)).toBeNull();
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkey.createRequests).toHaveLength(1);
   });
 
   it("a pending attempt is found by the ATTESTED id, not the raw response.id spelling", async () => {
-    createSubOrganizationMock.mockRejectedValue(new Error("Turnkey unreachable"));
+    turnkey.submitMode = "network_error_before_apply";
     const stores = newStores();
     const authenticator = createFixtureAuthenticator();
     expect((await completeRegistration({ ...stores, config, response: (await respond(stores, authenticator)).response, publicClient: buildPublicClient() })).outcome).toBe("pending");
@@ -411,6 +379,6 @@ describe("S5 L2: the registration credential id is the ATTESTED one, bound to re
     const result = await completeRegistration({ ...stores, config, response, publicClient: buildPublicClient() });
 
     expect(result).toEqual({ outcome: "rejected", reason: 'A registration is already pending for this passkey. Use "I already have an account" to resume it.' });
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkey.createRequests).toHaveLength(1);
   });
 });

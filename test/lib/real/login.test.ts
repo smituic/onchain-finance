@@ -1,16 +1,16 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPublicClient, custom, encodeAbiParameters, type Hex } from "viem";
 import { baseSepolia } from "viem/chains";
 import type { RealServerConfig } from "@/lib/real/server/config";
 import { createInMemoryChallengeStore } from "@/lib/real/server/challenge-store";
 import { createInMemoryRealAccountRegistry, type RealAccountRegistry } from "@/lib/real/server/registry";
-import { createInMemoryRegistrationAttemptStore, type RegistrationAttempt, type RegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
+import { REGISTRATION_IDENTITY_CONFLICT_REASON, createInMemoryRegistrationAttemptStore, type RegistrationAttempt, type RegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
 import { parseSession } from "@/lib/real/server/session";
 import { readAuthenticatedRealAccount } from "@/lib/real/server/auth";
 import { bytesToBase64Url } from "@/lib/real/bytes";
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
+import { FakeParentTurnkey } from "./fixtures/turnkey-parent-fake";
 
-const createSubOrganizationMock = vi.fn();
 const getWalletAccountsMock = vi.fn();
 const getSubOrgIdsMock = vi.fn();
 const getUsersMock = vi.fn();
@@ -21,7 +21,6 @@ vi.mock("@turnkey/http", async (importOriginal) => {
     ...actual,
     TurnkeyClient: vi.fn().mockImplementation(function TurnkeyClientMock() {
       return {
-        createSubOrganization: createSubOrganizationMock,
         getWalletAccounts: getWalletAccountsMock,
         getSubOrgIds: getSubOrgIdsMock,
         getUsers: getUsersMock,
@@ -397,32 +396,38 @@ describe("S4: login and the account session epoch", () => {
 });
 
 describe("S5 L2 (Option 3): an uncertain Turnkey create is never adopted — login on it reports needs-review", () => {
+  /** The parent-org side of Turnkey as the provisioning path reaches it (raw, parent-stamped POSTs). */
+  let turnkey = new FakeParentTurnkey();
+  beforeEach(() => {
+    turnkey = new FakeParentTurnkey();
+  });
   afterEach(() => {
-    createSubOrganizationMock.mockReset();
     getWalletAccountsMock.mockReset();
     getSubOrgIdsMock.mockReset();
     getUsersMock.mockReset();
   });
 
   const ownerAddress = "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF";
-  const turnkeyReads = () => getSubOrgIdsMock.mock.calls.length + getUsersMock.mock.calls.length + getWalletAccountsMock.mock.calls.length;
+  /** Every Turnkey read of any kind: SDK-client reads AND raw parent requests other than the one create (get_activity, list_wallet_accounts). */
+  const turnkeyReads = () =>
+    getSubOrgIdsMock.mock.calls.length + getUsersMock.mock.calls.length + getWalletAccountsMock.mock.calls.length + (turnkey.requests.length - turnkey.createRequests.length);
 
   /** The exact crash window: verified + durably pre-committed, then the ONE create's response is lost. */
   async function stuckAttempt() {
-    createSubOrganizationMock.mockRejectedValue(new Error("Turnkey unreachable"));
+    turnkey.submitMode = "network_error_before_apply";
     const registry = createInMemoryRealAccountRegistry();
     const challengeStore = createInMemoryChallengeStore();
     const attempts = newAttempts();
     const authenticator = createFixtureAuthenticator();
     const { optionsJSON } = await beginRegistration({ config, challengeStore });
-    const registered = await completeRegistration({ config, challengeStore, registry, attempts, response: buildRegistrationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId }) });
+    const registered = await completeRegistration({ config, challengeStore, registry, attempts, provisioningDeps: turnkey.deps(), response: buildRegistrationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId }) });
     expect(registered).toEqual({ outcome: "pending", reason: PROVISIONING_NEEDS_REVIEW_REASON });
     const attempt = (await attempts.findByCredentialId(authenticator.credentialIdBase64Url))!;
     expect(attempt).toMatchObject({ state: "provisioning_in_flight", externalOutcome: "unknown" });
     const login = async () => {
       const { optionsJSON: loginOptions } = await beginLogin({ config, challengeStore });
       const response = buildAuthenticationResponseJSON({ authenticator, challenge: loginOptions.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: attempt.userHandle });
-      return completeLogin({ config, challengeStore, registry, attempts, response, publicClient: buildPublicClient() });
+      return completeLogin({ config, challengeStore, registry, attempts, response, publicClient: buildPublicClient(), provisioningDeps: turnkey.deps() });
     };
     return { registry, attempts, authenticator, attempt, login };
   }
@@ -449,7 +454,7 @@ describe("S5 L2 (Option 3): an uncertain Turnkey create is never adopted — log
     expect("sessionCookie" in result).toBe(false);
     expect(turnkeyReads()).toBe(0);
     expect(vi.mocked(TurnkeyClient).mock.calls.length).toBe(clientsBefore); // no Turnkey client was even built
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkey.createRequests).toHaveLength(1);
     await expectUntouched(w);
   });
 
@@ -466,19 +471,37 @@ describe("S5 L2 (Option 3): an uncertain Turnkey create is never adopted — log
   it("repeated logins never dispatch another create, never read Turnkey, and never move the attempt", async () => {
     const w = await stuckAttempt();
     for (let i = 0; i < 3; i += 1) expect((await w.login()).outcome).toBe("pending");
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
+    expect(turnkey.createRequests).toHaveLength(1);
     expect(turnkeyReads()).toBe(0);
     await expectUntouched(w);
   });
 
   it("a blocked registration stays blocked on login — no Turnkey call, no session", async () => {
-    const w = await stuckAttempt();
-    await w.attempts.transition({ credentialId: w.attempt.credentialId, from: "provisioning_in_flight", to: "blocked", patch: { blockReason: "operator review" } });
+    // "provisioning_in_flight" is claim-only, so a block comes the real way: the
+    // create completes, and finalize finds another account already holding that
+    // sub-organization (S5 L2) and blocks the attempt.
+    turnkey.submitMode = "completed";
+    const registry = createInMemoryRealAccountRegistry();
+    await registry.createAccountWithPasskey({
+      account: { appUserId: "other-user", subOrganizationId: "sub-org-1", turnkeyUserId: "other-turnkey-user", walletId: "other-wallet", walletAccountId: "other-wallet-account", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222", accountConfigVersion: 1 },
+      passkey: { credentialId: "other-credential", appUserId: "other-user", credentialPublicKey: "other-cose", userHandle: "other-handle", counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false },
+    });
+    const challengeStore = createInMemoryChallengeStore();
+    const attempts = newAttempts();
+    const authenticator = createFixtureAuthenticator();
+    const { optionsJSON } = await beginRegistration({ config, challengeStore });
+    const registered = await completeRegistration({ config, challengeStore, registry, attempts, provisioningDeps: turnkey.deps(), publicClient: buildPublicClient(), response: buildRegistrationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId }) });
+    expect(registered).toEqual({ outcome: "blocked", reason: REGISTRATION_IDENTITY_CONFLICT_REASON });
+    const attempt = (await attempts.findByCredentialId(authenticator.credentialIdBase64Url))!;
+    const requestsBefore = turnkey.requests.length;
 
-    expect(await w.login()).toEqual({ outcome: "blocked", reason: "operator review" });
-    expect(turnkeyReads()).toBe(0);
-    expect(createSubOrganizationMock).toHaveBeenCalledTimes(1);
-    expect(await w.registry.findAccountByAppUserId(w.attempt.appUserId)).toBeNull();
+    const { optionsJSON: loginOptions } = await beginLogin({ config, challengeStore });
+    const response = buildAuthenticationResponseJSON({ authenticator, challenge: loginOptions.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: attempt.userHandle });
+    expect(await completeLogin({ config, challengeStore, registry, attempts, response, publicClient: buildPublicClient(), provisioningDeps: turnkey.deps() })).toEqual({ outcome: "blocked", reason: REGISTRATION_IDENTITY_CONFLICT_REASON });
+    expect(turnkey.requests).toHaveLength(requestsBefore);
+    expect(turnkeyReads() - (requestsBefore - turnkey.createRequests.length)).toBe(0); // nothing beyond the registration's own reads
+    expect(turnkey.createRequests).toHaveLength(1);
+    expect(await registry.findAccountByAppUserId(attempt.appUserId)).toBeNull();
   });
 });
 

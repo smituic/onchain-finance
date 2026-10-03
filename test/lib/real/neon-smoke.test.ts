@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 /**
  * Deterministic, per-fixture account identity derived from a run-specific
@@ -58,6 +58,26 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   const cleanupCredentialIds = new Set<string>();
   const cleanupAppUserIds = new Set<string>();
   const cleanupChallenges = new Set<string>();
+
+  /**
+   * A 'verified' SMOKE attempt moved straight to turnkey_created, as fixture setup. Production can reach
+   * that state only through the evidence-bound exit from "provisioning_in_flight" (claim-only); this
+   * suite's L3/finalize cases need the post-create state without assuming that migration is applied.
+   */
+  async function seedTurnkeyCreatedRow(credId: string, identity: { subOrganizationId: string; turnkeyUserId: string; walletId: string; walletAccountId: string; ownerAddress: string }) {
+    if (!credId.startsWith(`smoke-${runId}-`)) throw new Error("refusing to seed a non-smoke row");
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    const rows = (await createNeonSqlClient(databaseUrl!)`
+      UPDATE registration_attempts
+      SET state = 'turnkey_created', external_outcome = 'confirmed_created', sub_organization_id = ${identity.subOrganizationId},
+          turnkey_user_id = ${identity.turnkeyUserId}, wallet_id = ${identity.walletId}, wallet_account_id = ${identity.walletAccountId},
+          owner_address = ${identity.ownerAddress}, updated_at = now()
+      WHERE credential_id = ${credId} AND state = 'verified'
+      RETURNING state
+    `) as { state: string }[];
+    if (rows.length !== 1) throw new Error("seed: smoke attempt was not 'verified'");
+    return rows[0];
+  }
 
   afterAll(async () => {
     if (!databaseUrl) return;
@@ -194,24 +214,14 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
     // A CAS transition from the WRONG state must be rejected (null), never
     // silently applied. (S5 L2: and "active" is finalize-only — a generic
     // transition to it throws before any SQL is sent.)
-    expect(await stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "provisioning_in_flight" })).toBeNull();
+    expect(await stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "blocked" })).toBeNull();
     await expect(stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "active" })).rejects.toThrow(/only through finalize/);
+    // Provisioning Evidence Capture: "provisioning_in_flight" is claim-only — the generic API refuses it before any SQL.
+    await expect(stores.attempts.transition({ credentialId: credId, from: "verified", to: "provisioning_in_flight" })).rejects.toThrow(/only through beginProvisioningDispatch/);
 
-    const inFlight = await stores.attempts.transition({
-      credentialId: credId,
-      from: "verified",
-      to: "provisioning_in_flight",
-      patch: { externalOutcome: "unknown", externalProvisioningAttemptedAt: new Date().toISOString() },
-    });
-    expect(inFlight?.state).toBe("provisioning_in_flight");
-    expect(inFlight?.externalOutcome).toBe("unknown");
-
-    const created2 = await stores.attempts.transition({
-      credentialId: credId,
-      from: "provisioning_in_flight",
-      to: "turnkey_created",
-      patch: { ...turnkeyPatch(userId), externalOutcome: "confirmed_created" },
-    });
+    // Reaching turnkey_created now takes the dispatch-evidence path, which this suite does not assume is
+    // migrated; seed THIS smoke row's post-create state directly instead.
+    const created2 = await seedTurnkeyCreatedRow(credId, turnkeyPatch(userId));
     expect(created2?.state).toBe("turnkey_created");
 
     const finalized = await stores.attempts.finalize({
@@ -265,10 +275,9 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
       rawClientDataJson: "smoke-client-data",
       rawAttestationObject: "smoke-attestation-object",
     });
-    await stores.attempts.transition({ credentialId: credId, from: "verified", to: "provisioning_in_flight", patch: { externalOutcome: "unknown" } });
     const identity = identityOf(userId);
     const { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress } = identity;
-    await stores.attempts.transition({ credentialId: credId, from: "provisioning_in_flight", to: "turnkey_created", patch: { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress, externalOutcome: "confirmed_created" } });
+    await seedTurnkeyCreatedRow(credId, { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress });
     const finalizeInput = { credentialId: credId, registry: stores.registry, safeAddress: identity.safeAddress, safeOwnerAddress: identity.ownerAddress, accountConfigVersion: 1 };
     const counts = async () => {
       const [row] = (await sql`
@@ -282,11 +291,11 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
   it("S5 L3: a LOST CAS writes nothing even when the account/passkey ids are free (attempt moved off turnkey_created with every field still set)", async () => {
     const { stores, credId, finalizeInput, counts } = await seedTurnkeyCreated("l3-lost-cas");
-    expect(await stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "provisioning_in_flight" })).not.toBeNull();
+    expect(await stores.attempts.transition({ credentialId: credId, from: "turnkey_created", to: "verified" })).not.toBeNull();
 
     expect(await stores.attempts.finalize(finalizeInput)).toBeNull();
     expect(await counts()).toEqual({ accounts: 0, passkeys: 0 });
-    expect((await stores.attempts.findByCredentialId(credId))?.state).toBe("provisioning_in_flight");
+    expect((await stores.attempts.findByCredentialId(credId))?.state).toBe("verified");
   });
 
   it("S5 L3: a blocked attempt finalizes to null with no rows", async () => {
@@ -1510,5 +1519,277 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Slice S3
       expect(retried.ok).toBe(true);
       expect(after).toMatchObject({ target: "revoking", enrollment: "removal_in_progress", rows: 0 });
     }
+  });
+});
+
+/**
+ * Provisioning Evidence Capture — the Neon adapter's dispatch-evidence
+ * operations against real Postgres. NEEDS schema.sql's "Provisioning Evidence
+ * Capture" block applied to the target database (it is hand-applied, and was
+ * NOT applied when this suite was written), so it has its own explicit
+ * opt-in on top of DATABASE_URL:
+ *
+ *   REAL_SMOKE_PROVISIONING_DISPATCH=1 DATABASE_URL="postgres://..." pnpm test:neon-smoke
+ *
+ * What only a real database can prove: the claim and the evidence INSERT
+ * commit or roll back TOGETHER, real concurrent HTTP requests yield exactly
+ * one dispatch, the constraints fire, the body round-trips byte for byte,
+ * and the write-once guards hold under a race. Everything it writes carries
+ * the `smoke` prefix and is deleted in afterAll (dispatch rows first — they
+ * reference the attempt).
+ */
+describe.skipIf(!process.env.DATABASE_URL || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1")("Neon adapter smoke test — Provisioning Evidence Capture (live database)", () => {
+  const databaseUrl = process.env.DATABASE_URL;
+  const runId = randomUUID().slice(0, 8);
+  const cleanupCredentialIds = new Set<string>();
+  const sha = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
+  const IMMUTABLE = ["id", "credential_id", "dispatch_seq", "evidence_version", "organization_id", "stamp_public_key", "request_timestamp_ms", "request_body", "request_body_sha256", "created_at"];
+
+  const sqlFn = async () => {
+    const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
+    return createNeonSqlClient(databaseUrl!);
+  };
+  const storeFn = async () => {
+    const { createNeonRegistrationAttemptStore } = await import("@/lib/real/server/neon-store");
+    return createNeonRegistrationAttemptStore(await sqlFn());
+  };
+
+  /** Set only by the preflight below; nothing in this block writes unless it is true. */
+  let prerequisitesMet = false;
+
+  // PREFLIGHT — read-only, and BEFORE the first write of any kind: the table
+  // must exist in the database this suite targets. If it doesn't, the whole
+  // block refuses here, so no fixture attempt is ever inserted that cleanup
+  // would then have to remove through a missing table.
+  beforeAll(async () => {
+    const rows = (await (await sqlFn())`SELECT to_regclass('registration_provisioning_dispatches')::text AS t`) as { t: string | null }[];
+    if (rows[0]?.t !== "registration_provisioning_dispatches") {
+      throw new Error("Provisioning dispatch smoke refused: registration_provisioning_dispatches does not exist in this database (apply schema.sql's Provisioning Evidence Capture block first). Nothing was written.");
+    }
+    prerequisitesMet = true;
+  });
+
+  // Cleanup touches ONLY this run's smoke-prefixed fixtures. Each delete is
+  // attempted independently, so a failure removing dispatch rows never skips
+  // the attempt rows (and vice versa); every failure is reported at the end.
+  afterAll(async () => {
+    if (!databaseUrl || cleanupCredentialIds.size === 0) return;
+    const sql = await sqlFn();
+    const failures: string[] = [];
+    for (const id of cleanupCredentialIds) {
+      if (!id.startsWith(`smoke-${runId}-pd-`)) throw new Error("refusing to clean up a non-smoke id");
+      try {
+        await sql`DELETE FROM registration_provisioning_dispatches WHERE credential_id = ${id}`;
+      } catch (error) {
+        failures.push(`dispatch rows for a fixture: ${(error as Error).message.slice(0, 120)}`);
+      }
+      try {
+        await sql`DELETE FROM registration_attempts WHERE credential_id = ${id}`;
+      } catch (error) {
+        failures.push(`attempt row for a fixture: ${(error as Error).message.slice(0, 120)}`);
+      }
+    }
+    expect(failures).toEqual([]);
+    const residue = (await sql`SELECT count(*)::int AS n FROM registration_attempts WHERE credential_id LIKE ${`smoke-${runId}-pd-%`}`) as { n: number }[];
+    expect(residue[0]?.n).toBe(0);
+  });
+
+  /** A fresh 'verified' attempt with a run-unique, smoke-only id. Refuses unless the preflight passed. */
+  async function verifiedAttempt(suffix: string) {
+    if (!prerequisitesMet) throw new Error("Provisioning dispatch smoke: preflight did not pass; refusing to write.");
+    const store = await storeFn();
+    const credentialId = `smoke-${runId}-pd-${suffix}`;
+    cleanupCredentialIds.add(credentialId);
+    await store.createVerified({
+      credentialId,
+      appUserId: `smoke-${runId}-pd-user-${suffix}`,
+      userHandle: "smoke-user-handle",
+      credentialPublicKey: "smoke-public-key",
+      counter: 0,
+      transports: ["internal"],
+      credentialDeviceType: "singleDevice",
+      credentialBackedUp: false,
+      registrationChallenge: "smoke-registration-challenge",
+      rawClientDataJson: "smoke-client-data",
+      rawAttestationObject: "smoke-attestation-object",
+    });
+    return { store, credentialId };
+  }
+  /** Run-unique bodies: request_body_sha256 is unique across the whole table. */
+  const bodyFor = (label: string) => JSON.stringify({ smoke: runId, label, note: "quote \" backslash \\ apostrophe ' multibyte é ✓ 😀" });
+  const evidenceFor = (body: string) => ({ evidenceVersion: 1, organizationId: "smoke-parent-org", stampPublicKey: "smoke-02abc", requestTimestampMs: 1_790_204_988_123, requestBody: body, requestBodySha256: sha(body) });
+  const rawRows = async (credentialId: string) => (await sqlFn())`SELECT * FROM registration_provisioning_dispatches WHERE credential_id = ${credentialId} ORDER BY dispatch_seq` as Promise<Array<Record<string, unknown>>>;
+  const completed = {
+    status: "ACTIVITY_STATUS_COMPLETED" as const,
+    observedBy: "dispatch" as const,
+    turnkeyCreatedAt: "2026-09-24T00:00:00.000Z",
+    observedSubOrganizationId: "smoke-sub-org",
+    observedRootUserId: "smoke-root-user",
+    observedWalletId: "smoke-wallet",
+    observedOwnerAddress: "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF",
+    failureCode: null,
+    failureMessage: null,
+    intentVerdict: "exact" as const,
+    fingerprintVerdict: "match" as const,
+    voteVerdict: "parent_key" as const,
+  };
+  const failed = { ...completed, status: "ACTIVITY_STATUS_FAILED" as const, observedSubOrganizationId: null, observedRootUserId: null, observedWalletId: null, observedOwnerAddress: null, failureCode: 3, failureMessage: "smoke failure" };
+
+  it("the table exists (schema.sql's Provisioning Evidence Capture block is applied)", async () => {
+    const rows = (await (await sqlFn())`SELECT to_regclass('registration_provisioning_dispatches')::text AS t`) as { t: string | null }[];
+    expect(rows[0]?.t, "apply schema.sql's Provisioning Evidence Capture block first").toBe("registration_provisioning_dispatches");
+  });
+
+  it("claim + evidence commit together: the attempt is in flight / unknown and the row holds the exact body, byte for byte", async () => {
+    const { store, credentialId } = await verifiedAttempt("claim");
+    const body = bodyFor("claim");
+    const begun = await store.beginProvisioningDispatch({ credentialId, attemptedAt: "2026-09-24T00:00:00.000Z", evidence: evidenceFor(body) });
+
+    expect(begun?.attempt).toMatchObject({ credentialId, state: "provisioning_in_flight", externalOutcome: "unknown", externalProvisioningAttemptedAt: "2026-09-24T00:00:00.000Z" });
+    expect(begun?.dispatch).toMatchObject({ credentialId, dispatchSeq: 1, evidenceVersion: 1, requestTimestampMs: 1_790_204_988_123, requestBody: body, requestBodySha256: sha(body), turnkeyActivityId: null, terminalStatus: null });
+    const [row] = await rawRows(credentialId);
+    expect(row!.request_body).toBe(body);
+    const [digest] = (await (await sqlFn())`SELECT octet_length(request_body) AS bytes, encode(sha256(convert_to(request_body, 'UTF8')), 'hex') AS db_digest FROM registration_provisioning_dispatches WHERE credential_id = ${credentialId}`) as Array<{ bytes: number; db_digest: string }>;
+    expect(Number(digest!.bytes)).toBe(Buffer.byteLength(body, "utf8"));
+    expect(digest!.db_digest).toBe(sha(body));
+  });
+
+  it("five racing claims over real HTTP: exactly one wins, exactly one dispatch row exists", async () => {
+    const { store, credentialId } = await verifiedAttempt("race");
+    const results = await Promise.all([1, 2, 3, 4, 5].map((n) => store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor(`race-${n}`)) })));
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const rows = await rawRows(credentialId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.dispatch_seq).toBe(1);
+    expect((await store.findByCredentialId(credentialId))?.state).toBe("provisioning_in_flight");
+    // A later claim on the now in-flight attempt: null, still one row.
+    expect(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("race-late")) })).toBeNull();
+    expect(await rawRows(credentialId)).toHaveLength(1);
+  });
+
+  it("a constraint failure rolls the CLAIM back too: the attempt stays 'verified' and no row is written", async () => {
+    const first = await verifiedAttempt("rollback-a");
+    const second = await verifiedAttempt("rollback-b");
+    const body = bodyFor("rollback-shared");
+    await first.store.beginProvisioningDispatch({ credentialId: first.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(body) });
+
+    // The same body digest on another attempt: the unique constraint aborts the statement, and the claim with it.
+    await expect(second.store.beginProvisioningDispatch({ credentialId: second.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(body) })).rejects.toThrow(/registration_provisioning_dispatches_body_sha256_key/);
+    expect(await second.store.findByCredentialId(second.credentialId)).toMatchObject({ state: "verified", externalOutcome: "not_attempted", externalProvisioningAttemptedAt: null });
+    expect(await rawRows(second.credentialId)).toEqual([]);
+
+    // A digest that is not the digest of the body: refused by the CHECK(s), same rollback.
+    const other = bodyFor("rollback-digest");
+    await expect(second.store.beginProvisioningDispatch({ credentialId: second.credentialId, attemptedAt: new Date().toISOString(), evidence: { ...evidenceFor(other), requestBodySha256: sha(`${other} `) } })).rejects.toThrow(/check constraint/);
+    await expect(second.store.beginProvisioningDispatch({ credentialId: second.credentialId, attemptedAt: new Date().toISOString(), evidence: { ...evidenceFor(other), requestBodySha256: sha(other).toUpperCase() } })).rejects.toThrow(/check constraint/);
+    expect((await second.store.findByCredentialId(second.credentialId))?.state).toBe("verified");
+    expect(await rawRows(second.credentialId)).toEqual([]);
+
+    // And the attempt is still usable: a valid claim now succeeds.
+    expect((await second.store.beginProvisioningDispatch({ credentialId: second.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(other) }))?.dispatch.dispatchSeq).toBe(1);
+  });
+
+  it("one open dispatch per attempt: with the attempt forced back to 'verified', a second open row is still refused and the claim rolls back", async () => {
+    const { store, credentialId } = await verifiedAttempt("one-open");
+    await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("one-open-1")) });
+    // No API can return an attempt with an open dispatch to 'verified' (claim-only); simulate a buggy
+    // writer on THIS smoke row directly, to prove the index itself refuses a second open dispatch.
+    await expect(store.transition({ credentialId, from: "provisioning_in_flight", to: "verified" })).rejects.toThrow(/only through beginProvisioningDispatch/);
+    await (await sqlFn())`UPDATE registration_attempts SET state = 'verified' WHERE credential_id = ${credentialId} AND credential_id LIKE ${`smoke-${runId}-pd-%`}`;
+    await expect(store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("one-open-2")) })).rejects.toThrow(/registration_provisioning_dispatches_one_open_idx/);
+    expect((await store.findByCredentialId(credentialId))?.state).toBe("verified");
+    expect(await rawRows(credentialId)).toHaveLength(1);
+  });
+
+  it("write-once activity id under a race: two different ids -> exactly one is recorded and never replaced; a replay of it is idempotent", async () => {
+    const { store, credentialId } = await verifiedAttempt("activity");
+    const { dispatch } = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("activity")) }))!;
+    const ids = [`smoke-${runId}-act-A`, `smoke-${runId}-act-B`];
+    const results = await Promise.all(ids.map((activityId) => store.recordDispatchActivity({ dispatchId: dispatch.id, activityId, fingerprint: `sha256:${sha(activityId)}` })));
+    expect(results.map((r) => r.outcome).sort()).toEqual(["mismatch", "recorded"]);
+    const winner = ids[results.findIndex((r) => r.outcome === "recorded")]!;
+    const [row] = await rawRows(credentialId);
+    expect(row).toMatchObject({ turnkey_activity_id: winner, turnkey_activity_fingerprint: `sha256:${sha(winner)}` });
+    expect(row!.activity_recorded_at).toBeTruthy();
+
+    expect((await store.recordDispatchActivity({ dispatchId: dispatch.id, activityId: winner, fingerprint: "sha256:other" })).outcome).toBe("already_recorded");
+    expect((await rawRows(credentialId))[0]).toEqual(row); // nothing rewritten, not even the fingerprint
+    expect(await store.recordDispatchActivity({ dispatchId: randomUUID(), activityId: "x", fingerprint: null })).toEqual({ outcome: "not_found" });
+
+    // The same activity id on ANOTHER dispatch is refused by the unique constraint.
+    const other = await verifiedAttempt("activity-other");
+    const second = (await other.store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("activity-other")) }))!.dispatch;
+    await expect(other.store.recordDispatchActivity({ dispatchId: second.id, activityId: winner, fingerprint: null })).rejects.toThrow(/registration_provisioning_dispatches_activity_id_key/);
+  });
+
+  it("write-once terminal observation: needs the recorded id; two racing terminals -> one recorded; observations stop after it; the request evidence never changes", async () => {
+    const { store, credentialId } = await verifiedAttempt("terminal");
+    const { dispatch } = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("terminal")) }))!;
+    const [before] = await rawRows(credentialId);
+    const activityId = `smoke-${runId}-act-terminal`;
+
+    expect((await store.recordDispatchTerminal({ dispatchId: dispatch.id, activityId, observation: completed })).outcome).toBe("activity_mismatch");
+    expect(await store.recordDispatchObservation({ dispatchId: dispatch.id, activityId, status: "ACTIVITY_STATUS_PENDING" })).toBe(false);
+    await store.recordDispatchActivity({ dispatchId: dispatch.id, activityId, fingerprint: null });
+    expect(await store.recordDispatchObservation({ dispatchId: dispatch.id, activityId, status: "ACTIVITY_STATUS_PENDING" })).toBe(true);
+    expect((await rawRows(credentialId))[0]).toMatchObject({ last_observed_status: "ACTIVITY_STATUS_PENDING", terminal_status: null });
+
+    const results = await Promise.all([store.recordDispatchTerminal({ dispatchId: dispatch.id, activityId, observation: completed }), store.recordDispatchTerminal({ dispatchId: dispatch.id, activityId, observation: failed })]);
+    expect(results.map((r) => r.outcome).sort()).toEqual(["already_terminal", "recorded"]);
+    const [terminal] = await rawRows(credentialId);
+    expect(["ACTIVITY_STATUS_COMPLETED", "ACTIVITY_STATUS_FAILED"]).toContain(terminal!.terminal_status);
+
+    expect((await store.recordDispatchTerminal({ dispatchId: dispatch.id, activityId, observation: { ...completed, observedBy: "operator_poll" } })).outcome).toBe("already_terminal");
+    expect(await store.recordDispatchObservation({ dispatchId: dispatch.id, activityId, status: "ACTIVITY_STATUS_PENDING" })).toBe(false);
+    const [after] = await rawRows(credentialId);
+    expect(after).toEqual(terminal);
+    for (const column of IMMUTABLE) expect(after![column], column).toEqual(before![column]);
+    expect(after!.request_body).toBe(dispatch.requestBody);
+    // The attempt itself was never touched by any of this.
+    expect(await store.findByCredentialId(credentialId)).toMatchObject({ state: "provisioning_in_flight", externalOutcome: "unknown", subOrganizationId: null, ownerAddress: null });
+  });
+
+  it("a definitive failure then a new dispatch: sequence 2, and the first row is preserved exactly", async () => {
+    const { store, credentialId } = await verifiedAttempt("retry");
+    const one = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("retry-1")) }))!.dispatch;
+    await store.recordDispatchActivity({ dispatchId: one.id, activityId: `smoke-${runId}-act-retry-1`, fingerprint: null });
+    await store.recordDispatchTerminal({ dispatchId: one.id, activityId: `smoke-${runId}-act-retry-1`, observation: failed });
+    expect(await store.revertProvisioningAfterDefinitiveFailure({ credentialId, dispatchId: one.id, activityId: `smoke-${runId}-act-retry-1` })).toMatchObject({ state: "verified", externalOutcome: "definitive_failure" });
+    const [firstBefore] = await rawRows(credentialId);
+
+    const two = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("retry-2")) }))!.dispatch;
+    expect(two.dispatchSeq).toBe(2);
+    const rows = await rawRows(credentialId);
+    expect(rows.map((row) => row.dispatch_seq)).toEqual([1, 2]);
+    expect(rows[0]).toEqual(firstBefore);
+    expect((await store.findDispatchesByCredentialId(credentialId)).map((row) => [row.dispatchSeq, row.terminalStatus])).toEqual([[1, "ACTIVITY_STATUS_FAILED"], [2, null]]);
+  });
+
+  it("L1: the evidence-bound exits against real Postgres — an operator-recorded FAILED cannot revert; a stale dispatch cannot advance; the exact in-process evidence can", async () => {
+    const identity = { subOrganizationId: `smoke-${runId}-sub`, turnkeyUserId: `smoke-${runId}-user`, walletId: `smoke-${runId}-wallet`, walletAccountId: `smoke-${runId}-wa`, ownerAddress: "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF" };
+    const { store, credentialId } = await verifiedAttempt("exits");
+    const one = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("exits-1")) }))!.dispatch;
+    const act1 = `smoke-${runId}-act-exits-1`;
+    await store.recordDispatchActivity({ dispatchId: one.id, activityId: act1, fingerprint: null });
+    await store.recordDispatchTerminal({ dispatchId: one.id, activityId: act1, observation: { ...failed, observedBy: "operator_poll" } });
+    expect(await store.revertProvisioningAfterDefinitiveFailure({ credentialId, dispatchId: one.id, activityId: act1 })).toBeNull();
+    expect(await store.advanceProvisioningToTurnkeyCreated({ credentialId, dispatchId: one.id, activityId: act1, identity })).toBeNull();
+    expect((await store.findByCredentialId(credentialId))?.state).toBe("provisioning_in_flight");
+
+    const other = await verifiedAttempt("exits-ok");
+    const two = (await other.store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("exits-2")) }))!.dispatch;
+    const act2 = `smoke-${runId}-act-exits-2`;
+    await other.store.recordDispatchActivity({ dispatchId: two.id, activityId: act2, fingerprint: null });
+    await other.store.recordDispatchTerminal({ dispatchId: two.id, activityId: act2, observation: { ...completed, observedSubOrganizationId: identity.subOrganizationId, observedRootUserId: identity.turnkeyUserId, observedWalletId: identity.walletId, observedOwnerAddress: identity.ownerAddress } });
+    expect(await other.store.advanceProvisioningToTurnkeyCreated({ credentialId: other.credentialId, dispatchId: two.id, activityId: act2, identity: { ...identity, walletId: "smoke-wrong" } })).toBeNull();
+    expect(await other.store.advanceProvisioningToTurnkeyCreated({ credentialId: other.credentialId, dispatchId: two.id, activityId: act2, identity })).toMatchObject({ state: "turnkey_created", ...identity });
+    expect(await other.store.advanceProvisioningToTurnkeyCreated({ credentialId: other.credentialId, dispatchId: two.id, activityId: act2, identity })).toBeNull(); // single-use
+  });
+
+  it("the row never contains a stamp, a signature, or private key material — direct read, not just the mapped type", async () => {
+    const { store, credentialId } = await verifiedAttempt("columns");
+    await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("columns")) });
+    const [row] = await rawRows(credentialId);
+    expect(Object.keys(row!).filter((column) => /stamp|signature|private|secret|api_key/.test(column) && !/timestamp/.test(column))).toEqual(["stamp_public_key"]);
   });
 });

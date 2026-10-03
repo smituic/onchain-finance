@@ -715,3 +715,377 @@ BEGIN
   END LOOP;
 END $$;
 -- END S5 L2 identity-index migration
+
+-- BEGIN Provisioning Evidence Capture
+-- Hand-applied, idempotent, FAIL-CLOSED. Already applied (and its idempotent
+-- rerun proven) on a disposable Neon branch and on the REAL Neon database's
+-- public schema — see ARCHITECTURE.md's "Provisioning Evidence Capture" for
+-- what was verified. Any OTHER environment must apply it BEFORE deploying the
+-- code that uses it: the registration claim is ONE statement with this table's
+-- INSERT, so without the table no registration can dispatch (it fails closed;
+-- the attempt stays 'verified').
+--
+-- What was executed live is the single DO block that follows these comments
+-- (its text starts at the line that begins with DO and ends at its closing
+-- END line; sha256 6931570baead5295…, 20422 characters). Later edits to the
+-- comments ABOVE it (like this one) change the BEGIN..END text and its hash
+-- but not that statement. Extraction takes the first occurrence of the
+-- statement's opening token, so these comments must never spell it out.
+--
+-- One row per external CREATE_SUB_ORGANIZATION dispatch, inserted in the same
+-- statement as the attempt's verified -> provisioning_in_flight claim, BEFORE
+-- anything is stamped or sent. Evidence for a future operator-only resolver;
+-- nothing reads it back to move an attempt (Option 3 is unchanged).
+--
+--   immutable at insert   id, credential_id, dispatch_seq, evidence_version,
+--                         organization_id, stamp_public_key,
+--                         request_timestamp_ms, request_body,
+--                         request_body_sha256, created_at.
+--                         request_body is the EXACT string that was stamped and
+--                         sent; request_body_sha256 is OUR sha256 of its UTF-8
+--                         bytes. No UPDATE ever names these columns.
+--   write-once            turnkey_activity_id + turnkey_activity_fingerprint +
+--                         activity_recorded_at (first writer wins), then the
+--                         terminal observation (terminal_status … vote_verdict).
+--                         turnkey_activity_fingerprint is Turnkey's own string,
+--                         stored verbatim — never our digest.
+--   mutable               last_observed_status, last_observed_at, updated_at.
+--
+-- observed_* are what a COMPLETED activity reported. They are evidence only and
+-- are never copied into registration_attempts from here.
+--
+-- No stamp (X-Stamp), signature, or API key material is ever stored: request_body
+-- holds only the public WebAuthn ceremony artifacts and identifiers the attempt
+-- row already has.
+--
+-- FAIL-CLOSED, same convention as the S5 L2 block above: `IF NOT EXISTS` only
+-- trusts a NAME, so after creating whatever is missing the block proves, from
+-- the catalog, that every named object IS the intended one, and RAISEs
+-- (rolling the whole block back — nothing is ever dropped, rebuilt, or
+-- repaired) if any is not:
+--
+--   1. search_path is pinned to `pg_catalog, pg_temp` for the block's own
+--      transaction (declared types are schema-qualified because declarations
+--      resolve before the pin), so every name the DDL resolves — functions,
+--      operators, types — is a built-in. The schema is the single
+--      `target_schema` constant (the gated scratch-schema smoke swaps only it).
+--   2. IMMEDIATELY after `CREATE TABLE IF NOT EXISTS`, before any other DDL
+--      touches it, the relation under that name is checked on its own: an
+--      ordinary ('r'), permanent, non-partition table that is neither an
+--      inheritance child nor a parent, with row-level security neither
+--      enabled nor forced and no policy, no user trigger, no rule, and every
+--      column of a built-in base type (pg_catalog, not a domain, enum,
+--      composite, or range) with a built-in collation. A view, materialized
+--      view, foreign table, or any other same-named relation is refused here.
+--   3. A REFERENCE copy of the definition (everything except the foreign key,
+--      which a temporary table cannot have) is built in pg_temp in the same
+--      transaction. The target must match it structurally — so the expected
+--      shape is whatever THIS server deparses for THIS text, never a
+--      hand-copied string:
+--        - every constraint on the table validated;
+--        - every reference column: same type, typmod, collation, NOT NULL,
+--          identity/generated, and default (deparsed);
+--        - every reference constraint, by name: same kind, flags, key
+--          columns, and pg_get_constraintdef; unique/primary-key backing
+--          indexes structurally identical (btree, keys, opclasses, collations,
+--          options, NULLS [NOT] DISTINCT, no expression, no predicate);
+--        - the one-open index: an index ON THIS TABLE, btree, UNIQUE, valid,
+--          ready, immediate, not exclusion, exactly (credential_id), no
+--          expression, and the same predicate as the reference;
+--        - NO other index on the table: only the backing indexes of the
+--          reference's own unique/primary-key constraints and the one-open
+--          index. (Postgres never adds indexes to a table by itself — a
+--          foreign key creates none on the referencing side — so any extra
+--          index, expression or predicate index included, is foreign.)
+--   4. The foreign key is proven structurally: exactly credential_id ->
+--      <target_schema>.registration_attempts(credential_id), through that
+--      table's unique index on exactly that column, NO ACTION / MATCH SIMPLE,
+--      not deferrable, validated.
+--   5. Dependencies: Postgres records none on built-in (pinned) objects, but
+--      always records one on a user-defined function, operator, type, or
+--      collation. So every constraint, column default, and the one-open index
+--      may depend ONLY on this table (and, for the foreign key, on
+--      registration_attempts and its unique index); any other dependency is a
+--      look-alike and is refused.
+--
+-- Extra, unrelated columns of a built-in base type are tolerated (they cannot
+-- change what this slice writes or reads, and any default or generated
+-- expression on them is covered by the dependency rule); a same-named object
+-- of the wrong shape never is.
+--
+-- The body-digest CHECK uses built-ins only (sha256(bytea), encode,
+-- convert_to — no extension). convert_to is STABLE, so Neon's acceptance was
+-- once an open question; it is now live-verified: Neon accepted and enforced
+-- the CHECK in scratch schemas, on a disposable branch's public schema, and on
+-- the real database. The application still verifies the digest regardless; if
+-- that one constraint ever has to go, nothing else changes.
+DO $$
+DECLARE
+  -- Declared types are resolved BEFORE the search_path pin below, so each is schema-qualified.
+  target_schema CONSTANT pg_catalog.text := 'public';
+  table_name CONSTANT pg_catalog.text := 'registration_provisioning_dispatches';
+  reference_name CONSTANT pg_catalog.text := 'registration_provisioning_dispatches_reference';
+  fk_name CONSTANT pg_catalog.text := 'registration_provisioning_dispatches_credential_id_fkey';
+  one_open_name CONSTANT pg_catalog.text := 'registration_provisioning_dispatches_one_open_idx';
+  one_open_definition CONSTANT pg_catalog.text := '(credential_id) WHERE terminal_status IS NULL';
+  -- Every column and constraint except the foreign key, each constraint explicitly named.
+  definition CONSTANT pg_catalog.text := $definition$
+    id                            UUID NOT NULL DEFAULT gen_random_uuid(),
+    credential_id                 TEXT NOT NULL,
+    dispatch_seq                  INT NOT NULL,
+    evidence_version              INT NOT NULL,
+    organization_id               TEXT NOT NULL,
+    stamp_public_key              TEXT NOT NULL,
+    request_timestamp_ms          BIGINT NOT NULL,
+    request_body                  TEXT NOT NULL,
+    request_body_sha256           TEXT NOT NULL,
+    created_at                    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    turnkey_activity_id           TEXT,
+    turnkey_activity_fingerprint  TEXT,
+    activity_recorded_at          TIMESTAMPTZ,
+    terminal_status               TEXT,
+    terminal_observed_at          TIMESTAMPTZ,
+    terminal_observed_by          TEXT,
+    turnkey_created_at            TIMESTAMPTZ,
+    observed_sub_organization_id  TEXT,
+    observed_root_user_id         TEXT,
+    observed_wallet_id            TEXT,
+    observed_owner_address        TEXT,
+    failure_code                  INT,
+    failure_message               TEXT,
+    intent_verdict                TEXT,
+    fingerprint_verdict           TEXT,
+    vote_verdict                  TEXT,
+    last_observed_status          TEXT,
+    last_observed_at              TIMESTAMPTZ,
+    updated_at                    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT registration_provisioning_dispatches_pkey PRIMARY KEY (id),
+    CONSTRAINT registration_provisioning_dispatches_seq_key UNIQUE (credential_id, dispatch_seq),
+    CONSTRAINT registration_provisioning_dispatches_body_sha256_key UNIQUE (request_body_sha256),
+    -- NULLs are distinct, so any number of rows may still lack an activity id.
+    CONSTRAINT registration_provisioning_dispatches_activity_id_key UNIQUE (turnkey_activity_id),
+    CONSTRAINT registration_provisioning_dispatches_dispatch_seq_check CHECK (dispatch_seq >= 1),
+    CONSTRAINT registration_provisioning_dispatches_evidence_version_check CHECK (evidence_version >= 1),
+    CONSTRAINT registration_provisioning_dispatches_organization_id_check CHECK (organization_id <> ''),
+    CONSTRAINT registration_provisioning_dispatches_stamp_public_key_check CHECK (stamp_public_key <> ''),
+    CONSTRAINT registration_provisioning_dispatches_request_timestamp_ms_check CHECK (request_timestamp_ms >= 0),
+    CONSTRAINT registration_provisioning_dispatches_request_body_check CHECK (request_body <> ''),
+    CONSTRAINT registration_provisioning_dispatches_request_body_sha256_check CHECK (request_body_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT registration_provisioning_dispatches_body_digest_check
+      CHECK (request_body_sha256 = encode(sha256(convert_to(request_body, 'UTF8')), 'hex')),
+    CONSTRAINT registration_provisioning_dispatches_turnkey_activity_id_check CHECK (turnkey_activity_id <> ''),
+    CONSTRAINT registration_provisioning_dispatches_fingerprint_length_check CHECK (char_length(turnkey_activity_fingerprint) <= 200),
+    CONSTRAINT registration_provisioning_dispatches_terminal_status_check
+      CHECK (terminal_status IN ('ACTIVITY_STATUS_COMPLETED', 'ACTIVITY_STATUS_FAILED', 'ACTIVITY_STATUS_REJECTED')),
+    CONSTRAINT registration_provisioning_dispatches_terminal_observed_by_check CHECK (terminal_observed_by IN ('dispatch', 'operator_poll')),
+    CONSTRAINT registration_provisioning_dispatches_failure_message_check CHECK (char_length(failure_message) <= 500),
+    CONSTRAINT registration_provisioning_dispatches_intent_verdict_check CHECK (intent_verdict IN ('exact', 'fields_only', 'mismatch')),
+    CONSTRAINT registration_provisioning_dispatches_fingerprint_verdict_check CHECK (fingerprint_verdict IN ('match', 'mismatch', 'unrecognized_form')),
+    CONSTRAINT registration_provisioning_dispatches_vote_verdict_check CHECK (vote_verdict IN ('parent_key', 'other')),
+    CONSTRAINT registration_provisioning_dispatches_last_observed_status_check CHECK (char_length(last_observed_status) <= 100),
+    CONSTRAINT registration_provisioning_dispatches_activity_group_check
+      CHECK ((turnkey_activity_id IS NULL) = (activity_recorded_at IS NULL)
+        AND (turnkey_activity_fingerprint IS NULL OR turnkey_activity_id IS NOT NULL)),
+    CONSTRAINT registration_provisioning_dispatches_terminal_group_check
+      CHECK ((terminal_status IS NULL) = (terminal_observed_at IS NULL)
+        AND (terminal_status IS NULL) = (terminal_observed_by IS NULL)
+        AND (terminal_status IS NULL) = (intent_verdict IS NULL)
+        AND (terminal_status IS NULL) = (fingerprint_verdict IS NULL)
+        AND (terminal_status IS NULL) = (vote_verdict IS NULL)
+        AND (terminal_status IS NOT NULL OR turnkey_created_at IS NULL)),
+    CONSTRAINT registration_provisioning_dispatches_terminal_needs_id_check
+      CHECK (terminal_status IS NULL OR turnkey_activity_id IS NOT NULL),
+    CONSTRAINT registration_provisioning_dispatches_observed_result_check
+      CHECK (terminal_status IS NOT DISTINCT FROM 'ACTIVITY_STATUS_COMPLETED'
+        OR (observed_sub_organization_id IS NULL AND observed_root_user_id IS NULL
+          AND observed_wallet_id IS NULL AND observed_owner_address IS NULL)),
+    CONSTRAINT registration_provisioning_dispatches_failure_check
+      CHECK ((failure_code IS NULL AND failure_message IS NULL)
+        OR (terminal_status IS NOT NULL AND terminal_status IN ('ACTIVITY_STATUS_FAILED', 'ACTIVITY_STATUS_REJECTED')))
+  $definition$;
+  ns pg_catalog.oid;
+  tbl pg_catalog.oid;
+  ref pg_catalog.oid;
+  attempts_tbl pg_catalog.oid;
+  attempts_credential pg_catalog.int2;
+  own_credential pg_catalog.int2;
+  t record;
+  r record;
+  fk record;
+  ix record;
+  bad pg_catalog.text;
+BEGIN
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+
+  SELECT n.oid INTO ns FROM pg_catalog.pg_namespace n WHERE n.nspname = target_schema;
+  IF ns IS NULL THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: schema % does not exist.', target_schema;
+  END IF;
+  SELECT c.oid INTO attempts_tbl FROM pg_catalog.pg_class c WHERE c.relnamespace = ns AND c.relname = 'registration_attempts' AND c.relkind = 'r';
+  IF attempts_tbl IS NULL THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.registration_attempts is not an ordinary table.', target_schema;
+  END IF;
+
+  -- Create what is missing (IF NOT EXISTS trusts the name — everything below does not).
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I.%I (%s, CONSTRAINT %I FOREIGN KEY (credential_id) REFERENCES %I.registration_attempts (credential_id))',
+    target_schema, table_name, definition, fk_name, target_schema);
+
+  -- 1. The relation under that name, BEFORE any further DDL touches it.
+  SELECT c.oid, c.relkind, c.relpersistence, c.relispartition, c.relrowsecurity, c.relforcerowsecurity
+    INTO t FROM pg_catalog.pg_class c WHERE c.relnamespace = ns AND c.relname = table_name;
+  IF t.oid IS NULL OR t.relkind IS DISTINCT FROM 'r' OR t.relpersistence IS DISTINCT FROM 'p' OR t.relispartition IS NOT FALSE THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% is not an ordinary, permanent, non-partition table. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  tbl := t.oid;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = tbl OR i.inhparent = tbl) THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% takes part in table inheritance (as a child or a parent). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF t.relrowsecurity IS NOT FALSE OR t.relforcerowsecurity IS NOT FALSE OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol WHERE pol.polrelid = tbl) THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% has row-level security enabled or forced, or a policy. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger g WHERE g.tgrelid = tbl AND NOT g.tgisinternal)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite w WHERE w.ev_class = tbl)
+  THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% has a user trigger or a rule. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  SELECT pg_catalog.string_agg(a.attname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
+    WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
+      AND (ty.typnamespace IS DISTINCT FROM (SELECT n2.oid FROM pg_catalog.pg_namespace n2 WHERE n2.nspname = 'pg_catalog')
+        OR ty.typtype IS DISTINCT FROM 'b' OR ty.oid >= 16384 OR a.attcollation >= 16384);
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% column(s) % use a type or collation that is not a built-in base type/collation. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I.%I %s', one_open_name, target_schema, table_name, one_open_definition);
+
+  -- The reference: the same definition, deparsed by this server, in this transaction.
+  EXECUTE format('DROP TABLE IF EXISTS pg_temp.%I', reference_name);
+  EXECUTE format('CREATE TEMPORARY TABLE %I (%s) ON COMMIT DROP', reference_name, definition);
+  EXECUTE format('CREATE UNIQUE INDEX %I ON pg_temp.%I %s', reference_name || '_one_open', reference_name, one_open_definition);
+  SELECT c.oid INTO ref FROM pg_catalog.pg_class c WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname = reference_name;
+
+  -- (1, continued) Every constraint on the table is validated.
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid = tbl AND NOT k.convalidated) THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% has a constraint that is not validated.', target_schema, table_name;
+  END IF;
+
+  -- 2. Columns: every reference column, exactly.
+  SELECT pg_catalog.string_agg(rc.attname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_attribute rc
+    LEFT JOIN pg_catalog.pg_attrdef rd ON rd.adrelid = rc.attrelid AND rd.adnum = rc.attnum
+    WHERE rc.attrelid = ref AND rc.attnum > 0 AND NOT rc.attisdropped
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute tc
+        LEFT JOIN pg_catalog.pg_attrdef td ON td.adrelid = tc.attrelid AND td.adnum = tc.attnum
+        WHERE tc.attrelid = tbl AND tc.attname = rc.attname AND NOT tc.attisdropped AND tc.attnum > 0
+          AND tc.atttypid = rc.atttypid AND tc.atttypmod = rc.atttypmod AND tc.attcollation = rc.attcollation
+          AND tc.attnotnull = rc.attnotnull AND tc.attidentity = rc.attidentity AND tc.attgenerated = rc.attgenerated
+          AND pg_catalog.pg_get_expr(td.adbin, td.adrelid) IS NOT DISTINCT FROM pg_catalog.pg_get_expr(rd.adbin, rd.adrelid));
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% column(s) % differ from the intended definition. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- 3. Every reference constraint (NOT NULL is covered by the columns above), by name, structurally.
+  FOR r IN
+    SELECT k.conname, k.contype, k.condeferrable, k.condeferred, k.connoinherit,
+           pg_catalog.pg_get_constraintdef(k.oid) AS def,
+           (SELECT pg_catalog.array_agg(a.attname ORDER BY u.ord) FROM pg_catalog.unnest(k.conkey) WITH ORDINALITY u(attnum, ord)
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum) AS key_names,
+           k.conindid
+      FROM pg_catalog.pg_constraint k WHERE k.conrelid = ref AND k.contype IN ('c', 'u', 'p')
+  LOOP
+    SELECT k.oid, k.conindid INTO fk
+      FROM pg_catalog.pg_constraint k
+      WHERE k.conrelid = tbl AND k.conname = r.conname AND k.contype = r.contype AND k.convalidated
+        AND k.condeferrable = r.condeferrable AND k.condeferred = r.condeferred AND k.connoinherit = r.connoinherit
+        AND pg_catalog.pg_get_constraintdef(k.oid) = r.def
+        AND (SELECT pg_catalog.array_agg(a.attname ORDER BY u.ord) FROM pg_catalog.unnest(k.conkey) WITH ORDINALITY u(attnum, ord)
+              JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum) IS NOT DISTINCT FROM r.key_names;
+    IF fk.oid IS NULL THEN
+      RAISE EXCEPTION 'Provisioning evidence migration refused: constraint % on %.% is missing or not the intended definition. Nothing was changed; review and resolve by hand (never auto-dropped).', r.conname, target_schema, table_name;
+    END IF;
+    IF r.contype IN ('u', 'p') AND NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_index ti, pg_catalog.pg_index ri, pg_catalog.pg_class tic, pg_catalog.pg_class ric
+      WHERE ti.indexrelid = fk.conindid AND ri.indexrelid = r.conindid AND tic.oid = ti.indexrelid AND ric.oid = ri.indexrelid
+        AND ti.indrelid = tbl AND tic.relam = ric.relam
+        AND ti.indisunique AND ti.indisunique = ri.indisunique AND ti.indisprimary = ri.indisprimary
+        AND ti.indisvalid AND ti.indisready AND ti.indimmediate AND NOT ti.indisexclusion
+        AND ti.indnullsnotdistinct = ri.indnullsnotdistinct
+        AND ti.indnatts = ri.indnatts AND ti.indnkeyatts = ri.indnkeyatts
+        AND ti.indexprs IS NULL AND ti.indpred IS NULL AND ri.indexprs IS NULL AND ri.indpred IS NULL
+        AND ti.indclass::pg_catalog.text = ri.indclass::pg_catalog.text
+        AND ti.indcollation::pg_catalog.text = ri.indcollation::pg_catalog.text
+        AND ti.indoption::pg_catalog.text = ri.indoption::pg_catalog.text)
+    THEN
+      RAISE EXCEPTION 'Provisioning evidence migration refused: the index behind % on %.% is not the intended one.', r.conname, target_schema, table_name;
+    END IF;
+  END LOOP;
+
+  -- 4. The foreign key, structurally.
+  SELECT a.attnum INTO own_credential FROM pg_catalog.pg_attribute a WHERE a.attrelid = tbl AND a.attname = 'credential_id' AND NOT a.attisdropped;
+  SELECT a.attnum INTO attempts_credential FROM pg_catalog.pg_attribute a WHERE a.attrelid = attempts_tbl AND a.attname = 'credential_id' AND NOT a.attisdropped;
+  SELECT k.oid, k.conindid INTO fk FROM pg_catalog.pg_constraint k
+    WHERE k.conrelid = tbl AND k.conname = fk_name AND k.contype = 'f' AND k.convalidated AND NOT k.condeferrable
+      AND k.confrelid = attempts_tbl AND k.confupdtype = 'a' AND k.confdeltype = 'a' AND k.confmatchtype = 's'
+      AND k.conkey = ARRAY[own_credential]::pg_catalog.int2[] AND k.confkey = ARRAY[attempts_credential]::pg_catalog.int2[];
+  IF fk.oid IS NULL OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_index i WHERE i.indexrelid = fk.conindid AND i.indrelid = attempts_tbl AND i.indisunique AND i.indisvalid
+      AND i.indnkeyatts = 1 AND i.indkey[0] = attempts_credential AND i.indexprs IS NULL AND i.indpred IS NULL)
+  THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: % is not exactly credential_id -> %.registration_attempts(credential_id). Nothing was changed; review and resolve by hand (never auto-dropped).', fk_name, target_schema;
+  END IF;
+
+  -- 5. The one-open index.
+  SELECT c.oid, c.relkind, i.indrelid, c.relam, i.indisunique, i.indisprimary, i.indisvalid, i.indisready, i.indimmediate, i.indisexclusion,
+         i.indnatts, i.indnkeyatts, i.indkey[0] AS key0, i.indexprs IS NULL AS no_exprs, i.indnullsnotdistinct,
+         i.indclass::pg_catalog.text AS opclasses, i.indcollation::pg_catalog.text AS collations, i.indoption::pg_catalog.text AS options,
+         pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS pred
+    INTO ix
+    FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+    WHERE c.relnamespace = ns AND c.relname = one_open_name;
+  SELECT c.relam, i.indnullsnotdistinct, i.indclass::pg_catalog.text AS opclasses, i.indcollation::pg_catalog.text AS collations,
+         i.indoption::pg_catalog.text AS options, pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS pred
+    INTO r
+    FROM pg_catalog.pg_class c JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+    WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname = reference_name || '_one_open';
+  IF ix.oid IS NULL OR ix.relkind IS DISTINCT FROM 'i' OR ix.indrelid IS DISTINCT FROM tbl
+    OR ix.relam IS DISTINCT FROM (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'btree') OR ix.relam IS DISTINCT FROM r.relam
+    OR ix.indisunique IS NOT TRUE OR ix.indisprimary IS NOT FALSE OR ix.indisvalid IS NOT TRUE OR ix.indisready IS NOT TRUE
+    OR ix.indimmediate IS NOT TRUE OR ix.indisexclusion IS NOT FALSE
+    OR ix.indnatts IS DISTINCT FROM 1 OR ix.indnkeyatts IS DISTINCT FROM 1 OR ix.key0 IS DISTINCT FROM own_credential OR ix.no_exprs IS NOT TRUE
+    OR ix.indnullsnotdistinct IS DISTINCT FROM r.indnullsnotdistinct
+    OR ix.opclasses IS DISTINCT FROM r.opclasses OR ix.collations IS DISTINCT FROM r.collations OR ix.options IS DISTINCT FROM r.options
+    OR ix.pred IS NULL OR ix.pred IS DISTINCT FROM r.pred
+  THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% is not exactly UNIQUE (credential_id) WHERE terminal_status IS NULL on %.%. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, one_open_name, target_schema, table_name;
+  END IF;
+
+  -- 6. No index on the table but the reference constraints' backing indexes and the one-open index.
+  SELECT pg_catalog.string_agg(c.relname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+    WHERE i.indrelid = tbl AND i.indexrelid IS DISTINCT FROM ix.oid
+      AND i.indexrelid NOT IN (
+        SELECT k.conindid FROM pg_catalog.pg_constraint k
+        WHERE k.conrelid = tbl AND k.contype IN ('u', 'p')
+          AND k.conname IN (SELECT rk.conname FROM pg_catalog.pg_constraint rk WHERE rk.conrelid = ref AND rk.contype IN ('u', 'p')));
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% has unexpected index(es) %. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- 7. Dependencies: only on this table (and, for the foreign key, on registration_attempts and its unique index).
+  SELECT pg_catalog.string_agg(DISTINCT d.classid::pg_catalog.regclass::pg_catalog.text || ':' || d.objid::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_depend d
+    WHERE ((d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid IN (SELECT k.oid FROM pg_catalog.pg_constraint k WHERE k.conrelid = tbl))
+        OR (d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid IN (SELECT ad.oid FROM pg_catalog.pg_attrdef ad WHERE ad.adrelid = tbl))
+        OR (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = ix.oid))
+      AND NOT (d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = tbl)
+      AND NOT (d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid = fk.oid
+               AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid IN (attempts_tbl, fk.conindid));
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Provisioning evidence migration refused: %.% has a constraint, default, or index depending on an object other than its own columns (%). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  EXECUTE format('DROP TABLE pg_temp.%I', reference_name);
+END $$;
+-- END Provisioning Evidence Capture

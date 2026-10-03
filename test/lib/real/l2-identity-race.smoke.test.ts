@@ -217,9 +217,17 @@ describe.skipIf(!enabled)("S5 L2 post-index: finalize crosses the identity 23505
     rows.attemptCredentialId = credId;
     const identity = identityFor(userId);
     await s.attempts.createVerified({ credentialId: credId, appUserId: userId, userHandle: `${userId}-handle`, credentialPublicKey: `${userId}-cose`, counter: 0, transports: null, credentialDeviceType: null, credentialBackedUp: null, registrationChallenge: `${userId}-challenge`, rawClientDataJson: "x", rawAttestationObject: "x" });
-    await s.attempts.transition({ credentialId: credId, from: "verified", to: "provisioning_in_flight", patch: { externalOutcome: "unknown" } });
+    // "provisioning_in_flight" is claim-only (Provisioning Evidence Capture); this L2 suite does not assume
+    // the dispatch-evidence table is migrated, so it seeds THIS smoke row's post-create state directly.
     const { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress } = identity;
-    await s.attempts.transition({ credentialId: credId, from: "provisioning_in_flight", to: "turnkey_created", patch: { subOrganizationId, turnkeyUserId, walletId, walletAccountId, ownerAddress, externalOutcome: "confirmed_created" } });
+    const seeded = (await sql`
+      UPDATE registration_attempts
+      SET state = 'turnkey_created', external_outcome = 'confirmed_created', sub_organization_id = ${subOrganizationId}, turnkey_user_id = ${turnkeyUserId},
+          wallet_id = ${walletId}, wallet_account_id = ${walletAccountId}, owner_address = ${ownerAddress}, updated_at = now()
+      WHERE credential_id = ${credId} AND state = 'verified'
+      RETURNING state
+    `) as Array<{ state: string }>;
+    if (seeded.length !== 1) throw new Error("seed: smoke attempt was not 'verified'");
     const counts = async () => {
       const [row] = (await sql`SELECT (SELECT count(*) FROM real_accounts WHERE app_user_id = ${userId})::int AS accounts, (SELECT count(*) FROM real_passkeys WHERE credential_id = ${credId})::int AS passkeys`) as Array<{ accounts: number; passkeys: number }>;
       return row!;

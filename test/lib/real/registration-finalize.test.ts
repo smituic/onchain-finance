@@ -12,6 +12,7 @@ import {
   type RegistrationAttemptStore,
 } from "@/lib/real/server/registration-attempts";
 import { runProvisioningPipeline } from "@/lib/real/server/onboarding";
+import { seedTurnkeyCreatedThroughEvidence } from "./fixtures/provisioning-seed";
 
 /**
  * S5 L3: registration finalize atomicity (in-memory adapter) and the
@@ -68,21 +69,14 @@ async function seedTurnkeyCreated(attempts: RegistrationAttemptStore): Promise<R
     rawClientDataJson: "client-data",
     rawAttestationObject: "attestation",
   });
-  await attempts.transition({ credentialId, from: "verified", to: "provisioning_in_flight", patch: { externalOutcome: "unknown" } });
-  const created = await attempts.transition({
-    credentialId,
-    from: "provisioning_in_flight",
-    to: "turnkey_created",
-    patch: {
-      subOrganizationId: `sub-org-${seq}`,
-      turnkeyUserId: `turnkey-user-${seq}`,
-      walletId: `wallet-${seq}`,
-      walletAccountId: `wallet-account-${seq}`,
-      ownerAddress: getAddress(`0x${String(seq).padStart(40, "a")}`), // checksummed, mixed case
-      externalOutcome: "confirmed_created",
-    },
+  // "provisioning_in_flight" is claim-only: walk the production evidence path.
+  return seedTurnkeyCreatedThroughEvidence(attempts, credentialId, {
+    subOrganizationId: `sub-org-${seq}`,
+    turnkeyUserId: `turnkey-user-${seq}`,
+    walletId: `wallet-${seq}`,
+    walletAccountId: `wallet-account-${seq}`,
+    ownerAddress: getAddress(`0x${String(seq).padStart(40, "a")}`), // checksummed, mixed case
   });
-  return created!;
 }
 
 function world() {

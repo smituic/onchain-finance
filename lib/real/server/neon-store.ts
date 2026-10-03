@@ -3,7 +3,15 @@ import type { ChallengePurpose, ChallengeStore, StoredChallenge } from "./challe
 import { DuplicateAccountError, DuplicateCredentialError, IdentityConflictError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
 import { type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentPatch, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { PasskeyRevocationAttempt, PasskeyRevocationStore, RevocationAttemptPatch, RevocationAttemptState } from "./passkey-revocation-attempts";
-import { REGISTRATION_IDENTITY_CONFLICT_REASON, assertGenericTransition, type ExternalProvisioningOutcome, type RegistrationAttempt, type RegistrationAttemptState, type RegistrationAttemptStore } from "./registration-attempts";
+import {
+  REGISTRATION_IDENTITY_CONFLICT_REASON,
+  assertGenericTransition,
+  type ExternalProvisioningOutcome,
+  type ProvisioningDispatch,
+  type RegistrationAttempt,
+  type RegistrationAttemptState,
+  type RegistrationAttemptStore,
+} from "./registration-attempts";
 import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveResult } from "./payment-attempts";
 
 /**
@@ -56,6 +64,43 @@ function toAttempt(row: Row): RegistrationAttempt {
     accountConfigVersion: row.account_config_version === null || row.account_config_version === undefined ? null : Number(row.account_config_version),
     blockReason: (row.block_reason as string | null) ?? null,
     createdAt: new Date(row.created_at as string).toISOString(),
+    updatedAt: new Date(row.updated_at as string).toISOString(),
+  };
+}
+
+/** registration_provisioning_dispatches row. request_body is returned verbatim — the caller re-verifies its bytes and digest before anything is stamped. */
+function toDispatch(row: Row): ProvisioningDispatch {
+  const text = (value: unknown) => (value === null || value === undefined ? null : String(value));
+  const time = (value: unknown) => (value ? new Date(value as string).toISOString() : null);
+  return {
+    id: row.id as string,
+    credentialId: row.credential_id as string,
+    dispatchSeq: Number(row.dispatch_seq),
+    evidenceVersion: Number(row.evidence_version),
+    organizationId: row.organization_id as string,
+    stampPublicKey: row.stamp_public_key as string,
+    requestTimestampMs: Number(row.request_timestamp_ms),
+    requestBody: row.request_body as string,
+    requestBodySha256: row.request_body_sha256 as string,
+    createdAt: new Date(row.created_at as string).toISOString(),
+    turnkeyActivityId: text(row.turnkey_activity_id),
+    turnkeyActivityFingerprint: text(row.turnkey_activity_fingerprint),
+    activityRecordedAt: time(row.activity_recorded_at),
+    terminalStatus: text(row.terminal_status) as ProvisioningDispatch["terminalStatus"],
+    terminalObservedAt: time(row.terminal_observed_at),
+    terminalObservedBy: text(row.terminal_observed_by) as ProvisioningDispatch["terminalObservedBy"],
+    turnkeyCreatedAt: time(row.turnkey_created_at),
+    observedSubOrganizationId: text(row.observed_sub_organization_id),
+    observedRootUserId: text(row.observed_root_user_id),
+    observedWalletId: text(row.observed_wallet_id),
+    observedOwnerAddress: text(row.observed_owner_address),
+    failureCode: row.failure_code === null || row.failure_code === undefined ? null : Number(row.failure_code),
+    failureMessage: text(row.failure_message),
+    intentVerdict: text(row.intent_verdict) as ProvisioningDispatch["intentVerdict"],
+    fingerprintVerdict: text(row.fingerprint_verdict) as ProvisioningDispatch["fingerprintVerdict"],
+    voteVerdict: text(row.vote_verdict) as ProvisioningDispatch["voteVerdict"],
+    lastObservedStatus: text(row.last_observed_status),
+    lastObservedAt: time(row.last_observed_at),
     updatedAt: new Date(row.updated_at as string).toISOString(),
   };
 }
@@ -888,6 +933,164 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
 
     async updateCounter({ credentialId, counter }) {
       await sql`UPDATE registration_attempts SET counter = ${counter}, updated_at = now() WHERE credential_id = ${credentialId}`;
+    },
+
+    // Provisioning Evidence Capture: the pre-dispatch durability point. ONE
+    // batch, no read before it, no network inside it.
+    //
+    //  1. ONE statement: the verified -> provisioning_in_flight CAS is the
+    //     `claimed` CTE and the evidence INSERT selects FROM claimed — so a
+    //     lost CAS has nothing to insert, and an INSERT that violates any
+    //     constraint (digest CHECK, body-digest / sequence / one-open
+    //     uniqueness) aborts the transaction and the claim with it: the
+    //     attempt stays 'verified'. (A batch that COMMITTED but whose HTTP
+    //     response was lost also throws here — with the claim and evidence
+    //     durable and nothing sent: review, fail closed.) dispatch_seq is MAX + 1 for this
+    //     attempt; only the CAS winner computes it, and UNIQUE
+    //     (credential_id, dispatch_seq) rejects a collision instead of ever
+    //     overwriting a row. The guard aborts if a won CAS did not insert
+    //     exactly one row.
+    //  2. Read the row back in the same transaction: what the caller stamps
+    //     and sends is this PERSISTED body, never its own copy.
+    async beginProvisioningDispatch({ credentialId, attemptedAt, evidence }) {
+      const results = await sql.transaction([
+        sql`
+          WITH claimed AS (
+            UPDATE registration_attempts
+            SET state = 'provisioning_in_flight', external_outcome = 'unknown',
+                external_provisioning_attempted_at = ${attemptedAt}::timestamptz, updated_at = now()
+            WHERE credential_id = ${credentialId} AND state = 'verified'
+            RETURNING *
+          ),
+          inserted AS (
+            INSERT INTO registration_provisioning_dispatches
+              (credential_id, dispatch_seq, evidence_version, organization_id, stamp_public_key, request_timestamp_ms, request_body, request_body_sha256)
+            SELECT c.credential_id,
+                   (SELECT COALESCE(MAX(d.dispatch_seq), 0) + 1 FROM registration_provisioning_dispatches d WHERE d.credential_id = c.credential_id),
+                   ${evidence.evidenceVersion}::int, ${evidence.organizationId}, ${evidence.stampPublicKey},
+                   ${evidence.requestTimestampMs}::bigint, ${evidence.requestBody}, ${evidence.requestBodySha256}
+            FROM claimed c
+            RETURNING id
+          )
+          SELECT c.*,
+                 (SELECT (c.state || ':provisioning_dispatch_mismatch')::int WHERE (SELECT count(*) FROM inserted) <> 1) AS guard
+          FROM claimed c
+        `,
+        sql`SELECT * FROM registration_provisioning_dispatches WHERE credential_id = ${credentialId} AND request_body_sha256 = ${evidence.requestBodySha256}`,
+      ]);
+      const attemptRow = (results[0] as Row[])[0];
+      if (!attemptRow) return null; // lost the CAS: nothing was inserted, nothing may be dispatched
+      const dispatchRow = (results[1] as Row[])[0];
+      // Unreachable while the guard holds; never dispatch without the persisted row.
+      if (!dispatchRow) throw new Error("Provisioning dispatch claim committed without its evidence row.");
+      return { attempt: toAttempt(attemptRow), dispatch: toDispatch(dispatchRow) };
+    },
+
+    // First writer wins. The WHERE clause is the write-once guard; a row that
+    // already has an activity id is only read, never rewritten.
+    async recordDispatchActivity({ dispatchId, activityId, fingerprint }) {
+      const updated = (await sql`
+        UPDATE registration_provisioning_dispatches
+        SET turnkey_activity_id = ${activityId}, turnkey_activity_fingerprint = ${fingerprint}, activity_recorded_at = now(), updated_at = now()
+        WHERE id = ${dispatchId}::uuid AND turnkey_activity_id IS NULL
+        RETURNING *
+      `) as Row[];
+      if (updated[0]) return { outcome: "recorded", dispatch: toDispatch(updated[0]) };
+      const existing = (await sql`SELECT * FROM registration_provisioning_dispatches WHERE id = ${dispatchId}::uuid`) as Row[];
+      if (!existing[0]) return { outcome: "not_found" };
+      const dispatch = toDispatch(existing[0]);
+      return { outcome: dispatch.turnkeyActivityId === activityId ? "already_recorded" : "mismatch", dispatch };
+    },
+
+    // Write-once terminal group, bound to the activity id already recorded.
+    async recordDispatchTerminal({ dispatchId, activityId, observation }) {
+      const updated = (await sql`
+        UPDATE registration_provisioning_dispatches
+        SET terminal_status = ${observation.status}, terminal_observed_at = now(), terminal_observed_by = ${observation.observedBy},
+            turnkey_created_at = ${observation.turnkeyCreatedAt}::timestamptz,
+            observed_sub_organization_id = ${observation.observedSubOrganizationId}, observed_root_user_id = ${observation.observedRootUserId},
+            observed_wallet_id = ${observation.observedWalletId}, observed_owner_address = ${observation.observedOwnerAddress},
+            failure_code = ${observation.failureCode}::int, failure_message = ${observation.failureMessage},
+            intent_verdict = ${observation.intentVerdict}, fingerprint_verdict = ${observation.fingerprintVerdict}, vote_verdict = ${observation.voteVerdict},
+            last_observed_status = ${observation.status}, last_observed_at = now(), updated_at = now()
+        WHERE id = ${dispatchId}::uuid AND turnkey_activity_id = ${activityId} AND terminal_status IS NULL
+        RETURNING *
+      `) as Row[];
+      if (updated[0]) return { outcome: "recorded", dispatch: toDispatch(updated[0]) };
+      const existing = (await sql`SELECT * FROM registration_provisioning_dispatches WHERE id = ${dispatchId}::uuid`) as Row[];
+      if (!existing[0]) return { outcome: "not_found" };
+      const dispatch = toDispatch(existing[0]);
+      if (dispatch.turnkeyActivityId === null || dispatch.turnkeyActivityId !== activityId) return { outcome: "activity_mismatch", dispatch };
+      return { outcome: "already_terminal", dispatch };
+    },
+
+    async recordDispatchObservation({ dispatchId, activityId, status }) {
+      const rows = (await sql`
+        UPDATE registration_provisioning_dispatches
+        SET last_observed_status = ${status}, last_observed_at = now(), updated_at = now()
+        WHERE id = ${dispatchId}::uuid AND turnkey_activity_id = ${activityId} AND terminal_status IS NULL
+        RETURNING id
+      `) as Row[];
+      return rows.length > 0;
+    },
+
+    async findDispatchesByCredentialId(credentialId) {
+      const rows = (await sql`SELECT * FROM registration_provisioning_dispatches WHERE credential_id = ${credentialId} ORDER BY dispatch_seq ASC`) as Row[];
+      return rows.map(toDispatch);
+    },
+
+    // "provisioning_in_flight" is claim-only: these two single-statement CASes
+    // are the only ways out. Each requires, in the same statement, the
+    // attempt's NEWEST dispatch row (by dispatch_seq) to be exactly this one,
+    // with this activity id and an in-process ('dispatch') terminal
+    // observation proving the outcome. The EXISTS clauses are the twins of
+    // registration-attempts.ts's dispatchProvesDefinitiveFailure /
+    // dispatchProvesCreated. No match -> zero rows -> null, nothing changed.
+    async revertProvisioningAfterDefinitiveFailure({ credentialId, dispatchId, activityId }) {
+      const rows = (await sql`
+        UPDATE registration_attempts a
+        SET state = 'verified', external_outcome = 'definitive_failure', updated_at = now()
+        WHERE a.credential_id = ${credentialId} AND a.state = 'provisioning_in_flight'
+          AND EXISTS (
+            SELECT 1 FROM registration_provisioning_dispatches d
+            WHERE d.id = ${dispatchId}::uuid AND d.credential_id = a.credential_id
+              AND d.dispatch_seq = (SELECT max(x.dispatch_seq) FROM registration_provisioning_dispatches x WHERE x.credential_id = a.credential_id)
+              AND d.turnkey_activity_id = ${activityId}
+              AND d.terminal_status IN ('ACTIVITY_STATUS_FAILED', 'ACTIVITY_STATUS_REJECTED')
+              AND d.terminal_observed_by = 'dispatch'
+              AND d.fingerprint_verdict IN ('match', 'unrecognized_form')
+              AND (d.intent_verdict = 'exact' OR (d.intent_verdict = 'fields_only' AND d.fingerprint_verdict = 'match'))
+          )
+        RETURNING *
+      `) as Row[];
+      return rows[0] ? toAttempt(rows[0]) : null;
+    },
+
+    async advanceProvisioningToTurnkeyCreated({ credentialId, dispatchId, activityId, identity }) {
+      const rows = (await sql`
+        UPDATE registration_attempts a
+        SET state = 'turnkey_created', external_outcome = 'confirmed_created',
+            sub_organization_id = ${identity.subOrganizationId}, turnkey_user_id = ${identity.turnkeyUserId}, wallet_id = ${identity.walletId},
+            wallet_account_id = ${identity.walletAccountId}, owner_address = ${identity.ownerAddress}, updated_at = now()
+        WHERE a.credential_id = ${credentialId} AND a.state = 'provisioning_in_flight'
+          AND a.sub_organization_id IS NULL AND a.turnkey_user_id IS NULL AND a.wallet_id IS NULL AND a.wallet_account_id IS NULL AND a.owner_address IS NULL
+          AND EXISTS (
+            SELECT 1 FROM registration_provisioning_dispatches d
+            WHERE d.id = ${dispatchId}::uuid AND d.credential_id = a.credential_id
+              AND d.dispatch_seq = (SELECT max(x.dispatch_seq) FROM registration_provisioning_dispatches x WHERE x.credential_id = a.credential_id)
+              AND d.turnkey_activity_id = ${activityId}
+              AND d.terminal_status = 'ACTIVITY_STATUS_COMPLETED'
+              AND d.terminal_observed_by = 'dispatch'
+              AND d.intent_verdict = 'exact'
+              AND d.fingerprint_verdict IN ('match', 'unrecognized_form')
+              AND d.observed_sub_organization_id = ${identity.subOrganizationId}
+              AND d.observed_root_user_id = ${identity.turnkeyUserId}
+              AND d.observed_wallet_id = ${identity.walletId}
+              AND d.observed_owner_address = ${identity.ownerAddress}
+          )
+        RETURNING *
+      `) as Row[];
+      return rows[0] ? toAttempt(rows[0]) : null;
     },
 
     // S5 L3. ONE transaction, no read before it, no network inside it

@@ -13,8 +13,9 @@ import type { RealServerConfig } from "./config";
  * adoption here. Finding a sub-org that contains a credential (getSubOrgIds +
  * current shape) proves membership, not that our own CREATE_SUB_ORGANIZATION
  * made it, nor that nobody else holds authority in it — so an uncertain
- * create is never resolved automatically (onboarding.ts). A future
- * operator-only resolver must first capture exact dispatch evidence.
+ * create is never resolved automatically (onboarding.ts). The exact
+ * dispatch evidence a future operator-only resolver needs is captured by
+ * provisioning-dispatch.ts; nothing here reads it.
  */
 export type TurnkeyUserAuthenticator = { authenticatorId: string; credentialId: string; publicKey: string };
 
