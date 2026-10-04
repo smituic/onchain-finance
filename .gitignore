@@ -39,3 +39,6 @@ next-env.d.ts
 
 # Vercel
 .vercel
+
+# Local, untracked operator evidence (one-off scripts and their read-backs: endpoint/account fingerprints, row hashes)
+/evidence/
