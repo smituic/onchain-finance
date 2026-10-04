@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Expander } from "@/components/shell/expander";
 import { Note } from "@/components/shell/note";
+import { AccountIdentity } from "@/components/real/account-identity";
 import { RealPasskeysManager } from "@/components/real/real-passkeys-manager";
 import { useHasRealAccountHydrated, useRealAccountStore } from "@/lib/stores/real-account-store";
 import { useRealPasskeysStore } from "@/lib/stores/real-passkeys-store";
@@ -50,6 +51,7 @@ export function AccountSetup() {
         <Note title="Your account is connected">
           <p>Testnet only — this account holds no real money.</p>
         </Note>
+        <AccountIdentity />
         <Expander question="See account details">
           <p>Owner address: {account.ownerAddress}</p>
           <p>Safe address: {account.safeAddress}</p>

@@ -1,7 +1,8 @@
 import { cookies } from "next/headers";
 import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, requireRealServerConfig } from "@/lib/real/server/http";
 import { readAuthenticatedRealAccount } from "@/lib/real/server/auth";
-import { getRealAccountRegistry } from "@/lib/real/server/runtime";
+import { readAccountProfileBestEffort } from "@/lib/real/server/handle-claim";
+import { getAccountHandleStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
 
 export async function GET() {
@@ -24,11 +25,18 @@ export async function GET() {
       if (cookieValue !== undefined) store.delete(REAL_SESSION_COOKIE_NAME);
       return Response.json({ authenticated: false });
     }
+    // Human-readable identity is looked up here, for the response only — it is
+    // never in the session cookie and auth.ts never reads it. Best-effort: the
+    // session is already authenticated above, and a failure to read this
+    // presentation metadata never signs anyone out or fails the check.
+    const profile = await readAccountProfileBestEffort({ handles: getAccountHandleStore, appUserId: authenticated.account.appUserId });
     return Response.json({
       authenticated: true,
       appUserId: authenticated.account.appUserId,
       ownerAddress: authenticated.account.ownerAddress,
       safeAddress: authenticated.account.safeAddress,
+      handle: profile.handle,
+      displayName: profile.displayName,
     });
   } catch {
     return jsonInternalError();

@@ -36,6 +36,10 @@ export async function POST(request: Request) {
       appUserId: result.account.appUserId,
       ownerAddress: result.account.ownerAddress,
       safeAddress: result.account.safeAddress,
+      // A just-registered account cannot own a handle or a display name yet, so
+      // nothing is looked up: no profile-store failure can exist on this path.
+      handle: null,
+      displayName: null,
     });
   } catch {
     return jsonInternalError();

@@ -4,6 +4,7 @@ import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals } from 
 import { createInMemoryPasskeyRevocationStore } from "@/lib/real/server/passkey-revocation-attempts";
 import { createInMemoryBackupPasskeyEnrollmentStore } from "@/lib/real/server/backup-passkey-enrollment";
 import { createInMemoryChallengeStore } from "@/lib/real/server/challenge-store";
+import { createInMemoryAccountHandleStore } from "@/lib/real/server/account-handles";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import type { PaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
@@ -365,6 +366,7 @@ describe("2g-H: backup setup routes require a fresh step-up by the session crede
       getRealAccountRegistry: () => registry,
       getChallengeStore: () => recordingChallengeStore,
       getBackupPasskeyEnrollmentStore: () => enrollments,
+      getAccountHandleStore: () => createInMemoryAccountHandleStore(registry),
     }));
     const stepUpRoute = await import("@/app/api/real/account/passkeys/backup/step-up/options/route");
     const optionsRoute = await import("@/app/api/real/account/passkeys/backup/options/route");

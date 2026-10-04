@@ -1,6 +1,6 @@
 import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readJsonBody, requireRealServerConfig } from "@/lib/real/server/http";
 import { beginBackupEnrollment } from "@/lib/real/server/backup-passkey-pipeline";
-import { getBackupPasskeyEnrollmentStore, getChallengeStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
+import { getAccountHandleStore, getBackupPasskeyEnrollmentStore, getChallengeStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { readPasskeySession } from "@/app/api/real/account/passkeys/session";
 
 /**
@@ -21,6 +21,8 @@ export async function POST(request: Request) {
       challengeStore: getChallengeStore(),
       registry: getRealAccountRegistry(),
       enrollments: getBackupPasskeyEnrollmentStore(),
+      // A thunk, read best-effort: the handle only labels the new passkey, so a profile-store failure never fails the setup.
+      handles: getAccountHandleStore,
       appUserId: authenticated.account.appUserId,
       sessionCredentialId: authenticated.session.credentialId,
       stepUpResponse: (rawBody as { stepUp?: unknown }).stepUp,

@@ -6,6 +6,8 @@ import { PRODUCT_AREAS_BY_ID } from "@/lib/product-areas";
 import { Note } from "@/components/shell/note";
 import { AccountSetup } from "@/components/real/account-setup";
 import { CashBalance } from "@/components/real/cash-balance";
+import { accountTitle } from "@/lib/real/display/account-name";
+import { formatHandle } from "@/lib/real/handle";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 
 /**
@@ -19,14 +21,17 @@ import { useRealAccountStore } from "@/lib/stores/real-account-store";
 export function RealHomeView() {
   const pay = PRODUCT_AREAS_BY_ID.pay;
   const account = useRealAccountStore((s) => s.account);
+  // The account's own name leads once it has one; an account without a name or @name reads exactly as before.
+  const title = account ? accountTitle({ handle: account.handle ?? null, displayName: account.displayName ?? null }) : null;
 
   return (
     <div className="flex flex-col gap-8" data-testid="real-home">
       <section className="flex flex-col gap-2 pt-2">
         <p className="text-sm text-muted-foreground">Real Mode</p>
         <h1 className="font-heading text-2xl font-semibold tracking-tight">
-          {account ? "Your real account" : "Your real account isn't set up yet"}
+          {account ? (title ?? "Your real account") : "Your real account isn't set up yet"}
         </h1>
+        {account?.displayName && account.handle ? <p className="text-sm font-medium">{formatHandle(account.handle)}</p> : null}
         <p className="text-sm text-muted-foreground">
           {account
             ? "Connected with a passkey — no seed phrase or extension."

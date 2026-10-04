@@ -3,9 +3,11 @@
  * backup-passkey purposes — see schema.sql's identical CHECK constraint
  * comment for why they're kept distinct from 'registration'/'login'.
  * 'backup_step_up' (2g-H) is the fresh session-credential assertion that must
- * precede every backup registration challenge.
+ * precede every backup registration challenge. 'handle_claim' is the fresh
+ * session-credential assertion that must precede a permanent @handle claim
+ * (server/handle-claim.ts) — its own purpose, never backup_step_up.
  */
-export type ChallengePurpose = "registration" | "login" | "backup_registration" | "backup_login_verification" | "backup_step_up";
+export type ChallengePurpose = "registration" | "login" | "backup_registration" | "backup_login_verification" | "backup_step_up" | "handle_claim";
 
 export type StoredChallenge = {
   challenge: string;

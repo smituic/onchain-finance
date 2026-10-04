@@ -4,6 +4,7 @@ import { createInMemoryRegistrationAttemptStore, type RegistrationAttemptStore }
 import { createInMemoryPaymentAttemptStore, type PaymentAttemptStore } from "./payment-attempts";
 import { createInMemoryBackupPasskeyEnrollmentStore, type BackupPasskeyEnrollmentStore } from "./backup-passkey-enrollment";
 import { createInMemoryPasskeyRevocationStore, type PasskeyRevocationStore } from "./passkey-revocation-attempts";
+import { createInMemoryAccountHandleStore, type AccountHandleStore } from "./account-handles";
 import { createNeonDurableStores } from "./neon-store";
 
 /**
@@ -28,9 +29,10 @@ let attemptStore: RegistrationAttemptStore | null = null;
 let paymentAttemptStore: PaymentAttemptStore | null = null;
 let backupEnrollmentStore: BackupPasskeyEnrollmentStore | null = null;
 let revocationStore: PasskeyRevocationStore | null = null;
+let handleStore: AccountHandleStore | null = null;
 
 function ensureStoresInitialized(): void {
-  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore) return;
+  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore && handleStore) return;
 
   const databaseUrl = process.env.DATABASE_URL?.trim();
   if (databaseUrl) {
@@ -41,6 +43,7 @@ function ensureStoresInitialized(): void {
     paymentAttemptStore = durable.payments;
     backupEnrollmentStore = durable.backupEnrollments;
     revocationStore = durable.revocations;
+    handleStore = durable.handles;
     return;
   }
 
@@ -60,6 +63,7 @@ function ensureStoresInitialized(): void {
   paymentAttemptStore = createInMemoryPaymentAttemptStore(registry);
   backupEnrollmentStore = createInMemoryBackupPasskeyEnrollmentStore(registry);
   revocationStore = createInMemoryPasskeyRevocationStore(registry);
+  handleStore = createInMemoryAccountHandleStore(registry);
 }
 
 export function getRealAccountRegistry(): RealAccountRegistry {
@@ -90,4 +94,9 @@ export function getBackupPasskeyEnrollmentStore(): BackupPasskeyEnrollmentStore 
 export function getPasskeyRevocationStore(): PasskeyRevocationStore {
   ensureStoresInitialized();
   return revocationStore!;
+}
+
+export function getAccountHandleStore(): AccountHandleStore {
+  ensureStoresInitialized();
+  return handleStore!;
 }

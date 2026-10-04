@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals, type RealAccountRegistry } from "@/lib/real/server/registry";
 import { createInMemoryChallengeStore } from "@/lib/real/server/challenge-store";
+import { createInMemoryAccountHandleStore } from "@/lib/real/server/account-handles";
 import { createInMemoryRegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
 import { createInMemoryPaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { createInMemoryBackupPasskeyEnrollmentStore } from "@/lib/real/server/backup-passkey-enrollment";
@@ -77,6 +78,7 @@ async function seed() {
     payments: createInMemoryPaymentAttemptStore(registry),
     enrollments: createInMemoryBackupPasskeyEnrollmentStore(registry),
     revocations: createInMemoryPasskeyRevocationStore(registry),
+    handles: createInMemoryAccountHandleStore(registry),
   };
   return stores;
 }
@@ -92,6 +94,7 @@ function mockRuntime(stores: Stores, registryOverride?: Partial<RealAccountRegis
     getPaymentAttemptStore: () => stores.payments,
     getBackupPasskeyEnrollmentStore: () => stores.enrollments,
     getPasskeyRevocationStore: () => stores.revocations,
+    getAccountHandleStore: () => stores.handles,
   }));
 }
 

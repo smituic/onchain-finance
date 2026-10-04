@@ -12,6 +12,7 @@ import {
   type RegistrationAttemptState,
   type RegistrationAttemptStore,
 } from "./registration-attempts";
+import type { AccountHandleRecord, AccountHandleStore } from "./account-handles";
 import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveResult } from "./payment-attempts";
 
 /**
@@ -290,13 +291,27 @@ export const ACCOUNT_IDENTITY_UNIQUE_INDEXES = [
   "real_accounts_safe_address_lower_key",
 ] as const;
 
-export function isAccountIdentityUniqueViolation(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
+/** The exact constraint/index a 23505 names, or undefined for any other error (or a 23505 that names none). */
+export function uniqueViolationConstraintName(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
   const { code, constraint, message } = error as { code?: unknown; constraint?: unknown; message?: unknown };
-  if (String(code) !== "23505") return false;
-  const name = typeof constraint === "string" && constraint ? constraint : /unique constraint "([^"]+)"/.exec(typeof message === "string" ? message : "")?.[1];
+  if (String(code) !== "23505") return undefined;
+  return typeof constraint === "string" && constraint ? constraint : /unique constraint "([^"]+)"/.exec(typeof message === "string" ? message : "")?.[1];
+}
+
+export function isAccountIdentityUniqueViolation(error: unknown): boolean {
+  const name = uniqueViolationConstraintName(error);
   return name !== undefined && (ACCOUNT_IDENTITY_UNIQUE_INDEXES as readonly string[]).includes(name);
 }
+
+/**
+ * Account Handles: the two uniqueness rules on real_account_handles
+ * (schema.sql) — one account per handle (the primary key) and one handle per
+ * account. A 23505 naming EXACTLY one of these is a lost claim race; any
+ * other database error is never relabeled as one.
+ */
+export const ACCOUNT_HANDLE_PRIMARY_KEY = "real_account_handles_pkey";
+export const ACCOUNT_HANDLE_OWNER_KEY = "real_account_handles_app_user_id_key";
 
 export function createNeonChallengeStore(sql: NeonQueryFunction<false, false>): ChallengeStore {
   return {
@@ -411,6 +426,61 @@ export function createNeonRealAccountRegistry(sql: NeonQueryFunction<false, fals
         UPDATE real_accounts SET session_epoch = session_epoch + 1 WHERE app_user_id = ${appUserId} RETURNING session_epoch
       `) as Row[];
       return rows[0] ? toSessionEpoch(rows[0].session_epoch) : null;
+    },
+  };
+}
+
+export function createNeonAccountHandleStore(sql: NeonQueryFunction<false, false>): AccountHandleStore {
+  return {
+    async findHandle(handle) {
+      const rows = (await sql`SELECT handle, kind, app_user_id FROM real_account_handles WHERE handle = ${handle}`) as Row[];
+      const row = rows[0];
+      if (!row) return null;
+      return { handle: row.handle as string, kind: row.kind as AccountHandleRecord["kind"], appUserId: (row.app_user_id as string | null) ?? null };
+    },
+
+    async findProfileByAppUserId(appUserId) {
+      const rows = (await sql`
+        SELECT a.display_name, h.handle
+        FROM real_accounts a LEFT JOIN real_account_handles h ON h.app_user_id = a.app_user_id
+        WHERE a.app_user_id = ${appUserId}
+      `) as Row[];
+      const row = rows[0];
+      if (!row) return null;
+      return { handle: (row.handle as string | null) ?? null, displayName: (row.display_name as string | null) ?? null };
+    },
+
+    async claim({ handle, appUserId, credentialId }) {
+      try {
+        // ONE statement: the row is inserted only if the credential is, right
+        // now, an ACTIVE passkey of this account — re-checked by the database,
+        // not carried over from an earlier read. The owner and claimer columns
+        // come from that passkey row, never from the caller.
+        const rows = (await sql`
+          INSERT INTO real_account_handles (handle, kind, app_user_id, claimed_by_credential_id)
+          SELECT ${handle}, 'claimed', p.app_user_id, p.credential_id
+          FROM real_passkeys p
+          WHERE p.credential_id = ${credentialId} AND p.app_user_id = ${appUserId} AND p.status = 'active'
+          RETURNING handle
+        `) as Row[];
+        return rows[0] ? { outcome: "claimed", handle: rows[0].handle as string, alreadyOwned: false } : { outcome: "credential_not_active" };
+      } catch (error) {
+        // Only the two handle uniqueness rules are interpreted; anything else propagates.
+        const constraint = uniqueViolationConstraintName(error);
+        if (constraint !== ACCOUNT_HANDLE_PRIMARY_KEY && constraint !== ACCOUNT_HANDLE_OWNER_KEY) throw error;
+        // Rows are immutable, so what this account owns now is what it will always own.
+        const owned = (await sql`SELECT handle FROM real_account_handles WHERE app_user_id = ${appUserId}`) as Row[];
+        const existing = (owned[0]?.handle as string | undefined) ?? null;
+        if (existing === handle) return { outcome: "claimed", handle, alreadyOwned: true };
+        if (existing !== null) return { outcome: "already_has_handle", handle: existing };
+        if (constraint === ACCOUNT_HANDLE_PRIMARY_KEY) return { outcome: "handle_taken" };
+        throw error;
+      }
+    },
+
+    async setDisplayName({ appUserId, displayName }) {
+      const rows = (await sql`UPDATE real_accounts SET display_name = ${displayName} WHERE app_user_id = ${appUserId} RETURNING app_user_id`) as Row[];
+      return rows.length > 0;
     },
   };
 }
@@ -1418,6 +1488,7 @@ export type NeonDurableStores = {
   payments: PaymentAttemptStore;
   backupEnrollments: BackupPasskeyEnrollmentStore;
   revocations: PasskeyRevocationStore;
+  handles: AccountHandleStore;
 };
 
 /**
@@ -1442,7 +1513,7 @@ export function createNeonSqlClient(databaseUrl: string): NeonQueryFunction<fals
   return neon(databaseUrl, { isolationLevel: NEON_TRANSACTION_ISOLATION_LEVEL });
 }
 
-/** One connection (Neon's HTTP query function is stateless/per-request-safe), six adapters. */
+/** One connection (Neon's HTTP query function is stateless/per-request-safe), seven adapters. */
 export function createNeonDurableStores(databaseUrl: string): NeonDurableStores {
   const sql = createNeonSqlClient(databaseUrl);
   return {
@@ -1452,5 +1523,6 @@ export function createNeonDurableStores(databaseUrl: string): NeonDurableStores 
     payments: createNeonPaymentAttemptStore(sql),
     backupEnrollments: createNeonBackupPasskeyEnrollmentStore(sql),
     revocations: createNeonPasskeyRevocationStore(sql),
+    handles: createNeonAccountHandleStore(sql),
   };
 }

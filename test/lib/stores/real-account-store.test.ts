@@ -9,6 +9,7 @@ vi.mock("@/lib/real/account/webauthn-client", () => ({
   performLoginCeremony: ceremonies.performLoginCeremony,
   performRegistrationCeremony: ceremonies.performRegistrationCeremony,
   isWebAuthnCancellation: () => false,
+  signalAccountLabel: () => {},
 }));
 
 const { ALREADY_SIGNED_OUT_MESSAGE, SIGN_OUT_EVERYWHERE_FAILED_MESSAGE, createRealAccountStore } = await import("@/lib/stores/real-account-store");

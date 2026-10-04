@@ -6,6 +6,9 @@ import { credentialIdsEqual } from "../credential-id";
 import { addressesEqual, isValidUuid } from "../identifiers";
 import { serializeTurnkeyRawSignature } from "../signing/raw-signature";
 import type { ChallengeStore } from "./challenge-store";
+import { formatHandle } from "../handle";
+import type { AccountHandleStore } from "./account-handles";
+import { readAccountProfileBestEffort } from "./handle-claim";
 import { DuplicateCredentialError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
 import { isAbandonable, type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { RealServerConfig } from "./config";
@@ -227,12 +230,27 @@ export type BeginBackupEnrollmentResult =
  * 2g-H: EVERY call — first start or re-mint — requires a fresh step-up
  * assertion by the session credential (prepareBackupStepUp), verified before
  * anything is created or minted. A cookie alone gets nothing.
+ *
+ * Account Handles: once the account has claimed a handle, the new passkey's
+ * WebAuthn user entity is LABELLED with it (user.name = "@handle",
+ * user.displayName = the display name, else "@handle"), so the passkey
+ * manager shows a name the user recognizes. Presentation only: user.id stays
+ * a fresh random value per credential exactly as before, and the handle never
+ * reaches the Turnkey authenticator request (authenticatorName is unchanged).
+ * Without a handle — or without `handles` — the naming is what it always was.
+ *
+ * The profile read is BEST-EFFORT (readAccountProfileBestEffort; `handles` is
+ * a thunk so that failing to build the store is covered too): the label is
+ * cosmetic, so a profile-store failure is indistinguishable from "no handle"
+ * and never fails or re-prompts a backup enrollment whose step-up already
+ * verified. (The read is awaited, so a slow profile store can still delay it.)
  */
 export async function beginBackupEnrollment(input: {
   config: RealServerConfig;
   challengeStore: ChallengeStore;
   registry: RealAccountRegistry;
   enrollments: BackupPasskeyEnrollmentStore;
+  handles?: () => AccountHandleStore;
   appUserId: string;
   sessionCredentialId: string;
   stepUpResponse: unknown;
@@ -261,10 +279,13 @@ export async function beginBackupEnrollment(input: {
 
   const existingPasskeys = await input.registry.findPasskeysByAppUserId(input.appUserId);
   const userIdBytes = randomBytes(32);
+  const profile = input.handles ? await readAccountProfileBestEffort({ handles: input.handles, appUserId: input.appUserId }) : null;
+  const label = profile?.handle ? formatHandle(profile.handle) : null;
   const optionsJSON = await buildRegistrationOptions({
     config: input.config,
     userId: userIdBytes,
-    userName: `real-backup-${enrollment.id.slice(0, 8)}`,
+    userName: label ?? `real-backup-${enrollment.id.slice(0, 8)}`,
+    userDisplayName: label ? (profile?.displayName ?? label) : undefined,
     excludeCredentialIds: existingPasskeys.filter((p) => p.status !== "revoked").map((p) => p.credentialId),
   });
 

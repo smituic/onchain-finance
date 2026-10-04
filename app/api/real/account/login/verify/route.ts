@@ -2,7 +2,8 @@ import { cookies } from "next/headers";
 import type { AuthenticationResponseJSON } from "@simplewebauthn/server";
 import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readJsonBody, requireRealServerConfig } from "@/lib/real/server/http";
 import { completeLogin } from "@/lib/real/server/login";
-import { getChallengeStore, getRealAccountRegistry, getRegistrationAttemptStore } from "@/lib/real/server/runtime";
+import { readAccountProfileBestEffort } from "@/lib/real/server/handle-claim";
+import { getAccountHandleStore, getChallengeStore, getRealAccountRegistry, getRegistrationAttemptStore } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME, realSessionCookieOptions } from "@/lib/real/server/session";
 
 export async function POST(request: Request) {
@@ -31,10 +32,17 @@ export async function POST(request: Request) {
     const store = await cookies();
     store.set(REAL_SESSION_COOKIE_NAME, result.sessionCookie, realSessionCookieOptions());
 
+    // Sign-in is already complete and its session issued. The handle / display
+    // name are response enrichment only: if they can't be read, the login still
+    // succeeds, with none. Never part of the session cookie.
+    const profile = await readAccountProfileBestEffort({ handles: getAccountHandleStore, appUserId: result.account.appUserId });
+
     return Response.json({
       appUserId: result.account.appUserId,
       ownerAddress: result.account.ownerAddress,
       safeAddress: result.account.safeAddress,
+      handle: profile.handle,
+      displayName: profile.displayName,
     });
   } catch {
     return jsonInternalError();

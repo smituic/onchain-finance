@@ -56,7 +56,8 @@ export function readRealServerConfig(
     turnkeyApiPrivateKey: turnkeyApiPrivateKey!,
     sessionSecret: sessionSecret!,
     rpId: rpId!,
-    rpName: env.NEXT_PUBLIC_REAL_RP_NAME?.trim() || "onchain-finance",
+    // Presentation only (shown by passkey managers on NEW passkeys). The RP ID and expected origins are what verification uses.
+    rpName: env.NEXT_PUBLIC_REAL_RP_NAME?.trim() || "ON Chain Finance",
     expectedOrigins: readExpectedOrigins(env),
     rpcUrl: env.BASE_SEPOLIA_RPC_URL?.trim() || env.NEXT_PUBLIC_BASE_SEPOLIA_RPC_URL?.trim() || "https://sepolia.base.org",
     pimlicoApiKey: pimlicoApiKey!,
