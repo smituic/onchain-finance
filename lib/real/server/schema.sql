@@ -1172,6 +1172,288 @@ BEGIN
 END $$;
 -- END Account Handles
 
+-- BEGIN Payment Attempt Recipient Identity
+-- Hand-applied, idempotent, FAIL-CLOSED. NOT YET APPLIED TO ANY NEON DATABASE:
+-- it is statically tested (test/lib/real/payment-recipient-identity-schema.test.ts)
+-- and has a gated disposable-branch smoke
+-- (test/lib/real/payment-recipient-identity-migration.smoke.test.ts) that has
+-- not been run against Neon yet. Apply it only after that smoke and an
+-- independent audit.
+--
+-- WHAT IT ADDS: three nullable columns on payment_attempts, one CHECK, and two
+-- foreign keys — so that a LATER slice (Handle Pay Slice B, not built) can
+-- record WHO a payment was meant for when it is addressed to an @handle.
+-- Nothing reads or writes these columns today: prepare, reserve(), submit,
+-- reconcile, history, and every mapper are unchanged, and an existing INSERT
+-- that does not name them leaves all three NULL.
+--
+--   recipient_app_user_id   the recipient ACCOUNT (real_accounts.app_user_id).
+--   recipient_handle        the canonical handle the payer addressed
+--                           (real_account_handles.handle; COLLATE "C", like
+--                           the registry's own column).
+--   recipient_display_name  the recipient's display name AS SHOWN at prepare —
+--                           a snapshot for receipts, nullable even for a
+--                           handle payment, never an identity or lookup input.
+--                           Its length is already bounded where it is written
+--                           (real_accounts_display_name_check); it gets no
+--                           second length CHECK here.
+--
+-- No default, no backfill, no new index, no trigger. There is no
+-- `recipient_kind` column: "paid by handle" IS `recipient_handle IS NOT NULL`,
+-- and a second column saying so could only ever disagree with it.
+--
+-- payment_attempts_recipient_identity_check: a row is either an ADDRESS
+-- payment (all three NULL — every existing row, and every address payment
+-- from now on) or a HANDLE payment (handle AND account both set; the display
+-- name may still be NULL). A handle without an account, an account without a
+-- handle, or a display name on its own is refused.
+--
+-- Both foreign keys are direct, validated, not deferrable, MATCH SIMPLE, and
+-- NO ACTION on update and delete — nothing cascades and nothing is set NULL,
+-- so a recorded recipient can never silently vanish or be re-pointed:
+--   payment_attempts_recipient_app_user_id_fkey  -> real_accounts (app_user_id)
+--   payment_attempts_recipient_handle_fkey       -> real_account_handles (handle)
+--
+-- KNOWN, DELIBERATE GAP — PAIR INTEGRITY IS NOT ENFORCED HERE. The database
+-- proves the handle exists and the account exists, NOT that the handle belongs
+-- to that account. A composite key would need UNIQUE (handle, app_user_id) on
+-- real_account_handles, and that table's block above is closed, evidence-
+-- bearing, and proves its exact index set — it is not touched. The registry is
+-- immutable and never recycled, so a pair that is right when written stays
+-- right. Slice B must therefore derive BOTH values from the database inside
+-- the one atomic INSERT (never from the client), and must write the recipient
+-- address as lower(a.safe_address): payment_attempts.recipient is normalized
+-- lowercase, while real_accounts.safe_address is stored case-preserving.
+-- The standing audit query — it must return ZERO rows once handle payments
+-- exist (read-only):
+--   SELECT p.id
+--   FROM payment_attempts p
+--   LEFT JOIN real_account_handles h ON h.handle = p.recipient_handle
+--   LEFT JOIN real_accounts a ON a.app_user_id = p.recipient_app_user_id
+--   WHERE p.recipient_handle IS NOT NULL
+--     AND (h.kind IS DISTINCT FROM 'claimed'
+--       OR h.app_user_id IS DISTINCT FROM p.recipient_app_user_id
+--       OR lower(a.safe_address) IS DISTINCT FROM lower(p.recipient));
+--
+-- DECIDED FOR SLICE B (recorded here; this migration does not depend on it and
+-- no lookup code changes with it): a claimed handle with a valid account/Safe
+-- can RECEIVE Cash whether or not it currently has an active passkey —
+-- receiving and authenticating are separate concerns. Slice B removes the
+-- active-passkey condition from authoritative payment resolution and aligns
+-- the advisory lookup with that rule.
+--
+-- A recipient is always the account's Safe. The Turnkey signer address is not
+-- part of this block in any form.
+--
+-- WITHOUT THIS MIGRATION, Slice B fails CLOSED: its INSERT names these columns,
+-- so the statement is refused outright (undefined column) and no payment is
+-- reserved — a handle payment can never be stored with its identity silently
+-- dropped.
+--
+-- FAIL-CLOSED, same convention as the Account Handles block above: ONE DO
+-- block = ONE transaction; search_path pinned to `pg_catalog, pg_temp`;
+-- payment_attempts, real_accounts, and real_account_handles must each be an
+-- ordinary permanent table (so the Handles migration comes first); whatever is
+-- missing is created by name, and then everything is PROVEN from the catalog —
+-- each column against a reference copy deparsed by this server (built-in TEXT,
+-- no type modifier, not an array, the exact collation, nullable, no default,
+-- not identity, not generated), the CHECK (validated, enforced, not
+-- deferrable, exactly those three columns, the reference's own deparsed
+-- definition, depending on nothing but payment_attempts), both foreign keys
+-- (target table and column, the unique index behind it, NO ACTION both ways,
+-- MATCH SIMPLE, validated, enforced, not deferrable), and that NOTHING else —
+-- no index, trigger, view, policy, or second constraint — depends on the three
+-- columns. Any mismatch RAISEs and rolls the whole block back, including the
+-- columns it had just added. Nothing is ever dropped, altered into compliance,
+-- or repaired here, and no row is ever written.
+-- Pre-live checks (read-only):
+--   SELECT attname FROM pg_attribute WHERE attrelid = 'payment_attempts'::regclass AND attname LIKE 'recipient\_%';  -- none before first apply
+--   SELECT conname FROM pg_constraint WHERE conrelid = 'payment_attempts'::regclass AND conname LIKE 'payment_attempts_recipient_%' AND contype IN ('c', 'f');  -- none before first apply
+DO $$
+DECLARE
+  -- Declared types are resolved BEFORE the search_path pin below, so each is schema-qualified.
+  target_schema CONSTANT pg_catalog.text := 'public';
+  table_name CONSTANT pg_catalog.text := 'payment_attempts';
+  reference_name CONSTANT pg_catalog.text := 'payment_attempts_recipient_identity_reference';
+  check_name CONSTANT pg_catalog.text := 'payment_attempts_recipient_identity_check';
+  account_fk_name CONSTANT pg_catalog.text := 'payment_attempts_recipient_app_user_id_fkey';
+  handle_fk_name CONSTANT pg_catalog.text := 'payment_attempts_recipient_handle_fkey';
+  -- Exactly the three columns, each "<name> <definition>". The same text adds the column and builds the reference copy.
+  column_definitions CONSTANT pg_catalog.text[] := ARRAY[
+    'recipient_app_user_id TEXT',
+    'recipient_handle TEXT COLLATE "C"',
+    'recipient_display_name TEXT'
+  ];
+  -- The same text adds the CHECK and builds the reference copy.
+  check_expression CONSTANT pg_catalog.text :=
+    '(recipient_handle IS NULL AND recipient_app_user_id IS NULL AND recipient_display_name IS NULL) OR (recipient_handle IS NOT NULL AND recipient_app_user_id IS NOT NULL)';
+  ns pg_catalog.oid;
+  tbl pg_catalog.oid;
+  ref pg_catalog.oid;
+  accounts_tbl pg_catalog.oid;
+  handles_tbl pg_catalog.oid;
+  c_collation pg_catalog.oid;
+  default_collation pg_catalog.oid;
+  expected_collation pg_catalog.oid;
+  accounts_app_user pg_catalog.int2;
+  handles_handle pg_catalog.int2;
+  own_app_user pg_catalog.int2;
+  own_handle pg_catalog.int2;
+  own_display_name pg_catalog.int2;
+  column_definition pg_catalog.text;
+  col pg_catalog.text;
+  tc record;
+  rc record;
+  ck_ref record;
+  ck record;
+  account_fk record;
+  handle_fk record;
+  bad pg_catalog.text;
+BEGIN
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+
+  SELECT n.oid INTO ns FROM pg_catalog.pg_namespace n WHERE n.nspname = target_schema;
+  IF ns IS NULL THEN
+    RAISE EXCEPTION 'Payment recipient identity migration refused: schema % does not exist.', target_schema;
+  END IF;
+
+  -- 1. The three tables, each ordinary, permanent, and not a partition — BEFORE anything is added.
+  SELECT c.oid INTO tbl FROM pg_catalog.pg_class c
+    WHERE c.relnamespace = ns AND c.relname = table_name AND c.relkind = 'r' AND c.relpersistence = 'p' AND NOT c.relispartition;
+  SELECT c.oid INTO accounts_tbl FROM pg_catalog.pg_class c
+    WHERE c.relnamespace = ns AND c.relname = 'real_accounts' AND c.relkind = 'r' AND c.relpersistence = 'p' AND NOT c.relispartition;
+  SELECT c.oid INTO handles_tbl FROM pg_catalog.pg_class c
+    WHERE c.relnamespace = ns AND c.relname = 'real_account_handles' AND c.relkind = 'r' AND c.relpersistence = 'p' AND NOT c.relispartition;
+  IF tbl IS NULL OR accounts_tbl IS NULL OR handles_tbl IS NULL THEN
+    RAISE EXCEPTION 'Payment recipient identity migration refused: %.payment_attempts, %.real_accounts, or %.real_account_handles is missing or is not an ordinary, permanent, non-partition table (the Account Handles migration comes first). Nothing was changed; review and resolve by hand (never altered or dropped).', target_schema, target_schema, target_schema;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = tbl OR i.inhparent = tbl) THEN
+    RAISE EXCEPTION 'Payment recipient identity migration refused: %.% takes part in table inheritance (as a child or a parent). Nothing was changed; review and resolve by hand (never altered or dropped).', target_schema, table_name;
+  END IF;
+  SELECT a.attnum INTO accounts_app_user FROM pg_catalog.pg_attribute a WHERE a.attrelid = accounts_tbl AND a.attname = 'app_user_id' AND a.attnum > 0 AND NOT a.attisdropped;
+  SELECT a.attnum INTO handles_handle FROM pg_catalog.pg_attribute a WHERE a.attrelid = handles_tbl AND a.attname = 'handle' AND a.attnum > 0 AND NOT a.attisdropped;
+  SELECT co.oid INTO c_collation FROM pg_catalog.pg_collation co JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace WHERE cn.nspname = 'pg_catalog' AND co.collname = 'C';
+  SELECT co.oid INTO default_collation FROM pg_catalog.pg_collation co JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace WHERE cn.nspname = 'pg_catalog' AND co.collname = 'default';
+  IF accounts_app_user IS NULL OR handles_handle IS NULL OR c_collation IS NULL OR default_collation IS NULL THEN
+    RAISE EXCEPTION 'Payment recipient identity migration refused: %.real_accounts.app_user_id, %.real_account_handles.handle, or a built-in collation could not be found. Nothing was changed; review and resolve by hand (never altered or dropped).', target_schema, target_schema;
+  END IF;
+
+  -- 2. Add what is missing (IF NOT EXISTS trusts the name — everything below does not).
+  FOREACH column_definition IN ARRAY column_definitions LOOP
+    EXECUTE format('ALTER TABLE %I.%I ADD COLUMN IF NOT EXISTS %s', target_schema, table_name, column_definition);
+  END LOOP;
+
+  -- The reference: the same column and CHECK text, deparsed by this server, in this transaction.
+  EXECUTE format('DROP TABLE IF EXISTS pg_temp.%I', reference_name);
+  EXECUTE format('CREATE TEMPORARY TABLE %I (%s, CONSTRAINT %I CHECK (%s)) ON COMMIT DROP', reference_name, pg_catalog.array_to_string(column_definitions, ', '), check_name, check_expression);
+  SELECT c.oid INTO ref FROM pg_catalog.pg_class c WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname = reference_name;
+
+  -- 3. Each column, exactly: built-in TEXT, no type modifier, not an array, the intended collation, nullable, no default, not identity, not generated.
+  FOREACH column_definition IN ARRAY column_definitions LOOP
+    col := pg_catalog.split_part(column_definition, ' ', 1);
+    expected_collation := CASE WHEN col = 'recipient_handle' THEN c_collation ELSE default_collation END;
+    SELECT a.attnum, a.atttypid, a.atttypmod, a.attcollation, a.attndims, a.attnotnull, a.atthasdef, a.attidentity, a.attgenerated
+      INTO rc FROM pg_catalog.pg_attribute a WHERE a.attrelid = ref AND a.attname = col AND a.attnum > 0 AND NOT a.attisdropped;
+    SELECT a.attnum, a.atttypid, a.atttypmod, a.attcollation, a.attndims, a.attnotnull, a.atthasdef, a.attidentity, a.attgenerated
+      INTO tc FROM pg_catalog.pg_attribute a WHERE a.attrelid = tbl AND a.attname = col AND a.attnum > 0 AND NOT a.attisdropped;
+    IF tc.attnum IS NULL OR rc.attnum IS NULL
+      OR tc.atttypid IS DISTINCT FROM 'pg_catalog.text'::pg_catalog.regtype
+      OR tc.atttypid IS DISTINCT FROM rc.atttypid
+      OR tc.atttypmod IS DISTINCT FROM rc.atttypmod
+      OR tc.attndims IS DISTINCT FROM rc.attndims
+      OR tc.attcollation IS DISTINCT FROM rc.attcollation
+      OR tc.attcollation IS DISTINCT FROM expected_collation
+      OR tc.attnotnull IS NOT FALSE
+      OR tc.atthasdef IS NOT FALSE
+      OR tc.attidentity IS DISTINCT FROM rc.attidentity
+      OR tc.attgenerated IS DISTINCT FROM rc.attgenerated
+      OR EXISTS (SELECT 1 FROM pg_catalog.pg_attrdef ad WHERE ad.adrelid = tbl AND ad.adnum = tc.attnum)
+    THEN
+      RAISE EXCEPTION 'Payment recipient identity migration refused: %.%.% is missing or is not exactly the intended nullable TEXT column (collation, no default, not generated, not identity, not an array). Nothing was changed; review and resolve by hand (never altered or dropped).', target_schema, table_name, col;
+    END IF;
+  END LOOP;
+  SELECT a.attnum INTO own_app_user FROM pg_catalog.pg_attribute a WHERE a.attrelid = tbl AND a.attname = 'recipient_app_user_id' AND a.attnum > 0 AND NOT a.attisdropped;
+  SELECT a.attnum INTO own_handle FROM pg_catalog.pg_attribute a WHERE a.attrelid = tbl AND a.attname = 'recipient_handle' AND a.attnum > 0 AND NOT a.attisdropped;
+  SELECT a.attnum INTO own_display_name FROM pg_catalog.pg_attribute a WHERE a.attrelid = tbl AND a.attname = 'recipient_display_name' AND a.attnum > 0 AND NOT a.attisdropped;
+
+  -- 4. The CHECK: created only if no constraint has that name, then proven against the reference's own deparsed definition.
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid = tbl AND k.conname = check_name) THEN
+    EXECUTE format('ALTER TABLE %I.%I ADD CONSTRAINT %I CHECK (%s)', target_schema, table_name, check_name, check_expression);
+  END IF;
+  SELECT k.oid, k.connoinherit, pg_catalog.pg_get_constraintdef(k.oid) AS def INTO ck_ref
+    FROM pg_catalog.pg_constraint k WHERE k.conrelid = ref AND k.conname = check_name AND k.contype = 'c';
+  SELECT k.oid INTO ck FROM pg_catalog.pg_constraint k
+    WHERE k.conrelid = tbl AND k.conname = check_name AND k.contype = 'c'
+      AND k.convalidated AND NOT k.condeferrable AND NOT k.condeferred
+      AND COALESCE((pg_catalog.to_jsonb(k) ->> 'conenforced')::pg_catalog.bool, true)
+      AND k.connoinherit = ck_ref.connoinherit
+      AND (SELECT pg_catalog.array_agg(u.attnum ORDER BY u.attnum) FROM pg_catalog.unnest(k.conkey) AS u(attnum))
+        = (SELECT pg_catalog.array_agg(v.attnum ORDER BY v.attnum) FROM pg_catalog.unnest(ARRAY[own_app_user, own_handle, own_display_name]::pg_catalog.int2[]) AS v(attnum))
+      AND pg_catalog.pg_get_constraintdef(k.oid) = ck_ref.def;
+  IF ck_ref.oid IS NULL OR ck.oid IS NULL THEN
+    RAISE EXCEPTION 'Payment recipient identity migration refused: % on %.% is missing, not validated, not enforced, deferrable, or not exactly the intended CHECK over the three recipient columns. Nothing was changed; review and resolve by hand (never altered or dropped).', check_name, target_schema, table_name;
+  END IF;
+  SELECT pg_catalog.string_agg(DISTINCT d.refclassid::pg_catalog.regclass::pg_catalog.text || ':' || d.refobjid::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_depend d
+    WHERE d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid = ck.oid
+      AND NOT (d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = tbl);
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Payment recipient identity migration refused: % on %.% depends on an object other than that table (%). Nothing was changed; review and resolve by hand (never altered or dropped).', check_name, target_schema, table_name, bad;
+  END IF;
+
+  -- 5. Both foreign keys: created only if no constraint has that name, then proven structurally —
+  --    the target table and column, the unique index behind it, NO ACTION ('a') on update and delete, MATCH SIMPLE ('s'), validated, enforced, not deferrable.
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid = tbl AND k.conname = account_fk_name) THEN
+    EXECUTE format('ALTER TABLE %I.%I ADD CONSTRAINT %I FOREIGN KEY (recipient_app_user_id) REFERENCES %I.real_accounts (app_user_id) ON UPDATE NO ACTION ON DELETE NO ACTION',
+      target_schema, table_name, account_fk_name, target_schema);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid = tbl AND k.conname = handle_fk_name) THEN
+    EXECUTE format('ALTER TABLE %I.%I ADD CONSTRAINT %I FOREIGN KEY (recipient_handle) REFERENCES %I.real_account_handles (handle) ON UPDATE NO ACTION ON DELETE NO ACTION',
+      target_schema, table_name, handle_fk_name, target_schema);
+  END IF;
+  SELECT k.oid, k.conindid INTO account_fk FROM pg_catalog.pg_constraint k
+    WHERE k.conrelid = tbl AND k.conname = account_fk_name AND k.contype = 'f'
+      AND k.convalidated AND NOT k.condeferrable AND NOT k.condeferred
+      AND COALESCE((pg_catalog.to_jsonb(k) ->> 'conenforced')::pg_catalog.bool, true)
+      AND NOT COALESCE((pg_catalog.to_jsonb(k) ->> 'conperiod')::pg_catalog.bool, false)
+      AND k.confrelid = accounts_tbl AND k.confupdtype = 'a' AND k.confdeltype = 'a' AND k.confmatchtype = 's'
+      AND k.conkey = ARRAY[own_app_user]::pg_catalog.int2[] AND k.confkey = ARRAY[accounts_app_user]::pg_catalog.int2[];
+  IF account_fk.oid IS NULL OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_index i WHERE i.indexrelid = account_fk.conindid AND i.indrelid = accounts_tbl
+      AND i.indisunique AND i.indisvalid AND i.indisready AND i.indimmediate AND NOT i.indisexclusion
+      AND i.indnatts = 1 AND i.indnkeyatts = 1 AND i.indkey[0] = accounts_app_user AND i.indexprs IS NULL AND i.indpred IS NULL)
+  THEN
+    RAISE EXCEPTION 'Payment recipient identity migration refused: % is not exactly recipient_app_user_id -> %.real_accounts(app_user_id), validated, not deferrable, NO ACTION. Nothing was changed; review and resolve by hand (never altered or dropped).', account_fk_name, target_schema;
+  END IF;
+  SELECT k.oid, k.conindid INTO handle_fk FROM pg_catalog.pg_constraint k
+    WHERE k.conrelid = tbl AND k.conname = handle_fk_name AND k.contype = 'f'
+      AND k.convalidated AND NOT k.condeferrable AND NOT k.condeferred
+      AND COALESCE((pg_catalog.to_jsonb(k) ->> 'conenforced')::pg_catalog.bool, true)
+      AND NOT COALESCE((pg_catalog.to_jsonb(k) ->> 'conperiod')::pg_catalog.bool, false)
+      AND k.confrelid = handles_tbl AND k.confupdtype = 'a' AND k.confdeltype = 'a' AND k.confmatchtype = 's'
+      AND k.conkey = ARRAY[own_handle]::pg_catalog.int2[] AND k.confkey = ARRAY[handles_handle]::pg_catalog.int2[];
+  IF handle_fk.oid IS NULL OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_index i WHERE i.indexrelid = handle_fk.conindid AND i.indrelid = handles_tbl
+      AND i.indisunique AND i.indisvalid AND i.indisready AND i.indimmediate AND NOT i.indisexclusion
+      AND i.indnatts = 1 AND i.indnkeyatts = 1 AND i.indkey[0] = handles_handle AND i.indexprs IS NULL AND i.indpred IS NULL)
+  THEN
+    RAISE EXCEPTION 'Payment recipient identity migration refused: % is not exactly recipient_handle -> %.real_account_handles(handle), validated, not deferrable, NO ACTION. Nothing was changed; review and resolve by hand (never altered or dropped).', handle_fk_name, target_schema;
+  END IF;
+
+  -- 6. Nothing else depends on the three columns: no index, no trigger, no view or rule, no policy, no second CHECK or foreign key.
+  SELECT pg_catalog.string_agg(DISTINCT d.classid::pg_catalog.regclass::pg_catalog.text || ':' || d.objid::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_depend d
+    WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = tbl
+      AND d.refobjsubid IN (own_app_user, own_handle, own_display_name)
+      AND NOT (d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid IN (ck.oid, account_fk.oid, handle_fk.oid));
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Payment recipient identity migration refused: an unexpected object (%) depends on a recipient identity column of %.% (an index, trigger, view, policy, or another constraint). Nothing was changed; review and resolve by hand (never altered or dropped).', bad, target_schema, table_name;
+  END IF;
+
+  EXECUTE format('DROP TABLE pg_temp.%I', reference_name);
+END $$;
+-- END Payment Attempt Recipient Identity
+
 -- BEGIN Provisioning Evidence Capture
 -- Hand-applied, idempotent, FAIL-CLOSED. Already applied (and its idempotent
 -- rerun proven) on a disposable Neon branch and on the REAL Neon database's

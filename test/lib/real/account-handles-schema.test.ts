@@ -25,7 +25,11 @@ const definition = (/\$definition\$([\s\S]*?)\$definition\$/.exec(raw)?.[1] ?? "
   .filter((line) => !line.trim().startsWith("--"))
   .join("\n")
   .replace(/\s+/g, " ");
-const statementsOutside = (schema.slice(0, begin) + schema.slice(end))
+// The later Payment Attempt Recipient Identity block is carved out: it names the registry, but only as a foreign-key TARGET
+// (payment-recipient-identity-schema.test.ts proves it alters nothing but payment_attempts, and that this block's text is unchanged).
+const recipientBegin = schema.indexOf("-- BEGIN Payment Attempt Recipient Identity");
+const recipientEnd = schema.indexOf("-- END Payment Attempt Recipient Identity");
+const statementsOutside = (schema.slice(0, begin) + schema.slice(end, recipientBegin) + schema.slice(recipientEnd))
   .split("\n")
   .filter((line) => !line.trim().startsWith("--"))
   .join("\n");
@@ -46,8 +50,11 @@ describe("Account Handles migration (schema.sql structure)", () => {
     expect(code.match(/DO \$\$/g)).toHaveLength(1);
     expect(raw.match(/'public'/g)).toHaveLength(1);
     at("target_schema CONSTANT pg_catalog.text := 'public';");
-    // Nothing outside the block touches the registry or its supporting key.
+    // Nothing outside the block touches the registry or its supporting key (the one carved-out block only references the registry).
+    expect(recipientBegin).toBeGreaterThan(end);
+    expect(recipientEnd).toBeGreaterThan(recipientBegin);
     expect(statementsOutside).not.toMatch(/real_account_handles|real_passkeys_app_user_credential_key/);
+    expect(schema.slice(recipientBegin, recipientEnd)).not.toMatch(/real_passkeys_app_user_credential_key|ALTER TABLE [^ ]*real_account_handles|ON [^ ]*real_account_handles/);
   });
 
   it("pins search_path first and schema-qualifies every declared type", () => {
