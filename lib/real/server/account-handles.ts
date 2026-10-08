@@ -34,9 +34,30 @@ export type ClaimHandleResult =
   /** The claiming credential is not an active passkey of this account. */
   | { outcome: "credential_not_active" };
 
+/**
+ * What recipient resolution needs from a CLAIMED handle, and nothing more.
+ * SERVER-ONLY: `appUserId` and `safeAddress` must never reach a public
+ * response. `safeAddress` is real_accounts.safe_address — the account itself —
+ * and is never the Turnkey owner address (which this read does not select).
+ */
+export type PayableAccountRecord = {
+  handle: string;
+  displayName: string | null;
+  appUserId: string;
+  safeAddress: string;
+};
+
 export interface AccountHandleStore {
   /** Exact lookup of a canonical handle (reserved or claimed). Advisory only — claim() is authoritative. */
   findHandle(handle: string): Promise<AccountHandleRecord | null>;
+  /**
+   * handle -> app_user_id -> real_accounts.safe_address, in one read. Null for
+   * a reserved or unclaimed handle, and for an account that can't be paid to
+   * right now (PROVISIONAL: no ACTIVE passkey — nobody could sign in to it).
+   * Advisory: it decides nothing about a payment. `handle` must already be
+   * canonical (lib/real/handle.ts).
+   */
+  findPayableAccountByHandle(handle: string): Promise<PayableAccountRecord | null>;
   /** Null when the account doesn't exist. */
   findProfileByAppUserId(appUserId: string): Promise<AccountProfile | null>;
   /**
@@ -73,6 +94,16 @@ export function createInMemoryAccountHandleStore(registry: RealAccountRegistry):
   return {
     async findHandle(handle) {
       return byHandle.get(handle) ?? null;
+    },
+
+    async findPayableAccountByHandle(handle) {
+      const record = byHandle.get(handle);
+      if (!record || record.kind !== "claimed" || record.appUserId === null) return null;
+      const account = internals.accountsByAppUserId.get(record.appUserId);
+      if (!account) return null;
+      const hasActivePasskey = [...internals.passkeysByCredentialId.values()].some((passkey) => passkey.appUserId === account.appUserId && passkey.status === "active");
+      if (!hasActivePasskey) return null;
+      return { handle: record.handle, displayName: displayNames.get(account.appUserId) ?? null, appUserId: account.appUserId, safeAddress: account.safeAddress };
     },
 
     async findProfileByAppUserId(appUserId) {

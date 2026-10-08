@@ -439,6 +439,21 @@ export function createNeonAccountHandleStore(sql: NeonQueryFunction<false, false
       return { handle: row.handle as string, kind: row.kind as AccountHandleRecord["kind"], appUserId: (row.app_user_id as string | null) ?? null };
     },
 
+    async findPayableAccountByHandle(handle) {
+      // One joined read. Selects the Safe (a.safe_address) and never the Turnkey owner column. The EXISTS is the provisional "has an active passkey" usability rule.
+      const rows = (await sql`
+        SELECT h.handle, a.display_name, a.app_user_id, a.safe_address
+        FROM real_account_handles h
+        JOIN real_accounts a ON a.app_user_id = h.app_user_id
+        WHERE h.handle = ${handle}
+          AND h.kind = 'claimed'
+          AND EXISTS (SELECT 1 FROM real_passkeys p WHERE p.app_user_id = a.app_user_id AND p.status = 'active')
+      `) as Row[];
+      const row = rows[0];
+      if (!row) return null;
+      return { handle: row.handle as string, displayName: (row.display_name as string | null) ?? null, appUserId: row.app_user_id as string, safeAddress: row.safe_address as string };
+    },
+
     async findProfileByAppUserId(appUserId) {
       const rows = (await sql`
         SELECT a.display_name, h.handle

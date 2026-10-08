@@ -516,6 +516,7 @@ describe("readAuthenticatedRealAccount stays free of handle metadata (static)", 
       "app/api/real/account/login/verify/route.ts",
       "app/api/real/account/passkeys/backup/options/route.ts",
       "app/api/real/account/profile/route.ts",
+      "app/api/real/recipients/lookup/route.ts",
       "app/api/real/session/route.ts",
     ]);
     // Of those, the two that enrich an ALREADY-authenticated response use the best-effort read directly ...
@@ -523,8 +524,8 @@ describe("readAuthenticatedRealAccount stays free of handle metadata (static)", 
     expect(bestEffort).toEqual(["app/api/real/account/login/verify/route.ts", "app/api/real/session/route.ts"]);
     // ... the backup-options route hands the pipeline the store GETTER (a thunk), which the pipeline reads best-effort (N1) ...
     expect(readFileSync("app/api/real/account/passkeys/backup/options/route.ts", "utf8")).toMatch(/handles: getAccountHandleStore,\n/);
-    // ... and only the claim and profile routes — where the profile decides something — build the store eagerly and read it strictly.
+    // ... and only the claim and profile routes — where the profile decides something — and the recipient lookup, whose whole answer is the handle read, build the store eagerly and read it strictly.
     const strict = routes.filter((file) => /getAccountHandleStore\(\)/.test(readFileSync(file, "utf8"))).map((file) => file.split(path.sep).join("/")).sort();
-    expect(strict).toEqual(["app/api/real/account/handle/claim/route.ts", "app/api/real/account/handle/options/route.ts", "app/api/real/account/profile/route.ts"]);
+    expect(strict).toEqual(["app/api/real/account/handle/claim/route.ts", "app/api/real/account/handle/options/route.ts", "app/api/real/account/profile/route.ts", "app/api/real/recipients/lookup/route.ts"]);
   });
 });

@@ -102,7 +102,7 @@ describe("in-memory handle store (the twin of schema.sql's constraints)", () => 
 
   it("has no operation that changes or removes a handle", async () => {
     const { handles } = await world();
-    expect(Object.keys(handles).sort()).toEqual(["claim", "findHandle", "findProfileByAppUserId", "setDisplayName"]);
+    expect(Object.keys(handles).sort()).toEqual(["claim", "findHandle", "findPayableAccountByHandle", "findProfileByAppUserId", "setDisplayName"]);
   });
 
   it("display name: set, replace, clear; never touches the handle; unknown account is false", async () => {
