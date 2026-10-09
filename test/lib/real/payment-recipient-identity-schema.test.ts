@@ -349,7 +349,9 @@ describe("boundaries", () => {
     expect(comments).toContain("payment_attempts.recipient is normalized lowercase, while real_accounts.safe_address is stored case-preserving");
     expect(comments).toContain("can RECEIVE Cash whether or not it currently has an active passkey");
     expect(comments).toContain("WITHOUT THIS MIGRATION, Slice B fails CLOSED");
-    expect(comments).toContain("NOT YET APPLIED TO ANY NEON DATABASE");
+    expect(comments).toContain("Hand-applied, idempotent, FAIL-CLOSED. CLOSED / COMPLETE:");
+    expect(comments).toContain("was applied EXACTLY ONCE to the real Neon database's `public` schema");
+    expect(comments).not.toContain("NOT YET APPLIED TO ANY NEON DATABASE");
   });
 });
 

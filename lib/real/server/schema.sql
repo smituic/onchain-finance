@@ -1173,12 +1173,17 @@ END $$;
 -- END Account Handles
 
 -- BEGIN Payment Attempt Recipient Identity
--- Hand-applied, idempotent, FAIL-CLOSED. NOT YET APPLIED TO ANY NEON DATABASE:
--- it is statically tested (test/lib/real/payment-recipient-identity-schema.test.ts)
--- and has a gated disposable-branch smoke
--- (test/lib/real/payment-recipient-identity-migration.smoke.test.ts) that has
--- not been run against Neon yet. Apply it only after that smoke and an
--- independent audit.
+-- Hand-applied, idempotent, FAIL-CLOSED. CLOSED / COMPLETE: it is statically
+-- tested (test/lib/real/payment-recipient-identity-schema.test.ts), passed its
+-- gated disposable-branch smoke
+-- (test/lib/real/payment-recipient-identity-migration.smoke.test.ts) on Neon
+-- PostgreSQL 18.6 (64/64, `public` apply and idempotent rerun), passed an
+-- independent audit, was applied EXACTLY ONCE to the real Neon database's
+-- `public` schema (direct endpoint, no ambiguous outcome), and passed an
+-- independent production post-apply audit (no Critical, High, or Medium).
+-- Nothing is pending; no further apply is needed. This header is
+-- comment-only history: the executed DO block below, through its closing
+-- END line, is evidence-bearing and unchanged (SHA-256 in ARCHITECTURE.md).
 --
 -- WHAT IT ADDS: three nullable columns on payment_attempts, one CHECK, and two
 -- foreign keys — so that a LATER slice (Handle Pay Slice B, not built) can
@@ -1266,9 +1271,11 @@ END $$;
 -- columns. Any mismatch RAISEs and rolls the whole block back, including the
 -- columns it had just added. Nothing is ever dropped, altered into compliance,
 -- or repaired here, and no row is ever written.
--- Pre-live checks (read-only):
---   SELECT attname FROM pg_attribute WHERE attrelid = 'payment_attempts'::regclass AND attname LIKE 'recipient\_%';  -- none before first apply
---   SELECT conname FROM pg_constraint WHERE conrelid = 'payment_attempts'::regclass AND conname LIKE 'payment_attempts_recipient_%' AND contype IN ('c', 'f');  -- none before first apply
+-- Pre-live checks (read-only; historical — the real apply is done). Matching by
+-- wildcard is unsafe on PostgreSQL 18, which already names the legacy NOT NULL
+-- on `recipient` payment_attempts_recipient_not_null; match the exact names:
+--   SELECT attname FROM pg_attribute WHERE attrelid = 'payment_attempts'::regclass AND attname IN ('recipient_app_user_id', 'recipient_handle', 'recipient_display_name') AND NOT attisdropped;  -- none before first apply, three now
+--   SELECT conname FROM pg_constraint WHERE conrelid = 'payment_attempts'::regclass AND conname IN ('payment_attempts_recipient_identity_check', 'payment_attempts_recipient_app_user_id_fkey', 'payment_attempts_recipient_handle_fkey');  -- none before first apply, three now
 DO $$
 DECLARE
   -- Declared types are resolved BEFORE the search_path pin below, so each is schema-qualified.
