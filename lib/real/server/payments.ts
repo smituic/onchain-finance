@@ -18,6 +18,7 @@ import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "../constants";
 import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore } from "./payment-attempts";
 import { isWellFormedActivityId, verifyPaymentAuthorization } from "./payment-authorization";
 import type { RealServerConfig } from "./config";
+import type { PrepareRecipientSelector } from "./handle-recipient";
 
 /**
  * Pre-2f hardening: fixed, safe messages for every failure path in this
@@ -157,6 +158,12 @@ export type PreparePaymentOutcome =
   | { outcome: "unauthenticated" }
   | { outcome: "account_not_ready" }
   | { outcome: "invalid_recipient" }
+  /** A handle that is not already in canonical form. Refused before anything is reserved. */
+  | { outcome: "invalid_recipient_handle" }
+  /** Reserved, nonexistent, missing account, or invalid Safe — deliberately indistinguishable. */
+  | { outcome: "recipient_not_found" }
+  /** The handle is the payer's own account. (A direct address is not checked — unchanged.) */
+  | { outcome: "self_payment" }
   | { outcome: "invalid_amount" }
   | { outcome: "balance_check_failed"; reason: string }
   | { outcome: "insufficient_balance" }
@@ -193,7 +200,14 @@ export async function resolvePreparePayment(input: {
   paymentStore: PaymentAttemptStore;
   publicClient: RealPublicClient;
   pimlicoApiKey: string;
-  recipientInput: unknown;
+  /**
+   * The parsed recipient selector (handle-recipient.ts's parsePrepareRecipientSelector,
+   * run at the route). null = the request named zero or two recipients, refused as
+   * invalid_recipient AFTER authentication. This module deliberately imports no handle
+   * module: handle syntax is checked at the edge, and a `handle` selector arrives
+   * already verified canonical.
+   */
+  recipient: PrepareRecipientSelector | null;
   amountBaseUnitsInput: unknown;
   /** Unix ms. Injectable for tests — the server's own wall clock, same one resolveSubmitPayment's dispatch-margin check uses. */
   now?: () => number;
@@ -209,9 +223,20 @@ export async function resolvePreparePayment(input: {
   const ownerAddress = validateAddressCasePreserving(authenticated.account.ownerAddress);
   if (!safeAddress || !ownerAddress) return { outcome: "account_not_ready" };
 
-  if (typeof input.recipientInput !== "string") return { outcome: "invalid_recipient" };
-  const recipient = normalizeAddress(input.recipientInput);
-  if (!recipient) return { outcome: "invalid_recipient" };
+  // Exactly one recipient selector. No recipient VARIABLE survives this block:
+  // after reservation the only recipient authority is reserved.attempt.recipient.
+  let target: { kind: "address"; address: string } | { kind: "handle"; handle: string };
+  if (!input.recipient) return { outcome: "invalid_recipient" };
+  if (input.recipient.kind === "address") {
+    if (typeof input.recipient.value !== "string") return { outcome: "invalid_recipient" };
+    const address = normalizeAddress(input.recipient.value);
+    if (!address) return { outcome: "invalid_recipient" };
+    target = { kind: "address", address };
+  } else if (input.recipient.kind === "handle") {
+    target = { kind: "handle", handle: input.recipient.handle };
+  } else {
+    return { outcome: "invalid_recipient_handle" };
+  }
 
   if (typeof input.amountBaseUnitsInput !== "string") return { outcome: "invalid_amount" };
   const amountBaseUnits = input.amountBaseUnitsInput;
@@ -242,16 +267,32 @@ export async function resolvePreparePayment(input: {
     return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
   }
 
-  const reserved = await input.paymentStore.reserve({
+  const payment = {
     appUserId: authenticated.account.appUserId,
     safeAddress,
-    recipient,
     amountBaseUnits,
     chainId: BASE_SEPOLIA_CHAIN_ID,
     tokenAddress: REAL_CASH_TOKEN.address,
     authorizingCredentialId: authenticated.passkey.credentialId,
-  });
+  };
+  // An address payment goes through reserve() (identity snapshot all NULL, no
+  // handle lookup); a handle payment goes through reserveHandlePayment(), which
+  // resolves the recipient inside the reservation. Neither is told anything
+  // about the other.
+  const reserved =
+    target.kind === "address"
+      ? await input.paymentStore.reserve({ ...payment, recipient: target.address })
+      : await input.paymentStore.reserveHandlePayment({ ...payment, recipientHandle: target.handle });
   if (!reserved.ok) return { outcome: reserved.reason };
+
+  // THE single recipient source for the Safe transfer, for address AND handle
+  // payments: what the store actually recorded. Re-validated before it is
+  // encoded; if it is somehow unusable, fail closed — never derive another.
+  const attemptRecipient = normalizeAddress(reserved.attempt.recipient);
+  if (!attemptRecipient) {
+    await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "failed", patch: { failureReason: SAFE_PREPARE_FAILED } });
+    return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
+  }
 
   let prepared: PreparedUserOperationFields;
   try {
@@ -259,7 +300,7 @@ export async function resolvePreparePayment(input: {
       publicClient: input.publicClient,
       pimlicoApiKey: input.pimlicoApiKey,
       ownerAddress: ownerAddress as Address,
-      recipient: recipient as Address,
+      recipient: attemptRecipient as Address,
       amountBaseUnits,
     });
   } catch {

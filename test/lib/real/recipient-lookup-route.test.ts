@@ -127,11 +127,26 @@ describe("POST /api/real/recipients/lookup", () => {
     expect(await reserved.text()).toBe(await missing.text());
   });
 
-  it("an account whose passkeys are all inactive answers like a nonexistent handle (PROVISIONAL rule)", async () => {
+  it("Slice B: an account whose passkeys are all inactive is still found — receiving Cash is separate from signing in; the public shape is unchanged", async () => {
     const stores = await seed();
     await stores.registry.transitionPasskeyStatus({ credentialId: "cred-1", from: "active", to: "revoked" });
-    const body = await (await (await load(stores, mint(2))).lookup({ handle: "smit" })).json();
-    expect(body).toEqual({ found: false });
+    const response = await (await load(stores, mint(2))).lookup({ handle: "smit" });
+    const body = await response.json();
+    expect(body).toEqual({ found: true, handle: "smit", displayName: "Smit Patel", isSelf: false });
+    expect(Object.keys(body).sort()).toEqual(["displayName", "found", "handle", "isSelf"]);
+    expect(JSON.stringify(body)).not.toMatch(/app-user-1|0x/);
+  });
+
+  it("Slice B: a pending-only or revoking-only recipient is found; reserved and nonexistent stay { found: false }", async () => {
+    const stores = await seed();
+    for (const to of ["revoking", "revoked"] as const) {
+      await stores.registry.transitionPasskeyStatus({ credentialId: "cred-1", from: to === "revoking" ? "active" : "revoking", to });
+      const routes = await load(stores, mint(2));
+      expect(await (await routes.lookup({ handle: "smit" })).json(), to).toMatchObject({ found: true, handle: "smit" });
+    }
+    const routes = await load(stores, mint(2));
+    expect(await (await routes.lookup({ handle: "admin" })).json()).toEqual({ found: false });
+    expect(await (await routes.lookup({ handle: "nobody" })).json()).toEqual({ found: false });
   });
 
   it("malformed handle -> 400 with the canonicalizer's own reason", async () => {

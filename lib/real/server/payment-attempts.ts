@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { normalizeAddress } from "../identifiers";
 import { getInMemoryRegistryInternals, type RealAccountRegistry } from "./registry";
 
 /**
@@ -25,10 +26,14 @@ import { getInMemoryRegistryInternals, type RealAccountRegistry } from "./regist
  * reconciliation (server/payments.ts's resolvePaymentStatus, via
  * expected_user_operation_hash) can resolve either of them.
  *
- * `reserve()` is the single atomic entry point for creating a new attempt —
- * it enforces BOTH the per-account rate limit (10/hour, 30/day) AND "at most
- * one non-terminal attempt per account" in one operation, so there is no
- * separate count-then-create pair for a caller to misuse non-atomically. The
+ * `reserve()` (an address payment) and `reserveHandlePayment()` (an @handle
+ * payment, Handle Pay Slice B) are the only atomic entry points for creating a
+ * new attempt — each enforces BOTH the per-account rate limit (10/hour,
+ * 30/day) AND "at most one non-terminal attempt per account" in one
+ * operation, so there is no separate count-then-create pair for a caller to
+ * misuse non-atomically. They share one quota and one active-attempt rule;
+ * the handle variant additionally resolves the recipient inside the same
+ * operation and records the identity snapshot, while reserve() records none. The
  * Neon adapter (neon-store.ts) implements this as a single SQL statement
  * (advisory-lock + quota count + conditional insert) plus a partial unique
  * index as a database-level backstop; the in-memory adapter here enforces
@@ -88,6 +93,18 @@ export type PaymentAttempt = {
    * dispatched and never back-filled.
    */
   authorizingCredentialId: string | null;
+  /**
+   * Handle Pay Slice B — the recipient identity SNAPSHOT, SERVER-ONLY. All
+   * three are null for an address payment (every direct-address payment, and
+   * every row before Slice B). For a handle payment the store writes them
+   * together with `recipient` from ONE authoritative resolution (never from a
+   * caller): the recipient's account, the canonical handle that was paid, and
+   * the display name as it was at prepare. They are not a public shape — not
+   * in the prepare response, history, or any browser state.
+   */
+  recipientAppUserId: string | null;
+  recipientHandle: string | null;
+  recipientDisplayName: string | null;
   /** The Turnkey signRawPayload activity proven (server-side read) to be this payment's approval by authorizingCredentialId. Write-once; unique across payments. */
   turnkeySignActivityId: string | null;
   /** ISO time that proof passed. Write-once. */
@@ -134,6 +151,27 @@ export class DuplicateSignActivityError extends Error {
 
 export type ReserveResult = { ok: true; attempt: PaymentAttempt } | { ok: false; reason: "quota_exceeded" | "payment_in_progress" };
 
+/**
+ * What a handle payment's reservation may be told. There is deliberately NO
+ * recipient address, recipient app_user_id, or display name here: the store
+ * derives all three from the handle, in the one authoritative statement.
+ */
+export type ReserveHandlePaymentInput = {
+  appUserId: string;
+  safeAddress: string;
+  /** Already canonical (lib/real/handle.ts) — the store does not canonicalize. */
+  recipientHandle: string;
+  amountBaseUnits: string;
+  chainId: number;
+  tokenAddress: string;
+  authorizingCredentialId: string;
+};
+
+/** `recipient_not_found` covers a reserved handle, a nonexistent one, a missing account, and an invalid Safe — callers must not distinguish them. `self_payment`: the handle is the payer's own account. */
+export type ReserveHandlePaymentResult =
+  | { ok: true; attempt: PaymentAttempt }
+  | { ok: false; reason: "recipient_not_found" | "self_payment" | "quota_exceeded" | "payment_in_progress" };
+
 export const PAYMENT_RATE_LIMIT = { perHour: 10, perDay: 30 } as const;
 
 /**
@@ -151,6 +189,21 @@ export interface PaymentAttemptStore {
    * that call happens after reserve(), never before.
    */
   reserve(input: { appUserId: string; safeAddress: string; recipient: string; amountBaseUnits: string; chainId: number; tokenAddress: string; authorizingCredentialId: string }): Promise<ReserveResult>;
+
+  /**
+   * Handle Pay Slice B — the same single atomic entry point, for a payment
+   * addressed to an @handle. Quota and the one-active-payment rule are
+   * IDENTICAL to reserve(); the difference is that the recipient is resolved
+   * INSIDE the reservation: the claimed handle, its account, and that
+   * account's Safe come from the database in the same operation that creates
+   * the row (the Neon adapter is one INSERT ... SELECT), and
+   * `recipient`, `recipientAppUserId`, `recipientHandle`, and
+   * `recipientDisplayName` are all written from those joined rows. Nothing
+   * is created when the handle does not resolve to another account's valid
+   * Safe. Whether the recipient has an active passkey is irrelevant.
+   * reserve() stays address-only and never touches the handle directory.
+   */
+  reserveHandlePayment(input: ReserveHandlePaymentInput): Promise<ReserveHandlePaymentResult>;
 
   findById(id: string): Promise<PaymentAttempt | null>;
 
@@ -204,71 +257,107 @@ export function createInMemoryPaymentAttemptStore(registry?: RealAccountRegistry
   const attempts = new Map<string, PaymentAttempt>();
   const passkeys = registry ? getInMemoryRegistryInternals(registry).passkeysByCredentialId : null;
 
+  const accounts = registry ? getInMemoryRegistryInternals(registry).accountsByAppUserId : null;
+
   function forAccount(appUserId: string): PaymentAttempt[] {
     return [...attempts.values()].filter((attempt) => attempt.appUserId === appUserId);
   }
 
+  /** The one place an in-memory attempt is created — address and handle payments share the exact same active-attempt and quota rules. */
+  function reserveAttempt(
+    input: { appUserId: string; safeAddress: string; amountBaseUnits: string; chainId: number; tokenAddress: string; authorizingCredentialId: string },
+    destination: { recipient: string; recipientAppUserId: string | null; recipientHandle: string | null; recipientDisplayName: string | null },
+  ): ReserveResult {
+    // Everything below is synchronous (no `await`) until the write —
+    // under Node's single-threaded event loop this makes reservation a
+    // single atomic unit even under Promise.all([...]) concurrency,
+    // exactly like registry.ts's/registration-attempts.ts's in-memory
+    // adapters.
+    const now = Date.now();
+    const mine = forAccount(input.appUserId);
+
+    if (mine.some((attempt) => !isTerminalState(attempt.state))) {
+      return { ok: false, reason: "payment_in_progress" };
+    }
+
+    const hourly = mine.filter((attempt) => now - new Date(attempt.createdAt).getTime() < 60 * 60 * 1000).length;
+    if (hourly >= PAYMENT_RATE_LIMIT.perHour) return { ok: false, reason: "quota_exceeded" };
+
+    const daily = mine.filter((attempt) => now - new Date(attempt.createdAt).getTime() < 24 * 60 * 60 * 1000).length;
+    if (daily >= PAYMENT_RATE_LIMIT.perDay) return { ok: false, reason: "quota_exceeded" };
+
+    const nowIso = new Date(now).toISOString();
+    const attempt: PaymentAttempt = {
+      // Pre-2f hardening: a real UUID, matching Neon's gen_random_uuid()
+      // shape — not a "payment-attempt-N" placeholder. The new
+      // isValidUuid() guard (identifiers.ts) rejects non-UUID ids before
+      // they ever reach a store lookup, so this store's ids must be
+      // structurally realistic, not just unique.
+      id: randomUUID(),
+      appUserId: input.appUserId,
+      safeAddress: input.safeAddress,
+      recipient: destination.recipient,
+      amountBaseUnits: input.amountBaseUnits,
+      chainId: input.chainId,
+      tokenAddress: input.tokenAddress,
+      state: "prepared",
+      nonce: null,
+      callData: null,
+      factory: null,
+      factoryData: null,
+      callGasLimit: null,
+      verificationGasLimit: null,
+      preVerificationGas: null,
+      maxFeePerGas: null,
+      maxPriorityFeePerGas: null,
+      paymaster: null,
+      paymasterData: null,
+      paymasterVerificationGasLimit: null,
+      paymasterPostOpGasLimit: null,
+      expectedUserOperationHash: null,
+      validUntil: null,
+      prepareBlockNumber: null,
+      authorizingCredentialId: input.authorizingCredentialId,
+      recipientAppUserId: destination.recipientAppUserId,
+      recipientHandle: destination.recipientHandle,
+      recipientDisplayName: destination.recipientDisplayName,
+      turnkeySignActivityId: null,
+      authorizationVerifiedAt: null,
+      transactionHash: null,
+      failureReason: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    attempts.set(attempt.id, attempt);
+    return { ok: true, attempt };
+  }
+
   return {
     async reserve(input) {
-      // Everything below is synchronous (no `await`) until the write —
-      // under Node's single-threaded event loop this makes reserve() a
-      // single atomic unit even under Promise.all([...]) concurrency,
-      // exactly like registry.ts's/registration-attempts.ts's in-memory
-      // adapters.
-      const now = Date.now();
-      const mine = forAccount(input.appUserId);
+      // Address payment: the identity snapshot is explicitly all-null (the
+      // Neon twin names the three columns and writes NULL).
+      return reserveAttempt(input, { recipient: input.recipient, recipientAppUserId: null, recipientHandle: null, recipientDisplayName: null });
+    },
 
-      if (mine.some((attempt) => !isTerminalState(attempt.state))) {
-        return { ok: false, reason: "payment_in_progress" };
-      }
-
-      const hourly = mine.filter((attempt) => now - new Date(attempt.createdAt).getTime() < 60 * 60 * 1000).length;
-      if (hourly >= PAYMENT_RATE_LIMIT.perHour) return { ok: false, reason: "quota_exceeded" };
-
-      const daily = mine.filter((attempt) => now - new Date(attempt.createdAt).getTime() < 24 * 60 * 60 * 1000).length;
-      if (daily >= PAYMENT_RATE_LIMIT.perDay) return { ok: false, reason: "quota_exceeded" };
-
-      const nowIso = new Date(now).toISOString();
-      const attempt: PaymentAttempt = {
-        // Pre-2f hardening: a real UUID, matching Neon's gen_random_uuid()
-        // shape — not a "payment-attempt-N" placeholder. The new
-        // isValidUuid() guard (identifiers.ts) rejects non-UUID ids before
-        // they ever reach a store lookup, so this store's ids must be
-        // structurally realistic, not just unique.
-        id: randomUUID(),
-        appUserId: input.appUserId,
-        safeAddress: input.safeAddress,
-        recipient: input.recipient,
-        amountBaseUnits: input.amountBaseUnits,
-        chainId: input.chainId,
-        tokenAddress: input.tokenAddress,
-        state: "prepared",
-        nonce: null,
-        callData: null,
-        factory: null,
-        factoryData: null,
-        callGasLimit: null,
-        verificationGasLimit: null,
-        preVerificationGas: null,
-        maxFeePerGas: null,
-        maxPriorityFeePerGas: null,
-        paymaster: null,
-        paymasterData: null,
-        paymasterVerificationGasLimit: null,
-        paymasterPostOpGasLimit: null,
-        expectedUserOperationHash: null,
-        validUntil: null,
-        prepareBlockNumber: null,
-        authorizingCredentialId: input.authorizingCredentialId,
-        turnkeySignActivityId: null,
-        authorizationVerifiedAt: null,
-        transactionHash: null,
-        failureReason: null,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      };
-      attempts.set(attempt.id, attempt);
-      return { ok: true, attempt };
+    async reserveHandlePayment(input) {
+      // Synchronous from the handle lookup to the write (no `await` anywhere in
+      // this path), so the resolution and the reservation are one atomic unit
+      // under the event loop — the twin of the Neon statement's single
+      // INSERT ... SELECT. Only the payer-supplied payment fields come from the
+      // caller; the recipient is resolved here, from the directory.
+      const directory = registry ? getInMemoryRegistryInternals(registry).handleDirectory : null;
+      const row = directory?.byHandle.get(input.recipientHandle);
+      if (!directory || !row || row.kind !== "claimed" || row.appUserId === null) return { ok: false, reason: "recipient_not_found" };
+      const account = accounts?.get(row.appUserId);
+      const recipient = account ? normalizeAddress(account.safeAddress) : null;
+      if (!account || !recipient) return { ok: false, reason: "recipient_not_found" };
+      if (account.appUserId === input.appUserId) return { ok: false, reason: "self_payment" };
+      return reserveAttempt(input, {
+        recipient,
+        recipientAppUserId: account.appUserId,
+        recipientHandle: row.handle,
+        recipientDisplayName: directory.displayNames.get(account.appUserId) ?? null,
+      });
     },
 
     async findById(id) {

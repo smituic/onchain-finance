@@ -3,8 +3,9 @@ import type { AccountHandleStore } from "./account-handles";
 
 /**
  * Handle -> recipient, for ADVISORY discovery only (Slice A). It decides
- * nothing about a payment: the authoritative resolution at payment time is
- * separate, later work.
+ * nothing about a payment: the authoritative resolution happens again at
+ * prepare, inside the payment reservation itself (PaymentAttemptStore.
+ * reserveHandlePayment, Slice B) — this lookup is never the authority.
  *
  * The resolved destination is ALWAYS handle -> app_user_id ->
  * real_accounts.safe_address (the Safe is the account). It is never the
@@ -14,9 +15,9 @@ import type { AccountHandleStore } from "./account-handles";
  * by toPublicRecipientLookup, which names its fields explicitly and passes
  * neither through.
  *
- * A reserved handle, an unclaimed one, and an account that can't currently be
- * paid (the store's usability rule) are all one `not_found` — callers cannot
- * tell them apart.
+ * A reserved handle, an unclaimed one, and an account with no valid Safe
+ * address (the store's usability rule — passkeys are NOT part of it) are all
+ * one `not_found` — callers cannot tell them apart.
  */
 export type ResolvedHandleRecipient = {
   canonicalHandle: string;
@@ -54,4 +55,44 @@ export type PublicRecipientLookup = { found: false } | { found: true; handle: st
 export function toPublicRecipientLookup(result: Exclude<ResolveHandleRecipientResult, { outcome: "malformed" }>): PublicRecipientLookup {
   if (result.outcome === "not_found") return { found: false };
   return { found: true, handle: result.canonicalHandle, displayName: result.displayName, isSelf: result.outcome === "self" };
+}
+
+/**
+ * Handle Pay Slice B — who a payment is for, as the CLIENT stated it, parsed
+ * ONCE at the route into exactly one of these shapes (payments.ts imports only
+ * this type, never a handle module).
+ *
+ *  - `address`: the legacy path; `value` is untrusted and still `unknown`.
+ *  - `handle`: `handle` is a string that was ALREADY in canonical form as
+ *    received ("smit"), verified here.
+ *  - `invalid_handle`: a handle was named but is not strictly canonical.
+ *
+ * Nothing else a client could send (an app user id, a Safe address, a display
+ * name) is read: the recipient identity of a handle payment is derived by the
+ * payment store, from the handle alone.
+ */
+export type PrepareRecipientSelector = { kind: "address"; value: unknown } | { kind: "handle"; handle: string } | { kind: "invalid_handle" };
+
+/**
+ * The prepare wire contract: EXACTLY ONE of `recipient` (an address) or
+ * `recipientHandle`. Both present, neither present, or a body that isn't an
+ * object is null (invalid_recipient) — never "pick one". A present-but-wrong-
+ * typed value (null, a number) still counts as present, so it can't be used to
+ * hide a second selector.
+ *
+ * Prepare is strict where the advisory lookup is forgiving: the handle must
+ * already BE its canonical form. "@smit", "Smit", " smit ", and every other
+ * spelling that merely canonicalizes to a handle are `invalid_handle` — the
+ * browser is expected to send the canonical handle it got back from lookup.
+ */
+export function parsePrepareRecipientSelector(body: unknown): PrepareRecipientSelector | null {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
+  const { recipient, recipientHandle } = body as { recipient?: unknown; recipientHandle?: unknown };
+  const hasAddress = recipient !== undefined;
+  const hasHandle = recipientHandle !== undefined;
+  if (hasAddress === hasHandle) return null;
+  if (hasAddress) return { kind: "address", value: recipient };
+  if (typeof recipientHandle !== "string") return { kind: "invalid_handle" };
+  const canonical = canonicalizeHandle(recipientHandle);
+  return canonical.ok && canonical.handle === recipientHandle ? { kind: "handle", handle: canonical.handle } : { kind: "invalid_handle" };
 }

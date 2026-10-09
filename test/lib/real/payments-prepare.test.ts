@@ -46,6 +46,7 @@ vi.mock("@/lib/real/server/pimlico", () => ({
 }));
 
 const { resolvePreparePayment } = await import("@/lib/real/server/payments");
+type PrepareRecipientSelector = NonNullable<Parameters<typeof resolvePreparePayment>[0]["recipient"]>;
 
 async function seedAccount() {
   const registry = createInMemoryRealAccountRegistry();
@@ -107,7 +108,7 @@ function baseInput(overrides: Partial<Parameters<typeof resolvePreparePayment>[0
     paymentStore: createInMemoryPaymentAttemptStore(),
     publicClient: buildPublicClient(BigInt(100_000_000)),
     pimlicoApiKey: "pim_test_key",
-    recipientInput: RECIPIENT,
+    recipient: { kind: "address", value: RECIPIENT } as PrepareRecipientSelector | null,
     amountBaseUnitsInput: "1000000",
     ...overrides,
   };
@@ -199,7 +200,7 @@ describe("resolvePreparePayment", () => {
     const paymentStore = createInMemoryPaymentAttemptStore();
     const reserveSpy = vi.spyOn(paymentStore, "reserve");
 
-    const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore, recipientInput: "not-an-address" }));
+    const outcome = await resolvePreparePayment(baseInput({ registry, cookieValue, paymentStore, recipient: { kind: "address", value: "not-an-address" } }));
 
     expect(outcome).toEqual({ outcome: "invalid_recipient" });
     expect(reserveSpy).not.toHaveBeenCalled();

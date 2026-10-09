@@ -367,27 +367,47 @@ describe("today's code is untouched by the expanded schema", () => {
   };
   const NAMES = /recipient_app_user_id|recipient_handle|recipient_display_name|recipientAppUserId|recipientHandle|recipientDisplayName/;
 
-  it("no application code reads or writes the new columns yet (Slice B is not started)", () => {
+  it("Slice B: the recipient identity SNAPSHOT is named in exactly the two payment-store files — never in a route, the browser, a component, history, or any other server module", () => {
     const sources = [...walk("lib"), ...walk("app"), ...walk("components")];
     expect(sources.length).toBeGreaterThan(50);
-    for (const file of sources) expect(readFileSync(file, "utf8"), file).not.toMatch(NAMES);
+    const normalized = (file: string) => file.split(path.sep).join("/");
+    const files = (pattern: RegExp) => sources.filter((file) => pattern.test(readFileSync(file, "utf8"))).map(normalized).sort();
+    // The two columns / fields that exist only as the stored snapshot:
+    expect(files(/recipient_app_user_id|recipient_display_name|recipientAppUserId|recipientDisplayName/)).toEqual(["lib/real/server/neon-store.ts", "lib/real/server/payment-attempts.ts"]);
+    // The handle column itself (an exact identifier — `invalid_recipient_handle` is an outcome name, not the column):
+    expect(files(/(?<![A-Za-z0-9_])recipient_handle(?![A-Za-z0-9_])/)).toEqual(["lib/real/server/neon-store.ts"]);
+    // `recipientHandle` is also the prepare wire/service input name; it appears only along the prepare path and the store, and in no history/status/latest/component/browser file.
+    expect(files(/(?<![A-Za-z0-9_])recipientHandle(?![A-Za-z0-9_])/)).toEqual([
+      "app/api/real/payments/prepare/route.ts",
+      "lib/real/server/handle-recipient.ts",
+      "lib/real/server/neon-store.ts",
+      "lib/real/server/payment-attempts.ts",
+      "lib/real/server/payments.ts",
+    ]);
   });
 
-  it("the payment adapter stays explicit: reserve() names its INSERT columns and the row mapper names every field it reads", () => {
+  it("the payment adapter stays explicit: reserve() names its INSERT columns (the three identity columns explicitly NULL) and the row mapper names every field it reads", () => {
     const store = readFileSync("lib/real/server/neon-store.ts", "utf8");
-    expect(store.replace(/\s+/g, " ")).toContain(
-      "INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state, authorizing_credential_id)",
-    );
+    const flatStore = store.replace(/\s+/g, " ");
+    const INSERT_COLUMNS =
+      "INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state, authorizing_credential_id, recipient_app_user_id, recipient_handle, recipient_display_name)";
+    expect(flatStore.split(INSERT_COLUMNS)).toHaveLength(3); // reserve() and reserveHandlePayment(), and no third writer
+    expect(flatStore).toContain("'prepared', ${input.authorizingCredentialId}, NULL::text, NULL::text, NULL::text FROM _counts");
     const mapper = store.slice(store.indexOf("function toPaymentAttempt(row: Row): PaymentAttempt {"));
     const body = mapper.slice(0, mapper.indexOf("\n}\n"));
     expect(body.length).toBeGreaterThan(200);
     expect(body).not.toMatch(/\.\.\.row/); // never a spread, so an extra column cannot leak into a PaymentAttempt
     expect(body).toContain("row.recipient");
+    for (const column of ["row.recipient_app_user_id", "row.recipient_handle", "row.recipient_display_name"]) expect(body).toContain(column);
   });
 
-  it("the advisory lookup still applies its provisional active-passkey rule — this migration does not change it", () => {
-    const store = readFileSync("lib/real/server/neon-store.ts", "utf8").replace(/\s+/g, " ");
-    expect(store).toContain("AND EXISTS (SELECT 1 FROM real_passkeys p WHERE p.app_user_id = a.app_user_id AND p.status = 'active')");
+  it("Slice B: the advisory lookup no longer applies the provisional active-passkey rule — only a claimed handle and a valid Safe address", () => {
+    const store = readFileSync("lib/real/server/neon-store.ts", "utf8");
+    const start = store.indexOf("async findPayableAccountByHandle");
+    const read = store.slice(start, store.indexOf("async findProfileByAppUserId", start)).replace(/\s+/g, " ");
+    expect(start).toBeGreaterThan(-1);
+    expect(read).not.toContain("real_passkeys");
+    expect(read).toContain("h.kind = 'claimed' AND a.safe_address ~ '^0x[0-9a-fA-F]{40}$'");
   });
 
   it("Practice Mode is untouched: nothing under simulation/ or lib/stores knows about payment_attempts or a recipient identity", () => {

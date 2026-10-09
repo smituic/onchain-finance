@@ -13,7 +13,7 @@ import {
   type RegistrationAttemptStore,
 } from "./registration-attempts";
 import type { AccountHandleRecord, AccountHandleStore } from "./account-handles";
-import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveResult } from "./payment-attempts";
+import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveHandlePaymentResult, type ReserveResult } from "./payment-attempts";
 
 /**
  * SERVER-ONLY durable adapters for the vendor-neutral interfaces
@@ -242,6 +242,9 @@ function toPaymentAttempt(row: Row): PaymentAttempt {
     validUntil: row.valid_until === null || row.valid_until === undefined ? null : Number(row.valid_until),
     prepareBlockNumber: row.prepare_block_number === null || row.prepare_block_number === undefined ? null : String(row.prepare_block_number),
     authorizingCredentialId: (row.authorizing_credential_id as string | null) ?? null,
+    recipientAppUserId: (row.recipient_app_user_id as string | null) ?? null,
+    recipientHandle: (row.recipient_handle as string | null) ?? null,
+    recipientDisplayName: (row.recipient_display_name as string | null) ?? null,
     turnkeySignActivityId: (row.turnkey_sign_activity_id as string | null) ?? null,
     authorizationVerifiedAt: row.authorization_verified_at ? new Date(row.authorization_verified_at as string).toISOString() : null,
     transactionHash: (row.transaction_hash as string | null) ?? null,
@@ -440,14 +443,14 @@ export function createNeonAccountHandleStore(sql: NeonQueryFunction<false, false
     },
 
     async findPayableAccountByHandle(handle) {
-      // One joined read. Selects the Safe (a.safe_address) and never the Turnkey owner column. The EXISTS is the provisional "has an active passkey" usability rule.
+      // One joined read. Selects the Safe (a.safe_address) and never the Turnkey owner column. Usable = a claimed handle whose account has a valid Safe address — the SAME predicate the payment reservation applies. Passkeys are deliberately not consulted: receiving Cash is separate from signing in.
       const rows = (await sql`
         SELECT h.handle, a.display_name, a.app_user_id, a.safe_address
         FROM real_account_handles h
         JOIN real_accounts a ON a.app_user_id = h.app_user_id
         WHERE h.handle = ${handle}
           AND h.kind = 'claimed'
-          AND EXISTS (SELECT 1 FROM real_passkeys p WHERE p.app_user_id = a.app_user_id AND p.status = 'active')
+          AND a.safe_address ~ '^0x[0-9a-fA-F]{40}$'
       `) as Row[];
       const row = rows[0];
       if (!row) return null;
@@ -1360,8 +1363,8 @@ export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, fals
             FROM payment_attempts, _lock
             WHERE app_user_id = ${input.appUserId}
           )
-          INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state, authorizing_credential_id)
-          SELECT ${input.appUserId}, ${input.safeAddress}, ${input.recipient}, ${input.amountBaseUnits}, ${input.chainId}, ${input.tokenAddress}, 'prepared', ${input.authorizingCredentialId}
+          INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state, authorizing_credential_id, recipient_app_user_id, recipient_handle, recipient_display_name)
+          SELECT ${input.appUserId}, ${input.safeAddress}, ${input.recipient}, ${input.amountBaseUnits}, ${input.chainId}, ${input.tokenAddress}, 'prepared', ${input.authorizingCredentialId}, NULL::text, NULL::text, NULL::text
           FROM _counts
           WHERE hourly < 10 AND daily < 30 AND active = 0
           RETURNING *
@@ -1381,6 +1384,79 @@ export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, fals
           `) as Row[];
           const active = Number(counts[0]?.active ?? 0);
           if (active > 0) return { ok: false, reason: "payment_in_progress" };
+          return { ok: false, reason: "quota_exceeded" };
+        }
+
+        return { ok: true, attempt: toPaymentAttempt(rows[0]!) };
+      } catch (error) {
+        if (isUniqueViolation(error, "payment_attempts_one_active_per_account")) {
+          return { ok: false, reason: "payment_in_progress" };
+        }
+        throw error;
+      }
+    },
+
+    // Handle Pay Slice B. ONE authoritative statement: the same advisory lock
+    // and quota/active counts as reserve() above, joined to the handle
+    // registry and the recipient's account, with the INSERT's values taken
+    // directly from those joined rows. The caller supplies the canonical
+    // handle and the payer's own fields — never a recipient address,
+    // recipient app_user_id, or display name — so the handle, the recipient
+    // account, the Safe destination, and the name snapshot cannot disagree.
+    //
+    //   h.handle = <handle> AND h.kind = 'claimed'  -> a reserved/unclaimed handle yields no row
+    //   a.app_user_id = h.app_user_id               -> the handle's own account (real_accounts PK: at most one)
+    //   a.app_user_id <> <payer>                    -> self-payment yields no row
+    //   a.safe_address ~ '^0x[0-9a-fA-F]{40}$'      -> an invalid Safe yields no row
+    //
+    // At most one row is possible: _counts is a single aggregate row, h is
+    // keyed by its primary key, and a by its primary key. The destination is
+    // the Safe (a.safe_address), lower-cased as payment_attempts.recipient is
+    // always normalized; the Turnkey owner column is never selected and the
+    // passkey table is never consulted (receiving is not signing in).
+    //
+    // A zero-row result means the statement already refused; the follow-up
+    // read below only NAMES the reason for the caller and inserts nothing. The
+    // order of the answer is: recipient_not_found, self_payment,
+    // payment_in_progress, quota_exceeded.
+    async reserveHandlePayment(input): Promise<ReserveHandlePaymentResult> {
+      try {
+        const rows = (await sql`
+          WITH _lock AS MATERIALIZED (
+            SELECT pg_advisory_xact_lock(hashtext(${input.appUserId})::bigint)
+          ), _counts AS (
+            SELECT
+              count(*) FILTER (WHERE created_at > now() - interval '1 hour') AS hourly,
+              count(*) FILTER (WHERE created_at > now() - interval '1 day') AS daily,
+              count(*) FILTER (WHERE state NOT IN ('confirmed', 'failed', 'cancelled')) AS active
+            FROM payment_attempts, _lock
+            WHERE app_user_id = ${input.appUserId}
+          )
+          INSERT INTO payment_attempts (app_user_id, safe_address, recipient, amount_base_units, chain_id, token_address, state, authorizing_credential_id, recipient_app_user_id, recipient_handle, recipient_display_name)
+          SELECT ${input.appUserId}, ${input.safeAddress}, pg_catalog.lower(a.safe_address), ${input.amountBaseUnits}, ${input.chainId}, ${input.tokenAddress}, 'prepared', ${input.authorizingCredentialId}, a.app_user_id, h.handle, a.display_name
+          FROM _counts
+          JOIN real_account_handles h ON h.handle = ${input.recipientHandle} AND h.kind = 'claimed'
+          JOIN real_accounts a ON a.app_user_id = h.app_user_id
+          WHERE _counts.hourly < 10 AND _counts.daily < 30 AND _counts.active = 0
+            AND a.app_user_id <> ${input.appUserId}
+            AND a.safe_address ~ '^0x[0-9a-fA-F]{40}$'
+          RETURNING *
+        `) as Row[];
+
+        if (rows.length === 0) {
+          // Informational ONLY — the statement above already refused and wrote
+          // nothing; this read is not authority and inserts nothing.
+          const why = (await sql`
+            SELECT
+              (SELECT a.app_user_id FROM real_account_handles h JOIN real_accounts a ON a.app_user_id = h.app_user_id
+                WHERE h.handle = ${input.recipientHandle} AND h.kind = 'claimed' AND a.safe_address ~ '^0x[0-9a-fA-F]{40}$') AS recipient_app_user_id,
+              count(*) FILTER (WHERE state NOT IN ('confirmed', 'failed', 'cancelled')) AS active
+            FROM payment_attempts WHERE app_user_id = ${input.appUserId}
+          `) as Row[];
+          const recipientAppUserId = (why[0]?.recipient_app_user_id as string | null | undefined) ?? null;
+          if (recipientAppUserId === null) return { ok: false, reason: "recipient_not_found" };
+          if (recipientAppUserId === input.appUserId) return { ok: false, reason: "self_payment" };
+          if (Number(why[0]?.active ?? 0) > 0) return { ok: false, reason: "payment_in_progress" };
           return { ok: false, reason: "quota_exceeded" };
         }
 

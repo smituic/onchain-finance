@@ -1,4 +1,5 @@
 import { HANDLE_MAX_LENGTH, HANDLE_MIN_LENGTH, HANDLE_PATTERN, RESERVED_HANDLES } from "../handle";
+import { normalizeAddress } from "../identifiers";
 import { getInMemoryRegistryInternals, type RealAccountRegistry } from "./registry";
 
 /**
@@ -52,10 +53,13 @@ export interface AccountHandleStore {
   findHandle(handle: string): Promise<AccountHandleRecord | null>;
   /**
    * handle -> app_user_id -> real_accounts.safe_address, in one read. Null for
-   * a reserved or unclaimed handle, and for an account that can't be paid to
-   * right now (PROVISIONAL: no ACTIVE passkey — nobody could sign in to it).
-   * Advisory: it decides nothing about a payment. `handle` must already be
-   * canonical (lib/real/handle.ts).
+   * a reserved or unclaimed handle, and for an account whose Safe address is
+   * not a valid address. Whether the account has an active passkey is NOT
+   * part of the rule: receiving Cash is separate from signing in, so a claimed
+   * handle with a valid Safe is payable either way (the same rule the
+   * authoritative payment reservation uses). Advisory: it decides nothing
+   * about a payment — prepare re-resolves from the database. `handle` must
+   * already be canonical (lib/real/handle.ts).
    */
   findPayableAccountByHandle(handle: string): Promise<PayableAccountRecord | null>;
   /** Null when the account doesn't exist. */
@@ -90,6 +94,8 @@ export function createInMemoryAccountHandleStore(registry: RealAccountRegistry):
   const byHandle = new Map<string, AccountHandleRecord>(RESERVED_HANDLES.map((handle) => [handle, { handle, kind: "reserved", appUserId: null }]));
   const handleByAppUserId = new Map<string, string>();
   const displayNames = new Map<string, string>();
+  // The in-memory payment store resolves a handle payment from these same two maps (see InMemoryRegistryInternals.handleDirectory).
+  internals.handleDirectory = { byHandle, displayNames };
 
   return {
     async findHandle(handle) {
@@ -101,8 +107,8 @@ export function createInMemoryAccountHandleStore(registry: RealAccountRegistry):
       if (!record || record.kind !== "claimed" || record.appUserId === null) return null;
       const account = internals.accountsByAppUserId.get(record.appUserId);
       if (!account) return null;
-      const hasActivePasskey = [...internals.passkeysByCredentialId.values()].some((passkey) => passkey.appUserId === account.appUserId && passkey.status === "active");
-      if (!hasActivePasskey) return null;
+      // No active-passkey requirement: only a usable Safe address (the Neon twin checks the same shape in SQL).
+      if (!normalizeAddress(account.safeAddress)) return null;
       return { handle: record.handle, displayName: displayNames.get(account.appUserId) ?? null, appUserId: account.appUserId, safeAddress: account.safeAddress };
     },
 

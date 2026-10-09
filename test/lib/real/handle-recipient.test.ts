@@ -62,22 +62,33 @@ describe("findPayableAccountByHandle — in-memory adapter", () => {
     for (const near of ["smi", "smit1", "mit", "SMIT", "@smit", "maya", "maya_"]) expect(await handles.findPayableAccountByHandle(near), near).toBeNull();
   });
 
-  it("PROVISIONAL: an account with no ACTIVE passkey is not payable; one active passkey (even a backup) is enough", async () => {
+  it("Slice B rule: an account with NO active passkey is still payable — receiving Cash is separate from signing in", async () => {
     const { handles, internals } = await world();
     const primary = internals.passkeysByCredentialId.get("cred-1")!;
     internals.passkeysByCredentialId.set("cred-1", { ...primary, status: "revoked" });
-    expect(await handles.findPayableAccountByHandle("smit")).toBeNull();
-    internals.passkeysByCredentialId.set("cred-1b", { ...primary, credentialId: "cred-1b", role: "backup", status: "active" });
+    expect(await handles.findPayableAccountByHandle("smit")).toMatchObject({ handle: "smit", appUserId: "app-user-1", safeAddress: safe(1) });
+    internals.passkeysByCredentialId.delete("cred-1"); // no passkey rows at all
     expect(await handles.findPayableAccountByHandle("smit")).toMatchObject({ safeAddress: safe(1) });
   });
 
-  it("a pending or revoking passkey alone does not make an account payable", async () => {
+  it("a pending-only, revoking-only, or revoked-only recipient is payable", async () => {
     const { handles, internals } = await world();
     const primary = internals.passkeysByCredentialId.get("cred-1")!;
-    internals.passkeysByCredentialId.set("cred-1", { ...primary, status: "pending" });
-    expect(await handles.findPayableAccountByHandle("smit")).toBeNull();
-    internals.passkeysByCredentialId.set("cred-1", { ...primary, status: "revoking" });
-    expect(await handles.findPayableAccountByHandle("smit")).toBeNull();
+    for (const status of ["pending", "revoking", "revoked"] as const) {
+      internals.passkeysByCredentialId.set("cred-1", { ...primary, status });
+      expect(await handles.findPayableAccountByHandle("smit"), status).toMatchObject({ safeAddress: safe(1) });
+    }
+  });
+
+  it("an account without a usable Safe address is NOT payable (the store's only usability rule)", async () => {
+    const { handles, internals } = await world();
+    const account = internals.accountsByAppUserId.get("app-user-1")!;
+    for (const bad of ["", "not-an-address", "0x1234", `0x${"g".repeat(40)}`, `${safe(1)}00`]) {
+      internals.accountsByAppUserId.set("app-user-1", { ...account, safeAddress: bad });
+      expect(await handles.findPayableAccountByHandle("smit"), JSON.stringify(bad)).toBeNull();
+    }
+    internals.accountsByAppUserId.set("app-user-1", { ...account, safeAddress: safe(1).toUpperCase().replace("0X", "0x") }); // mixed case is a valid Safe
+    expect(await handles.findPayableAccountByHandle("smit")).not.toBeNull();
   });
 
   it("is read-only: nothing is claimed or changed by looking", async () => {
@@ -109,7 +120,9 @@ describe("findPayableAccountByHandle — Neon adapter (query shape; no live data
     expect(text).toMatch(/JOIN real_accounts a ON a\.app_user_id = h\.app_user_id/);
     expect(text).toMatch(/h\.handle = \?/);
     expect(text).toContain("h.kind = 'claimed'");
-    expect(text).toMatch(/EXISTS \(SELECT 1 FROM real_passkeys p WHERE p\.app_user_id = a\.app_user_id AND p\.status = 'active'\)/);
+    // Slice B: the passkey rule is gone; the only usability predicate is a valid Safe address — the SAME shape the payment reservation applies.
+    expect(text).not.toMatch(/real_passkeys|EXISTS/i);
+    expect(text).toContain("a.safe_address ~ '^0x[0-9a-fA-F]{40}$'");
     expect(text).not.toMatch(/INSERT|UPDATE|DELETE/i);
   });
 
@@ -159,11 +172,19 @@ describe("resolveHandleRecipient", () => {
     expect(await resolve("@@smit")).toEqual({ outcome: "malformed", reason: "Use only letters a–z, numbers, and underscores." });
   });
 
-  it("not_found: nonexistent, reserved, and unpayable are one indistinguishable outcome", async () => {
+  it("not_found: nonexistent, reserved, and an invalid-Safe account are one indistinguishable outcome", async () => {
+    const w = await world();
+    const account = w.internals.accountsByAppUserId.get("app-user-2")!;
+    w.internals.accountsByAppUserId.set("app-user-2", { ...account, safeAddress: "not-an-address" });
+    for (const handle of ["nobody", "admin", "@support", "maya_chen"]) expect(await resolve(handle, "app-user-3", w.handles), handle).toEqual({ outcome: "not_found" });
+  });
+
+  it("Slice B: a recipient with zero active passkeys resolves ok (and self still resolves self)", async () => {
     const w = await world();
     const primary = w.internals.passkeysByCredentialId.get("cred-2")!;
     w.internals.passkeysByCredentialId.set("cred-2", { ...primary, status: "revoked" });
-    for (const handle of ["nobody", "admin", "@support", "maya_chen"]) expect(await resolve(handle, "app-user-3", w.handles), handle).toEqual({ outcome: "not_found" });
+    expect(await resolve("maya_chen", "app-user-3", w.handles)).toMatchObject({ outcome: "ok", canonicalHandle: "maya_chen", safeAddress: safe(2) });
+    expect(await resolve("maya_chen", "app-user-2", w.handles)).toMatchObject({ outcome: "self" });
   });
 
   it("self: detected by app_user_id, with the same resolved fields", async () => {

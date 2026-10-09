@@ -29,8 +29,8 @@ import { PAIR_INTEGRITY_AUDIT_SQL, pairIntegrityAuditFor } from "./fixtures/paym
  *
  * WHAT THIS DELIBERATELY SHOWS IS NOT ENFORCED: a handle paired with ANOTHER
  * account's id is accepted by the database (there is no composite foreign
- * key). Handle Pay Slice B — not built — must derive both from the database
- * in one atomic INSERT and write lower(a.safe_address) as the recipient; the
+ * key). Handle Pay Slice B — COMPLETE / CLOSED — derives both from the database
+ * in one atomic INSERT and writes lower(a.safe_address) as the recipient; the
  * standing audit query (fixtures/payment-recipient-audit.ts) is what catches
  * a violation. Also decided for Slice B, and visible here: a claimed handle
  * can receive whether or not its account has an active passkey, so nothing in

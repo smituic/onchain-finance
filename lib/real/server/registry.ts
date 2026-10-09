@@ -175,6 +175,21 @@ export type InMemoryRegistryInternals = {
   passkeysByCredentialId: Map<string, RealPasskeyRecord>;
   /** Every in-memory enrollment store built on this registry registers its map here (2g-H: a pending passkey's removal moves its enrollment atomically). */
   backupEnrollmentMaps: Map<string, BackupPasskeyEnrollment>[];
+  /**
+   * The in-memory handle directory (account-handles.ts), registered by
+   * createInMemoryAccountHandleStore. Lazy because the runtime builds the
+   * payment store BEFORE the handle store; the in-memory payment store reads
+   * it at call time, so its reserveHandlePayment can resolve a handle
+   * synchronously — the twin of the Neon statement's JOINs. Null until a
+   * handle store exists (a handle payment then fails closed as not found).
+   */
+  handleDirectory: InMemoryHandleDirectory | null;
+};
+
+/** The two maps of the in-memory handle store — reserved and claimed rows by handle, and display names by app_user_id. Server-internal; never exposed to a route or the browser. */
+export type InMemoryHandleDirectory = {
+  byHandle: Map<string, { handle: string; kind: "reserved" | "claimed"; appUserId: string | null }>;
+  displayNames: Map<string, string>;
 };
 
 const inMemoryInternals = new WeakMap<RealAccountRegistry, InMemoryRegistryInternals>();
@@ -268,6 +283,6 @@ export function createInMemoryRealAccountRegistry(): RealAccountRegistry {
       return next.sessionEpoch;
     },
   };
-  inMemoryInternals.set(registry, { accountsByAppUserId, passkeysByCredentialId, backupEnrollmentMaps: [] });
+  inMemoryInternals.set(registry, { accountsByAppUserId, passkeysByCredentialId, backupEnrollmentMaps: [], handleDirectory: null });
   return registry;
 }

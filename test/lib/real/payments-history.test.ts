@@ -113,6 +113,9 @@ describe("resolvePaymentHistory", () => {
       reserve: async () => {
         throw new Error("not used by resolvePaymentHistory");
       },
+      reserveHandlePayment: async () => {
+        throw new Error("not used by resolvePaymentHistory");
+      },
       findById: async () => null,
       findLatestByAppUserId: async () => null,
       transition: async () => null,
@@ -229,6 +232,10 @@ describe("toPaymentHistoryEntry — data minimization", () => {
       validUntil: 1_900_000_600,
       prepareBlockNumber: "47000000",
       authorizingCredentialId: "credential-1",
+      // Slice B's server-only recipient identity snapshot — populated here so the assertion below proves it never reaches a history entry.
+      recipientAppUserId: "app-user-2",
+      recipientHandle: "maya_chen",
+      recipientDisplayName: "Maya Chen",
       turnkeySignActivityId: "turnkey-activity-1",
       authorizationVerifiedAt: "2026-01-01T00:00:03.000Z",
       transactionHash: "0xtxhash",
@@ -249,5 +256,7 @@ describe("toPaymentHistoryEntry — data minimization", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:05.000Z",
     });
+    // Handle Pay Slice B: the recipient identity snapshot is server-only. History is Slice D's work, not this one's.
+    expect(JSON.stringify(entry)).not.toMatch(/app-user-2|maya_chen|Maya Chen|recipientAppUserId|recipientHandle|recipientDisplayName/);
   });
 });

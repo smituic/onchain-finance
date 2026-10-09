@@ -78,6 +78,9 @@ function createTrapPaymentAttemptStore(): PaymentAttemptStore {
     reserve: async () => {
       throw new Error("not used in this test");
     },
+    reserveHandlePayment: async () => {
+      throw new Error("not used in this test");
+    },
     findById: async (id: string) => {
       if (!UUID_PATTERN.test(id)) {
         throw new Error(`invalid input syntax for type uuid: "${id}"`);

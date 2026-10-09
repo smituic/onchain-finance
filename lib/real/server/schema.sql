@@ -1186,11 +1186,14 @@ END $$;
 -- END line, is evidence-bearing and unchanged (SHA-256 in ARCHITECTURE.md).
 --
 -- WHAT IT ADDS: three nullable columns on payment_attempts, one CHECK, and two
--- foreign keys — so that a LATER slice (Handle Pay Slice B, not built) can
--- record WHO a payment was meant for when it is addressed to an @handle.
--- Nothing reads or writes these columns today: prepare, reserve(), submit,
--- reconcile, history, and every mapper are unchanged, and an existing INSERT
--- that does not name them leaves all three NULL.
+-- foreign keys — so that a later slice can record WHO a payment was meant for
+-- when it is addressed to an @handle. That slice, Handle Pay Slice B, is now
+-- COMPLETE / CLOSED: the three columns are populated by the authoritative
+-- Handle Pay prepare path (one INSERT ... SELECT that derives them from the
+-- database), an address payment writes all three as explicit NULLs, and the
+-- row mapper reads them server-side only. Submit, reconcile, and history are
+-- unchanged, and an INSERT that does not name the columns still leaves all
+-- three NULL. (When this migration was applied, nothing read or wrote them.)
 --
 --   recipient_app_user_id   the recipient ACCOUNT (real_accounts.app_user_id).
 --   recipient_handle        the canonical handle the payer addressed

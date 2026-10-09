@@ -190,7 +190,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       paymentStore,
       publicClient: buildBalanceCheckClient(BigInt(20_000_000)),
       pimlicoApiKey: "pim_test_key",
-      recipientInput: RECIPIENT,
+      recipient: { kind: "address", value: RECIPIENT },
       amountBaseUnitsInput: "10000",
     });
 
@@ -240,7 +240,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       paymentStore,
       publicClient: buildBalanceCheckClient(BigInt(20_000_000)),
       pimlicoApiKey: "pim_test_key",
-      recipientInput: RECIPIENT,
+      recipient: { kind: "address", value: RECIPIENT },
       amountBaseUnitsInput: "10000",
     });
     expect(prepared.outcome).toBe("ready");
