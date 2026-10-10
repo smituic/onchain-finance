@@ -1,5 +1,6 @@
 import { canonicalizeHandle } from "../handle";
 import type { AccountHandleStore } from "./account-handles";
+import { RECIPIENT_PROBE_POLICIES, type RateLimiter } from "./rate-limit";
 
 /**
  * Handle -> recipient, for ADVISORY discovery only (Slice A). It decides
@@ -18,6 +19,12 @@ import type { AccountHandleStore } from "./account-handles";
  * A reserved handle, an unclaimed one, and an account with no valid Safe
  * address (the store's usability rule — passkeys are NOT part of it) are all
  * one `not_found` — callers cannot tell them apart.
+ *
+ * Slice E: every lookup of a well-formed handle is charged to the CALLER's
+ * recipient-probe budget AFTER the handle is canonicalized and BEFORE the
+ * store is read — found and not-found cost the same, a malformed handle costs
+ * nothing, and a denied caller causes no read at all. The limiter is told
+ * only the caller's own app_user_id, never the handle.
  */
 export type ResolvedHandleRecipient = {
   canonicalHandle: string;
@@ -29,13 +36,18 @@ export type ResolvedHandleRecipient = {
 export type ResolveHandleRecipientResult =
   | { outcome: "malformed"; reason: string }
   | { outcome: "not_found" }
+  /** Slice E: the caller's probe budget is spent. The store was not read. */
+  | { outcome: "rate_limited"; retryAfterSeconds: number }
   /** The handle is the caller's own account (compared by durable app_user_id, not by address). */
   | ({ outcome: "self" } & ResolvedHandleRecipient)
   | ({ outcome: "ok" } & ResolvedHandleRecipient);
 
-export async function resolveHandleRecipient(input: { handles: AccountHandleStore; handle: unknown; currentAppUserId: string }): Promise<ResolveHandleRecipientResult> {
+export async function resolveHandleRecipient(input: { handles: AccountHandleStore; rateLimiter: RateLimiter; handle: unknown; currentAppUserId: string }): Promise<ResolveHandleRecipientResult> {
   const canonical = canonicalizeHandle(input.handle);
   if (!canonical.ok) return { outcome: "malformed", reason: canonical.reason };
+
+  const admitted = await input.rateLimiter.consume({ subject: input.currentAppUserId, policies: RECIPIENT_PROBE_POLICIES });
+  if (!admitted.allowed) return { outcome: "rate_limited", retryAfterSeconds: admitted.retryAfterSeconds };
 
   const payable = await input.handles.findPayableAccountByHandle(canonical.handle);
   if (!payable) return { outcome: "not_found" };
@@ -51,8 +63,8 @@ export async function resolveHandleRecipient(input: { handles: AccountHandleStor
 
 export type PublicRecipientLookup = { found: false } | { found: true; handle: string; displayName: string | null; isSelf: boolean };
 
-/** The ONLY shape the lookup route returns. Explicit fields — never a spread of the resolved recipient. Not defined for `malformed` (that is a 400). */
-export function toPublicRecipientLookup(result: Exclude<ResolveHandleRecipientResult, { outcome: "malformed" }>): PublicRecipientLookup {
+/** The ONLY shape the lookup route returns for a lookup that ran. Explicit fields — never a spread of the resolved recipient. Not defined for `malformed` (a 400) or `rate_limited` (a 429). */
+export function toPublicRecipientLookup(result: Exclude<ResolveHandleRecipientResult, { outcome: "malformed" | "rate_limited" }>): PublicRecipientLookup {
   if (result.outcome === "not_found") return { found: false };
   return { found: true, handle: result.canonicalHandle, displayName: result.displayName, isSelf: result.outcome === "self" };
 }

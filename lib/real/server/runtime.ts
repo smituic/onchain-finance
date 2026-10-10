@@ -5,6 +5,7 @@ import { createInMemoryPaymentAttemptStore, type PaymentAttemptStore } from "./p
 import { createInMemoryBackupPasskeyEnrollmentStore, type BackupPasskeyEnrollmentStore } from "./backup-passkey-enrollment";
 import { createInMemoryPasskeyRevocationStore, type PasskeyRevocationStore } from "./passkey-revocation-attempts";
 import { createInMemoryAccountHandleStore, type AccountHandleStore } from "./account-handles";
+import { createInMemoryRateLimitStore, createRateLimiter, type RateLimiter } from "./rate-limit";
 import { createNeonDurableStores } from "./neon-store";
 
 /**
@@ -30,9 +31,11 @@ let paymentAttemptStore: PaymentAttemptStore | null = null;
 let backupEnrollmentStore: BackupPasskeyEnrollmentStore | null = null;
 let revocationStore: PasskeyRevocationStore | null = null;
 let handleStore: AccountHandleStore | null = null;
+// Slice E: selected with the other stores — Neon whenever a database is configured, in-memory only for local development. Production without a database throws below, so it can never silently run on process-local counters.
+let rateLimiter: RateLimiter | null = null;
 
 function ensureStoresInitialized(): void {
-  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore && handleStore) return;
+  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore && handleStore && rateLimiter) return;
 
   const databaseUrl = process.env.DATABASE_URL?.trim();
   if (databaseUrl) {
@@ -44,6 +47,7 @@ function ensureStoresInitialized(): void {
     backupEnrollmentStore = durable.backupEnrollments;
     revocationStore = durable.revocations;
     handleStore = durable.handles;
+    rateLimiter = createRateLimiter(durable.rateLimits);
     return;
   }
 
@@ -64,6 +68,7 @@ function ensureStoresInitialized(): void {
   backupEnrollmentStore = createInMemoryBackupPasskeyEnrollmentStore(registry);
   revocationStore = createInMemoryPasskeyRevocationStore(registry);
   handleStore = createInMemoryAccountHandleStore(registry);
+  rateLimiter = createRateLimiter(createInMemoryRateLimitStore());
 }
 
 export function getRealAccountRegistry(): RealAccountRegistry {
@@ -99,4 +104,10 @@ export function getPasskeyRevocationStore(): PasskeyRevocationStore {
 export function getAccountHandleStore(): AccountHandleStore {
   ensureStoresInitialized();
   return handleStore!;
+}
+
+/** Slice E: the per-account abuse limiter for recipient probing and payment prepare (rate-limit.ts). */
+export function getRateLimiter(): RateLimiter {
+  ensureStoresInitialized();
+  return rateLimiter!;
 }

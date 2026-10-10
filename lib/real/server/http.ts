@@ -33,6 +33,20 @@ export function jsonInternalError(): Response {
 }
 
 /**
+ * Handle Pay Slice E: the ONE shape of a rate-limit denial — 429, a friendly
+ * message, `code: "rate_limited"` (so a client can tell it from the payment
+ * quota's 429, which keeps its own body), and a whole-second Retry-After.
+ * Nothing else: no remaining count, reset time, bucket, account, or target.
+ */
+export const RECIPIENT_PROBE_RATE_LIMITED_MESSAGE = "Too many tries. Try again later.";
+export const PAYMENT_PREPARE_RATE_LIMITED_MESSAGE = "You're going a bit fast. Try again later.";
+
+export function rateLimitedResponse(message: string, retryAfterSeconds: number): Response {
+  const seconds = Number.isFinite(retryAfterSeconds) ? Math.max(1, Math.ceil(retryAfterSeconds)) : 1;
+  return Response.json({ error: message, code: "rate_limited" }, { status: 429, headers: { "Retry-After": String(seconds) } });
+}
+
+/**
  * Parses a request body as JSON, returning null on any parse failure
  * instead of throwing — so a malformed body becomes a clean 400 at the
  * call site, never an uncaught exception that would otherwise fall through

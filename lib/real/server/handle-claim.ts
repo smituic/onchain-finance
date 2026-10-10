@@ -7,6 +7,7 @@ import { canonicalizeHandle, isReservedHandle } from "../handle";
 import type { AccountHandleStore, AccountProfile } from "./account-handles";
 import type { ChallengeStore } from "./challenge-store";
 import type { RealServerConfig } from "./config";
+import { RECIPIENT_PROBE_POLICIES, type RateLimiter } from "./rate-limit";
 import type { RealAccountRegistry } from "./registry";
 import { buildLoginOptions, verifyLogin } from "./webauthn";
 
@@ -37,6 +38,8 @@ const SESSION_PASSKEY_NOT_ACTIVE = "The passkey you're signed in with isn't acti
 export type PrepareHandleClaimResult =
   | { outcome: "ready"; handle: string; optionsJSON: Awaited<ReturnType<typeof buildLoginOptions>> }
   | { outcome: "invalid"; reason: string }
+  /** Slice E: the caller's recipient-probe budget is spent. Nothing was read and no challenge was created. */
+  | { outcome: "rate_limited"; retryAfterSeconds: number }
   | { outcome: "unavailable"; reason: string }
   /** The account already holds a handle (`handle`); nothing is minted. */
   | { outcome: "already_has_handle"; reason: string; handle: string }
@@ -54,6 +57,8 @@ export async function prepareHandleClaim(input: {
   challengeStore: ChallengeStore;
   registry: RealAccountRegistry;
   handles: AccountHandleStore;
+  /** Slice E: "is this name taken?" is the same question the recipient lookup answers, so it draws on the same per-account probe budget. */
+  rateLimiter: RateLimiter;
   appUserId: string;
   sessionCredentialId: string;
   handle: unknown;
@@ -61,6 +66,12 @@ export async function prepareHandleClaim(input: {
   const canonical = canonicalizeHandle(input.handle);
   if (!canonical.ok) return { outcome: "invalid", reason: canonical.reason };
   const handle = canonical.handle;
+
+  // Charged after the name is known to be well-formed and before anything is
+  // read or minted: a denied request does no availability read and creates no
+  // WebAuthn challenge. The limiter is told only the caller's own account.
+  const admitted = await input.rateLimiter.consume({ subject: input.appUserId, policies: RECIPIENT_PROBE_POLICIES });
+  if (!admitted.allowed) return { outcome: "rate_limited", retryAfterSeconds: admitted.retryAfterSeconds };
 
   const profile = await input.handles.findProfileByAppUserId(input.appUserId);
   if (!profile) return { outcome: "rejected", reason: "No account found for this session." };

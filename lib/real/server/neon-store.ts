@@ -13,6 +13,7 @@ import {
   type RegistrationAttemptStore,
 } from "./registration-attempts";
 import type { AccountHandleRecord, AccountHandleStore } from "./account-handles";
+import type { RateLimitBucketState, RateLimitStore } from "./rate-limit";
 import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveHandlePaymentResult, type ReserveResult } from "./payment-attempts";
 
 /**
@@ -1572,6 +1573,60 @@ export function createNeonPaymentAttemptStore(sql: NeonQueryFunction<false, fals
   };
 }
 
+/**
+ * Handle Pay Slice E — the durable rate-limit counters (real_rate_limits).
+ *
+ * ONE statement per request, whatever the number of buckets: a multi-row
+ * INSERT ... ON CONFLICT DO UPDATE that charges every bucket atomically — no
+ * application-level read-then-write, no transaction, and nothing external
+ * while a row lock is held. Rows are produced in byte order of bucket name
+ * (ORDER BY ... COLLATE "C"), so two concurrent requests for one account — a
+ * lookup (two buckets) and a handle prepare (four, including those two) —
+ * take their row locks in the same order and cannot deadlock.
+ *
+ * Each bucket's limit and window travel in ONE JSON parameter keyed by bucket
+ * name (the policies arrive validated and sorted — rate-limit.ts), which the
+ * conflict branch reads back by the row's own bucket.
+ *
+ * Time is the DATABASE's now(): a window opens at the first request and is
+ * reset by the first request after it has elapsed; a request inside it only
+ * increments the count, capped at limit + 1, and never moves window_start.
+ *
+ * The only values written are the bucket name, the caller's own app_user_id
+ * (`subject`), a timestamp, and a count. No handle, recipient, address, or
+ * request detail reaches this statement.
+ *
+ * FAIL CLOSED: a missing table or any database error throws out of consume()
+ * (the caller answers its generic 500). Rows are mapped field by field.
+ */
+export function createNeonRateLimitStore(sql: NeonQueryFunction<false, false>): RateLimitStore {
+  return {
+    async consume({ subject, policies }) {
+      const budgets = JSON.stringify(Object.fromEntries(policies.map((policy) => [policy.bucket, { limit: policy.limit, windowSeconds: policy.windowSeconds }])));
+      const rows = (await sql`
+        INSERT INTO real_rate_limits AS r (bucket, subject, window_start, hits)
+        SELECT p.key, ${subject}::text, now(), 1
+        FROM jsonb_each(${budgets}::jsonb) AS p
+        ORDER BY p.key COLLATE "C"
+        ON CONFLICT (bucket, subject) DO UPDATE SET
+          window_start = CASE
+            WHEN r.window_start + make_interval(secs => (${budgets}::jsonb -> r.bucket ->> 'windowSeconds')::int) <= now() THEN now()
+            ELSE r.window_start
+          END,
+          hits = CASE
+            WHEN r.window_start + make_interval(secs => (${budgets}::jsonb -> r.bucket ->> 'windowSeconds')::int) <= now() THEN 1
+            ELSE LEAST(r.hits + 1, (${budgets}::jsonb -> r.bucket ->> 'limit')::int + 1)
+          END
+        RETURNING
+          r.bucket,
+          r.hits,
+          GREATEST(1, ceil(extract(epoch FROM (r.window_start + make_interval(secs => (${budgets}::jsonb -> r.bucket ->> 'windowSeconds')::int) - now()))))::int AS seconds_until_reset
+      `) as Row[];
+      return rows.map((row): RateLimitBucketState => ({ bucket: row.bucket as string, hits: Number(row.hits), secondsUntilReset: Number(row.seconds_until_reset) }));
+    },
+  };
+}
+
 export type NeonDurableStores = {
   challengeStore: ChallengeStore;
   registry: RealAccountRegistry;
@@ -1580,6 +1635,7 @@ export type NeonDurableStores = {
   backupEnrollments: BackupPasskeyEnrollmentStore;
   revocations: PasskeyRevocationStore;
   handles: AccountHandleStore;
+  rateLimits: RateLimitStore;
 };
 
 /**
@@ -1604,7 +1660,7 @@ export function createNeonSqlClient(databaseUrl: string): NeonQueryFunction<fals
   return neon(databaseUrl, { isolationLevel: NEON_TRANSACTION_ISOLATION_LEVEL });
 }
 
-/** One connection (Neon's HTTP query function is stateless/per-request-safe), seven adapters. */
+/** One connection (Neon's HTTP query function is stateless/per-request-safe), eight adapters. */
 export function createNeonDurableStores(databaseUrl: string): NeonDurableStores {
   const sql = createNeonSqlClient(databaseUrl);
   return {
@@ -1615,5 +1671,6 @@ export function createNeonDurableStores(databaseUrl: string): NeonDurableStores 
     backupEnrollments: createNeonBackupPasskeyEnrollmentStore(sql),
     revocations: createNeonPasskeyRevocationStore(sql),
     handles: createNeonAccountHandleStore(sql),
+    rateLimits: createNeonRateLimitStore(sql),
   };
 }

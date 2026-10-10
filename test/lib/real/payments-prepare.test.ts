@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { freshRateLimiter } from "./fixtures/rate-limit";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPublicClient, custom, encodeAbiParameters } from "viem";
@@ -106,6 +107,7 @@ function baseInput(overrides: Partial<Parameters<typeof resolvePreparePayment>[0
     sessionSecret: SECRET,
     registry: createInMemoryRealAccountRegistry(),
     paymentStore: createInMemoryPaymentAttemptStore(),
+    rateLimiter: freshRateLimiter(),
     publicClient: buildPublicClient(BigInt(100_000_000)),
     pimlicoApiKey: "pim_test_key",
     recipient: { kind: "address", value: RECIPIENT } as PrepareRecipientSelector | null,

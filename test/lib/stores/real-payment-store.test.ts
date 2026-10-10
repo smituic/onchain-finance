@@ -1060,6 +1060,129 @@ describe("real-payment-store — Slice C: paying by @name", () => {
     });
   });
 
+  /**
+   * Handle Pay Slice E — what the client does when the server says "too many".
+   * A rate-limited name check is its own state (not the generic failure), is
+   * never retried automatically, and is cleared by editing like every other
+   * lookup state. A rate-limited prepare shows the server's message and keeps
+   * the resolved name.
+   */
+  describe("rate limiting (Slice E)", () => {
+    const LOOKUP_429 = () => jsonResponse(429, { error: "Too many tries. Try again later.", code: "rate_limited" });
+    const PREPARE_429 = () => jsonResponse(429, { error: "You're going a bit fast. Try again later.", code: "rate_limited" });
+
+    it("a 429 from the name check is the rate_limited state — not the generic lookup error, and not a recipient error message", async () => {
+      stubApi({ lookup: LOOKUP_429 });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      await store.getState().lookupRecipient();
+      expect(store.getState()).toMatchObject({ status: "editing", recipientLookup: { status: "rate_limited" }, error: null });
+    });
+
+    it("an ordinary failure is unchanged: a 500 or a network error is still the generic lookup error", async () => {
+      const answers: Array<() => Response> = [() => jsonResponse(500, { error: "Something went wrong. Please try again." }), () => Promise.reject(new Error("network down")) as never];
+      stubApi({ lookup: () => answers.shift()!() });
+      for (let i = 0; i < 2; i++) {
+        const store = editingStore();
+        store.getState().setRecipientInput("@smit");
+        await store.getState().lookupRecipient();
+        expect(store.getState().recipientLookup, String(i)).toEqual({ status: "error" });
+      }
+    });
+
+    it("editing or clearing the field drops the rate-limit state immediately", async () => {
+      stubApi({ lookup: LOOKUP_429 });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      await store.getState().lookupRecipient();
+      expect(store.getState().recipientLookup).toEqual({ status: "rate_limited" });
+      store.getState().setRecipientInput("@smitt");
+      expect(store.getState().recipientLookup).toEqual({ status: "idle" });
+      await store.getState().lookupRecipient();
+      store.getState().setRecipientInput("");
+      expect(store.getState().recipientLookup).toEqual({ status: "idle" });
+    });
+
+    it("NO automatic retry: leaving the field again asks nothing; each Review press asks exactly once and never loops", async () => {
+      const api = stubApi({ lookup: LOOKUP_429 });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      store.getState().setAmountInput("1");
+
+      await store.getState().lookupRecipient();
+      expect(api.lookups()).toHaveLength(1);
+      // Blur again (and again): still rate limited, and no request goes out.
+      await store.getState().lookupRecipient();
+      await store.getState().lookupRecipient();
+      expect(api.lookups()).toHaveLength(1);
+
+      // One explicit Review press = one request; it stays on the form.
+      await store.getState().review();
+      expect(api.lookups()).toHaveLength(2);
+      expect(store.getState()).toMatchObject({ status: "editing", recipientLookup: { status: "rate_limited" } });
+      await store.getState().review();
+      expect(api.lookups()).toHaveLength(3);
+      expect(store.getState().status).toBe("editing");
+      // Nothing was prepared, and no timer or background request follows.
+      expect(api.prepares()).toHaveLength(0);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(api.calls).toHaveLength(3);
+    });
+
+    it("once the budget has recovered, the next Review press finds the name and opens review", async () => {
+      const answers = [LOOKUP_429(), jsonResponse(200, FOUND_SMIT)];
+      const api = stubApi({ lookup: () => answers.shift()! });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      expect(store.getState()).toMatchObject({ status: "editing", recipientLookup: { status: "rate_limited" } });
+      await store.getState().review();
+      expect(api.lookups()).toHaveLength(2);
+      expect(store.getState()).toMatchObject({ status: "reviewing", recipientLookup: { status: "found", handle: "smit" } });
+    });
+
+    it("a rate-limited PREPARE shows the server's friendly message, keeps the resolved name, and is NOT retried", async () => {
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: PREPARE_429 });
+      const store = await reviewingSmit(api);
+
+      await store.getState().confirmAndSend();
+
+      expect(store.getState()).toMatchObject({
+        status: "editing",
+        recipientInput: "@smit",
+        recipientLookup: { status: "found", handle: "smit", displayName: "Smit Patel" },
+        attempt: null,
+        error: "You're going a bit fast. Try again later.",
+      });
+      expect(store.getState().error).not.toMatch(/couldn't find|429|rate_limited/i);
+      expect(api.prepares()).toHaveLength(1);
+      expect(api.lookups()).toHaveLength(1);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(api.prepares()).toHaveLength(1);
+    });
+
+    it("the payment QUOTA's 429 is still its own message, and also keeps the resolved name", async () => {
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: () => jsonResponse(429, { error: "You've reached the payment limit for now. Try again later." }) });
+      const store = await reviewingSmit(api);
+      await store.getState().confirmAndSend();
+      expect(store.getState()).toMatchObject({ status: "editing", recipientLookup: { status: "found", handle: "smit" }, error: "You've reached the payment limit for now. Try again later." });
+      expect(api.prepares()).toHaveLength(1);
+    });
+
+    it("a rate-limited ADDRESS prepare shows the same message and keeps the typed address", async () => {
+      const api = stubApi({ prepare: PREPARE_429 });
+      const store = editingStore();
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("1");
+      void store.getState().review();
+      await store.getState().confirmAndSend();
+      expect(store.getState()).toMatchObject({ status: "editing", recipientInput: ADDRESS, attempt: null, error: "You're going a bit fast. Try again later." });
+      expect(api.prepares()).toHaveLength(1);
+      expect(api.lookups()).toHaveLength(0);
+    });
+  });
+
   describe("direct address (regression)", () => {
     it("a pasted address is never looked up, review opens synchronously, and the prepare body is unchanged", async () => {
       useRealAccountStore.setState({ account: ACCOUNT });

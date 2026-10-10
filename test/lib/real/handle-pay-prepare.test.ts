@@ -8,6 +8,7 @@ import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals } from 
 import { REAL_SESSION_COOKIE_NAME, createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { rpcBlock } from "./fixtures/chain-block";
+import { denyingRateLimiter, failingRateLimiter, freshRateLimiter, recordingRateLimiter } from "./fixtures/rate-limit";
 
 /**
  * Handle Pay Slice B through prepare: the wire contract (exactly one
@@ -86,7 +87,8 @@ async function world() {
   await handles.claim({ handle: "maya_chen", appUserId: "app-user-2", credentialId: "credential-2" });
   await handles.setDisplayName({ appUserId: "app-user-2", displayName: "Maya Chen" });
   await handles.claim({ handle: "payer_one", appUserId: "app-user-1", credentialId: "credential-1" });
-  return { registry, payments, handles, internals: getInMemoryRegistryInternals(registry) };
+  // One limiter per world, like one process: every prepare in a test draws on the same per-account budgets.
+  return { registry, payments, handles, rateLimiter: freshRateLimiter(), internals: getInMemoryRegistryInternals(registry) };
 }
 type World = Awaited<ReturnType<typeof world>>;
 
@@ -98,6 +100,7 @@ function prepare(w: World, recipient: Parameters<typeof resolvePreparePayment>[0
     sessionSecret: SECRET,
     registry: w.registry,
     paymentStore: w.payments,
+    rateLimiter: w.rateLimiter,
     publicClient: publicClient(),
     pimlicoApiKey: "pim_test_key",
     recipient,
@@ -483,6 +486,220 @@ describe("Slice D — recipientIdentity on every payer-facing read surface", () 
   });
 });
 
+// ------------------------------------------------------------------ Slice E: rate limiting
+
+/**
+ * Handle Pay Slice E — prepare is charged to the PAYER's own budget once the
+ * request is authenticated and well-formed, and before the balance read, the
+ * block-clock read, the reservation (and, for a handle, the recipient
+ * resolution inside it), and Pimlico. An address prepare draws on the prepare
+ * budget; a handle prepare on the prepare AND the recipient-probe budgets.
+ */
+describe("Slice E — prepare rate limiting", () => {
+  const PREPARE = ["pay_prepare_day", "pay_prepare_short"];
+  const ALL_FOUR = ["pay_prepare_day", "pay_prepare_short", "recipient_probe_day", "recipient_probe_short"];
+
+  /** A chain client that counts every RPC it is asked for, by method. */
+  function countingClient() {
+    const rpc: string[] = [];
+    const client = createPublicClient({
+      chain: baseSepolia,
+      transport: custom({
+        request: async ({ method, params }: { method: string; params?: unknown[] }) => {
+          if (method !== "eth_chainId") rpc.push(method);
+          if (method === "eth_chainId") return `0x${baseSepolia.id.toString(16)}`;
+          if (method === "eth_getBlockByNumber") return rpcBlock({ timestamp: BigInt(1_900_000_000) });
+          if (method === "eth_call") {
+            const selector = ((params?.[0] ?? {}) as { data?: string }).data?.slice(0, 10);
+            if (selector === BALANCE_OF_SELECTOR) return encodeAbiParameters([{ type: "uint256" }], [BigInt(100_000_000)]);
+            if (selector === DECIMALS_SELECTOR) return encodeAbiParameters([{ type: "uint8" }], [6]);
+          }
+          throw new Error(`Unexpected method: ${method}`);
+        },
+      }),
+    });
+    return { client, rpc };
+  }
+  const attemptsOf = (w: World, n = 1) => w.payments.findRecentByAppUserId({ appUserId: `app-user-${n}`, limit: 25 });
+
+  it("an unauthenticated request, an invalid selector, and an invalid amount consume NOTHING", async () => {
+    const w = await world();
+    const { limiter, charges } = recordingRateLimiter();
+    const run = (recipient: Parameters<typeof prepare>[1], overrides: Parameters<typeof prepare>[2] = {}) => prepare(w, recipient, { rateLimiter: limiter, ...overrides });
+
+    expect(await run(handleSelector({ recipientHandle: "maya_chen" }), { cookieValue: undefined })).toEqual({ outcome: "unauthenticated" });
+    expect(await run({ kind: "address", value: ADDRESS_RECIPIENT }, { cookieValue: "garbage" })).toEqual({ outcome: "unauthenticated" });
+    // Zero or two selectors, a non-canonical handle, a bad address.
+    expect(await run(handleSelector({}))).toEqual({ outcome: "invalid_recipient" });
+    expect(await run(handleSelector({ recipient: ADDRESS_RECIPIENT, recipientHandle: "maya_chen" }))).toEqual({ outcome: "invalid_recipient" });
+    for (const bad of ["@maya_chen", "Maya_Chen", " maya_chen", "ab"]) expect(await run(handleSelector({ recipientHandle: bad })), bad).toEqual({ outcome: "invalid_recipient_handle" });
+    for (const bad of ["0x1234", "not an address", 7, null]) expect(await run({ kind: "address", value: bad }), String(bad)).toEqual({ outcome: "invalid_recipient" });
+    // A bad amount, on both paths.
+    for (const amountBaseUnitsInput of ["0", "-1", "1.5", "", "abc", 1_000_000, null, "99999999999999999999"]) {
+      expect(await run(handleSelector({ recipientHandle: "maya_chen" }), { amountBaseUnitsInput }), String(amountBaseUnitsInput)).toEqual({ outcome: "invalid_amount" });
+      expect(await run({ kind: "address", value: ADDRESS_RECIPIENT }, { amountBaseUnitsInput }), String(amountBaseUnitsInput)).toEqual({ outcome: "invalid_amount" });
+    }
+    expect(charges).toEqual([]);
+    expect(await attemptsOf(w)).toEqual([]);
+  });
+
+  it("an ADDRESS prepare consumes both prepare buckets ONLY; a HANDLE prepare consumes all four — for the payer, with nothing about the recipient", async () => {
+    const w = await world();
+    const { limiter, charges, inputs } = recordingRateLimiter();
+
+    expect((await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT }, { rateLimiter: limiter })).outcome).toBe("ready");
+    expect(charges).toEqual([{ subject: "app-user-1", buckets: PREPARE }]);
+
+    // Whatever the handle turns out to be — payable (here refused only because a payment is in progress), reserved, or nonexistent — the charge is the same.
+    expect(await prepare(w, handleSelector({ recipientHandle: "maya_chen" }), { rateLimiter: limiter })).toEqual({ outcome: "payment_in_progress" });
+    expect(await prepare(w, handleSelector({ recipientHandle: "nobody_here" }), { rateLimiter: limiter })).toEqual({ outcome: "recipient_not_found" });
+    expect(await prepare(w, handleSelector({ recipientHandle: "admin" }), { rateLimiter: limiter })).toEqual({ outcome: "recipient_not_found" });
+    expect(charges.slice(1)).toEqual([
+      { subject: "app-user-1", buckets: ALL_FOUR },
+      { subject: "app-user-1", buckets: ALL_FOUR },
+      { subject: "app-user-1", buckets: ALL_FOUR },
+    ]);
+    expect(JSON.stringify(inputs)).not.toMatch(/maya|nobody_here|admin|app-user-2|0x/i);
+  });
+
+  it("the charge comes BEFORE the balance RPC, the block-clock RPC, the reservation, and Pimlico (ordering)", async () => {
+    const w = await world();
+    const order: string[] = [];
+    const { client, rpc } = countingClient();
+    const limiter = { consume: async () => (order.push(`limiter(rpc so far: ${rpc.length})`), { allowed: true as const }) };
+    const reserve = vi.spyOn(w.payments, "reserveHandlePayment").mockImplementation(async () => (order.push("reserve"), { ok: false, reason: "recipient_not_found" }));
+    prepareMock.mockImplementation(async () => (order.push("pimlico"), { ...preparedFields }));
+
+    expect(await prepare(w, handleSelector({ recipientHandle: "maya_chen" }), { rateLimiter: limiter, publicClient: client })).toEqual({ outcome: "recipient_not_found" });
+
+    expect(order).toEqual(["limiter(rpc so far: 0)", "reserve"]);
+    expect(rpc).toEqual(expect.arrayContaining(["eth_call", "eth_getBlockByNumber"]));
+    expect(reserve).toHaveBeenCalledTimes(1);
+  });
+
+  it("a rate-limited prepare does NO balance RPC, NO block-clock RPC, creates NO payment attempt, and makes NO Pimlico call — address and handle", async () => {
+    for (const recipient of [{ kind: "address", value: ADDRESS_RECIPIENT } as const, handleSelector({ recipientHandle: "maya_chen" })]) {
+      const w = await world();
+      const { client, rpc } = countingClient();
+      const reserve = vi.spyOn(w.payments, "reserve");
+      const reserveHandle = vi.spyOn(w.payments, "reserveHandlePayment");
+
+      const outcome = await prepare(w, recipient, { rateLimiter: denyingRateLimiter(250), publicClient: client });
+
+      expect(outcome).toEqual({ outcome: "rate_limited", retryAfterSeconds: 250 });
+      expect(rpc).toEqual([]);
+      expect(reserve).not.toHaveBeenCalled();
+      expect(reserveHandle).not.toHaveBeenCalled();
+      expect(prepareMock).not.toHaveBeenCalled();
+      expect(await attemptsOf(w)).toEqual([]);
+    }
+  });
+
+  it("the 21st prepare in a window is rate limited — and it is a different outcome from the payment quota", async () => {
+    const w = await world();
+    w.rateLimiter = freshRateLimiter(() => 1_900_000_000_000);
+    expect((await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT })).outcome).toBe("ready");
+    for (let i = 0; i < 19; i++) expect(await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT }), String(i)).toEqual({ outcome: "payment_in_progress" });
+    expect(await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT })).toEqual({ outcome: "rate_limited", retryAfterSeconds: 600 });
+    expect(await attemptsOf(w)).toHaveLength(1);
+
+    // The payment quota is still its own thing, decided by the store after admission.
+    const w2 = await world();
+    vi.spyOn(w2.payments, "reserve").mockResolvedValueOnce({ ok: false, reason: "quota_exceeded" });
+    expect(await prepare(w2, { kind: "address", value: ADDRESS_RECIPIENT })).toEqual({ outcome: "quota_exceeded" });
+  });
+
+  it("budgets are per payer: one account's exhausted budget never limits another", async () => {
+    const w = await world();
+    w.rateLimiter = freshRateLimiter(() => 1_900_000_000_000);
+    for (let i = 0; i < 20; i++) await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT });
+    expect((await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT })).outcome).toBe("rate_limited");
+    // Account 2 is admitted (whatever its own prepare then does) — it is charged to ITS budget, not refused by account 1's.
+    const recording = recordingRateLimiter(w.rateLimiter);
+    expect((await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT }, { cookieValue: cookieFor(2), rateLimiter: recording.limiter })).outcome).not.toBe("rate_limited");
+    expect(recording.charges).toEqual([{ subject: "app-user-2", buckets: PREPARE }]);
+    expect((await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT })).outcome).toBe("rate_limited"); // account 1 is still limited
+  });
+
+  it("a limiter failure THROWS out of prepare (fail closed): nothing is read, reserved, or sent", async () => {
+    const w = await world();
+    const { client, rpc } = countingClient();
+    await expect(prepare(w, handleSelector({ recipientHandle: "maya_chen" }), { rateLimiter: failingRateLimiter(), publicClient: client })).rejects.toThrow();
+    expect(rpc).toEqual([]);
+    expect(prepareMock).not.toHaveBeenCalled();
+    expect(await attemptsOf(w)).toEqual([]);
+  });
+
+  it("an admitted prepare is otherwise unchanged: same destination, same stored identity, same public attempt", async () => {
+    const w = await world();
+    const outcome = await prepare(w, handleSelector({ recipientHandle: "maya_chen" }));
+    if (outcome.outcome !== "ready") throw new Error(`expected ready, got ${outcome.outcome}`);
+    expect(outcome.attempt).toMatchObject({ recipient: MAYA_SAFE.toLowerCase(), recipientIdentity: { handle: "maya_chen", displayName: "Maya Chen" } });
+    expect(Object.keys(outcome.attempt).sort()).toEqual(["amountBaseUnits", "createdAt", "failureReason", "id", "prepared", "recipient", "recipientIdentity", "state", "transactionHash", "updatedAt"]);
+    expect(await w.payments.findById(outcome.attempt.id)).toMatchObject({ recipientAppUserId: "app-user-2", recipientHandle: "maya_chen", recipientDisplayName: "Maya Chen" });
+    expect(JSON.stringify(outcome)).not.toMatch(/app-user-2|recipientAppUserId|bucket|hits/);
+  });
+});
+
+/**
+ * THE ORACLE this slice bounds. With a payment already in progress, a handle
+ * prepare never reserves anything — yet its refusal still tells a payable
+ * handle (`payment_in_progress`) from a missing one (`recipient_not_found`).
+ * Slice B's classification is deliberately unchanged; what changes is that the
+ * question can only be asked 20 times per 10 minutes (and 100 per day), on the
+ * same budget as the recipient lookup.
+ */
+describe("Slice E — the handle-prepare existence oracle is bounded", () => {
+  it("found vs not-found is still distinguishable while admitted; after the shared probe budget is spent every answer is rate_limited and NO resolution work happens", async () => {
+    const w = await world();
+    w.rateLimiter = freshRateLimiter(() => 1_900_000_000_000);
+
+    // The payer already has a non-terminal attempt.
+    expect((await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT })).outcome).toBe("ready");
+    const reserveHandle = vi.spyOn(w.payments, "reserveHandlePayment");
+    const { limiter, charges } = recordingRateLimiter(w.rateLimiter);
+
+    // The address prepare above used 1 of the payer's 20 prepares, so 19 handle prepares are admitted
+    // (a handle prepare needs BOTH its prepare and its probe budget).
+    const answers: string[] = [];
+    for (let i = 0; i < 19; i++) {
+      const handle = i % 2 === 0 ? "maya_chen" : `nobody_${i}`;
+      answers.push((await prepare(w, handleSelector({ recipientHandle: handle }), { rateLimiter: limiter })).outcome);
+    }
+    // Unchanged Slice B classification: the oracle exists...
+    expect(answers).toEqual(Array.from({ length: 19 }, (_, i) => (i % 2 === 0 ? "payment_in_progress" : "recipient_not_found")));
+    expect(reserveHandle).toHaveBeenCalledTimes(19);
+
+    // ...but it is bounded: every further probe is refused identically for an existing and a missing handle,
+    for (const handle of ["maya_chen", "nobody_x", "admin", "payer_one"]) {
+      expect(await prepare(w, handleSelector({ recipientHandle: handle }), { rateLimiter: limiter }), handle).toEqual({ outcome: "rate_limited", retryAfterSeconds: 600 });
+    }
+    // and no recipient resolution / business work happens for them.
+    expect(reserveHandle).toHaveBeenCalledTimes(19);
+    expect(charges).toHaveLength(23);
+    expect(charges.every((charge) => charge.subject === "app-user-1" && charge.buckets.includes("recipient_probe_short"))).toBe(true);
+
+    // The recipient LOOKUP draws on the same probe budget — which the four denied prepares were still charged to — so it is closed too:
+    // the oracle cannot be continued there.
+    const { resolveHandleRecipient } = await import("@/lib/real/server/handle-recipient");
+    expect(await resolveHandleRecipient({ handles: w.handles, rateLimiter: w.rateLimiter, handle: "maya_chen", currentAppUserId: "app-user-1" })).toEqual({ outcome: "rate_limited", retryAfterSeconds: 600 });
+    // A different payer is unaffected.
+    expect(await resolveHandleRecipient({ handles: w.handles, rateLimiter: w.rateLimiter, handle: "maya_chen", currentAppUserId: "app-user-2" })).toMatchObject({ outcome: "self" });
+  });
+
+  it("lookups and handle prepares spend ONE shared probe budget: 10 lookups + 10 handle prepares exhaust it", async () => {
+    const w = await world();
+    w.rateLimiter = freshRateLimiter(() => 1_900_000_000_000);
+    const { resolveHandleRecipient } = await import("@/lib/real/server/handle-recipient");
+    for (let i = 0; i < 10; i++) expect((await resolveHandleRecipient({ handles: w.handles, rateLimiter: w.rateLimiter, handle: "maya_chen", currentAppUserId: "app-user-1" })).outcome).toBe("ok");
+    for (let i = 0; i < 10; i++) expect((await prepare(w, handleSelector({ recipientHandle: `nobody_${i}` }))).outcome).toBe("recipient_not_found");
+    expect((await prepare(w, handleSelector({ recipientHandle: "maya_chen" }))).outcome).toBe("rate_limited");
+    expect((await resolveHandleRecipient({ handles: w.handles, rateLimiter: w.rateLimiter, handle: "maya_chen", currentAppUserId: "app-user-1" })).outcome).toBe("rate_limited");
+    // An ADDRESS prepare does not draw on the probe budget and is still admitted (10 of its 20 prepares are left).
+    expect((await prepare(w, { kind: "address", value: ADDRESS_RECIPIENT })).outcome).toBe("ready");
+  });
+});
+
 // ------------------------------------------------------------------ the actual route
 
 describe("POST /api/real/payments/prepare — the actual route code", () => {
@@ -501,7 +718,7 @@ describe("POST /api/real/payments/prepare — the actual route code", () => {
     vi.resetModules();
     stubEnv();
     vi.doMock("next/headers", () => ({ cookies: async () => ({ get: (name: string) => (name === REAL_SESSION_COOKIE_NAME && cookie !== undefined ? { name, value: cookie } : undefined) }) }));
-    vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => w.registry, getPaymentAttemptStore: () => w.payments, getAccountHandleStore: () => w.handles }));
+    vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => w.registry, getPaymentAttemptStore: () => w.payments, getAccountHandleStore: () => w.handles, getRateLimiter: () => w.rateLimiter }));
     vi.doMock("@/lib/real/chain/client", () => ({ createRealPublicClient: () => publicClient() }));
     vi.doMock("@/lib/real/server/pimlico", () => ({
       prepareCashTransferUserOperation: (...args: unknown[]) => prepareMock(...(args as [never])),
@@ -619,6 +836,52 @@ describe("POST /api/real/payments/prepare — the actual route code", () => {
     expect(addressBody.attempt.recipientIdentity).toBeNull();
     expect(await w.payments.findById(addressBody.attempt.id)).toMatchObject({ recipient: ADDRESS_RECIPIENT, recipientAppUserId: null, recipientHandle: null, recipientDisplayName: null });
     expect(prepareMock.mock.calls.at(-1)![0]).toMatchObject({ recipient: ADDRESS_RECIPIENT });
+  });
+
+  it("Slice E: a rate-limited prepare is 429 { error, code: 'rate_limited' } with Retry-After — for an address and a handle — and creates nothing", async () => {
+    const w = await world();
+    w.rateLimiter = denyingRateLimiter(345);
+    const post = await load(w, cookieFor(1));
+    for (const body of [{ recipient: ADDRESS_RECIPIENT, amountBaseUnits: "1000000" }, { recipientHandle: "maya_chen", amountBaseUnits: "1000000" }, { recipientHandle: "nobody_here", amountBaseUnits: "1000000" }]) {
+      const response = await post(body);
+      expect(response.status, JSON.stringify(body)).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe("345");
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual({ error: "You're going a bit fast. Try again later.", code: "rate_limited" });
+      expect(text).not.toMatch(/bucket|hits|subject|pay_prepare|recipient_probe|app-user|maya|remaining|reset/i);
+    }
+    expect(prepareMock).not.toHaveBeenCalled();
+    expect(await w.payments.findRecentByAppUserId({ appUserId: "app-user-1", limit: 10 })).toEqual([]);
+  });
+
+  it("Slice E: the payment QUOTA's 429 is unchanged — its own message, no `code`, no Retry-After", async () => {
+    const w = await world();
+    vi.spyOn(w.payments, "reserve").mockResolvedValueOnce({ ok: false, reason: "quota_exceeded" });
+    const response = await (await load(w, cookieFor(1)))({ recipient: ADDRESS_RECIPIENT, amountBaseUnits: "1000000" });
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBeNull();
+    expect(await response.json()).toEqual({ error: "You've reached the payment limit for now. Try again later." });
+  });
+
+  it("Slice E: malformed and unauthenticated requests are never charged; a limiter failure is the generic 500 with no detail and nothing created", async () => {
+    const w = await world();
+    const recording = recordingRateLimiter();
+    w.rateLimiter = recording.limiter;
+    const post = await load(w, cookieFor(1));
+    expect((await post({ amountBaseUnits: "1000000" })).status).toBe(400);
+    expect((await post({ recipientHandle: "@maya_chen", amountBaseUnits: "1000000" })).status).toBe(400);
+    expect((await post({ recipientHandle: "maya_chen", amountBaseUnits: "0" })).status).toBe(400);
+    expect((await (await load(w, undefined))({ recipientHandle: "maya_chen", amountBaseUnits: "1000000" })).status).toBe(401);
+    expect(recording.charges).toEqual([]);
+
+    w.rateLimiter = failingRateLimiter();
+    const response = await (await load(w, cookieFor(1)))({ recipientHandle: "maya_chen", amountBaseUnits: "1000000" });
+    expect(response.status).toBe(500);
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({ error: "Something went wrong. Please try again." });
+    expect(text).not.toMatch(/real_rate_limits|relation|bucket|recipient_probe|app-user|maya/i);
+    expect(prepareMock).not.toHaveBeenCalled();
+    expect(await w.payments.findRecentByAppUserId({ appUserId: "app-user-1", limit: 10 })).toEqual([]);
   });
 
   it("an unauthenticated request is 401 even with an invalid selector", async () => {

@@ -8,6 +8,7 @@ import { prepareBackupStepUp } from "@/lib/real/server/backup-passkey-pipeline";
 import { beginLogin } from "@/lib/real/server/login";
 import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals, type RealAccountRegistry } from "@/lib/real/server/registry";
 import { buildAuthenticationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
+import { freshRateLimiter } from "./fixtures/rate-limit";
 
 /**
  * Claiming a permanent @handle, end to end through the real
@@ -67,7 +68,7 @@ async function world(): Promise<World> {
 }
 
 const prepare = (w: World, seat: Seat, handle: unknown) =>
-  prepareHandleClaim({ config, challengeStore: w.challengeStore, registry: w.registry, handles: w.handles, appUserId: seat.appUserId, sessionCredentialId: seat.authenticator.credentialIdBase64Url, handle });
+  prepareHandleClaim({ config, challengeStore: w.challengeStore, registry: w.registry, handles: w.handles, rateLimiter: freshRateLimiter(), appUserId: seat.appUserId, sessionCredentialId: seat.authenticator.credentialIdBase64Url, handle });
 
 async function ready(w: World, seat: Seat, handle: string) {
   const prepared = await prepare(w, seat, handle);
@@ -148,7 +149,7 @@ describe("prepareHandleClaim — options", () => {
       expect((await prepare(w, w.a, "smit")).outcome).toBe("rejected");
     }
     // Account 1's session naming account 2's credential.
-    expect((await prepareHandleClaim({ config, challengeStore: w.challengeStore, registry: w.registry, handles: w.handles, appUserId: "app-user-1", sessionCredentialId: w.b.authenticator.credentialIdBase64Url, handle: "smit" })).outcome).toBe("rejected");
+    expect((await prepareHandleClaim({ config, challengeStore: w.challengeStore, registry: w.registry, handles: w.handles, rateLimiter: freshRateLimiter(), appUserId: "app-user-1", sessionCredentialId: w.b.authenticator.credentialIdBase64Url, handle: "smit" })).outcome).toBe("rejected");
     expect(w.minted).toHaveLength(0);
   });
 });
@@ -510,7 +511,7 @@ describe("display name service", () => {
     const w = await world();
     const handles: AccountHandleStore = { ...w.handles, findProfileByAppUserId: async () => Promise.reject(new Error("db down")) };
     await expect(readAccountProfile({ handles, appUserId: "app-user-1" })).rejects.toThrow("db down");
-    await expect(prepareHandleClaim({ config, challengeStore: w.challengeStore, registry: w.registry, handles, appUserId: "app-user-1", sessionCredentialId: w.a.authenticator.credentialIdBase64Url, handle: "smit" })).rejects.toThrow("db down");
+    await expect(prepareHandleClaim({ config, challengeStore: w.challengeStore, registry: w.registry, handles, rateLimiter: freshRateLimiter(), appUserId: "app-user-1", sessionCredentialId: w.a.authenticator.credentialIdBase64Url, handle: "smit" })).rejects.toThrow("db down");
     expect(w.minted).toHaveLength(0);
   });
 });

@@ -11,6 +11,7 @@ import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { checkRealApiRequest } from "@/lib/real/server/request-gate";
 import { REAL_SESSION_COOKIE_NAME, createSessionPayload, parseSession, serializeSession } from "@/lib/real/server/session";
 import { buildAuthenticationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
+import { denyingRateLimiter, failingRateLimiter, freshRateLimiter, recordingRateLimiter } from "./fixtures/rate-limit";
 
 /**
  * Account Handles through the ACTUAL route.ts code — only next/headers'
@@ -65,6 +66,7 @@ const mint = (seat: Seat) => serializeSession(createSessionPayload({ appUserId: 
 async function load(stores: Stores, cookie: string | undefined, overrides: Record<string, unknown> = {}) {
   vi.resetModules();
   stubEnv();
+  const rateLimiter = freshRateLimiter(); // one per load, like one process (override getRateLimiter to observe or deny)
   const set: Array<{ name: string; value: string }> = [];
   const deleted: string[] = [];
   vi.doMock("next/headers", () => ({
@@ -82,6 +84,7 @@ async function load(stores: Stores, cookie: string | undefined, overrides: Recor
     getBackupPasskeyEnrollmentStore: () => stores.enrollments,
     getPasskeyRevocationStore: () => stores.revocations,
     getAccountHandleStore: () => stores.handles,
+    getRateLimiter: () => rateLimiter,
     ...overrides,
   }));
   const post = (url: string, body: unknown) => new Request(`http://localhost${url}`, { method: "POST", headers: { "content-type": "application/json" }, body: typeof body === "string" ? body : JSON.stringify(body) });
@@ -527,5 +530,131 @@ describe("readAuthenticatedRealAccount stays free of handle metadata (static)", 
     // ... and only the claim and profile routes — where the profile decides something — and the recipient lookup, whose whole answer is the handle read, build the store eagerly and read it strictly.
     const strict = routes.filter((file) => /getAccountHandleStore\(\)/.test(readFileSync(file, "utf8"))).map((file) => file.split(path.sep).join("/")).sort();
     expect(strict).toEqual(["app/api/real/account/handle/claim/route.ts", "app/api/real/account/handle/options/route.ts", "app/api/real/account/profile/route.ts", "app/api/real/recipients/lookup/route.ts"]);
+  });
+});
+
+/**
+ * Handle Pay Slice E — the handle-claim options step answers "is this name
+ * taken?", so it draws on the SAME per-account recipient-probe budget as the
+ * recipient lookup, charged before the availability read and before any
+ * WebAuthn challenge exists.
+ */
+describe("POST /api/real/account/handle/options — rate limiting (Slice E)", () => {
+  const PROBE = ["recipient_probe_day", "recipient_probe_short"];
+  const countingChallenges = (stores: Stores) => {
+    let created = 0;
+    return { created: () => created, store: { ...stores.challengeStore, create: (input: Parameters<Stores["challengeStore"]["create"]>[0]) => (created++, stores.challengeStore.create(input)) } };
+  };
+  const countingHandles = (stores: Stores) => {
+    const reads: string[] = [];
+    const store = {
+      ...stores.handles,
+      findHandle: (handle: string) => (reads.push("findHandle"), stores.handles.findHandle(handle)),
+      findProfileByAppUserId: (appUserId: string) => (reads.push("findProfileByAppUserId"), stores.handles.findProfileByAppUserId(appUserId)),
+    };
+    return { reads, store };
+  };
+
+  it("an unauthenticated request, a malformed body, and a malformed name consume NOTHING", async () => {
+    const stores = await seed();
+    const { limiter, charges } = recordingRateLimiter();
+    const overrides = { getRateLimiter: () => limiter };
+    expect((await (await load(stores, undefined, overrides)).options({ handle: "smit" })).status).toBe(401);
+    const routes = await load(stores, mint(stores.a), overrides);
+    for (const body of ["{not json", JSON.stringify("smit")]) expect((await routes.options(body)).status).toBe(400);
+    for (const handle of ["", "@", "ab", "@@smit", "sm it", "1smit", 7, null, undefined]) expect((await routes.options({ handle })).status, JSON.stringify(handle)).toBe(400);
+    expect(charges).toEqual([]);
+  });
+
+  it("an availability check consumes BOTH probe buckets for the caller — available, taken, and reserved names alike — and the limiter is never told the name", async () => {
+    const stores = await seed();
+    await stores.handles.claim({ handle: "taken_name", appUserId: "app-user-2", credentialId: stores.b.authenticator.credentialIdBase64Url });
+    const { limiter, charges, inputs } = recordingRateLimiter();
+    const routes = await load(stores, mint(stores.a), { getRateLimiter: () => limiter });
+
+    expect((await routes.options({ handle: "@Free_Name" })).status).toBe(200);
+    expect((await routes.options({ handle: "taken_name" })).status).toBe(409);
+    expect((await routes.options({ handle: "admin" })).status).toBe(409);
+
+    expect(charges).toEqual([
+      { subject: "app-user-1", buckets: PROBE },
+      { subject: "app-user-1", buckets: PROBE },
+      { subject: "app-user-1", buckets: PROBE },
+    ]);
+    expect(JSON.stringify(inputs)).not.toMatch(/free_name|taken_name|admin|app-user-2/i);
+  });
+
+  it("it shares ONE budget with the recipient lookup: the 21st probe is the 429 contract, with no availability read and NO WebAuthn challenge", async () => {
+    const stores = await seed();
+    await stores.handles.claim({ handle: "taken_name", appUserId: "app-user-2", credentialId: stores.b.authenticator.credentialIdBase64Url });
+    const limiter = freshRateLimiter(() => 1_900_000_000_000);
+    const challenges = countingChallenges(stores);
+    const handles = countingHandles(stores);
+    const routes = await load(stores, mint(stores.a), { getRateLimiter: () => limiter, getChallengeStore: () => challenges.store, getAccountHandleStore: () => handles.store });
+
+    for (let i = 0; i < 20; i++) expect((await routes.options({ handle: i % 2 ? "taken_name" : `free_name_${i}` })).status, String(i)).toBe(i % 2 ? 409 : 200);
+    expect(challenges.created()).toBe(10);
+    const readsBefore = handles.reads.length;
+
+    for (const handle of ["taken_name", "free_name_x", "admin"]) {
+      const response = await routes.options({ handle });
+      expect(response.status, handle).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe("600");
+      expect(await response.json()).toEqual({ error: "Too many tries. Try again later.", code: "rate_limited" });
+    }
+    expect(challenges.created()).toBe(10); // no challenge row for a denied request
+    expect(handles.reads.length).toBe(readsBefore); // and no availability or profile read
+
+    // The other account's budget is untouched.
+    const other = await load(stores, mint(stores.b), { getRateLimiter: () => limiter });
+    expect((await other.options({ handle: "anything_else" })).status).toBe(409); // already has a handle — but it was admitted, not limited
+  });
+
+  it("a denied request reads nothing and creates nothing, even when every store would throw", async () => {
+    const stores = await seed();
+    // Any METHOD call on either store throws: a denied request may hold the stores, but must never use them.
+    const refuse = (what: string) => () =>
+      new Proxy(
+        {},
+        {
+          get: (_target, method) => () => {
+            throw new Error(`${what} .${String(method)}() must not be called when rate limited`);
+          },
+        },
+      );
+    const routes = await load(stores, mint(stores.a), { getRateLimiter: () => denyingRateLimiter(77), getChallengeStore: refuse("challenge store"), getAccountHandleStore: refuse("handle store") });
+    const response = await routes.options({ handle: "free_name" });
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("77");
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({ error: "Too many tries. Try again later.", code: "rate_limited" });
+    expect(text).not.toMatch(/bucket|hits|subject|recipient_probe|app-user|free_name|optionsJSON|challenge/i);
+  });
+
+  it("a limiter failure is the generic 500 — FAIL CLOSED: no availability answer, no challenge, no detail", async () => {
+    const stores = await seed();
+    const challenges = countingChallenges(stores);
+    const handles = countingHandles(stores);
+    const routes = await load(stores, mint(stores.a), { getRateLimiter: () => failingRateLimiter(), getChallengeStore: () => challenges.store, getAccountHandleStore: () => handles.store });
+    const response = await routes.options({ handle: "free_name" });
+    expect(response.status).toBe(500);
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({ error: "Something went wrong. Please try again." });
+    expect(text).not.toMatch(/real_rate_limits|relation|bucket|recipient_probe|app-user/i);
+    expect(challenges.created()).toBe(0);
+    expect(handles.reads).toEqual([]);
+  });
+
+  it("claiming is unchanged: a normal options -> claim still succeeds, and /handle/claim itself is not charged", async () => {
+    const stores = await seed();
+    const { limiter, charges } = recordingRateLimiter();
+    const routes = await load(stores, mint(stores.a), { getRateLimiter: () => limiter });
+    const prepared = await routes.options({ handle: "smit" });
+    expect(prepared.status).toBe(200);
+    const { optionsJSON } = (await prepared.json()) as { optionsJSON: { challenge: string } };
+    const claimed = await routes.claim({ handle: "smit", response: assertion(stores.a, optionsJSON.challenge) });
+    expect(claimed.status).toBe(200);
+    expect(await claimed.json()).toMatchObject({ handle: "smit" });
+    expect(charges).toEqual([{ subject: "app-user-1", buckets: PROBE }]);
   });
 });

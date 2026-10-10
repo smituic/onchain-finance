@@ -13,7 +13,7 @@ import { REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { exceedsAvailableBalance, parseCashInputToBaseUnits } from "@/lib/real/payments/amount";
 import { formatHandle } from "@/lib/real/handle";
 import { describePaymentRecipient, shortenAddress } from "@/lib/real/display/payment-recipient";
-import { RECIPIENT_LOOKUP_FAILED_MESSAGE, RECIPIENT_NOT_FOUND_MESSAGE, ownHandleMessage, resolveRecipientView } from "@/lib/real/recipient-input";
+import { RECIPIENT_LOOKUP_FAILED_MESSAGE, RECIPIENT_LOOKUP_RATE_LIMITED_MESSAGE, RECIPIENT_NOT_FOUND_MESSAGE, ownHandleMessage, resolveRecipientView } from "@/lib/real/recipient-input";
 
 function formatAmount(amountBaseUnits: string): string {
   return formatCashBaseUnits(amountBaseUnits, REAL_CASH_TOKEN.decimals);
@@ -98,11 +98,13 @@ export function RealPayForm() {
         ? RECIPIENT_NOT_FOUND_MESSAGE
         : recipient.kind === "lookup_failed"
           ? RECIPIENT_LOOKUP_FAILED_MESSAGE
-          : recipientTouched && recipient.kind === "invalid"
-            ? recipient.message
-            : recipientTouched && recipient.kind === "self"
-              ? ownHandleMessage(recipient.handle)
-              : null;
+          : recipient.kind === "lookup_rate_limited"
+            ? RECIPIENT_LOOKUP_RATE_LIMITED_MESSAGE
+            : recipientTouched && recipient.kind === "invalid"
+              ? recipient.message
+              : recipientTouched && recipient.kind === "self"
+                ? ownHandleMessage(recipient.handle)
+                : null;
     return (
       <form
         className="flex flex-col gap-4"

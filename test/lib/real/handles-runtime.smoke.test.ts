@@ -16,6 +16,7 @@ import { createSessionPayload, serializeSession } from "@/lib/real/server/sessio
 import { buildLoginOptions } from "@/lib/real/server/webauthn";
 import { checkDisposableTarget, connectSmokeDb, connectSmokeStores, requireDisposableTargetUrl, type SmokeDb } from "./fixtures/handles-smoke-db";
 import { buildAuthenticationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
+import { freshRateLimiter } from "./fixtures/rate-limit";
 
 /**
  * MANUAL, LIVE-DATABASE runtime/concurrency proof of Account Handles: the
@@ -203,7 +204,7 @@ describe.skipIf(!enabled)("Account Handles — runtime and concurrency against a
 
   async function prepare(who: Seat, handle: unknown, overrides: { challengeStore?: ChallengeStore } = {}) {
     const s = await stores();
-    return prepareHandleClaim({ config, challengeStore: overrides.challengeStore ?? s.challengeStore, registry: s.registry, handles: s.handles, appUserId: who.appUserId, sessionCredentialId: who.credentialId, handle });
+    return prepareHandleClaim({ config, challengeStore: overrides.challengeStore ?? s.challengeStore, registry: s.registry, handles: s.handles, rateLimiter: freshRateLimiter(), appUserId: who.appUserId, sessionCredentialId: who.credentialId, handle });
   }
   async function ready(who: Seat, handle: string) {
     const prepared = await prepare(who, handle);

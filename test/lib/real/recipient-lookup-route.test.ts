@@ -4,6 +4,7 @@ import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
 import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { checkRealApiRequest } from "@/lib/real/server/request-gate";
 import { REAL_SESSION_COOKIE_NAME, createSessionPayload, serializeSession } from "@/lib/real/server/session";
+import { denyingRateLimiter, failingRateLimiter, freshRateLimiter, recordingRateLimiter } from "./fixtures/rate-limit";
 
 /**
  * POST /api/real/recipients/lookup through the ACTUAL route.ts code — only
@@ -47,12 +48,14 @@ const mint = (n: number) => serializeSession(createSessionPayload({ appUserId: `
 async function load(stores: Stores, cookie: string | undefined, overrides: Record<string, unknown> = {}) {
   vi.resetModules();
   stubEnv();
+  const rateLimiter = freshRateLimiter(); // one per load, like one process (override getRateLimiter to observe or deny)
   vi.doMock("next/headers", () => ({
     cookies: async () => ({ get: (name: string) => (name === REAL_SESSION_COOKIE_NAME && cookie !== undefined ? { name, value: cookie } : undefined) }),
   }));
   vi.doMock("@/lib/real/server/runtime", () => ({
     getRealAccountRegistry: () => stores.registry,
     getAccountHandleStore: () => stores.handles,
+    getRateLimiter: () => rateLimiter,
     ...overrides,
   }));
   const route = await import("@/app/api/real/recipients/lookup/route");
@@ -242,5 +245,103 @@ describe("request gate — /api/real/recipients/lookup is JSON-only and same-ori
     expect(gate({ body: "{}" })?.status).toBe(415);
     expect(gate({ headers: { "content-type": "application/json", "sec-fetch-site": "cross-site" }, body: "{}" })?.status).toBe(403);
     expect(gate({ headers: { "content-type": "application/json", origin: "https://evil.example" }, body: "{}" })?.status).toBe(403);
+  });
+});
+
+/**
+ * Handle Pay Slice E — the lookup is charged to the CALLER's recipient-probe
+ * budget after the handle is validated and before anything is read.
+ */
+describe("POST /api/real/recipients/lookup — rate limiting (Slice E)", () => {
+  const PROBE = ["recipient_probe_day", "recipient_probe_short"];
+
+  it("an unauthenticated request, a malformed body, and a malformed handle consume NOTHING", async () => {
+    const stores = await seed();
+    const { limiter, charges } = recordingRateLimiter();
+    const overrides = { getRateLimiter: () => limiter };
+    for (const cookie of [undefined, "garbage"]) expect((await (await load(stores, cookie, overrides)).lookup({ handle: "smit" })).status).toBe(401);
+    const { lookup } = await load(stores, mint(2), overrides);
+    for (const body of ["{not json", "[]".slice(0, 1), JSON.stringify("smit"), JSON.stringify(null)]) expect((await lookup(body)).status).toBe(400);
+    for (const handle of ["", "@", "ab", "@@smit", "sm it", "smít", 7, null, undefined, { handle: "smit" }]) expect((await lookup({ handle })).status, JSON.stringify(handle)).toBe(400);
+    expect(charges).toEqual([]);
+  });
+
+  it("an allowed lookup consumes BOTH probe buckets, for the caller's own account — found and not-found alike — and the limiter is never told the handle", async () => {
+    const stores = await seed();
+    const { limiter, charges, inputs } = recordingRateLimiter();
+    const { lookup } = await load(stores, mint(2), { getRateLimiter: () => limiter });
+
+    expect(await (await lookup({ handle: "@Smit" })).json()).toMatchObject({ found: true });
+    expect(await (await lookup({ handle: "nobody_here" })).json()).toEqual({ found: false });
+    expect(await (await lookup({ handle: "admin" })).json()).toEqual({ found: false });
+
+    expect(charges).toEqual([
+      { subject: "app-user-2", buckets: PROBE },
+      { subject: "app-user-2", buckets: PROBE },
+      { subject: "app-user-2", buckets: PROBE },
+    ]);
+    expect(JSON.stringify(inputs)).not.toMatch(/smit|nobody_here|admin|app-user-1|0x/i);
+    expect(Object.keys(inputs[0]!).sort()).toEqual(["policies", "subject"]);
+  });
+
+  it("the 21st lookup in a window is exactly the 429 contract, and the recipient store is NOT read for it", async () => {
+    const stores = await seed();
+    let reads = 0;
+    const counted = { ...stores.handles, findPayableAccountByHandle: (handle: string) => (reads++, stores.handles.findPayableAccountByHandle(handle)) };
+    const limiter = freshRateLimiter(() => 1_900_000_000_000);
+    const { lookup } = await load(stores, mint(2), { getRateLimiter: () => limiter, getAccountHandleStore: () => counted });
+
+    for (let i = 0; i < 20; i++) expect((await lookup({ handle: i % 2 ? "smit" : `nobody_${i}` })).status, String(i)).toBe(200);
+    expect(reads).toBe(20);
+
+    for (const handle of ["smit", "nobody_x"]) {
+      const response = await lookup({ handle });
+      expect(response.status).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe("600");
+      expect(await response.json()).toEqual({ error: "Too many tries. Try again later.", code: "rate_limited" });
+    }
+    expect(reads).toBe(20); // a denied lookup reads nothing — found and not-found are indistinguishable once limited
+
+    // Another account's budget is its own.
+    const other = await load(stores, mint(1), { getRateLimiter: () => limiter, getAccountHandleStore: () => counted });
+    expect((await other.lookup({ handle: "smit" })).status).toBe(200);
+  });
+
+  it("a denied lookup never touches the handle store at all, and its response carries no limiter internals", async () => {
+    const stores = await seed();
+    const { lookup } = await load(stores, mint(2), {
+      getRateLimiter: () => denyingRateLimiter(4321),
+      // Any METHOD call on the handle store throws: a denied lookup may hold the store, but must never use it.
+      getAccountHandleStore: () =>
+        new Proxy(
+          {},
+          {
+            get: (_target, method) => () => {
+              throw new Error(`handle store .${String(method)}() must not be called when rate limited`);
+            },
+          },
+        ),
+    });
+    const response = await lookup({ handle: "smit" });
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("4321");
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({ error: "Too many tries. Try again later.", code: "rate_limited" });
+    expect(text).not.toMatch(/bucket|hits|subject|recipient_probe|app-user|smit|remaining|reset/i);
+    expect([...response.headers.keys()].sort()).toEqual(["content-type", "retry-after"]);
+  });
+
+  it("a limiter failure is the generic 500 — FAIL CLOSED: no lookup, and no database, table, bucket, or account detail", async () => {
+    const stores = await seed();
+    let reads = 0;
+    const counted = { ...stores.handles, findPayableAccountByHandle: (handle: string) => (reads++, stores.handles.findPayableAccountByHandle(handle)) };
+    const { lookup } = await load(stores, mint(2), { getRateLimiter: () => failingRateLimiter(), getAccountHandleStore: () => counted });
+    const response = await lookup({ handle: "smit" });
+    expect(response.status).toBe(500);
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({ error: "Something went wrong. Please try again." });
+    expect(text).not.toMatch(/real_rate_limits|relation|bucket|recipient_probe|app-user|smit/i);
+    expect(response.headers.get("Retry-After")).toBeNull();
+    expect(reads).toBe(0);
   });
 });

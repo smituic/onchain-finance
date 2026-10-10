@@ -422,7 +422,10 @@ export function createRealPaymentStore() {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ handle: canonicalHandle }),
           });
-          next = response.ok ? parseLookupResponse(await response.json(), canonicalHandle) : { status: "error" };
+          // Slice E: 429 is this account's name-check budget, shown as its own
+          // message. Nothing retries it automatically — leaving the field does
+          // not ask again; only pressing Review does, once per press.
+          next = response.status === 429 ? { status: "rate_limited" } : response.ok ? parseLookupResponse(await response.json(), canonicalHandle) : { status: "error" };
         } catch {
           next = { status: "error" };
         }
@@ -475,7 +478,7 @@ export function createRealPaymentStore() {
         set({ status: "reviewing", error: null });
         return null;
       }
-      return view.handle;
+      return view.handle; // unresolved, checking, lookup_failed, or lookup_rate_limited: one lookup per Review press
     }
 
     return {

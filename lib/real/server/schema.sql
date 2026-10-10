@@ -1464,6 +1464,232 @@ BEGIN
 END $$;
 -- END Payment Attempt Recipient Identity
 
+-- BEGIN Handle Pay Rate Limits
+-- Handle Pay Slice E. Hand-applied, idempotent, FAIL-CLOSED. APPLIED to the REAL
+-- Neon database's public schema on 2026-10-10 (PostgreSQL 18.6), exactly once,
+-- after the disposable-Neon concurrency smoke passed, and independently
+-- read-only audited afterward. What was executed is the single DO block that
+-- follows these comments (its text starts at the line that begins with DO and
+-- ends at its closing END line): SHA-256
+-- 78c5557d5b615805f0eb8c63e62d09eccffc792c95f9e2782f9af48d92d1513d, 11680
+-- characters. That statement is evidence-bearing: do not change it. Later edits
+-- to the comments ABOVE it (like this one) change the BEGIN..END text but not
+-- that statement; extraction takes the first occurrence of the statement's
+-- opening token, so these comments must never spell it out.
+--
+-- In any OTHER environment (a new database, or a branch that will run the app)
+-- it must be applied BEFORE the Slice E application code is
+-- deployed. The recipient lookup, the handle-claim options step, and every
+-- payment prepare charge this table first and FAIL CLOSED without it (the
+-- limiter statement throws, so the route answers its generic 500 and does no
+-- protected work).
+--
+-- One row per (bucket, subject): a first-request-anchored FIXED WINDOW counter.
+--   bucket        one of the four budgets named in the CHECK below
+--   subject       the authenticated account's app_user_id — the ONLY thing a
+--                 budget is keyed by
+--   window_start  the database's now() at the first request of the window
+--   hits          requests charged in this window, capped by the writer at
+--                 limit + 1 (so a denied caller cannot grow it without bound)
+--
+-- PRIVACY — the table holds nothing about WHO was looked up or paid: no handle,
+-- no recipient account, no Safe address, no display name, no IP address, no
+-- session, no request body. Deliberately no foreign key (the limiter must never
+-- lock or depend on real_accounts), no secondary index (every statement
+-- addresses rows by the full primary key), no trigger, and no backfill.
+--
+-- ONE WRITER, ONE STATEMENT: the Neon adapter's consume() charges every bucket
+-- of a request in a single multi-row INSERT ... ON CONFLICT DO UPDATE, rows in
+-- byte order of bucket name, so concurrent requests for one subject take their
+-- row locks in the same order.
+--
+-- ROLLBACK (never run automatically): this block created only this table, so
+-- `DROP TABLE real_rate_limits` removes everything it added. The Slice E
+-- application code must be rolled back first — without the table it fails closed.
+--
+-- FAIL-CLOSED, same convention as the Provisioning Evidence Capture block
+-- below: `IF NOT EXISTS` only trusts a NAME, so after creating the table if it
+-- is missing the block proves, from the catalog, that the relation under that
+-- name IS the intended one, and RAISEs (rolling the whole block back — nothing
+-- is ever dropped, rebuilt, or repaired) if it is not:
+--   1. search_path is pinned to `pg_catalog, pg_temp`; the schema is the single
+--      `target_schema` constant (the gated scratch-schema smoke swaps only it).
+--   2. the relation is an ordinary, permanent, non-partition table, neither an
+--      inheritance child nor a parent, with no row-level security or policy, no
+--      user trigger, no rule, and only built-in base types and collations;
+--   3. it has EXACTLY the reference's columns — same count, and each with the
+--      same type, typmod, collation, NOT NULL, identity/generated, and default
+--      (so an added handle / target / IP / session column is refused);
+--   4. it has EXACTLY the reference's constraints, each validated and identical
+--      by name, kind, flags, key columns, and deparsed definition — so no
+--      foreign key and no extra CHECK — and no other table references it;
+--   5. its only index is the primary key's, structurally identical to the
+--      reference's; and
+--   6. no constraint, default, or index depends on anything but this table.
+DO $$
+DECLARE
+  -- Declared types are resolved BEFORE the search_path pin below, so each is schema-qualified.
+  target_schema CONSTANT pg_catalog.text := 'public';
+  table_name CONSTANT pg_catalog.text := 'real_rate_limits';
+  reference_name CONSTANT pg_catalog.text := 'real_rate_limits_reference';
+  -- Every column and constraint, each constraint explicitly named.
+  definition CONSTANT pg_catalog.text := $definition$
+    bucket        TEXT COLLATE "C" NOT NULL,
+    subject       TEXT NOT NULL,
+    window_start  TIMESTAMPTZ NOT NULL,
+    hits          INTEGER NOT NULL,
+    CONSTRAINT real_rate_limits_pkey PRIMARY KEY (bucket, subject),
+    CONSTRAINT real_rate_limits_bucket_check
+      CHECK (bucket IN ('recipient_probe_short', 'recipient_probe_day', 'pay_prepare_short', 'pay_prepare_day')),
+    CONSTRAINT real_rate_limits_hits_check CHECK (hits >= 1)
+  $definition$;
+  ns pg_catalog.oid;
+  tbl pg_catalog.oid;
+  ref pg_catalog.oid;
+  t record;
+  r record;
+  k record;
+  bad pg_catalog.text;
+BEGIN
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+
+  SELECT n.oid INTO ns FROM pg_catalog.pg_namespace n WHERE n.nspname = target_schema;
+  IF ns IS NULL THEN
+    RAISE EXCEPTION 'Rate limit migration refused: schema % does not exist.', target_schema;
+  END IF;
+
+  -- Create what is missing (IF NOT EXISTS trusts the name — everything below does not).
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I.%I (%s)', target_schema, table_name, definition);
+
+  -- 2. The relation under that name.
+  SELECT c.oid, c.relkind, c.relpersistence, c.relispartition, c.relrowsecurity, c.relforcerowsecurity
+    INTO t FROM pg_catalog.pg_class c WHERE c.relnamespace = ns AND c.relname = table_name;
+  IF t.oid IS NULL OR t.relkind IS DISTINCT FROM 'r' OR t.relpersistence IS DISTINCT FROM 'p' OR t.relispartition IS NOT FALSE THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% is not an ordinary, permanent, non-partition table. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  tbl := t.oid;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = tbl OR i.inhparent = tbl) THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% takes part in table inheritance (as a child or a parent). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF t.relrowsecurity IS NOT FALSE OR t.relforcerowsecurity IS NOT FALSE OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol WHERE pol.polrelid = tbl) THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% has row-level security enabled or forced, or a policy. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger g WHERE g.tgrelid = tbl AND NOT g.tgisinternal)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite w WHERE w.ev_class = tbl)
+  THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% has a user trigger or a rule. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  SELECT pg_catalog.string_agg(a.attname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
+    WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
+      AND (ty.typnamespace IS DISTINCT FROM (SELECT n2.oid FROM pg_catalog.pg_namespace n2 WHERE n2.nspname = 'pg_catalog')
+        OR ty.typtype IS DISTINCT FROM 'b' OR ty.oid >= 16384 OR a.attcollation >= 16384);
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% column(s) % use a type or collation that is not a built-in base type/collation. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- The reference: the same definition, deparsed by this server, in this transaction.
+  EXECUTE format('DROP TABLE IF EXISTS pg_temp.%I', reference_name);
+  EXECUTE format('CREATE TEMPORARY TABLE %I (%s) ON COMMIT DROP', reference_name, definition);
+  SELECT c.oid INTO ref FROM pg_catalog.pg_class c WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname = reference_name;
+
+  -- 3. Columns: exactly the reference's — no more, no fewer, each identical.
+  IF (SELECT pg_catalog.count(*) FROM pg_catalog.pg_attribute a WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped)
+    IS DISTINCT FROM (SELECT pg_catalog.count(*) FROM pg_catalog.pg_attribute a WHERE a.attrelid = ref AND a.attnum > 0 AND NOT a.attisdropped)
+  THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% does not have exactly the intended columns (bucket, subject, window_start, hits). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  SELECT pg_catalog.string_agg(rc.attname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_attribute rc
+    LEFT JOIN pg_catalog.pg_attrdef rd ON rd.adrelid = rc.attrelid AND rd.adnum = rc.attnum
+    WHERE rc.attrelid = ref AND rc.attnum > 0 AND NOT rc.attisdropped
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute tc
+        LEFT JOIN pg_catalog.pg_attrdef td ON td.adrelid = tc.attrelid AND td.adnum = tc.attnum
+        WHERE tc.attrelid = tbl AND tc.attname = rc.attname AND NOT tc.attisdropped AND tc.attnum > 0
+          AND tc.atttypid = rc.atttypid AND tc.atttypmod = rc.atttypmod AND tc.attcollation = rc.attcollation
+          AND tc.attnotnull = rc.attnotnull AND tc.attidentity = rc.attidentity AND tc.attgenerated = rc.attgenerated
+          AND pg_catalog.pg_get_expr(td.adbin, td.adrelid) IS NOT DISTINCT FROM pg_catalog.pg_get_expr(rd.adbin, rd.adrelid));
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% column(s) % differ from the intended definition. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- 4. Constraints: exactly the reference's CHECK and PRIMARY KEY constraints —
+  --    so no foreign key, no extra CHECK, and nothing else references this
+  --    table. (PostgreSQL 18 also records each NOT NULL as a constraint row;
+  --    those are proven by the column comparison above, on every version.)
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl AND NOT c.convalidated) THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% has a constraint that is not validated.', target_schema, table_name;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl AND c.contype NOT IN ('c', 'p', 'n'))
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.confrelid = tbl)
+  THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% has, or is the target of, a foreign key (or another unintended kind of constraint). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF (SELECT pg_catalog.count(*) FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl AND c.contype IN ('c', 'p'))
+    IS DISTINCT FROM (SELECT pg_catalog.count(*) FROM pg_catalog.pg_constraint c WHERE c.conrelid = ref AND c.contype IN ('c', 'p'))
+  THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% does not have exactly the intended constraints. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  FOR r IN
+    SELECT c.conname, c.contype, c.condeferrable, c.condeferred, c.connoinherit,
+           pg_catalog.pg_get_constraintdef(c.oid) AS def,
+           (SELECT pg_catalog.array_agg(a.attname ORDER BY u.ord) FROM pg_catalog.unnest(c.conkey) WITH ORDINALITY u(attnum, ord)
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum) AS key_names,
+           c.conindid
+      FROM pg_catalog.pg_constraint c WHERE c.conrelid = ref AND c.contype IN ('c', 'p')
+  LOOP
+    SELECT c.oid, c.conindid INTO k
+      FROM pg_catalog.pg_constraint c
+      WHERE c.conrelid = tbl AND c.conname = r.conname AND c.contype = r.contype AND c.convalidated
+        AND c.condeferrable = r.condeferrable AND c.condeferred = r.condeferred AND c.connoinherit = r.connoinherit
+        AND pg_catalog.pg_get_constraintdef(c.oid) = r.def
+        AND (SELECT pg_catalog.array_agg(a.attname ORDER BY u.ord) FROM pg_catalog.unnest(c.conkey) WITH ORDINALITY u(attnum, ord)
+              JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum) IS NOT DISTINCT FROM r.key_names;
+    IF k.oid IS NULL THEN
+      RAISE EXCEPTION 'Rate limit migration refused: constraint % on %.% is missing or not the intended definition. Nothing was changed; review and resolve by hand (never auto-dropped).', r.conname, target_schema, table_name;
+    END IF;
+    -- 5. The primary key's backing index, structurally.
+    IF r.contype = 'p' AND NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_index ti, pg_catalog.pg_index ri, pg_catalog.pg_class tic, pg_catalog.pg_class ric
+      WHERE ti.indexrelid = k.conindid AND ri.indexrelid = r.conindid AND tic.oid = ti.indexrelid AND ric.oid = ri.indexrelid
+        AND ti.indrelid = tbl AND tic.relam = ric.relam
+        AND ti.indisunique AND ti.indisunique = ri.indisunique AND ti.indisprimary AND ti.indisprimary = ri.indisprimary
+        AND ti.indisvalid AND ti.indisready AND ti.indimmediate AND NOT ti.indisexclusion
+        AND ti.indnullsnotdistinct = ri.indnullsnotdistinct
+        AND ti.indnatts = ri.indnatts AND ti.indnkeyatts = ri.indnkeyatts
+        AND ti.indexprs IS NULL AND ti.indpred IS NULL AND ri.indexprs IS NULL AND ri.indpred IS NULL
+        AND ti.indclass::pg_catalog.text = ri.indclass::pg_catalog.text
+        AND ti.indcollation::pg_catalog.text = ri.indcollation::pg_catalog.text
+        AND ti.indoption::pg_catalog.text = ri.indoption::pg_catalog.text)
+    THEN
+      RAISE EXCEPTION 'Rate limit migration refused: the index behind % on %.% is not the intended one.', r.conname, target_schema, table_name;
+    END IF;
+  END LOOP;
+
+  -- 5 (continued). No index on the table but the primary key's.
+  SELECT pg_catalog.string_agg(c.relname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+    WHERE i.indrelid = tbl
+      AND i.indexrelid NOT IN (SELECT c2.conindid FROM pg_catalog.pg_constraint c2 WHERE c2.conrelid = tbl AND c2.contype = 'p');
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% has unexpected index(es) %. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- 6. Dependencies: only on this table.
+  SELECT pg_catalog.string_agg(DISTINCT d.classid::pg_catalog.regclass::pg_catalog.text || ':' || d.objid::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_depend d
+    WHERE ((d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid IN (SELECT c.oid FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl))
+        OR (d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid IN (SELECT ad.oid FROM pg_catalog.pg_attrdef ad WHERE ad.adrelid = tbl)))
+      AND NOT (d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = tbl);
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Rate limit migration refused: %.% has a constraint or default depending on an object other than its own columns (%). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  EXECUTE format('DROP TABLE pg_temp.%I', reference_name);
+END $$;
+-- END Handle Pay Rate Limits
+
 -- BEGIN Provisioning Evidence Capture
 -- Hand-applied, idempotent, FAIL-CLOSED. Already applied (and its idempotent
 -- rerun proven) on a disposable Neon branch and on the REAL Neon database's

@@ -6,6 +6,7 @@ import { createInMemoryAccountHandleStore, type AccountHandleStore } from "@/lib
 import { resolveHandleRecipient, toPublicRecipientLookup } from "@/lib/real/server/handle-recipient";
 import { createNeonAccountHandleStore } from "@/lib/real/server/neon-store";
 import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals } from "@/lib/real/server/registry";
+import { freshRateLimiter } from "./fixtures/rate-limit";
 
 /**
  * Handle -> payable account (Slice A, advisory). The destination is always
@@ -152,7 +153,7 @@ describe("findPayableAccountByHandle — Neon adapter (query shape; no live data
 });
 
 describe("resolveHandleRecipient", () => {
-  const resolve = async (handle: unknown, currentAppUserId = "app-user-2", handles?: AccountHandleStore) => resolveHandleRecipient({ handles: handles ?? (await world()).handles, handle, currentAppUserId });
+  const resolve = async (handle: unknown, currentAppUserId = "app-user-2", handles?: AccountHandleStore) => resolveHandleRecipient({ handles: handles ?? (await world()).handles, rateLimiter: freshRateLimiter(), handle, currentAppUserId });
 
   it("ok: canonical handle, display name, app_user_id and the Safe (server-side)", async () => {
     expect(await resolve("smit")).toEqual({ outcome: "ok", canonicalHandle: "smit", displayName: "Smit Patel", appUserId: "app-user-1", safeAddress: safe(1) });
@@ -193,7 +194,8 @@ describe("resolveHandleRecipient", () => {
 
   it("self is decided by identity, not address: another account is never 'self' even if asked about its own handle by someone else", async () => {
     expect(await resolve("smit", "app-user-3")).toMatchObject({ outcome: "ok" });
-    expect(await resolve("smit", "")).toMatchObject({ outcome: "ok" });
+    // Slice E: a lookup with NO caller identity is refused outright (the limiter has no one to charge) — it is never answered as "not self".
+    await expect(resolve("smit", "")).rejects.toThrow(/no subject/);
     expect(await resolve("smit", safe(1))).toMatchObject({ outcome: "ok" }); // an address is not an identity
   });
 
@@ -206,10 +208,10 @@ describe("resolveHandleRecipient", () => {
 describe("toPublicRecipientLookup — the only public shape", () => {
   it("found: exactly { found, handle, displayName, isSelf }", async () => {
     const { handles } = await world();
-    const ok = toPublicRecipientLookup((await resolveHandleRecipient({ handles, handle: "smit", currentAppUserId: "app-user-2" })) as never);
+    const ok = toPublicRecipientLookup((await resolveHandleRecipient({ handles, rateLimiter: freshRateLimiter(), handle: "smit", currentAppUserId: "app-user-2" })) as never);
     expect(ok).toEqual({ found: true, handle: "smit", displayName: "Smit Patel", isSelf: false });
     expect(Object.keys(ok).sort()).toEqual(["displayName", "found", "handle", "isSelf"]);
-    const self = toPublicRecipientLookup((await resolveHandleRecipient({ handles, handle: "smit", currentAppUserId: "app-user-1" })) as never);
+    const self = toPublicRecipientLookup((await resolveHandleRecipient({ handles, rateLimiter: freshRateLimiter(), handle: "smit", currentAppUserId: "app-user-1" })) as never);
     expect(self).toEqual({ found: true, handle: "smit", displayName: "Smit Patel", isSelf: true });
   });
 
@@ -221,7 +223,7 @@ describe("toPublicRecipientLookup — the only public shape", () => {
 
   it("never carries the app user id or either address", async () => {
     const { handles } = await world();
-    const serialized = JSON.stringify(toPublicRecipientLookup((await resolveHandleRecipient({ handles, handle: "smit", currentAppUserId: "app-user-2" })) as never));
+    const serialized = JSON.stringify(toPublicRecipientLookup((await resolveHandleRecipient({ handles, rateLimiter: freshRateLimiter(), handle: "smit", currentAppUserId: "app-user-2" })) as never));
     for (const secret of ["app-user-1", safe(1), owner(1), "sub-org-1", "turnkey-user-1", "cred-1", "user-handle-1"]) expect(serialized).not.toContain(secret);
   });
 });

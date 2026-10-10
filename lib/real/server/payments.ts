@@ -17,6 +17,7 @@ import { fetchUserOperationReceipt, prepareCashTransferUserOperation, sendPrepar
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "../constants";
 import { DuplicateSignActivityError, toPublicRecipientIdentity, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type PublicRecipientIdentity } from "./payment-attempts";
 import { isWellFormedActivityId, verifyPaymentAuthorization } from "./payment-authorization";
+import { ADDRESS_PREPARE_POLICIES, HANDLE_PREPARE_POLICIES, type RateLimiter } from "./rate-limit";
 import type { RealServerConfig } from "./config";
 import type { PrepareRecipientSelector } from "./handle-recipient";
 
@@ -168,6 +169,8 @@ export type PreparePaymentOutcome =
   /** The handle is the payer's own account. (A direct address is not checked — unchanged.) */
   | { outcome: "self_payment" }
   | { outcome: "invalid_amount" }
+  /** Slice E: the payer's prepare (or, for a handle, probe) budget is spent. Nothing was read, reserved, or sent. Distinct from quota_exceeded, the payment quota. */
+  | { outcome: "rate_limited"; retryAfterSeconds: number }
   | { outcome: "balance_check_failed"; reason: string }
   | { outcome: "insufficient_balance" }
   | { outcome: "quota_exceeded" }
@@ -195,12 +198,24 @@ export type PreparePaymentOutcome =
  * approve it — the app session's own credential, just re-checked active and
  * owned by this account (readAuthenticatedRealAccount). Never a
  * client-supplied id; never changed afterwards.
+ *
+ * Slice E: once the request is authenticated and well-formed (account ready,
+ * one valid selector, a valid amount) it is charged to the payer's own rate
+ * budget — BEFORE the balance read, the block-clock read, the reservation
+ * (and, for a handle, the recipient resolution inside it), and Pimlico. An
+ * address payment draws on the prepare budget; a handle payment draws on the
+ * prepare AND the recipient-probe budgets, because its refusals tell an
+ * existing handle from a missing one. A denied request does none of that work
+ * and creates no attempt. This changes no payment authority and none of the
+ * outcomes below it.
  */
 export async function resolvePreparePayment(input: {
   cookieValue: string | undefined | null;
   sessionSecret: string;
   registry: RealAccountRegistry;
   paymentStore: PaymentAttemptStore;
+  /** Slice E: required, so no caller can prepare a payment unmetered. Told only the payer's app_user_id — never the recipient. */
+  rateLimiter: RateLimiter;
   publicClient: RealPublicClient;
   pimlicoApiKey: string;
   /**
@@ -246,6 +261,12 @@ export async function resolvePreparePayment(input: {
   if (!isCanonicalBaseUnitsString(amountBaseUnits) || isZeroBaseUnits(amountBaseUnits) || exceedsPaymentCeiling(amountBaseUnits)) {
     return { outcome: "invalid_amount" };
   }
+
+  const admitted = await input.rateLimiter.consume({
+    subject: authenticated.account.appUserId,
+    policies: target.kind === "handle" ? HANDLE_PREPARE_POLICIES : ADDRESS_PREPARE_POLICIES,
+  });
+  if (!admitted.allowed) return { outcome: "rate_limited", retryAfterSeconds: admitted.retryAfterSeconds };
 
   let balanceBaseUnits: string;
   try {

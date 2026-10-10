@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { freshRateLimiter } from "./fixtures/rate-limit";
 import { createPublicClient, custom, encodeAbiParameters, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { baseSepolia } from "viem/chains";
@@ -188,6 +189,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       sessionSecret: SECRET,
       registry,
       paymentStore,
+      rateLimiter: freshRateLimiter(),
       publicClient: buildBalanceCheckClient(BigInt(20_000_000)),
       pimlicoApiKey: "pim_test_key",
       recipient: { kind: "address", value: RECIPIENT },
@@ -238,6 +240,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       sessionSecret: SECRET,
       registry,
       paymentStore,
+      rateLimiter: freshRateLimiter(),
       publicClient: buildBalanceCheckClient(BigInt(20_000_000)),
       pimlicoApiKey: "pim_test_key",
       recipient: { kind: "address", value: RECIPIENT },

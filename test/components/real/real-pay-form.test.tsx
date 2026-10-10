@@ -876,4 +876,60 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     expect(useRealPaymentStore.getState().attempt).toMatchObject({ recipientIdentity: null });
     expect(screen.getByTestId("real-pay-confirmed").textContent).not.toContain("@");
   });
+
+  // ---- Slice E: rate limiting, as the person sees it.
+  it("a rate-limited name check says 'Too many tries. Try again later.' — not the generic failure — and never retries by itself", async () => {
+    const { lookups } = stubRoutes({ lookup: () => jsonResponse(429, { error: "Too many tries. Try again later.", code: "rate_limited" }) });
+    const input = await renderForm();
+    fireEvent.change(input, { target: { value: "@smit" } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.blur(input);
+
+    await waitFor(() => expect(screen.getByText("Too many tries. Try again later.")).toBeInTheDocument());
+    expect(screen.queryByText("Couldn't check that name. Try again.")).not.toBeInTheDocument();
+    expect(screen.getByTestId("real-pay-recipient-status")).toHaveTextContent(/^Too many tries\. Try again later\.$/);
+    expect(screen.getByTestId("real-pay-form").textContent).not.toMatch(/429|rate.?limit|Retry-After|seconds/i); // no HTTP jargon, no countdown
+    expect(lookups).toHaveLength(1);
+
+    // Leaving the field again does not ask again; nothing happens in the background.
+    fireEvent.blur(input);
+    fireEvent.blur(input);
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(lookups).toHaveLength(1);
+
+    // Review asks once more (an explicit press), stays on the form, and shows the message once.
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(lookups).toHaveLength(2));
+    expect(screen.getByTestId("real-pay-form")).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-review")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Too many tries. Try again later.")).toHaveLength(1);
+
+    // Editing clears it straight away.
+    fireEvent.change(input, { target: { value: "@smi" } });
+    expect(screen.queryByText("Too many tries. Try again later.")).not.toBeInTheDocument();
+    expect(input).not.toHaveAttribute("aria-invalid");
+  });
+
+  it("a rate-limited prepare returns to the form with the server's message, the name still resolved, and no second prepare", async () => {
+    const { prepares, lookups } = stubRoutes({
+      lookup: () => jsonResponse(200, FOUND_SMIT),
+      prepare: () => jsonResponse(429, { error: "You're going a bit fast. Try again later.", code: "rate_limited" }),
+    });
+    const input = await renderForm();
+    fireEvent.change(input, { target: { value: "@smit" } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(screen.getByText("You're going a bit fast. Try again later.")).toBeInTheDocument();
+    expect(screen.queryByText("We couldn't find anyone with that name.")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("To")).toHaveValue("@smit");
+    expect(screen.getByTestId("real-pay-recipient-status")).toHaveTextContent("Smit Patel"); // still resolved
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(prepares).toHaveLength(1);
+    expect(lookups).toHaveLength(1);
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
 });
