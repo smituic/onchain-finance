@@ -53,6 +53,7 @@ function attemptFixture(overrides: Record<string, unknown> = {}) {
     id: "payment-attempt-1",
     state: "awaiting_authorization",
     recipient: RECIPIENT,
+    recipientIdentity: null as unknown,
     amountBaseUnits: "1000000",
     transactionHash: null,
     failureReason: null,
@@ -71,7 +72,6 @@ describe("RealPayForm", () => {
       status: "idle",
       recipientInput: "",
       recipientLookup: { status: "idle" },
-      recipientLabel: null,
       amountInput: "",
       attempt: null,
       subOrganizationId: null,
@@ -496,6 +496,7 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     lookup?: (body: { handle: string }) => Response;
     prepare?: (body: unknown) => Response;
     submit?: () => Response;
+    status?: () => Response;
   };
 
   function stubRoutes(routes: Routes) {
@@ -513,7 +514,7 @@ describe("RealPayForm — Slice C: paying by @name", () => {
       }
       if (url.endsWith("/api/real/payments/submit") && method === "POST" && routes.submit) return routes.submit();
       if (url.endsWith("/api/real/account/balance")) return jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "19000000" });
-      if (url.includes("/status")) return jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }), serverNowSeconds: 1_900_000_000 });
+      if (url.includes("/status")) return routes.status?.() ?? jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }), serverNowSeconds: 1_900_000_000 });
       return null;
     });
     return { lookups, prepares };
@@ -679,11 +680,16 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     expect(screen.getByTestId("real-pay-review").textContent).not.toMatch(/0x|null/);
   });
 
-  it("approval, sending, and sent screens name the person (display name + @name) instead of the address, and prepare got only the handle", async () => {
-    const { prepares } = stubRoutes({
-      lookup: () => jsonResponse(200, FOUND_SMIT),
-      prepare: prepareOk,
-      submit: () => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123" }) }),
+  // ---- Slice D: after prepare, the recipient's name comes from attempt.recipientIdentity (the server's stored snapshot).
+  const STORED = { handle: "smit", displayName: "Smit P. (stored)" };
+  const restored = (overrides: Record<string, unknown> = {}) => () =>
+    jsonResponse(200, { attempt: attemptFixture(overrides), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 });
+
+  it("Review shows the advisory lookup; after prepare the approval, sending, and sent screens show the attempt's AUTHORITATIVE identity — the stored snapshot wins over the lookup's name", async () => {
+    const { prepares, lookups } = stubRoutes({
+      lookup: () => jsonResponse(200, FOUND_SMIT), // advisory: "Smit Patel"
+      prepare: () => jsonResponse(200, { attempt: attemptFixture({ recipientIdentity: STORED }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 }),
+      submit: () => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123", recipientIdentity: STORED }) }),
     });
     signPreparedPaymentMock.mockRejectedValueOnce(Object.assign(new Error("cancelled"), { name: "NotAllowedError" }));
     let finishSigning: (value: { signature: string; activityId: string }) => void = () => {};
@@ -693,36 +699,44 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     fireEvent.change(input, { target: { value: "@smit" } });
     fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
     fireEvent.click(screen.getByRole("button", { name: "Review" }));
+
+    // Before prepare there is no attempt: Review shows what the lookup said.
     await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    expect(screen.getByTestId("real-pay-review")).toHaveTextContent("Smit Patel");
+    expect(screen.getByTestId("real-pay-review")).toHaveTextContent("@smit");
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
-    // Passkey prompt dismissed -> the pending-approval screen.
+    // Passkey prompt dismissed -> the pending-approval screen, now from the attempt.
     await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
     expect(prepares).toEqual([{ recipientHandle: "smit", amountBaseUnits: "1000000" }]);
-    expect(screen.getByText("To: Smit Patel (@smit)")).toBeInTheDocument();
+    expect(screen.getByText("To: Smit P. (stored) (@smit)")).toBeInTheDocument();
+    expect(screen.queryByText(/Smit Patel/)).not.toBeInTheDocument();
     expect(screen.queryByText(RECIPIENT, { exact: false })).not.toBeInTheDocument();
     expect(screen.getByText(/Only continue if you started this payment/)).toBeInTheDocument();
 
     // Sending.
-    useRealPaymentStore.setState({ status: "submitting" });
-    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toHaveTextContent("To Smit Patel (@smit)"));
-    useRealPaymentStore.setState({ status: "awaiting_authorization" });
+    act(() => useRealPaymentStore.setState({ status: "submitting" }));
+    expect(screen.getByTestId("real-pay-sending")).toHaveTextContent("To Smit P. (stored) (@smit)");
+    act(() => useRealPaymentStore.setState({ status: "awaiting_authorization" }));
 
     // Continue -> sent.
     await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     await act(async () => finishSigning({ signature: "0xsignature", activityId: "activity-1" }));
     await waitFor(() => expect(screen.getByTestId("real-pay-confirmed")).toBeInTheDocument());
-    expect(screen.getByTestId("real-pay-confirmed")).toHaveTextContent("to Smit Patel (@smit)");
+    expect(screen.getByTestId("real-pay-confirmed")).toHaveTextContent("to Smit P. (stored) (@smit)");
     expect(screen.getByTestId("real-pay-confirmed").textContent).not.toContain("0x3333");
+    expect(lookups).toHaveLength(1);
 
-    // "Send another payment" clears the label with everything else.
     fireEvent.click(screen.getByRole("button", { name: "Send another payment" }));
-    expect(useRealPaymentStore.getState()).toMatchObject({ recipientLabel: null, recipientLookup: { status: "idle" }, recipientInput: "" });
+    expect(useRealPaymentStore.getState()).toMatchObject({ attempt: null, recipientLookup: { status: "idle" }, recipientInput: "" });
   });
 
   it("a handle payment with no display name is named by its @name alone on the approval screen", async () => {
-    stubRoutes({ lookup: () => jsonResponse(200, { ...FOUND_SMIT, displayName: null }), prepare: prepareOk });
+    stubRoutes({
+      lookup: () => jsonResponse(200, { ...FOUND_SMIT, displayName: null }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture({ recipientIdentity: { handle: "smit", displayName: null } }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 }),
+    });
     signPreparedPaymentMock.mockRejectedValueOnce(Object.assign(new Error("cancelled"), { name: "NotAllowedError" }));
     const input = await renderForm();
     fireEvent.change(input, { target: { value: "@smit" } });
@@ -735,28 +749,90 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     act(() => useRealPaymentStore.getState().reset());
   });
 
-  it("a label for a different attempt id is never reused — the full address is shown", async () => {
-    stubRoutes({ latest: () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 }) });
+  it("RELOAD: a restored handle payment waiting for approval shows Name (@handle) and the warning — from /latest alone, with no lookup", async () => {
+    const { lookups } = stubRoutes({ latest: restored({ recipientIdentity: STORED }) });
     render(<RealPayForm />);
     await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
 
-    act(() => useRealPaymentStore.setState({ recipientLabel: { attemptId: "some-other-attempt", handle: "smit", displayName: "Smit Patel" } }));
-
-    expect(screen.getByText(RECIPIENT, { exact: false })).toBeInTheDocument();
-    expect(screen.queryByText(/Smit Patel/)).not.toBeInTheDocument();
+    expect(screen.getByText("To: Smit P. (stored) (@smit)")).toBeInTheDocument();
+    expect(screen.queryByText(RECIPIENT, { exact: false })).not.toBeInTheDocument();
+    expect(screen.getByText(/Only continue if you started this payment/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeInTheDocument();
+    expect(lookups).toHaveLength(0);
+    expect(useRealPaymentStore.getState()).toMatchObject({ recipientInput: "", recipientLookup: { status: "idle" } });
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
     act(() => useRealPaymentStore.getState().reset());
   });
 
-  it("a reload-restored attempt has no label: the address is shown, as before", async () => {
-    stubRoutes({ latest: () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 }) });
-    // Even if a label survived in memory from an earlier flow, init() drops it.
-    useRealPaymentStore.setState({ recipientLabel: { attemptId: "payment-attempt-1", handle: "smit", displayName: "Smit Patel" } });
+  it("RELOAD: a restored handle payment with no display name shows '@handle' alone", async () => {
+    stubRoutes({ latest: restored({ recipientIdentity: { handle: "smit", displayName: null } }) });
     render(<RealPayForm />);
     await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
-
-    expect(useRealPaymentStore.getState().recipientLabel).toBeNull();
-    expect(screen.getByText(`To: ${RECIPIENT}`)).toBeInTheDocument();
+    expect(screen.getByText("To: @smit")).toBeInTheDocument();
+    expect(screen.queryByText(RECIPIENT, { exact: false })).not.toBeInTheDocument();
     act(() => useRealPaymentStore.getState().reset());
+  });
+
+  it("RELOAD: a restored confirmed handle payment shows 'Sent … to Name (@handle)' from the stored snapshot", async () => {
+    const { lookups } = stubRoutes({ latest: restored({ state: "confirmed", prepared: null, transactionHash: "0xabc123", recipientIdentity: { handle: "smit", displayName: "Smit Patel" } }) });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-confirmed")).toBeInTheDocument());
+    expect(screen.getByTestId("real-pay-confirmed")).toHaveTextContent("$1.00 to Smit Patel (@smit)");
+    expect(screen.getByTestId("real-pay-confirmed").textContent).not.toContain("0x3333");
+    expect(lookups).toHaveLength(0);
+  });
+
+  it("RELOAD: a restored submitted handle payment keeps its name through the status check that confirms it", async () => {
+    stubRoutes({
+      latest: restored({ state: "submitted", prepared: null, recipientIdentity: STORED }),
+      status: () => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", prepared: null, transactionHash: "0xabc123", recipientIdentity: STORED }), serverNowSeconds: 1_900_000_000 }),
+    });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-confirmed")).toBeInTheDocument());
+    expect(screen.getByTestId("real-pay-confirmed")).toHaveTextContent("to Smit P. (stored) (@smit)");
+    expect(useRealPaymentStore.getState().attempt).toMatchObject({ state: "confirmed", recipientIdentity: STORED });
+  });
+
+  it("ADDRESS: a restored address payment still shows the FULL address on approval and the shortened one when sent — never a name", async () => {
+    stubRoutes({ latest: restored({ recipientIdentity: null }) });
+    const first = render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    expect(screen.getByText(`To: ${RECIPIENT}`)).toBeInTheDocument();
+    expect(screen.getByText(/Only continue if you started this payment/)).toBeInTheDocument();
+    expect(screen.getByTestId("real-pay-resume").textContent).not.toContain("@");
+    act(() => useRealPaymentStore.getState().reset());
+    first.unmount();
+
+    useRealPaymentStore.setState({ status: "idle" });
+    stubRoutes({ latest: restored({ state: "confirmed", prepared: null, transactionHash: "0xabc123", recipientIdentity: null }) });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-confirmed")).toBeInTheDocument());
+    expect(screen.getByTestId("real-pay-confirmed")).toHaveTextContent("$1.00 to 0x3333…3333");
+    expect(screen.getByTestId("real-pay-confirmed").textContent).not.toContain("@");
+  });
+
+  it("a malformed recipientIdentity from the server falls back to the address — nothing is repaired or half-shown", async () => {
+    const malformed: unknown[] = [
+      { handle: "@smit", displayName: "Smit Patel" },
+      { handle: "Smit", displayName: "Smit Patel" },
+      { displayName: "Smit Patel" },
+      { handle: "smit" },
+      { handle: "smit", displayName: "" },
+      { handle: "smit", displayName: 7 },
+      { handle: "smit", displayName: "Smit Patel", appUserId: "app-user-2" },
+      "smit",
+      undefined,
+    ];
+    for (const recipientIdentity of malformed) {
+      useRealPaymentStore.setState({ status: "idle" });
+      stubRoutes({ latest: restored({ recipientIdentity }) });
+      const view = render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+      expect(screen.getByText(`To: ${RECIPIENT}`), JSON.stringify(recipientIdentity)).toBeInTheDocument();
+      expect(screen.getByTestId("real-pay-resume").textContent, JSON.stringify(recipientIdentity)).not.toMatch(/Smit|@|app-user/);
+      act(() => useRealPaymentStore.getState().reset());
+      view.unmount();
+    }
   });
 
   it("prepare 404 after a found name: back on the form with the text kept and the server's message", async () => {
@@ -797,6 +873,7 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     expect(screen.getByTestId("real-pay-confirmed")).toHaveTextContent("to 0x3333…3333");
     expect(lookups).toHaveLength(0);
     expect(prepares).toEqual([{ recipient: RECIPIENT, amountBaseUnits: "1000000" }]);
-    expect(useRealPaymentStore.getState().recipientLabel).toBeNull();
+    expect(useRealPaymentStore.getState().attempt).toMatchObject({ recipientIdentity: null });
+    expect(screen.getByTestId("real-pay-confirmed").textContent).not.toContain("@");
   });
 });

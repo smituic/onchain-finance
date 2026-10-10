@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { RealPaymentAttemptState } from "./real-payment-store";
+import type { PaymentRecipientIdentity } from "@/lib/real/display/payment-recipient";
 
 /**
  * Batch 2e: read-only, unpersisted, fetch-only — mirrors
@@ -11,6 +12,8 @@ import type { RealPaymentAttemptState } from "./real-payment-store";
 export type PaymentHistoryEntry = {
   id: string;
   recipient: string;
+  /** Slice D: the stored snapshot of who a handle payment was addressed to; null for an address payment. Validated where it is shown (lib/real/display/payment-recipient.ts). */
+  recipientIdentity: PaymentRecipientIdentity | null;
   amountBaseUnits: string;
   state: RealPaymentAttemptState;
   transactionHash: string | null;

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRealPaymentStore, EXPIRY_FOLLOW_UP_MS } from "@/lib/stores/real-payment-store";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
+import { signPreparedPayment } from "@/lib/real/payments/client-sign";
 import type { WirePreparedFields } from "@/lib/real/payments/prepared-operation";
 
 // Slice C's prepare tests run confirmAndSend past /prepare; the passkey step is
@@ -38,6 +39,7 @@ function baseAttempt() {
     id: "attempt-1",
     state: "awaiting_authorization" as const,
     recipient: "0x2222222222222222222222222222222222222222",
+    recipientIdentity: null as { handle: string; displayName: string | null } | null,
     amountBaseUnits: "1000000",
     transactionHash: null,
     failureReason: null,
@@ -68,6 +70,7 @@ describe("real-payment-store — init() resets prior-account state before fetchi
         id: "stale-attempt",
         state: "awaiting_authorization",
         recipient: "0x1111111111111111111111111111111111111111",
+        recipientIdentity: null,
         amountBaseUnits: "42000000",
         transactionHash: null,
         failureReason: null,
@@ -526,7 +529,14 @@ describe("real-payment-store — Slice C: paying by @name", () => {
   type Deferred = { resolve: (response: Response) => void; reject: (reason: unknown) => void };
 
   /** Routes fetch by URL; a handler may return a Response, throw, or return a promise it resolves later. */
-  function stubApi(handlers: { lookup?: (body: { handle: string }) => Response | Promise<Response>; prepare?: (body: unknown) => Response; cancel?: () => Response }) {
+  function stubApi(handlers: {
+    lookup?: (body: { handle: string }) => Response | Promise<Response>;
+    prepare?: (body: unknown) => Response;
+    cancel?: () => Response;
+    latest?: () => Response;
+    status?: () => Response;
+    submit?: (body: unknown) => Response;
+  }) {
     const calls: Call[] = [];
     vi.stubGlobal(
       "fetch",
@@ -535,7 +545,9 @@ describe("real-payment-store — Slice C: paying by @name", () => {
         const rawBody = typeof init?.body === "string" ? init.body : null;
         const body: unknown = rawBody ? JSON.parse(rawBody) : undefined;
         calls.push({ url, method: (init?.method ?? "GET").toUpperCase(), rawBody, body });
-        if (url.endsWith("/api/real/payments/latest")) return jsonResponse(200, { attempt: null });
+        if (url.endsWith("/api/real/payments/latest")) return handlers.latest?.() ?? jsonResponse(200, { attempt: null });
+        if (url.endsWith("/status") && handlers.status) return handlers.status();
+        if (url.endsWith("/api/real/payments/submit") && handlers.submit) return handlers.submit(body);
         if (url.endsWith("/api/real/recipients/lookup") && handlers.lookup) return handlers.lookup(body as { handle: string });
         if (url.endsWith("/api/real/payments/prepare") && handlers.prepare) return handlers.prepare(body);
         if (url.endsWith("/cancel") && handlers.cancel) return handlers.cancel();
@@ -817,18 +829,17 @@ describe("real-payment-store — Slice C: paying by @name", () => {
       }
     });
 
-    it("init() and reset() clear a resolved recipient and the same-session label", async () => {
+    it("init() and reset() clear a resolved recipient", async () => {
       stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT) });
       for (const clear of ["init", "reset"] as const) {
         const store = editingStore();
         store.getState().setRecipientInput("@smit");
         await store.getState().lookupRecipient();
-        store.setState({ recipientLabel: { attemptId: "attempt-1", handle: "smit", displayName: "Smit Patel" } });
 
         if (clear === "init") await store.getState().init();
         else store.getState().reset();
 
-        expect(store.getState(), clear).toMatchObject({ recipientInput: "", recipientLookup: { status: "idle" }, recipientLabel: null });
+        expect(store.getState(), clear).toMatchObject({ recipientInput: "", recipientLookup: { status: "idle" }, attempt: null });
       }
     });
 
@@ -903,7 +914,7 @@ describe("real-payment-store — Slice C: paying by @name", () => {
       await store.getState().confirmAndSend();
 
       expect(api.prepares()).toHaveLength(0);
-      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, recipientLabel: null });
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
       expect(store.getState().error).toBeTruthy();
     });
 
@@ -928,7 +939,6 @@ describe("real-payment-store — Slice C: paying by @name", () => {
         status: "editing",
         recipientInput: "@smit",
         recipientLookup: { status: "idle" },
-        recipientLabel: null,
         attempt: null,
         error: "We couldn't find anyone with that name.",
       });
@@ -951,31 +961,34 @@ describe("real-payment-store — Slice C: paying by @name", () => {
     });
   });
 
-  describe("same-session recipient label", () => {
-    it("is set by a successful handle prepare, for that attempt id only", async () => {
+  /**
+   * Slice D: after prepare the attempt's own `recipientIdentity` — the
+   * server's stored snapshot, on every response that returns the attempt — is
+   * the ONE source of the recipient's name. The Slice C in-memory label is
+   * gone; nothing here is kept beside the attempt, and nothing is sent back.
+   */
+  describe("attempt.recipientIdentity — the one post-prepare identity (Slice D)", () => {
+    const SNAPSHOT = { handle: "smit", displayName: "Smit P. (stored)" };
+    const handleAttempt = (overrides: Record<string, unknown> = {}) => ({ ...baseAttempt(), recipientIdentity: SNAPSHOT, ...overrides });
+    const prepareHandleOk = () => jsonResponse(200, { attempt: handleAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) });
+
+    it("a successful handle prepare stores the SERVER's identity on the attempt — not the advisory lookup's — and keeps no separate label", async () => {
       useRealAccountStore.setState({ account: ACCOUNT });
-      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: prepareOk });
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: prepareHandleOk });
       const store = await reviewingSmit(api);
+      // Before prepare there is no attempt: the lookup is all the Review screen has.
+      expect(store.getState().attempt).toBeNull();
+      expect(store.getState().recipientLookup).toMatchObject({ status: "found", displayName: "Smit Patel" });
+
       await store.getState().confirmAndSend();
 
-      expect(store.getState().recipientLabel).toEqual({ attemptId: "attempt-1", handle: "smit", displayName: "Smit Patel" });
+      expect(store.getState().attempt?.recipientIdentity).toEqual(SNAPSHOT);
+      expect(store.getState()).not.toHaveProperty("recipientLabel");
       store.getState().reset();
-      expect(store.getState().recipientLabel).toBeNull();
+      expect(store.getState().attempt).toBeNull();
     });
 
-    it("a successful cancel clears it, along with the resolved recipient", async () => {
-      useRealAccountStore.setState({ account: ACCOUNT });
-      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: prepareOk, cancel: () => jsonResponse(200, { attempt: { ...baseAttempt(), state: "cancelled", prepared: null } }) });
-      const store = await reviewingSmit(api);
-      await store.getState().confirmAndSend();
-      expect(store.getState().recipientLabel).not.toBeNull();
-
-      await store.getState().cancel();
-
-      expect(store.getState()).toMatchObject({ status: "editing", recipientInput: "", recipientLookup: { status: "idle" }, recipientLabel: null });
-    });
-
-    it("an address payment never gets one", async () => {
+    it("an address payment's attempt has a null identity", async () => {
       useRealAccountStore.setState({ account: ACCOUNT });
       const api = stubApi({ prepare: prepareOk });
       const store = editingStore();
@@ -984,8 +997,66 @@ describe("real-payment-store — Slice C: paying by @name", () => {
       void store.getState().review();
       await store.getState().confirmAndSend();
       expect(api.prepares()).toHaveLength(1);
-      expect(store.getState().recipientLabel).toBeNull();
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", recipientIdentity: null });
       store.getState().reset();
+    });
+
+    it("reload: init() -> latest restores the identity with the attempt — no lookup request, no lookup state, nothing persisted", async () => {
+      const api = stubApi({ latest: () => jsonResponse(200, { attempt: handleAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) }) });
+      const store = createRealPaymentStore();
+
+      await store.getState().init();
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", recipientInput: "", recipientLookup: { status: "idle" }, attempt: { id: "attempt-1", recipientIdentity: SNAPSHOT } });
+      expect(api.lookups()).toHaveLength(0);
+      expect(api.calls.map((call) => call.url)).toEqual(["/api/real/payments/latest"]);
+      store.getState().reset();
+    });
+
+    it("a status check replaces the attempt and the identity comes from that response", async () => {
+      const renamed = { handle: "smit", displayName: null };
+      stubApi({ status: () => jsonResponse(200, { attempt: handleAttempt({ state: "confirmed", prepared: null, recipientIdentity: renamed }), serverNowSeconds: Math.floor(Date.now() / 1000) }) });
+      const store = createRealPaymentStore();
+      store.setState({ status: "submitted", attempt: handleAttempt({ state: "submitted" }) });
+
+      await store.getState().checkStatus();
+
+      expect(store.getState()).toMatchObject({ status: "confirmed", attempt: { state: "confirmed", recipientIdentity: renamed } });
+    });
+
+    it("a successful cancel drops the attempt, and its identity with it", async () => {
+      useRealAccountStore.setState({ account: ACCOUNT });
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: prepareHandleOk, cancel: () => jsonResponse(200, { attempt: handleAttempt({ state: "cancelled", prepared: null }) }) });
+      const store = await reviewingSmit(api);
+      await store.getState().confirmAndSend();
+      expect(store.getState().attempt?.recipientIdentity).toEqual(SNAPSHOT);
+
+      await store.getState().cancel();
+
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, recipientInput: "", recipientLookup: { status: "idle" } });
+    });
+
+    it("SECURITY: the identity is read-only — prepare, submit, and cancel never send it (or any name) back", async () => {
+      useRealAccountStore.setState({ account: ACCOUNT });
+      vi.mocked(signPreparedPayment).mockResolvedValueOnce({ signature: "0xsignature", activityId: "activity-1" } as never);
+      const api = stubApi({
+        lookup: () => jsonResponse(200, FOUND_SMIT),
+        prepare: prepareHandleOk,
+        // The server can't confirm yet: the attempt stays awaiting, so it can then be cancelled.
+        submit: () => jsonResponse(503, { error: "We couldn't confirm your passkey approval yet. Try again in a moment.", retryable: true }),
+        cancel: () => jsonResponse(200, { attempt: handleAttempt({ state: "cancelled", prepared: null }) }),
+      });
+      const store = await reviewingSmit(api);
+      await store.getState().confirmAndSend();
+      await store.getState().cancel();
+
+      const mutations = api.calls.filter((call) => call.method === "POST" && !call.url.endsWith("/api/real/recipients/lookup"));
+      expect(mutations.map((call) => [call.url, call.body])).toEqual([
+        ["/api/real/payments/prepare", { recipientHandle: "smit", amountBaseUnits: "1000000" }],
+        ["/api/real/payments/submit", { attemptId: "attempt-1", signature: "0xsignature", activityId: "activity-1" }],
+        ["/api/real/payments/attempt-1/cancel", undefined],
+      ]);
+      for (const call of api.calls) expect(call.rawBody ?? "", call.url).not.toMatch(/recipientIdentity|displayName|Smit|stored/);
     });
   });
 

@@ -1,6 +1,6 @@
 import { readAuthenticatedRealAccount } from "./auth";
 import type { RealAccountRegistry } from "./registry";
-import type { PaymentAttempt, PaymentAttemptState, PaymentAttemptStore } from "./payment-attempts";
+import { toPublicRecipientIdentity, type PaymentAttempt, type PaymentAttemptState, type PaymentAttemptStore, type PublicRecipientIdentity } from "./payment-attempts";
 
 /**
  * Batch 2e: a physically separate read module from server/payments.ts on
@@ -25,10 +25,16 @@ import type { PaymentAttempt, PaymentAttemptState, PaymentAttemptStore } from ".
  * set of fixed, safe strings — see server/payments.ts's SAFE_* constants),
  * and history only ever needs the mapped status label
  * (lib/real/display/payment-status.ts), never the internal reason.
+ *
+ * Slice D: `recipientIdentity` is the payment's own stored snapshot (the
+ * handle that was paid and the display name at prepare), through the same
+ * mapper the payment responses use — never a live profile read, and null for
+ * an address payment. The recipient's account id is not part of it.
  */
 export type PaymentHistoryEntry = {
   id: string;
   recipient: string;
+  recipientIdentity: PublicRecipientIdentity | null;
   amountBaseUnits: string;
   state: PaymentAttemptState;
   transactionHash: string | null;
@@ -40,6 +46,7 @@ export function toPaymentHistoryEntry(attempt: PaymentAttempt): PaymentHistoryEn
   return {
     id: attempt.id,
     recipient: attempt.recipient,
+    recipientIdentity: toPublicRecipientIdentity(attempt),
     amountBaseUnits: attempt.amountBaseUnits,
     state: attempt.state,
     transactionHash: attempt.transactionHash,

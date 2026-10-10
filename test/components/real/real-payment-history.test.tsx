@@ -204,3 +204,108 @@ describe("RealPaymentHistory", () => {
     await waitFor(() => expect(screen.getByTestId("real-payment-history-row-payment-attempt-account-b")).toBeInTheDocument());
   });
 });
+
+/**
+ * Handle Pay Slice D — a handle payment's row names who it was sent to (the
+ * payment's stored snapshot); an address payment's row stays an address.
+ * Nothing is looked up, and an address is never turned into a name.
+ */
+describe("RealPaymentHistory — Slice D: recipient identity", () => {
+  const SMIT = { handle: "smit", displayName: "Smit Patel" };
+  const recipientOf = (id: string) => screen.getByTestId(`real-payment-history-row-${id}`).querySelector('[data-testid="real-payment-history-recipient"]') as HTMLElement;
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealPaymentHistoryStore.setState({ entries: [], status: "idle", error: null });
+    vi.unstubAllGlobals();
+  });
+
+  async function renderWith(entries: unknown[]) {
+    const fetchMock = stubHistoryOnlyFetch(entries);
+    render(<RealPaymentHistory />);
+    await waitFor(() => expect(screen.getAllByTestId("real-payment-history-recipient").length).toBe(entries.length));
+    return fetchMock;
+  }
+
+  it("a handle payment row reads 'To Name (@handle)' and does not show the address", async () => {
+    await renderWith([entry({ recipientIdentity: SMIT })]);
+    const recipient = recipientOf("payment-attempt-1");
+    expect(recipient).toHaveTextContent(/^To\s*Smit Patel\s*\(@smit\)$/);
+    expect(recipient).toHaveAttribute("title", "Smit Patel (@smit)");
+    expect(screen.getByTestId("real-payment-history-row-payment-attempt-1").textContent).not.toMatch(/0x3333/);
+  });
+
+  it("a handle payment with no display name reads 'To @handle'", async () => {
+    await renderWith([entry({ recipientIdentity: { handle: "smit", displayName: null } })]);
+    expect(recipientOf("payment-attempt-1")).toHaveTextContent(/^To\s*@smit$/);
+    expect(screen.getByTestId("real-payment-history-row-payment-attempt-1").textContent).not.toMatch(/0x3333|null/);
+  });
+
+  it("a direct-address row is unchanged: 'To 0x3333…3333' (identity null, or absent on an older response)", async () => {
+    await renderWith([entry({ id: "a", recipientIdentity: null }), entry({ id: "b" })]);
+    for (const id of ["a", "b"]) {
+      expect(recipientOf(id)).toHaveTextContent(/^To 0x3333…3333$/);
+      expect(recipientOf(id).textContent).not.toContain("@");
+    }
+  });
+
+  it("a direct-address payment to an address that IS a known person's account still shows the address — next to that person's handle payment", async () => {
+    // Same recipient address on both rows; only the one that was PAID BY HANDLE carries an identity.
+    const fetchMock = await renderWith([entry({ id: "by-handle", recipientIdentity: SMIT }), entry({ id: "by-address", recipientIdentity: null })]);
+    expect(recipientOf("by-handle")).toHaveTextContent(/Smit Patel\s*\(@smit\)/);
+    expect(recipientOf("by-address")).toHaveTextContent(/^To 0x3333…3333$/);
+    expect(recipientOf("by-address").textContent).not.toMatch(/Smit|@/);
+    // Nothing was looked up to decide that: history is the only request.
+    expect(fetchMock.mock.calls.every(([input]) => String(input).includes("/api/real/payments/history"))).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("the identity is shown whatever the outcome: failed, cancelled, pending, submitted, and unknown rows all name the handle", async () => {
+    const states = ["confirmed", "failed", "cancelled", "awaiting_authorization", "submitted", "unknown", "prepared", "signed", "submitting"];
+    await renderWith(states.map((state) => entry({ id: state, state, recipientIdentity: SMIT })));
+    for (const state of states) {
+      expect(recipientOf(state), state).toHaveTextContent(/^To\s*Smit Patel\s*\(@smit\)$/);
+    }
+    expect(screen.getByTestId("real-payment-history-row-failed")).toHaveTextContent("Failed");
+    expect(screen.getByTestId("real-payment-history-row-cancelled")).toHaveTextContent("Cancelled");
+  });
+
+  it("a maximum-length name is layout-safe: the name truncates, the @handle and the date never shrink, and the full label stays available", async () => {
+    const longest = { handle: "a".repeat(20), displayName: "W".repeat(40) };
+    await renderWith([entry({ recipientIdentity: longest })]);
+    const recipient = recipientOf("payment-attempt-1");
+    const [to, name, handle] = Array.from(recipient.children) as HTMLElement[];
+
+    expect(recipient.className).toMatch(/\bmin-w-0\b/);
+    expect(to).toHaveTextContent("To");
+    expect(name).toHaveTextContent("W".repeat(40));
+    expect(name.className).toMatch(/\btruncate\b/);
+    expect(name.className).toMatch(/\bmin-w-0\b/);
+    expect(handle).toHaveTextContent(`(@${"a".repeat(20)})`);
+    expect(handle.className).toMatch(/\bshrink-0\b/);
+    expect(handle.className).not.toMatch(/\btruncate\b/);
+    expect(recipient).toHaveAttribute("title", `${"W".repeat(40)} (@${"a".repeat(20)})`);
+    expect((recipient.nextElementSibling as HTMLElement).className).toMatch(/\bshrink-0\b/); // the date
+  });
+
+  it("a malformed identity falls back to the address — never a half-shown or repaired name", async () => {
+    const malformed: unknown[] = [{ handle: "@smit", displayName: "Smit Patel" }, { handle: "Smit", displayName: null }, { displayName: "Smit Patel" }, { handle: "smit", displayName: "" }, { handle: "smit", displayName: "Smit Patel", appUserId: "app-user-2" }, "smit"];
+    await renderWith(malformed.map((recipientIdentity, index) => entry({ id: `m${index}`, recipientIdentity })));
+    malformed.forEach((recipientIdentity, index) => {
+      expect(recipientOf(`m${index}`), JSON.stringify(recipientIdentity)).toHaveTextContent(/^To 0x3333…3333$/);
+    });
+    expect(screen.getByTestId("real-payment-history").textContent).not.toMatch(/Smit|@|app-user/);
+  });
+
+  it("amount, status, date, and transaction details still work on a handle payment row", async () => {
+    await renderWith([entry({ recipientIdentity: SMIT, transactionHash: VALID_TX_HASH })]);
+    const row = screen.getByTestId("real-payment-history-row-payment-attempt-1");
+    expect(row).toHaveTextContent("$1.00");
+    expect(row).toHaveTextContent("Sent");
+    fireEvent.click(screen.getByText("See transaction details"));
+    expect(row).toHaveTextContent(`Transaction: ${VALID_TX_HASH}`);
+    const link = screen.getByRole("link", { name: "View on Base Sepolia explorer" });
+    expect(link.getAttribute("href")).toContain(VALID_TX_HASH);
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+});

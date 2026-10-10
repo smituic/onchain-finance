@@ -58,6 +58,26 @@ export function isTerminalState(state: PaymentAttemptState): boolean {
   return !NON_TERMINAL_STATES.includes(state);
 }
 
+/**
+ * Handle Pay Slice D — who a handle payment was addressed to, as shown to its
+ * payer: the immutable handle and the display name AS STORED ON THE PAYMENT at
+ * prepare. Null for an address payment.
+ */
+export type PublicRecipientIdentity = { handle: string; displayName: string | null };
+
+/**
+ * The ONLY place the recipient snapshot becomes public. It names its two
+ * fields explicitly — never a spread — and takes only those two, so the
+ * recipient's account id cannot reach it. It reads the payment's own stored
+ * snapshot: no database read and no live profile, so an old payment keeps the
+ * name it was sent to, and an address payment is never given an identity
+ * (nothing is inferred from `recipient`).
+ */
+export function toPublicRecipientIdentity(attempt: Pick<PaymentAttempt, "recipientHandle" | "recipientDisplayName">): PublicRecipientIdentity | null {
+  if (attempt.recipientHandle === null) return null;
+  return { handle: attempt.recipientHandle, displayName: attempt.recipientDisplayName };
+}
+
 export type PaymentAttempt = {
   id: string;
   appUserId: string;
@@ -94,13 +114,17 @@ export type PaymentAttempt = {
    */
   authorizingCredentialId: string | null;
   /**
-   * Handle Pay Slice B — the recipient identity SNAPSHOT, SERVER-ONLY. All
-   * three are null for an address payment (every direct-address payment, and
-   * every row before Slice B). For a handle payment the store writes them
-   * together with `recipient` from ONE authoritative resolution (never from a
-   * caller): the recipient's account, the canonical handle that was paid, and
-   * the display name as it was at prepare. They are not a public shape — not
-   * in the prepare response, history, or any browser state.
+   * Handle Pay Slice B — the recipient identity SNAPSHOT. All three are null
+   * for an address payment (every direct-address payment, and every row
+   * before Slice B). For a handle payment the store writes them together with
+   * `recipient` from ONE authoritative resolution (never from a caller): the
+   * recipient's account, the canonical handle that was paid, and the display
+   * name as it was at prepare.
+   *
+   * Slice D: the handle and the display-name snapshot are shown to the PAYER
+   * through toPublicRecipientIdentity below — the one place they become
+   * public. `recipientAppUserId` stays SERVER-ONLY: it is in no response,
+   * history entry, or browser state.
    */
   recipientAppUserId: string | null;
   recipientHandle: string | null;

@@ -15,7 +15,7 @@ import { computeValidUntil, hasEnoughValidityToDispatch } from "../payments/vali
 import { readLatestBlockClock, readUserOperationChainState, type EntryPointReader } from "../chain/entry-point";
 import { fetchUserOperationReceipt, prepareCashTransferUserOperation, sendPreparedUserOperation } from "./pimlico";
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "../constants";
-import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore } from "./payment-attempts";
+import { DuplicateSignActivityError, toPublicRecipientIdentity, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type PublicRecipientIdentity } from "./payment-attempts";
 import { isWellFormedActivityId, verifyPaymentAuthorization } from "./payment-authorization";
 import type { RealServerConfig } from "./config";
 import type { PrepareRecipientSelector } from "./handle-recipient";
@@ -67,6 +67,8 @@ export type PublicPaymentAttempt = {
   id: string;
   state: PaymentAttemptState;
   recipient: string;
+  /** Slice D: the handle a handle payment was addressed to, with its stored display-name snapshot; null for an address payment. Presentation only — nothing reads it back as authority. */
+  recipientIdentity: PublicRecipientIdentity | null;
   amountBaseUnits: string;
   transactionHash: string | null;
   failureReason: string | null;
@@ -91,6 +93,7 @@ function toPublicAttempt(attempt: PaymentAttempt): PublicPaymentAttempt {
     id: attempt.id,
     state: attempt.state,
     recipient: attempt.recipient,
+    recipientIdentity: toPublicRecipientIdentity(attempt),
     amountBaseUnits: attempt.amountBaseUnits,
     transactionHash: attempt.transactionHash,
     failureReason: attempt.failureReason,

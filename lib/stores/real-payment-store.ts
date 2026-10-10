@@ -6,6 +6,7 @@ import { signPreparedPayment } from "@/lib/real/payments/client-sign";
 import { isWebAuthnCancellation } from "@/lib/real/signing/passkey";
 import type { WirePreparedFields } from "@/lib/real/payments/prepared-operation";
 import { ownHandleMessage, resolveRecipientView, type RecipientLookup, type RecipientView } from "@/lib/real/recipient-input";
+import type { PaymentRecipientIdentity } from "@/lib/real/display/payment-recipient";
 import { useRealAccountStore } from "./real-account-store";
 import { useRealBalanceStore } from "./real-balance-store";
 
@@ -31,6 +32,15 @@ export type RealPaymentAttempt = {
   id: string;
   state: RealPaymentAttemptState;
   recipient: string;
+  /**
+   * Slice D: the server's stored snapshot of who a handle payment was
+   * addressed to; null for an address payment. Every response that returns
+   * the attempt carries it, so it is the ONE source of the recipient's name
+   * after prepare (and after a reload). Shown only through
+   * lib/real/display/payment-recipient.ts, which validates it first; never
+   * sent back to the server.
+   */
+  recipientIdentity: PaymentRecipientIdentity | null;
   amountBaseUnits: string;
   transactionHash: string | null;
   failureReason: string | null;
@@ -71,13 +81,6 @@ export type RealPaymentStore = {
    * handle on the server, and no address or account id is ever kept here.
    */
   recipientLookup: RecipientLookup;
-  /**
-   * Slice C: who THIS session's handle payment was addressed to, so the
-   * approval/sending/sent screens can say "Smit Patel @smit" instead of an
-   * address. Set only after a successful handle prepare; memory only (gone on
-   * reload, when the address is shown again); valid only for `attemptId`.
-   */
-  recipientLabel: { attemptId: string; handle: string; displayName: string | null } | null;
   amountInput: string;
   attempt: RealPaymentAttempt | null;
   subOrganizationId: string | null;
@@ -479,7 +482,6 @@ export function createRealPaymentStore() {
       status: "idle",
       recipientInput: "",
       recipientLookup: { status: "idle" },
-      recipientLabel: null,
       amountInput: "",
       attempt: null,
       subOrganizationId: null,
@@ -500,7 +502,7 @@ export function createRealPaymentStore() {
         // this (see components/real/real-pay-form.tsx's account-change
         // effect). Without this, a stale recipient/amount typed under one
         // account could survive into a different signed-in account.
-        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, recipientLabel: null, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
+        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
         try {
           const response = await fetch("/api/real/payments/latest");
           if (response.status === 401) {
@@ -595,7 +597,6 @@ export function createRealPaymentStore() {
             subOrganizationId: result.subOrganizationId,
             authorizingCredentialId: result.authorizingCredentialId,
             pendingSubmission: null,
-            recipientLabel: view.kind === "found" ? { attemptId: result.attempt.id, handle: view.handle, displayName: view.displayName } : null,
             clockOffsetSeconds: computeClockOffsetSeconds(result.serverNowSeconds),
             error: null,
           });
@@ -652,7 +653,6 @@ export function createRealPaymentStore() {
             status: "editing",
             attempt: null,
             recipientLookup: { status: "idle" },
-            recipientLabel: null,
             subOrganizationId: null,
             authorizingCredentialId: null,
             pendingSubmission: null,
@@ -719,7 +719,7 @@ export function createRealPaymentStore() {
         generation++;
         lookupSequence++;
         clearExpiryTimeout();
-        set({ status: "editing", recipientLookup: { status: "idle" }, recipientLabel: null, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
+        set({ status: "editing", recipientLookup: { status: "idle" }, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
       },
     };
   });

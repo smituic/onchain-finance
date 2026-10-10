@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
-import { createInMemoryPaymentAttemptStore, type PaymentAttempt, type PaymentAttemptStore } from "@/lib/real/server/payment-attempts";
+import { createInMemoryPaymentAttemptStore, toPublicRecipientIdentity, type PaymentAttempt, type PaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { clampHistoryLimit, resolvePaymentHistory, toPaymentHistoryEntry } from "@/lib/real/server/payment-history";
 
 const SECRET = "test-session-secret";
@@ -232,7 +232,7 @@ describe("toPaymentHistoryEntry — data minimization", () => {
       validUntil: 1_900_000_600,
       prepareBlockNumber: "47000000",
       authorizingCredentialId: "credential-1",
-      // Slice B's server-only recipient identity snapshot — populated here so the assertion below proves it never reaches a history entry.
+      // The recipient identity snapshot — populated here so the assertions below prove exactly which part of it reaches a history entry (Slice D).
       recipientAppUserId: "app-user-2",
       recipientHandle: "maya_chen",
       recipientDisplayName: "Maya Chen",
@@ -246,17 +246,44 @@ describe("toPaymentHistoryEntry — data minimization", () => {
 
     const entry = toPaymentHistoryEntry(attempt);
 
-    expect(Object.keys(entry).sort()).toEqual(["amountBaseUnits", "createdAt", "id", "recipient", "state", "transactionHash", "updatedAt"].sort());
+    expect(Object.keys(entry).sort()).toEqual(["amountBaseUnits", "createdAt", "id", "recipient", "recipientIdentity", "state", "transactionHash", "updatedAt"].sort());
     expect(entry).toEqual({
       id: "payment-attempt-1",
       recipient: "0x2222222222222222222222222222222222222222",
+      recipientIdentity: { handle: "maya_chen", displayName: "Maya Chen" },
       amountBaseUnits: "1000000",
       state: "confirmed",
       transactionHash: "0xtxhash",
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:05.000Z",
     });
-    // Handle Pay Slice B: the recipient identity snapshot is server-only. History is Slice D's work, not this one's.
-    expect(JSON.stringify(entry)).not.toMatch(/app-user-2|maya_chen|Maya Chen|recipientAppUserId|recipientHandle|recipientDisplayName/);
+    // Handle Pay Slice D: history shows the payer the handle and the stored display-name snapshot, nested, with exactly those two keys.
+    expect(Object.keys(entry.recipientIdentity!).sort()).toEqual(["displayName", "handle"]);
+    // The recipient's account id stays server-only, and the snapshot's flat field names never appear.
+    expect(JSON.stringify(entry)).not.toMatch(/app-user-2|recipientAppUserId|recipientHandle|recipientDisplayName/);
+
+    // A handle payment with no display name; and an address payment, which never gets an identity.
+    expect(toPaymentHistoryEntry({ ...attempt, recipientDisplayName: null }).recipientIdentity).toEqual({ handle: "maya_chen", displayName: null });
+    const addressEntry = toPaymentHistoryEntry({ ...attempt, recipientAppUserId: null, recipientHandle: null, recipientDisplayName: null });
+    expect(addressEntry.recipientIdentity).toBeNull();
+    expect(addressEntry.recipient).toBe("0x2222222222222222222222222222222222222222");
+  });
+});
+
+describe("toPublicRecipientIdentity — the one public view of the recipient snapshot (Slice D)", () => {
+  it("a handle payment maps to exactly { handle, displayName }; a null display name is kept as null", () => {
+    expect(toPublicRecipientIdentity({ recipientHandle: "smit", recipientDisplayName: "Smit Patel" })).toEqual({ handle: "smit", displayName: "Smit Patel" });
+    expect(toPublicRecipientIdentity({ recipientHandle: "smit", recipientDisplayName: null })).toEqual({ handle: "smit", displayName: null });
+  });
+
+  it("an address payment maps to null", () => {
+    expect(toPublicRecipientIdentity({ recipientHandle: null, recipientDisplayName: null })).toBeNull();
+  });
+
+  it("extra fields on the object it is handed — the account id included — never come through", () => {
+    const stored = { recipientHandle: "smit", recipientDisplayName: "Smit Patel", recipientAppUserId: "app-user-2", recipient: "0x2222222222222222222222222222222222222222", appUserId: "app-user-1" };
+    const identity = toPublicRecipientIdentity(stored)!;
+    expect(Object.keys(identity).sort()).toEqual(["displayName", "handle"]);
+    expect(JSON.stringify(identity)).not.toMatch(/app-user|0x2222/);
   });
 });

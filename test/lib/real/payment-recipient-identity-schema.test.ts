@@ -388,6 +388,48 @@ describe("today's code is untouched by the expanded schema", () => {
     ]);
   });
 
+  it("Slice D: the PUBLIC recipient identity is named only by the mappers that build it and the payer-facing surfaces that show it", () => {
+    const sources = [...walk("lib"), ...walk("app"), ...walk("components")];
+    const normalized = (file: string) => file.split(path.sep).join("/");
+    const files = (pattern: RegExp) => sources.filter((file) => pattern.test(readFileSync(file, "utf8"))).map(normalized).sort();
+    // `recipientIdentity` — the nested { handle, displayName } read shape — appears in exactly these files. No route file
+    // (app/api/real/**), no signing or payments-core module (lib/real/payments/**, lib/real/signing/**), no neon-store, no
+    // handle-recipient/recipient-input, and no Practice code names it: it is never read back as a mutation input.
+    // (The two components do not name it at all: they hand the whole attempt / history entry to the display helper.)
+    expect(files(/recipientIdentity|RecipientIdentity/)).toEqual([
+      "lib/real/display/payment-recipient.ts",
+      "lib/real/server/payment-attempts.ts",
+      "lib/real/server/payment-history.ts",
+      "lib/real/server/payments.ts",
+      "lib/stores/real-payment-history-store.ts",
+      "lib/stores/real-payment-store.ts",
+    ]);
+    // The two components show a recipient only through the display helper, which validates the identity before anything is rendered.
+    for (const file of ["components/real/real-pay-form.tsx", "components/real/real-payment-history.tsx"]) {
+      expect(readFileSync(file, "utf8"), file).toContain("describePaymentRecipient(");
+    }
+  });
+
+  it("Slice D: toPublicRecipientIdentity builds exactly { handle, displayName } from the snapshot and cannot see the recipient's account id", () => {
+    const source = readFileSync("lib/real/server/payment-attempts.ts", "utf8");
+    const start = source.indexOf("export function toPublicRecipientIdentity(");
+    expect(start).toBeGreaterThan(-1);
+    const helper = source.slice(start, source.indexOf("\n}\n", start) + 3);
+    expect(helper.length).toBeGreaterThan(100);
+    expect(helper).toContain('Pick<PaymentAttempt, "recipientHandle" | "recipientDisplayName">');
+    expect(helper).toContain("return { handle: attempt.recipientHandle, displayName: attempt.recipientDisplayName };");
+    expect(helper).not.toMatch(/recipientAppUserId|appUserId|app_user_id|ownerAddress|safeAddress|attempt\.recipient\b(?!Handle|DisplayName)/);
+    expect(helper).not.toMatch(/\.\.\./); // never a spread
+    expect(helper).not.toMatch(/await|sql`|findBy|directory/); // no database read, no live profile
+    // The account id is exposed by neither public mapper.
+    for (const file of ["lib/real/server/payments.ts", "lib/real/server/payment-history.ts"]) {
+      expect(readFileSync(file, "utf8"), file).not.toMatch(/recipientAppUserId|recipient_app_user_id|recipientDisplayName|recipient_display_name/);
+      expect(readFileSync(file, "utf8"), file).toContain("recipientIdentity: toPublicRecipientIdentity(attempt),");
+    }
+    // History still reads no handle or account table: the snapshot is the only source.
+    expect(readFileSync("lib/real/server/payment-history.ts", "utf8")).not.toMatch(/real_account_handles|real_accounts|account-handles|handle-recipient/);
+  });
+
   it("the payment adapter stays explicit: reserve() names its INSERT columns (the three identity columns explicitly NULL) and the row mapper names every field it reads", () => {
     const store = readFileSync("lib/real/server/neon-store.ts", "utf8");
     const flatStore = store.replace(/\s+/g, " ");

@@ -12,16 +12,8 @@ import { CASH_LABEL, formatCashBaseUnits } from "@/lib/real/display/cash";
 import { REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { exceedsAvailableBalance, parseCashInputToBaseUnits } from "@/lib/real/payments/amount";
 import { formatHandle } from "@/lib/real/handle";
+import { describePaymentRecipient, shortenAddress } from "@/lib/real/display/payment-recipient";
 import { RECIPIENT_LOOKUP_FAILED_MESSAGE, RECIPIENT_NOT_FOUND_MESSAGE, ownHandleMessage, resolveRecipientView } from "@/lib/real/recipient-input";
-
-function short(address: string): string {
-  return `${address.slice(0, 6)}…${address.slice(-4)}`;
-}
-
-/** A person paid by @name, in a sentence. The @name is always there — a display name is never shown on its own. */
-function nameWithHandle(person: { handle: string; displayName: string | null }): string {
-  return person.displayName ? `${person.displayName} (${formatHandle(person.handle)})` : formatHandle(person.handle);
-}
 
 function formatAmount(amountBaseUnits: string): string {
   return formatCashBaseUnits(amountBaseUnits, REAL_CASH_TOKEN.decimals);
@@ -42,7 +34,6 @@ export function RealPayForm() {
   const status = useRealPaymentStore((s) => s.status);
   const recipientInput = useRealPaymentStore((s) => s.recipientInput);
   const recipientLookup = useRealPaymentStore((s) => s.recipientLookup);
-  const recipientLabel = useRealPaymentStore((s) => s.recipientLabel);
   const amountInput = useRealPaymentStore((s) => s.amountInput);
   const attempt = useRealPaymentStore((s) => s.attempt);
   const isPastValidity = useRealPaymentStore((s) => s.isAttemptPastValidity);
@@ -95,9 +86,10 @@ export function RealPayForm() {
 
   const amountBaseUnits = parseCashInputToBaseUnits(amountInput);
   const recipient = resolveRecipientView(recipientInput, recipientLookup, account.handle ?? null);
-  // Slice C: the name this session paid — only for the attempt it was set
-  // for. After a reload there is none, and the address is shown instead.
-  const paidTo = recipientLabel && attempt && recipientLabel.attemptId === attempt.id ? recipientLabel : null;
+  // Slice D: once a payment is prepared, who it is to comes from the attempt
+  // itself — the server's stored snapshot, the same after a reload — never
+  // from the earlier advisory lookup. An address payment has no identity.
+  const paidTo = attempt ? describePaymentRecipient(attempt) : null;
   const insufficientLive = Boolean(balance && amountBaseUnits && exceedsAvailableBalance(amountBaseUnits, balance.balanceBaseUnits));
 
   if (status === "editing") {
@@ -153,7 +145,7 @@ export function RealPayForm() {
                 {recipient.displayName ? <p className="text-xs text-muted-foreground">{formatHandle(recipient.handle)}</p> : null}
               </>
             ) : recipient.kind === "address" ? (
-              <p className="text-xs text-muted-foreground">Sending to account address {short(recipient.recipient)}</p>
+              <p className="text-xs text-muted-foreground">Sending to account address {shortenAddress(recipient.recipient)}</p>
             ) : null}
           </div>
         </div>
@@ -197,7 +189,7 @@ export function RealPayForm() {
                 {recipient.displayName ? <span className="text-xs text-muted-foreground">{formatHandle(recipient.handle)}</span> : null}
               </span>
             ) : (
-              <span className="font-medium">{short(recipient.kind === "address" ? recipient.recipient : recipientInput.trim())}</span>
+              <span className="font-medium">{shortenAddress(recipient.kind === "address" ? recipient.recipient : recipientInput.trim())}</span>
             )}
           </div>
           <div className="flex items-center justify-between text-sm">
@@ -255,12 +247,11 @@ export function RealPayForm() {
                   authorized, so the real risk is the legitimate user later
                   approving something they didn't start without a clear look
                   at exactly where it's going. */}
-              {/* Slice C: a payment THIS session just prepared by @name shows
-                  that name. The label is memory-only and tied to this attempt
-                  id, so an attempt this session didn't start (or any attempt
-                  after a reload) still shows the full address. */}
-              {paidTo ? (
-                <p className="text-sm text-muted-foreground">To: {nameWithHandle(paidTo)}</p>
+              {/* Slice D: a handle payment names the person it was sent to
+                  (name + @handle, from the attempt's stored snapshot — also
+                  after a reload) instead; the warning below stays for both. */}
+              {paidTo?.kind === "handle" ? (
+                <p className="break-words text-sm text-muted-foreground">To: {paidTo.label}</p>
               ) : (
                 <p className="break-all font-mono text-xs text-muted-foreground">To: {attempt.recipient}</p>
               )}
@@ -308,7 +299,7 @@ export function RealPayForm() {
     return (
       <div className="flex flex-col items-center gap-2 rounded-xl bg-muted/60 px-4 py-6 text-center" role="status" data-testid="real-pay-sending">
         <p className="text-sm font-medium">Sending…</p>
-        {paidTo ? <p className="text-xs text-muted-foreground">To {nameWithHandle(paidTo)}</p> : null}
+        {paidTo?.kind === "handle" ? <p className="break-words text-xs text-muted-foreground">To {paidTo.label}</p> : null}
         {status === "submitted" ? (
           <Button variant="outline" size="sm" onClick={() => void checkStatus()}>
             Check status
@@ -324,7 +315,7 @@ export function RealPayForm() {
         <div className="flex flex-col gap-1 rounded-xl bg-muted/60 px-4 py-3.5" role="status">
           <p className="text-sm font-medium">Sent</p>
           <p className="text-sm text-muted-foreground">
-            {formatAmount(attempt.amountBaseUnits)} to {paidTo ? nameWithHandle(paidTo) : short(attempt.recipient)}
+            {formatAmount(attempt.amountBaseUnits)} to {paidTo ? paidTo.label : shortenAddress(attempt.recipient)}
           </p>
         </div>
         {attempt.transactionHash ? (

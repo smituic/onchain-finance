@@ -7,12 +7,10 @@ import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import { useRealPaymentHistoryStore, type PaymentHistoryEntry } from "@/lib/stores/real-payment-history-store";
 import { formatCashBaseUnits } from "@/lib/real/display/cash";
 import { paymentStatusLabel } from "@/lib/real/display/payment-status";
+import { describePaymentRecipient } from "@/lib/real/display/payment-recipient";
+import { formatHandle } from "@/lib/real/handle";
 import { normalizeHash } from "@/lib/real/identifiers";
 import { BASE_SEPOLIA_EXPLORER_TX_BASE_URL, REAL_CASH_TOKEN } from "@/lib/real/constants";
-
-function shortenAddress(address: string): string {
-  return `${address.slice(0, 6)}…${address.slice(-4)}`;
-}
 
 /** Only ever called after a client-side fetch resolves (see the loading branch below) — never during a server-rendered first paint — so a fixed locale is enough to keep this hydration-safe without any extra "mounted" gating. */
 function formatWhen(iso: string): string {
@@ -25,6 +23,11 @@ function HistoryRow({ entry }: { entry: PaymentHistoryEntry }) {
   // explorer link, and the link is only ever built from this validated,
   // normalized value, never the raw field.
   const validTxHash = normalizeHash(entry.transactionHash);
+  // Slice D: a handle payment is shown by the name it was sent to (the
+  // payment's own stored snapshot, whatever its outcome); an address payment
+  // by its address. Nothing is looked up, and an address is never turned
+  // into a name.
+  const recipient = describePaymentRecipient(entry);
 
   return (
     <li data-testid={`real-payment-history-row-${entry.id}`} className="flex flex-col gap-1 rounded-xl bg-muted/60 px-4 py-3.5">
@@ -33,8 +36,17 @@ function HistoryRow({ entry }: { entry: PaymentHistoryEntry }) {
         <span className="text-sm font-medium">{paymentStatusLabel(entry.state)}</span>
       </div>
       <div className="flex items-center justify-between gap-4 text-xs text-muted-foreground">
-        <span>To {shortenAddress(entry.recipient)}</span>
-        <span>{formatWhen(entry.createdAt)}</span>
+        {recipient.kind === "handle" ? (
+          // A long display name truncates; the @handle beside it never does.
+          <span className="flex min-w-0 gap-1" data-testid="real-payment-history-recipient" title={recipient.label}>
+            <span className="shrink-0">To</span>
+            {recipient.displayName !== null ? <span className="min-w-0 truncate">{recipient.displayName}</span> : null}
+            <span className="shrink-0">{recipient.displayName !== null ? `(${formatHandle(recipient.handle)})` : formatHandle(recipient.handle)}</span>
+          </span>
+        ) : (
+          <span data-testid="real-payment-history-recipient">To {recipient.label}</span>
+        )}
+        <span className="shrink-0">{formatWhen(entry.createdAt)}</span>
       </div>
       {validTxHash ? (
         <Expander question="See transaction details">

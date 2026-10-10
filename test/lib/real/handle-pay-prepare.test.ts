@@ -50,7 +50,8 @@ vi.mock("@/lib/real/server/pimlico", () => ({
   fetchUserOperationReceipt: vi.fn(),
 }));
 
-const { resolvePreparePayment } = await import("@/lib/real/server/payments");
+const { resolvePreparePayment, resolveSubmitPayment, resolvePaymentStatus, resolveLatestPayment, resolveCancelPayment } = await import("@/lib/real/server/payments");
+const { resolvePaymentHistory } = await import("@/lib/real/server/payment-history");
 
 function publicClient(balance = BigInt(100_000_000)) {
   return createPublicClient({
@@ -189,14 +190,17 @@ describe("resolvePreparePayment — handle path", () => {
     expect((await prepare(w, handleSelector({ recipientHandle: "maya_chen" }))).outcome).toBe("ready");
   });
 
-  it("the prepare response carries no recipient identity beyond the public attempt shape", async () => {
+  it("Slice D: the prepare response carries exactly recipientIdentity { handle, displayName } — and still nothing else about the recipient", async () => {
     const w = await world();
     const outcome = await prepare(w, handleSelector({ recipientHandle: "maya_chen" }));
     expect(outcome.outcome).toBe("ready");
     if (outcome.outcome !== "ready") return;
     expect(Object.keys(outcome).sort()).toEqual(["attempt", "authorizingCredentialId", "outcome", "serverNowSeconds", "subOrganizationId"]);
-    expect(Object.keys(outcome.attempt).sort()).toEqual(["amountBaseUnits", "createdAt", "failureReason", "id", "prepared", "recipient", "state", "transactionHash", "updatedAt"]);
-    expect(JSON.stringify(outcome)).not.toMatch(/app-user-2|maya_chen|Maya Chen|recipientAppUserId|recipientHandle|recipientDisplayName|turnkey-user-2|sub-org-2/);
+    expect(Object.keys(outcome.attempt).sort()).toEqual(["amountBaseUnits", "createdAt", "failureReason", "id", "prepared", "recipient", "recipientIdentity", "state", "transactionHash", "updatedAt"]);
+    expect(outcome.attempt.recipientIdentity).toEqual({ handle: "maya_chen", displayName: "Maya Chen" });
+    expect(Object.keys(outcome.attempt.recipientIdentity!).sort()).toEqual(["displayName", "handle"]);
+    // The recipient's account id, Turnkey ids, and the snapshot's flat field names stay server-only.
+    expect(JSON.stringify(outcome)).not.toMatch(/app-user-2|recipientAppUserId|recipientHandle|recipientDisplayName|turnkey-user-2|sub-org-2/);
   });
 
   it("a reserved handle, a nonexistent one, and an invalid-Safe account are one recipient_not_found — and nothing is reserved or prepared", async () => {
@@ -348,6 +352,137 @@ describe("the Safe transfer is built from reserved.attempt.recipient — and onl
   });
 });
 
+// ------------------------------------------------------------------ Slice D: the public recipient identity
+
+/**
+ * Handle Pay Slice D — every response that returns a payment attempt, and
+ * history, shows its payer `recipientIdentity: { handle, displayName }` for a
+ * handle payment and null for an address payment. It is the payment's own
+ * stored snapshot (never the recipient's live profile), and the recipient's
+ * account id is in none of them.
+ */
+describe("Slice D — recipientIdentity on every payer-facing read surface", () => {
+  const MAYA = { handle: "maya_chen", displayName: "Maya Chen" };
+  const NOW_MS = 1_900_000_000_000; // the fixture block's own timestamp: the attempt is inside its validity window
+  const session = (w: World, n = 1) => ({ cookieValue: cookieFor(n), sessionSecret: SECRET, registry: w.registry, paymentStore: w.payments });
+  const NO_LEAK = /app-user-2|recipientAppUserId|recipientHandle|recipientDisplayName|turnkey-user-2|sub-org-2/;
+
+  async function preparedHandleAttempt(w: World) {
+    const outcome = await prepare(w, handleSelector({ recipientHandle: "maya_chen" }));
+    if (outcome.outcome !== "ready") throw new Error(`expected ready, got ${outcome.outcome}`);
+    return outcome.attempt;
+  }
+
+  it("latest, status, cancel, and history all carry the handle payment's identity — and never the recipient's account id", async () => {
+    const w = await world();
+    const prepared = await preparedHandleAttempt(w);
+    expect(prepared.recipientIdentity).toEqual(MAYA);
+
+    const latest = await resolveLatestPayment({ ...session(w), now: () => NOW_MS });
+    expect(latest).toMatchObject({ outcome: "ok", attempt: { id: prepared.id, recipient: MAYA_SAFE.toLowerCase(), recipientIdentity: MAYA } });
+
+    const status = await resolvePaymentStatus({ ...session(w), pimlicoApiKey: "pim_test_key", publicClient: publicClient() as never, attemptId: prepared.id, now: () => NOW_MS });
+    expect(status).toMatchObject({ outcome: "ok", attempt: { id: prepared.id, state: "awaiting_authorization", recipientIdentity: MAYA } });
+
+    const history = await resolvePaymentHistory({ ...session(w), limitInput: null });
+    expect(history).toMatchObject({ outcome: "ok", entries: [{ id: prepared.id, recipient: MAYA_SAFE.toLowerCase(), recipientIdentity: MAYA }] });
+
+    const cancelled = await resolveCancelPayment({ ...session(w), attemptId: prepared.id });
+    expect(cancelled).toMatchObject({ outcome: "cancelled", attempt: { id: prepared.id, state: "cancelled", recipientIdentity: MAYA } });
+
+    // The identity is who the payer tried to pay — it stays on a cancelled payment.
+    const after = await resolvePaymentHistory({ ...session(w), limitInput: null });
+    expect(after).toMatchObject({ outcome: "ok", entries: [{ state: "cancelled", recipientIdentity: MAYA }] });
+
+    for (const response of [latest, status, history, cancelled, after]) expect(JSON.stringify(response)).not.toMatch(NO_LEAK);
+  });
+
+  it("submit carries it too (here: a refused signature fails the payment, and the failed attempt still names who it was for)", async () => {
+    const w = await world();
+    const prepared = await preparedHandleAttempt(w);
+
+    const submitted = await resolveSubmitPayment({
+      ...session(w),
+      pimlicoApiKey: "pim_test_key",
+      config: {} as never,
+      attemptId: prepared.id,
+      signature: "0x00",
+      activityId: "01a12620-1c25-7329-86d4-f8a86a1d8d90",
+      now: () => NOW_MS,
+    });
+
+    expect(submitted).toMatchObject({ outcome: "failed", attempt: { id: prepared.id, state: "failed", recipient: MAYA_SAFE.toLowerCase(), recipientIdentity: MAYA } });
+    expect(JSON.stringify(submitted)).not.toMatch(NO_LEAK);
+    expect(await resolvePaymentHistory({ ...session(w), limitInput: null })).toMatchObject({ outcome: "ok", entries: [{ state: "failed", recipientIdentity: MAYA }] });
+  });
+
+  it("a handle payment to an account with no display name is { handle, displayName: null } on every surface", async () => {
+    const w = await world();
+    await w.handles.setDisplayName({ appUserId: "app-user-2", displayName: null });
+    const prepared = await preparedHandleAttempt(w);
+    const nameless = { handle: "maya_chen", displayName: null };
+
+    expect(prepared.recipientIdentity).toEqual(nameless);
+    expect(await resolveLatestPayment({ ...session(w), now: () => NOW_MS })).toMatchObject({ outcome: "ok", attempt: { recipientIdentity: nameless } });
+    expect(await resolvePaymentHistory({ ...session(w), limitInput: null })).toMatchObject({ outcome: "ok", entries: [{ recipientIdentity: nameless }] });
+  });
+
+  it("SNAPSHOT: after the recipient renames themselves, latest / status / history still show the name stored on the payment", async () => {
+    const w = await world();
+    const prepared = await preparedHandleAttempt(w);
+
+    await w.handles.setDisplayName({ appUserId: "app-user-2", displayName: "Maya Renamed" });
+    // The live profile really did change...
+    expect((await w.handles.findPayableAccountByHandle("maya_chen"))?.displayName).toBe("Maya Renamed");
+
+    // ...and no payer-facing read follows it.
+    const latest = await resolveLatestPayment({ ...session(w), now: () => NOW_MS });
+    const status = await resolvePaymentStatus({ ...session(w), pimlicoApiKey: "pim_test_key", publicClient: publicClient() as never, attemptId: prepared.id, now: () => NOW_MS });
+    const history = await resolvePaymentHistory({ ...session(w), limitInput: null });
+    expect(latest).toMatchObject({ outcome: "ok", attempt: { recipientIdentity: MAYA } });
+    expect(status).toMatchObject({ outcome: "ok", attempt: { recipientIdentity: MAYA } });
+    expect(history).toMatchObject({ outcome: "ok", entries: [{ recipientIdentity: MAYA }] });
+    for (const response of [latest, status, history]) expect(JSON.stringify(response)).not.toContain("Maya Renamed");
+
+    // A NEW payment takes the new name; the old one keeps the old one.
+    await resolveCancelPayment({ ...session(w), attemptId: prepared.id });
+    const second = await preparedHandleAttempt(w);
+    expect(second.recipientIdentity).toEqual({ handle: "maya_chen", displayName: "Maya Renamed" });
+    const both = await resolvePaymentHistory({ ...session(w), limitInput: null });
+    if (both.outcome !== "ok") throw new Error("expected history");
+    expect(both.entries.map((entry) => entry.recipientIdentity)).toEqual([{ handle: "maya_chen", displayName: "Maya Renamed" }, MAYA]);
+  });
+
+  it("ADDRESS: a direct-address payment has recipientIdentity null everywhere — even when the address IS a known handle owner's Safe", async () => {
+    const w = await world();
+    const outcome = await prepare(w, { kind: "address", value: MAYA_SAFE });
+    if (outcome.outcome !== "ready") throw new Error(`expected ready, got ${outcome.outcome}`);
+    expect(outcome.attempt).toMatchObject({ recipient: MAYA_SAFE.toLowerCase(), recipientIdentity: null });
+
+    const latest = await resolveLatestPayment({ ...session(w), now: () => NOW_MS });
+    const status = await resolvePaymentStatus({ ...session(w), pimlicoApiKey: "pim_test_key", publicClient: publicClient() as never, attemptId: outcome.attempt.id, now: () => NOW_MS });
+    const history = await resolvePaymentHistory({ ...session(w), limitInput: null });
+    const cancelled = await resolveCancelPayment({ ...session(w), attemptId: outcome.attempt.id });
+    expect(latest).toMatchObject({ outcome: "ok", attempt: { recipientIdentity: null } });
+    expect(status).toMatchObject({ outcome: "ok", attempt: { recipientIdentity: null } });
+    expect(history).toMatchObject({ outcome: "ok", entries: [{ recipient: MAYA_SAFE.toLowerCase(), recipientIdentity: null }] });
+    expect(cancelled).toMatchObject({ outcome: "cancelled", attempt: { recipientIdentity: null } });
+    for (const response of [outcome, latest, status, history, cancelled]) expect(JSON.stringify(response)).not.toMatch(/maya_chen|Maya Chen|app-user-2/);
+  });
+
+  it("AUTHORIZATION is unchanged: another account cannot read the attempt by id, and its latest / history never include it", async () => {
+    const w = await world();
+    const prepared = await preparedHandleAttempt(w);
+
+    expect(await resolvePaymentStatus({ ...session(w, 2), pimlicoApiKey: "pim_test_key", publicClient: publicClient() as never, attemptId: prepared.id, now: () => NOW_MS })).toEqual({ outcome: "not_found" });
+    expect(await resolveCancelPayment({ ...session(w, 2), attemptId: prepared.id })).toEqual({ outcome: "not_found" });
+    expect(await resolveLatestPayment({ ...session(w, 2), now: () => NOW_MS })).toEqual({ outcome: "none" });
+    expect(await resolvePaymentHistory({ ...session(w, 2), limitInput: null })).toEqual({ outcome: "ok", entries: [] });
+    expect(await resolveLatestPayment({ ...session(w), cookieValue: "garbage" })).toEqual({ outcome: "unauthenticated" });
+    expect(await resolvePaymentHistory({ ...session(w), cookieValue: "garbage", limitInput: null })).toEqual({ outcome: "unauthenticated" });
+  });
+});
+
 // ------------------------------------------------------------------ the actual route
 
 describe("POST /api/real/payments/prepare — the actual route code", () => {
@@ -385,7 +520,7 @@ describe("POST /api/real/payments/prepare — the actual route code", () => {
     vi.doUnmock("@/lib/real/server/pimlico");
   });
 
-  it('{ recipientHandle: "maya_chen", amountBaseUnits } -> 200 ready; the handle is bound and the response has no recipient identity', async () => {
+  it('{ recipientHandle: "maya_chen", amountBaseUnits } -> 200 ready; the handle is bound and the response names it as recipientIdentity only', async () => {
     const w = await world();
     const post = await load(w, cookieFor(1));
     const response = await post({ recipientHandle: "maya_chen", amountBaseUnits: "1000000" });
@@ -393,7 +528,8 @@ describe("POST /api/real/payments/prepare — the actual route code", () => {
     const body = await response.json();
     expect(Object.keys(body).sort()).toEqual(["attempt", "authorizingCredentialId", "serverNowSeconds", "subOrganizationId"]);
     expect(body.attempt.recipient).toBe(MAYA_SAFE.toLowerCase());
-    expect(JSON.stringify(body)).not.toMatch(/app-user-2|maya_chen|Maya Chen|recipientAppUserId|recipientHandle|recipientDisplayName/);
+    expect(body.attempt.recipientIdentity).toEqual({ handle: "maya_chen", displayName: "Maya Chen" });
+    expect(JSON.stringify(body)).not.toMatch(/app-user-2|recipientAppUserId|recipientHandle|recipientDisplayName/);
     expect(await w.payments.findById(body.attempt.id)).toMatchObject({ recipientHandle: "maya_chen", recipientAppUserId: "app-user-2", recipientDisplayName: "Maya Chen" });
   });
 
@@ -402,6 +538,7 @@ describe("POST /api/real/payments/prepare — the actual route code", () => {
     const response = await (await load(w, cookieFor(1)))({ recipient: ADDRESS_RECIPIENT, amountBaseUnits: "1000000" });
     expect(response.status).toBe(200);
     const body = await response.json();
+    expect(body.attempt.recipientIdentity).toBeNull();
     expect(await w.payments.findById(body.attempt.id)).toMatchObject({ recipient: ADDRESS_RECIPIENT, recipientAppUserId: null, recipientHandle: null, recipientDisplayName: null });
   });
 
@@ -457,6 +594,31 @@ describe("POST /api/real/payments/prepare — the actual route code", () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(await w.payments.findById(body.attempt.id)).toMatchObject({ recipient: MAYA_SAFE.toLowerCase(), recipientAppUserId: "app-user-2", recipientDisplayName: "Maya Chen" });
+  });
+
+  it("Slice D: a client sending the public recipientIdentity back (or any name/account metadata) changes nothing — it is read data, never a mutation input", async () => {
+    const w = await world();
+    const post = await load(w, cookieFor(1));
+    const forgedIdentity = { handle: "payer_one", displayName: "Forged", appUserId: "app-user-1", safeAddress: ADDRESS_RECIPIENT };
+
+    // On a handle payment: the destination and the stored/returned identity are still the database's.
+    const handleResponse = await post({ recipientHandle: "maya_chen", amountBaseUnits: "1000000", recipientIdentity: forgedIdentity, displayName: "Forged", handle: "payer_one", appUserId: "app-user-1" });
+    expect(handleResponse.status).toBe(200);
+    const handleBody = await handleResponse.json();
+    expect(handleBody.attempt.recipient).toBe(MAYA_SAFE.toLowerCase());
+    expect(handleBody.attempt.recipientIdentity).toEqual({ handle: "maya_chen", displayName: "Maya Chen" });
+    expect(await w.payments.findById(handleBody.attempt.id)).toMatchObject({ recipient: MAYA_SAFE.toLowerCase(), recipientAppUserId: "app-user-2", recipientHandle: "maya_chen", recipientDisplayName: "Maya Chen" });
+    expect(prepareMock.mock.calls.at(-1)![0]).toMatchObject({ recipient: MAYA_SAFE.toLowerCase() });
+    await w.payments.transition({ id: handleBody.attempt.id, from: "awaiting_authorization", to: "cancelled" });
+
+    // On an address payment: a forged identity never turns it into a handle payment.
+    const addressResponse = await post({ recipient: ADDRESS_RECIPIENT, amountBaseUnits: "1000000", recipientIdentity: { handle: "maya_chen", displayName: "Maya Chen" } });
+    expect(addressResponse.status).toBe(200);
+    const addressBody = await addressResponse.json();
+    expect(addressBody.attempt.recipient).toBe(ADDRESS_RECIPIENT);
+    expect(addressBody.attempt.recipientIdentity).toBeNull();
+    expect(await w.payments.findById(addressBody.attempt.id)).toMatchObject({ recipient: ADDRESS_RECIPIENT, recipientAppUserId: null, recipientHandle: null, recipientDisplayName: null });
+    expect(prepareMock.mock.calls.at(-1)![0]).toMatchObject({ recipient: ADDRESS_RECIPIENT });
   });
 
   it("an unauthenticated request is 401 even with an invalid selector", async () => {
