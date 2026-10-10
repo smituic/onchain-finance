@@ -32,7 +32,7 @@ export function RealPayView() {
         </h2>
         <p className="text-sm text-muted-foreground">
           {account
-            ? "Send test Cash to another Base Sepolia address. Each payment needs a fresh passkey approval."
+            ? "Pay someone by their @name. Each payment needs a fresh passkey approval."
             : "Connect a real account to send Cash and see your real test-network balance."}
         </p>
       </section>

@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRealPaymentStore, EXPIRY_FOLLOW_UP_MS } from "@/lib/stores/real-payment-store";
+import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import type { WirePreparedFields } from "@/lib/real/payments/prepared-operation";
+
+// Slice C's prepare tests run confirmAndSend past /prepare; the passkey step is
+// stubbed as "the user dismissed the prompt", which leaves the attempt awaiting.
+vi.mock("@/lib/real/payments/client-sign", () => ({
+  signPreparedPayment: vi.fn(async () => {
+    throw Object.assign(new Error("dismissed"), { name: "NotAllowedError" });
+  }),
+}));
 
 function jsonResponse(status: number, body: unknown) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -500,5 +509,517 @@ describe("real-payment-store — S2 delta: stale status responses are discarded"
     rejectA(new Error("network down"));
     await pendingA;
     expect(store.getState()).toMatchObject({ status: "editing", attempt: null, error: null });
+  });
+});
+
+/**
+ * Handle Pay Slice C — the Pay UI's store half. The lookup is advisory: it
+ * keeps only { handle, displayName, isSelf }, and prepare is sent the
+ * canonical handle alone (the server derives the destination).
+ */
+describe("real-payment-store — Slice C: paying by @name", () => {
+  const ADDRESS = "0x3333333333333333333333333333333333333333";
+  const ACCOUNT = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const FOUND_SMIT = { found: true, handle: "smit", displayName: "Smit Patel", isSelf: false };
+
+  type Call = { url: string; method: string; rawBody: string | null; body: unknown };
+  type Deferred = { resolve: (response: Response) => void; reject: (reason: unknown) => void };
+
+  /** Routes fetch by URL; a handler may return a Response, throw, or return a promise it resolves later. */
+  function stubApi(handlers: { lookup?: (body: { handle: string }) => Response | Promise<Response>; prepare?: (body: unknown) => Response; cancel?: () => Response }) {
+    const calls: Call[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const rawBody = typeof init?.body === "string" ? init.body : null;
+        const body: unknown = rawBody ? JSON.parse(rawBody) : undefined;
+        calls.push({ url, method: (init?.method ?? "GET").toUpperCase(), rawBody, body });
+        if (url.endsWith("/api/real/payments/latest")) return jsonResponse(200, { attempt: null });
+        if (url.endsWith("/api/real/recipients/lookup") && handlers.lookup) return handlers.lookup(body as { handle: string });
+        if (url.endsWith("/api/real/payments/prepare") && handlers.prepare) return handlers.prepare(body);
+        if (url.endsWith("/cancel") && handlers.cancel) return handlers.cancel();
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+    return {
+      calls,
+      lookups: () => calls.filter((call) => call.url.endsWith("/api/real/recipients/lookup")),
+      prepares: () => calls.filter((call) => call.url.endsWith("/api/real/payments/prepare")),
+    };
+  }
+
+  function deferredResponse(): { promise: Promise<Response> } & Deferred {
+    let resolve: Deferred["resolve"] = () => {};
+    let reject: Deferred["reject"] = () => {};
+    const promise = new Promise<Response>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  const prepareOk = () => jsonResponse(200, { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) });
+
+  function editingStore() {
+    const store = createRealPaymentStore();
+    store.setState({ status: "editing" });
+    return store;
+  }
+
+  /** A store sitting on the review screen for a found @smit. */
+  async function reviewingSmit(api: ReturnType<typeof stubApi>) {
+    const store = editingStore();
+    store.getState().setRecipientInput("@smit");
+    store.getState().setAmountInput("1");
+    await store.getState().review();
+    expect(store.getState().status).toBe("reviewing");
+    expect(api.lookups()).toHaveLength(1);
+    return store;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  describe("lookup", () => {
+    it("typing never looks anything up; leaving the field looks up the canonical handle exactly once", async () => {
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT) });
+      const store = editingStore();
+
+      for (const value of ["@", "@s", "@sm", "@smi", " @Smit "]) store.getState().setRecipientInput(value);
+      expect(api.calls).toHaveLength(0);
+
+      await store.getState().lookupRecipient();
+      expect(api.lookups()).toHaveLength(1);
+      expect(api.lookups()[0]).toMatchObject({ method: "POST", rawBody: '{"handle":"smit"}' });
+      expect(store.getState().recipientLookup).toEqual({ status: "found", handle: "smit", displayName: "Smit Patel", isSelf: false });
+
+      // Already resolved: leaving the field again (or pressing Review) asks nothing more.
+      await store.getState().lookupRecipient();
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      expect(api.lookups()).toHaveLength(1);
+      expect(store.getState().status).toBe("reviewing");
+    });
+
+    it("shows looking_up while the request is in flight", async () => {
+      const pending = deferredResponse();
+      stubApi({ lookup: () => pending.promise });
+      const store = editingStore();
+      store.getState().setRecipientInput("smit");
+
+      const lookup = store.getState().lookupRecipient();
+      expect(store.getState().recipientLookup).toEqual({ status: "looking_up" });
+      pending.resolve(jsonResponse(200, FOUND_SMIT));
+      await lookup;
+      expect(store.getState().recipientLookup.status).toBe("found");
+    });
+
+    it("Review looks an unresolved name up and opens review only after it is found", async () => {
+      const pending = deferredResponse();
+      const api = stubApi({ lookup: () => pending.promise });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      store.getState().setAmountInput("1");
+
+      const review = store.getState().review();
+      expect(store.getState().status).toBe("editing");
+      pending.resolve(jsonResponse(200, FOUND_SMIT));
+      await review;
+
+      expect(api.lookups()).toHaveLength(1);
+      expect(store.getState().status).toBe("reviewing");
+    });
+
+    it("Review joins the lookup the field's blur already started — one request, not two", async () => {
+      const pending = deferredResponse();
+      const api = stubApi({ lookup: () => pending.promise });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      store.getState().setAmountInput("1");
+
+      const blur = store.getState().lookupRecipient();
+      const review = store.getState().review();
+      pending.resolve(jsonResponse(200, FOUND_SMIT));
+      await Promise.all([blur, review]);
+
+      expect(api.lookups()).toHaveLength(1);
+      expect(store.getState().status).toBe("reviewing");
+    });
+
+    it("Review does not open if the amount was edited while the name was being checked", async () => {
+      const pending = deferredResponse();
+      stubApi({ lookup: () => pending.promise });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      store.getState().setAmountInput("1");
+
+      const review = store.getState().review();
+      store.getState().setAmountInput("15");
+      pending.resolve(jsonResponse(200, FOUND_SMIT));
+      await review;
+
+      expect(store.getState().status).toBe("editing");
+      expect(store.getState().recipientLookup.status).toBe("found");
+    });
+
+    it("an invalid amount is reported before any lookup is sent", async () => {
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT) });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      await store.getState().review();
+      expect(api.calls).toHaveLength(0);
+      expect(store.getState()).toMatchObject({ status: "editing", error: "Enter an amount greater than zero." });
+    });
+
+    it("a found name with no display name keeps displayName null", async () => {
+      stubApi({ lookup: () => jsonResponse(200, { found: true, handle: "smit", displayName: null, isSelf: false }) });
+      const store = editingStore();
+      store.getState().setRecipientInput("smit");
+      await store.getState().lookupRecipient();
+      expect(store.getState().recipientLookup).toEqual({ status: "found", handle: "smit", displayName: null, isSelf: false });
+    });
+
+    it("not found: Review stays on the form and does not ask again", async () => {
+      const api = stubApi({ lookup: () => jsonResponse(200, { found: false }) });
+      const store = editingStore();
+      store.getState().setRecipientInput("@nobody");
+      store.getState().setAmountInput("1");
+
+      await store.getState().review();
+      expect(store.getState()).toMatchObject({ status: "editing", recipientLookup: { status: "not_found" } });
+      await store.getState().review();
+      await store.getState().lookupRecipient();
+      expect(api.lookups()).toHaveLength(1);
+      expect(store.getState().status).toBe("editing");
+    });
+
+    it("the lookup says it's you: Review refuses to advance", async () => {
+      stubApi({ lookup: () => jsonResponse(200, { ...FOUND_SMIT, isSelf: true }) });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      store.getState().setAmountInput("1");
+
+      await store.getState().review();
+      expect(store.getState().status).toBe("editing");
+      await store.getState().review();
+      expect(store.getState()).toMatchObject({ status: "editing", error: "That's your own @smit." });
+    });
+
+    it("your own @name (already known locally) is self immediately — no lookup request at all", async () => {
+      useRealAccountStore.setState({ account: { ...ACCOUNT, handle: "smit" } });
+      const api = stubApi({});
+      const store = editingStore();
+      store.getState().setRecipientInput(" @Smit ");
+      store.getState().setAmountInput("1");
+
+      await store.getState().lookupRecipient();
+      await store.getState().review();
+
+      expect(api.calls).toHaveLength(0);
+      expect(store.getState()).toMatchObject({ status: "editing", error: "That's your own @smit.", recipientLookup: { status: "idle" } });
+    });
+
+    it("a network failure or a server error is 'error', and the next blur or Review retries", async () => {
+      let attempt = 0;
+      const api = stubApi({
+        lookup: () => {
+          attempt += 1;
+          if (attempt === 1) throw new Error("network down");
+          if (attempt === 2) return jsonResponse(500, { error: "Something went wrong." });
+          return jsonResponse(200, FOUND_SMIT);
+        },
+      });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      store.getState().setAmountInput("1");
+
+      await store.getState().lookupRecipient();
+      expect(store.getState().recipientLookup).toEqual({ status: "error" });
+      await store.getState().lookupRecipient();
+      expect(store.getState().recipientLookup).toEqual({ status: "error" });
+      expect(store.getState().status).toBe("editing");
+
+      await store.getState().review();
+      expect(api.lookups()).toHaveLength(3);
+      expect(store.getState().status).toBe("reviewing");
+    });
+
+    it("an answer about a different handle than the one asked is an error, never a found recipient", async () => {
+      stubApi({ lookup: () => jsonResponse(200, { ...FOUND_SMIT, handle: "someone_else" }) });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      await store.getState().lookupRecipient();
+      expect(store.getState().recipientLookup).toEqual({ status: "error" });
+    });
+
+    it("stale response: @smi starts, @smit starts, @smit wins, the late @smi answer is ignored", async () => {
+      const smi = deferredResponse();
+      const smit = deferredResponse();
+      const api = stubApi({ lookup: (body) => (body.handle === "smi" ? smi.promise : smit.promise) });
+      const store = editingStore();
+
+      store.getState().setRecipientInput("@smi");
+      const first = store.getState().lookupRecipient();
+      store.getState().setRecipientInput("@smit");
+      const second = store.getState().lookupRecipient();
+
+      smit.resolve(jsonResponse(200, FOUND_SMIT));
+      await second;
+      expect(store.getState().recipientLookup).toEqual({ status: "found", handle: "smit", displayName: "Smit Patel", isSelf: false });
+
+      smi.resolve(jsonResponse(200, { found: true, handle: "smi", displayName: "Somebody Else", isSelf: false }));
+      await first;
+      expect(api.lookups().map((call) => call.body)).toEqual([{ handle: "smi" }, { handle: "smit" }]);
+      expect(store.getState().recipientLookup).toEqual({ status: "found", handle: "smit", displayName: "Smit Patel", isSelf: false });
+    });
+
+    it("editing or clearing the field drops a found, not-found, or failed answer immediately", async () => {
+      const answers = [jsonResponse(200, FOUND_SMIT), jsonResponse(200, { found: false }), jsonResponse(500, {})];
+      stubApi({ lookup: () => answers.shift()! });
+      const store = editingStore();
+
+      for (const expected of ["found", "not_found", "error"]) {
+        store.getState().setRecipientInput("@smit");
+        await store.getState().lookupRecipient();
+        expect(store.getState().recipientLookup.status).toBe(expected);
+        store.getState().setRecipientInput("@smitt");
+        expect(store.getState().recipientLookup).toEqual({ status: "idle" });
+      }
+      store.getState().setRecipientInput("");
+      expect(store.getState().recipientLookup).toEqual({ status: "idle" });
+    });
+
+    it("an answer that arrives after an edit, a reset, or an init is ignored", async () => {
+      for (const invalidate of ["edit", "reset", "init"] as const) {
+        const pending = deferredResponse();
+        stubApi({ lookup: () => pending.promise });
+        const store = editingStore();
+        store.getState().setRecipientInput("@smit");
+        const lookup = store.getState().lookupRecipient();
+
+        if (invalidate === "edit") {
+          // Same canonical handle afterwards — the sequence alone must reject it.
+          store.getState().setRecipientInput("@smi");
+          store.getState().setRecipientInput("@smit");
+        } else if (invalidate === "reset") {
+          store.getState().reset();
+          store.getState().setRecipientInput("@smit");
+        } else {
+          await store.getState().init();
+          store.getState().setRecipientInput("@smit");
+        }
+        pending.resolve(jsonResponse(200, FOUND_SMIT));
+        await lookup;
+        expect(store.getState().recipientLookup, invalidate).toEqual({ status: "idle" });
+      }
+    });
+
+    it("init() and reset() clear a resolved recipient and the same-session label", async () => {
+      stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT) });
+      for (const clear of ["init", "reset"] as const) {
+        const store = editingStore();
+        store.getState().setRecipientInput("@smit");
+        await store.getState().lookupRecipient();
+        store.setState({ recipientLabel: { attemptId: "attempt-1", handle: "smit", displayName: "Smit Patel" } });
+
+        if (clear === "init") await store.getState().init();
+        else store.getState().reset();
+
+        expect(store.getState(), clear).toMatchObject({ recipientInput: "", recipientLookup: { status: "idle" }, recipientLabel: null });
+      }
+    });
+
+    it("a malformed name or a partial address never calls lookup; Review reports it and stays on the form", async () => {
+      const api = stubApi({});
+      for (const [input, message] of [
+        ["@@smit", "Enter a valid @name."],
+        ["ab", "Enter a valid @name."],
+        ["0xabc", "Enter a valid account address."],
+        ["", "Enter who you're paying."],
+      ]) {
+        const store = editingStore();
+        store.getState().setRecipientInput(input);
+        store.getState().setAmountInput("1");
+        await store.getState().lookupRecipient();
+        await store.getState().review();
+        expect(store.getState(), input).toMatchObject({ status: "editing", error: message });
+      }
+      expect(api.calls).toHaveLength(0);
+    });
+
+    it("SECURITY: only handle/displayName/isSelf are kept — a Safe, app user id, or owner in the answer is dropped", async () => {
+      stubApi({
+        lookup: () =>
+          jsonResponse(200, { ...FOUND_SMIT, safeAddress: "0x9999999999999999999999999999999999999999", appUserId: "app-user-9", ownerAddress: "0x8888888888888888888888888888888888888888", recipient: "0x9999999999999999999999999999999999999999" }),
+      });
+      const store = editingStore();
+      store.getState().setRecipientInput("@smit");
+      await store.getState().lookupRecipient();
+
+      expect(store.getState().recipientLookup).toEqual({ status: "found", handle: "smit", displayName: "Smit Patel", isSelf: false });
+      const snapshot = JSON.stringify(store.getState());
+      for (const leaked of ["0x9999", "app-user-9", "0x8888"]) expect(snapshot).not.toContain(leaked);
+    });
+  });
+
+  describe("prepare", () => {
+    it("a handle payment sends exactly { recipientHandle, amountBaseUnits } — nothing else, no address", async () => {
+      useRealAccountStore.setState({ account: ACCOUNT });
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: prepareOk });
+      const store = editingStore();
+      store.getState().setRecipientInput(" @Smit ");
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+
+      expect(api.prepares()).toHaveLength(1);
+      expect(api.prepares()[0].rawBody).toBe('{"recipientHandle":"smit","amountBaseUnits":"1000000"}');
+      expect(store.getState().status).toBe("awaiting_authorization");
+      store.getState().reset();
+    });
+
+    it("SECURITY: forged identity fields in the lookup answer never reach prepare, and no address is synthesized", async () => {
+      useRealAccountStore.setState({ account: ACCOUNT });
+      const api = stubApi({
+        lookup: () => jsonResponse(200, { ...FOUND_SMIT, recipient: ADDRESS, recipientSafe: ADDRESS, safeAddress: ADDRESS, recipientAppUserId: "app-user-9", appUserId: "app-user-9", recipientDisplayName: "Forged", ownerAddress: ADDRESS }),
+        prepare: prepareOk,
+      });
+      const store = await reviewingSmit(api);
+      await store.getState().confirmAndSend();
+
+      expect(api.prepares()[0].body).toEqual({ recipientHandle: "smit", amountBaseUnits: "1000000" });
+      expect(api.prepares()[0].rawBody).not.toMatch(/0x|app-user|Forged|Smit Patel/);
+      store.getState().reset();
+    });
+
+    it("fails closed without calling prepare when the found handle isn't the current input's handle", async () => {
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: prepareOk });
+      const store = await reviewingSmit(api);
+      store.setState({ recipientLookup: { status: "found", handle: "someone_else", displayName: "Someone Else", isSelf: false } });
+
+      await store.getState().confirmAndSend();
+
+      expect(api.prepares()).toHaveLength(0);
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, recipientLabel: null });
+      expect(store.getState().error).toBeTruthy();
+    });
+
+    it("fails closed without calling prepare when the lookup isn't 'found' or says it's the payer", async () => {
+      for (const recipientLookup of [{ status: "idle" }, { status: "looking_up" }, { status: "not_found" }, { status: "error" }, { status: "found", handle: "smit", displayName: null, isSelf: true }] as const) {
+        const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: prepareOk });
+        const store = await reviewingSmit(api);
+        store.setState({ recipientLookup });
+        await store.getState().confirmAndSend();
+        expect(api.prepares(), recipientLookup.status).toHaveLength(0);
+        expect(store.getState().status).toBe("editing");
+      }
+    });
+
+    it("prepare 404 (the name is gone): back to the form, text kept, resolution cleared, the server's message shown", async () => {
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: () => jsonResponse(404, { error: "We couldn't find anyone with that name." }) });
+      const store = await reviewingSmit(api);
+
+      await store.getState().confirmAndSend();
+
+      expect(store.getState()).toMatchObject({
+        status: "editing",
+        recipientInput: "@smit",
+        recipientLookup: { status: "idle" },
+        recipientLabel: null,
+        attempt: null,
+        error: "We couldn't find anyone with that name.",
+      });
+    });
+
+    it("prepare self-payment refusal: back to the form, resolution cleared, the server's copy shown", async () => {
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: () => jsonResponse(400, { error: "You can't pay yourself." }) });
+      const store = await reviewingSmit(api);
+
+      await store.getState().confirmAndSend();
+
+      expect(store.getState()).toMatchObject({ status: "editing", recipientInput: "@smit", recipientLookup: { status: "idle" }, error: "You can't pay yourself." });
+    });
+
+    it("a prepare failure that isn't about the recipient (409) keeps the resolved name", async () => {
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: () => jsonResponse(409, { error: "You already have a payment in progress." }) });
+      const store = await reviewingSmit(api);
+      await store.getState().confirmAndSend();
+      expect(store.getState()).toMatchObject({ status: "editing", recipientLookup: { status: "found", handle: "smit" }, error: "You already have a payment in progress." });
+    });
+  });
+
+  describe("same-session recipient label", () => {
+    it("is set by a successful handle prepare, for that attempt id only", async () => {
+      useRealAccountStore.setState({ account: ACCOUNT });
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: prepareOk });
+      const store = await reviewingSmit(api);
+      await store.getState().confirmAndSend();
+
+      expect(store.getState().recipientLabel).toEqual({ attemptId: "attempt-1", handle: "smit", displayName: "Smit Patel" });
+      store.getState().reset();
+      expect(store.getState().recipientLabel).toBeNull();
+    });
+
+    it("a successful cancel clears it, along with the resolved recipient", async () => {
+      useRealAccountStore.setState({ account: ACCOUNT });
+      const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: prepareOk, cancel: () => jsonResponse(200, { attempt: { ...baseAttempt(), state: "cancelled", prepared: null } }) });
+      const store = await reviewingSmit(api);
+      await store.getState().confirmAndSend();
+      expect(store.getState().recipientLabel).not.toBeNull();
+
+      await store.getState().cancel();
+
+      expect(store.getState()).toMatchObject({ status: "editing", recipientInput: "", recipientLookup: { status: "idle" }, recipientLabel: null });
+    });
+
+    it("an address payment never gets one", async () => {
+      useRealAccountStore.setState({ account: ACCOUNT });
+      const api = stubApi({ prepare: prepareOk });
+      const store = editingStore();
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("1");
+      void store.getState().review();
+      await store.getState().confirmAndSend();
+      expect(api.prepares()).toHaveLength(1);
+      expect(store.getState().recipientLabel).toBeNull();
+      store.getState().reset();
+    });
+  });
+
+  describe("direct address (regression)", () => {
+    it("a pasted address is never looked up, review opens synchronously, and the prepare body is unchanged", async () => {
+      useRealAccountStore.setState({ account: ACCOUNT });
+      const api = stubApi({ prepare: prepareOk });
+      const store = editingStore();
+      store.getState().setRecipientInput(`  ${ADDRESS.toUpperCase().replace("0X", "0x")}  `);
+      store.getState().setAmountInput("1");
+
+      await store.getState().lookupRecipient();
+      void store.getState().review();
+      expect(store.getState().status).toBe("reviewing"); // no await: still synchronous
+      await store.getState().confirmAndSend();
+
+      expect(api.lookups()).toHaveLength(0);
+      expect(api.prepares()[0].rawBody).toBe(JSON.stringify({ recipient: ADDRESS, amountBaseUnits: "1000000" }));
+      store.getState().reset();
+    });
+
+    it("the account's own address is still left to the server (no client-side address self check was added)", async () => {
+      useRealAccountStore.setState({ account: { ...ACCOUNT, handle: "smit" } });
+      const api = stubApi({ prepare: () => jsonResponse(400, { error: "You can't pay yourself." }) });
+      const store = editingStore();
+      store.getState().setRecipientInput(ACCOUNT.safeAddress);
+      store.getState().setAmountInput("1");
+      void store.getState().review();
+      expect(store.getState().status).toBe("reviewing");
+      await store.getState().confirmAndSend();
+
+      expect(api.lookups()).toHaveLength(0);
+      expect(api.prepares()[0].body).toEqual({ recipient: ACCOUNT.safeAddress, amountBaseUnits: "1000000" });
+      expect(store.getState()).toMatchObject({ status: "editing", recipientInput: ACCOUNT.safeAddress, error: "You can't pay yourself." });
+    });
   });
 });

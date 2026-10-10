@@ -376,13 +376,15 @@ describe("today's code is untouched by the expanded schema", () => {
     expect(files(/recipient_app_user_id|recipient_display_name|recipientAppUserId|recipientDisplayName/)).toEqual(["lib/real/server/neon-store.ts", "lib/real/server/payment-attempts.ts"]);
     // The handle column itself (an exact identifier — `invalid_recipient_handle` is an outcome name, not the column):
     expect(files(/(?<![A-Za-z0-9_])recipient_handle(?![A-Za-z0-9_])/)).toEqual(["lib/real/server/neon-store.ts"]);
-    // `recipientHandle` is also the prepare wire/service input name; it appears only along the prepare path and the store, and in no history/status/latest/component/browser file.
+    // `recipientHandle` is also the prepare wire/service input name; it appears only along the prepare path and the store, and in no history/status/latest/component file.
+    // Slice C: the ONE browser file that names it is the Real payment store, which sends it as the prepare request's selector (the canonical handle only — see real-payment-store.test.ts).
     expect(files(/(?<![A-Za-z0-9_])recipientHandle(?![A-Za-z0-9_])/)).toEqual([
       "app/api/real/payments/prepare/route.ts",
       "lib/real/server/handle-recipient.ts",
       "lib/real/server/neon-store.ts",
       "lib/real/server/payment-attempts.ts",
       "lib/real/server/payments.ts",
+      "lib/stores/real-payment-store.ts",
     ]);
   });
 
@@ -415,7 +417,9 @@ describe("today's code is untouched by the expanded schema", () => {
     expect(practice.length).toBeGreaterThan(5);
     for (const file of practice) {
       const text = readFileSync(file, "utf8");
-      expect(text, file).not.toMatch(NAMES);
+      // Slice C: the Real payment store sends the prepare wire selector `recipientHandle`; every stored-snapshot name stays forbidden there too.
+      const isRealPaymentStore = file.split(path.sep).join("/") === "lib/stores/real-payment-store.ts";
+      expect(text, file).not.toMatch(isRealPaymentStore ? /recipient_app_user_id|recipient_handle|recipient_display_name|recipientAppUserId|recipientDisplayName/ : NAMES);
       expect(text, file).not.toMatch(/payment_attempts|real_account_handles/);
     }
   });

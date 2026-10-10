@@ -1,11 +1,11 @@
 import { create } from "zustand";
-import { normalizeAddress } from "@/lib/real/identifiers";
 import { exceedsAvailableBalance, exceedsPaymentCeiling, isZeroBaseUnits, MAX_PAYMENT_BASE_UNITS, parseCashInputToBaseUnits } from "@/lib/real/payments/amount";
 import { formatCashBaseUnits } from "@/lib/real/display/cash";
 import { REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { signPreparedPayment } from "@/lib/real/payments/client-sign";
 import { isWebAuthnCancellation } from "@/lib/real/signing/passkey";
 import type { WirePreparedFields } from "@/lib/real/payments/prepared-operation";
+import { ownHandleMessage, resolveRecipientView, type RecipientLookup, type RecipientView } from "@/lib/real/recipient-input";
 import { useRealAccountStore } from "./real-account-store";
 import { useRealBalanceStore } from "./real-balance-store";
 
@@ -65,6 +65,19 @@ export type RealPaymentStatus =
 export type RealPaymentStore = {
   status: RealPaymentStatus;
   recipientInput: string;
+  /**
+   * Slice C: the advisory @name lookup for the CURRENT recipientInput — any
+   * edit resets it to idle. It never routes money: prepare re-resolves the
+   * handle on the server, and no address or account id is ever kept here.
+   */
+  recipientLookup: RecipientLookup;
+  /**
+   * Slice C: who THIS session's handle payment was addressed to, so the
+   * approval/sending/sent screens can say "Smit Patel @smit" instead of an
+   * address. Set only after a successful handle prepare; memory only (gone on
+   * reload, when the address is shown again); valid only for `attemptId`.
+   */
+  recipientLabel: { attemptId: string; handle: string; displayName: string | null } | null;
   amountInput: string;
   attempt: RealPaymentAttempt | null;
   subOrganizationId: string | null;
@@ -106,7 +119,10 @@ export type RealPaymentStore = {
   init: () => Promise<void>;
   setRecipientInput: (value: string) => void;
   setAmountInput: (value: string) => void;
-  review: () => void;
+  /** Recipient field blur: looks up an @name that hasn't been checked yet. Never called per keystroke; a no-op for an address, a malformed name, or the account's own name. */
+  lookupRecipient: () => Promise<void>;
+  /** Synchronous for an address or an already-found @name. An unchecked @name is looked up first, and review opens only if it is found. */
+  review: () => Promise<void>;
   editAgain: () => void;
   /** Fresh flow: prepare -> sign -> submit, from the "reviewing" status. */
   confirmAndSend: () => Promise<void>;
@@ -122,6 +138,7 @@ class ApiError extends Error {
   constructor(
     message: string,
     readonly retryable: boolean,
+    readonly status: number,
   ) {
     super(message);
   }
@@ -134,8 +151,22 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
   });
   const json = (await response.json()) as T & { error?: string; retryable?: boolean };
-  if (!response.ok) throw new ApiError(json.error ?? `Request failed (${response.status}).`, json.retryable === true);
+  if (!response.ok) throw new ApiError(json.error ?? `Request failed (${response.status}).`, json.retryable === true, response.status);
   return json;
+}
+
+/**
+ * Reads the lookup answer field by field — never a spread — so nothing beyond
+ * handle/displayName/isSelf can enter the store. An answer for any handle
+ * other than the one asked about is an error, and a missing isSelf is treated
+ * as self (fail closed).
+ */
+function parseLookupResponse(json: unknown, canonicalHandle: string): RecipientLookup {
+  if (typeof json !== "object" || json === null) return { status: "error" };
+  const { found, handle, displayName, isSelf } = json as { found?: unknown; handle?: unknown; displayName?: unknown; isSelf?: unknown };
+  if (found === false) return { status: "not_found" };
+  if (found !== true || handle !== canonicalHandle) return { status: "error" };
+  return { status: "found", handle: canonicalHandle, displayName: typeof displayName === "string" ? displayName : null, isSelf: isSelf !== false };
 }
 
 const OTHER_PASSKEY_MESSAGE = "This payment was started with a different passkey. Cancel it and start a new payment.";
@@ -296,6 +327,11 @@ export function createRealPaymentStore() {
   // Part B: at most ONE outstanding expiry timer per store. Every arm clears
   // the previous one first, and init()/reset()/a successful cancel clear it.
   let expiryTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  // Slice C: bumped by every recipient edit, init(), reset(), and a successful
+  // cancel. A lookup answer applies only if its sequence AND generation are
+  // still current and the input still names the handle it asked about.
+  let lookupSequence = 0;
+  let inFlightLookup: { handle: string; sequence: number; promise: Promise<void> } | null = null;
 
   function clearExpiryTimeout() {
     if (expiryTimeoutId !== null) {
@@ -365,9 +401,85 @@ export function createRealPaymentStore() {
       return Promise.resolve();
     }
 
+    function currentRecipientView(): RecipientView {
+      return resolveRecipientView(get().recipientInput, get().recipientLookup, useRealAccountStore.getState().account?.handle ?? null);
+    }
+
+    /** One exact lookup of an already-canonical handle. A second caller for the same still-current lookup joins it instead of sending another request. */
+    function lookupHandle(canonicalHandle: string): Promise<void> {
+      if (inFlightLookup && inFlightLookup.handle === canonicalHandle && inFlightLookup.sequence === lookupSequence) return inFlightLookup.promise;
+      const mySequence = ++lookupSequence;
+      const myGeneration = generation;
+      set({ recipientLookup: { status: "looking_up" } });
+      const promise = (async () => {
+        let next: RecipientLookup;
+        try {
+          const response = await fetch("/api/real/recipients/lookup", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ handle: canonicalHandle }),
+          });
+          next = response.ok ? parseLookupResponse(await response.json(), canonicalHandle) : { status: "error" };
+        } catch {
+          next = { status: "error" };
+        }
+        if (inFlightLookup?.sequence === mySequence) inFlightLookup = null;
+        if (mySequence !== lookupSequence || myGeneration !== generation) return;
+        const view = currentRecipientView();
+        if (view.kind !== "checking" || view.handle !== canonicalHandle) return;
+        set({ recipientLookup: next });
+      })();
+      inFlightLookup = { handle: canonicalHandle, sequence: mySequence, promise };
+      return promise;
+    }
+
+    /**
+     * The synchronous part of review(): validates, and opens the review
+     * screen for an address or a found @name. Returns the handle that still
+     * needs a lookup before review can open, otherwise null.
+     */
+    function reviewNow(): string | null {
+      const view = currentRecipientView();
+      if (view.kind === "empty") {
+        set({ error: "Enter who you're paying." });
+        return null;
+      }
+      if (view.kind === "invalid") {
+        set({ error: view.message });
+        return null;
+      }
+      if (view.kind === "self") {
+        set({ error: ownHandleMessage(view.handle) });
+        return null;
+      }
+      if (view.kind === "not_found") return null;
+
+      const amountBaseUnits = parseCashInputToBaseUnits(get().amountInput);
+      if (!amountBaseUnits || isZeroBaseUnits(amountBaseUnits)) {
+        set({ error: "Enter an amount greater than zero." });
+        return null;
+      }
+      if (exceedsPaymentCeiling(amountBaseUnits)) {
+        set({ error: `Payments are limited to ${formatCashBaseUnits(MAX_PAYMENT_BASE_UNITS, REAL_CASH_TOKEN.decimals)} each for now.` });
+        return null;
+      }
+      const balance = useRealBalanceStore.getState().balance;
+      if (balance && exceedsAvailableBalance(amountBaseUnits, balance.balanceBaseUnits)) {
+        set({ error: "That's more than your available Cash." });
+        return null;
+      }
+      if (view.kind === "address" || view.kind === "found") {
+        set({ status: "reviewing", error: null });
+        return null;
+      }
+      return view.handle;
+    }
+
     return {
       status: "idle",
       recipientInput: "",
+      recipientLookup: { status: "idle" },
+      recipientLabel: null,
       amountInput: "",
       attempt: null,
       subOrganizationId: null,
@@ -380,6 +492,7 @@ export function createRealPaymentStore() {
 
       init: async () => {
         const myGeneration = ++generation;
+        lookupSequence++;
         clearExpiryTimeout();
         // Pre-2f hardening: clear any prior account's recipient/amount/
         // attempt/error as the FIRST synchronous action, before the fetch —
@@ -387,7 +500,7 @@ export function createRealPaymentStore() {
         // this (see components/real/real-pay-form.tsx's account-change
         // effect). Without this, a stale recipient/amount typed under one
         // account could survive into a different signed-in account.
-        set({ status: "idle", recipientInput: "", amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
+        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, recipientLabel: null, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
         try {
           const response = await fetch("/api/real/payments/latest");
           if (response.status === 401) {
@@ -425,49 +538,56 @@ export function createRealPaymentStore() {
         }
       },
 
-      setRecipientInput: (value) => set({ recipientInput: value, error: null }),
+      setRecipientInput: (value) => {
+        // Any edit drops the previous answer and any answer still on its way.
+        lookupSequence++;
+        set({ recipientInput: value, recipientLookup: { status: "idle" }, error: null });
+      },
       setAmountInput: (value) => set({ amountInput: value, error: null }),
 
+      lookupRecipient: async () => {
+        if (get().status !== "editing") return;
+        const view = currentRecipientView();
+        if (view.kind === "unresolved" || view.kind === "lookup_failed") await lookupHandle(view.handle);
+      },
+
       review: () => {
-        const { recipientInput, amountInput } = get();
-        const recipient = normalizeAddress(recipientInput);
-        if (!recipient) {
-          set({ error: "Enter a valid recipient address." });
-          return;
-        }
-        const amountBaseUnits = parseCashInputToBaseUnits(amountInput);
-        if (!amountBaseUnits || isZeroBaseUnits(amountBaseUnits)) {
-          set({ error: "Enter an amount greater than zero." });
-          return;
-        }
-        if (exceedsPaymentCeiling(amountBaseUnits)) {
-          set({ error: `Payments are limited to ${formatCashBaseUnits(MAX_PAYMENT_BASE_UNITS, REAL_CASH_TOKEN.decimals)} each for now.` });
-          return;
-        }
-        const balance = useRealBalanceStore.getState().balance;
-        if (balance && exceedsAvailableBalance(amountBaseUnits, balance.balanceBaseUnits)) {
-          set({ error: "That's more than your available Cash." });
-          return;
-        }
-        set({ status: "reviewing", error: null });
+        const handle = reviewNow();
+        if (handle === null) return Promise.resolve();
+        // Handle path only: look the name up (or join the lookup the field's
+        // blur already started), then open review only if nothing changed
+        // underneath it and the name was found.
+        const myGeneration = generation;
+        const amountInput = get().amountInput;
+        return lookupHandle(handle).then(() => {
+          if (myGeneration !== generation || get().status !== "editing" || get().amountInput !== amountInput) return;
+          const view = currentRecipientView();
+          if (view.kind === "found" && view.handle === handle) reviewNow();
+        });
       },
 
       editAgain: () => set({ status: "editing", error: null }),
 
       confirmAndSend: async () => {
         if (get().status !== "reviewing") return; // guards a double-tap from re-firing prepare
-        const recipient = normalizeAddress(get().recipientInput);
+        const view = currentRecipientView();
         const amountBaseUnits = parseCashInputToBaseUnits(get().amountInput);
-        if (!recipient || !amountBaseUnits) {
+        // Fails closed: a handle payment goes out only from `found` — the
+        // lookup's handle is the current input's handle and isn't the payer.
+        if ((view.kind !== "address" && view.kind !== "found") || !amountBaseUnits) {
           set({ status: "editing", error: "Enter a valid recipient and amount." });
           return;
         }
+        // Exactly one selector. A handle payment names ONLY the canonical
+        // handle: the server derives the destination, and the lookup result
+        // is never sent as (or treated as) the payment's authority.
+        const body = view.kind === "address" ? { recipient: view.recipient, amountBaseUnits } : { recipientHandle: view.handle, amountBaseUnits };
 
         set({ status: "preparing", error: null });
         try {
           const result = await api<{ attempt: RealPaymentAttempt; subOrganizationId: string; authorizingCredentialId: string; serverNowSeconds: number }>("/api/real/payments/prepare", {
             method: "POST",
-            body: JSON.stringify({ recipient, amountBaseUnits }),
+            body: JSON.stringify(body),
           });
           set({
             status: "awaiting_authorization",
@@ -475,12 +595,22 @@ export function createRealPaymentStore() {
             subOrganizationId: result.subOrganizationId,
             authorizingCredentialId: result.authorizingCredentialId,
             pendingSubmission: null,
+            recipientLabel: view.kind === "found" ? { attemptId: result.attempt.id, handle: view.handle, displayName: view.displayName } : null,
             clockOffsetSeconds: computeClockOffsetSeconds(result.serverNowSeconds),
             error: null,
           });
           await scheduleOrRunExpiryCheck();
         } catch (error) {
-          set({ status: "editing", error: error instanceof Error ? error.message : "Could not prepare the payment." });
+          // The server no longer finds the name (404) or refused the request
+          // itself (400, e.g. paying yourself): the earlier lookup answer is
+          // stale, so drop it. The typed text stays for the user to fix.
+          const staleRecipient = view.kind === "found" && error instanceof ApiError && (error.status === 404 || error.status === 400);
+          if (staleRecipient) lookupSequence++;
+          set({
+            status: "editing",
+            error: error instanceof Error ? error.message : "Could not prepare the payment.",
+            ...(staleRecipient ? { recipientLookup: { status: "idle" } as const } : {}),
+          });
           return;
         }
 
@@ -517,9 +647,12 @@ export function createRealPaymentStore() {
 
         if (response.ok) {
           clearExpiryTimeout();
+          lookupSequence++;
           set({
             status: "editing",
             attempt: null,
+            recipientLookup: { status: "idle" },
+            recipientLabel: null,
             subOrganizationId: null,
             authorizingCredentialId: null,
             pendingSubmission: null,
@@ -584,8 +717,9 @@ export function createRealPaymentStore() {
 
       reset: () => {
         generation++;
+        lookupSequence++;
         clearExpiryTimeout();
-        set({ status: "editing", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
+        set({ status: "editing", recipientLookup: { status: "idle" }, recipientLabel: null, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
       },
     };
   });

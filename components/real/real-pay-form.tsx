@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -11,10 +11,16 @@ import { useRealPaymentStore } from "@/lib/stores/real-payment-store";
 import { CASH_LABEL, formatCashBaseUnits } from "@/lib/real/display/cash";
 import { REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { exceedsAvailableBalance, parseCashInputToBaseUnits } from "@/lib/real/payments/amount";
-import { normalizeAddress } from "@/lib/real/identifiers";
+import { formatHandle } from "@/lib/real/handle";
+import { RECIPIENT_LOOKUP_FAILED_MESSAGE, RECIPIENT_NOT_FOUND_MESSAGE, ownHandleMessage, resolveRecipientView } from "@/lib/real/recipient-input";
 
 function short(address: string): string {
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
+}
+
+/** A person paid by @name, in a sentence. The @name is always there — a display name is never shown on its own. */
+function nameWithHandle(person: { handle: string; displayName: string | null }): string {
+  return person.displayName ? `${person.displayName} (${formatHandle(person.handle)})` : formatHandle(person.handle);
 }
 
 function formatAmount(amountBaseUnits: string): string {
@@ -22,7 +28,8 @@ function formatAmount(amountBaseUnits: string): string {
 }
 
 /**
- * Real Pay's send flow (Batch 2d) — Cash / recipient / amount / review /
+ * Real Pay's send flow (Batch 2d; Slice C adds paying by @name through the
+ * one "To" field) — Cash / recipient / amount / review /
  * approve / sending / sent throughout, no USDC/Safe/UserOperation/
  * EntryPoint/Pimlico/gas/calldata in the primary copy (that detail lives
  * behind the Expander for the confirmed state, developer-only). Renders
@@ -34,6 +41,8 @@ export function RealPayForm() {
 
   const status = useRealPaymentStore((s) => s.status);
   const recipientInput = useRealPaymentStore((s) => s.recipientInput);
+  const recipientLookup = useRealPaymentStore((s) => s.recipientLookup);
+  const recipientLabel = useRealPaymentStore((s) => s.recipientLabel);
   const amountInput = useRealPaymentStore((s) => s.amountInput);
   const attempt = useRealPaymentStore((s) => s.attempt);
   const isPastValidity = useRealPaymentStore((s) => s.isAttemptPastValidity);
@@ -42,6 +51,7 @@ export function RealPayForm() {
   const init = useRealPaymentStore((s) => s.init);
   const setRecipientInput = useRealPaymentStore((s) => s.setRecipientInput);
   const setAmountInput = useRealPaymentStore((s) => s.setAmountInput);
+  const lookupRecipient = useRealPaymentStore((s) => s.lookupRecipient);
   const review = useRealPaymentStore((s) => s.review);
   const editAgain = useRealPaymentStore((s) => s.editAgain);
   const confirmAndSend = useRealPaymentStore((s) => s.confirmAndSend);
@@ -49,6 +59,10 @@ export function RealPayForm() {
   const cancel = useRealPaymentStore((s) => s.cancel);
   const checkStatus = useRealPaymentStore((s) => s.checkStatus);
   const reset = useRealPaymentStore((s) => s.reset);
+
+  // Format and "that's you" feedback waits until the field is left (or Review
+  // is pressed) — never while the name is still being typed.
+  const [recipientTouched, setRecipientTouched] = useState(false);
 
   useEffect(() => {
     // Pre-2f hardening: the else branch matters — without it, logging out
@@ -80,27 +94,68 @@ export function RealPayForm() {
   }
 
   const amountBaseUnits = parseCashInputToBaseUnits(amountInput);
+  const recipient = resolveRecipientView(recipientInput, recipientLookup, account.handle ?? null);
+  // Slice C: the name this session paid — only for the attempt it was set
+  // for. After a reload there is none, and the address is shown instead.
+  const paidTo = recipientLabel && attempt && recipientLabel.attemptId === attempt.id ? recipientLabel : null;
   const insufficientLive = Boolean(balance && amountBaseUnits && exceedsAvailableBalance(amountBaseUnits, balance.balanceBaseUnits));
 
   if (status === "editing") {
+    const recipientProblem =
+      recipient.kind === "not_found"
+        ? RECIPIENT_NOT_FOUND_MESSAGE
+        : recipient.kind === "lookup_failed"
+          ? RECIPIENT_LOOKUP_FAILED_MESSAGE
+          : recipientTouched && recipient.kind === "invalid"
+            ? recipient.message
+            : recipientTouched && recipient.kind === "self"
+              ? ownHandleMessage(recipient.handle)
+              : null;
     return (
       <form
         className="flex flex-col gap-4"
         data-testid="real-pay-form"
         onSubmit={(event) => {
           event.preventDefault();
-          review();
+          setRecipientTouched(true);
+          void review();
         }}
       >
         <div className="flex flex-col gap-1.5">
-          <Label htmlFor="real-pay-recipient">Recipient</Label>
+          <Label htmlFor="real-pay-recipient">To</Label>
           <Input
             id="real-pay-recipient"
             autoComplete="off"
-            placeholder="0x…"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            placeholder="@name"
             value={recipientInput}
-            onChange={(event) => setRecipientInput(event.target.value)}
+            aria-invalid={recipientProblem ? true : undefined}
+            aria-describedby="real-pay-recipient-status"
+            onChange={(event) => {
+              setRecipientTouched(false);
+              setRecipientInput(event.target.value);
+            }}
+            onBlur={() => {
+              setRecipientTouched(true);
+              void lookupRecipient();
+            }}
           />
+          <div id="real-pay-recipient-status" role="status" className="min-h-5" data-testid="real-pay-recipient-status">
+            {recipientProblem ? (
+              <p className="text-sm text-destructive">{recipientProblem}</p>
+            ) : recipient.kind === "checking" ? (
+              <p className="text-xs text-muted-foreground">Checking…</p>
+            ) : recipient.kind === "found" ? (
+              <>
+                <p className="text-sm font-medium">{recipient.displayName ?? formatHandle(recipient.handle)}</p>
+                {recipient.displayName ? <p className="text-xs text-muted-foreground">{formatHandle(recipient.handle)}</p> : null}
+              </>
+            ) : recipient.kind === "address" ? (
+              <p className="text-xs text-muted-foreground">Sending to account address {short(recipient.recipient)}</p>
+            ) : null}
+          </div>
         </div>
 
         <div className="flex flex-col gap-1.5">
@@ -121,7 +176,7 @@ export function RealPayForm() {
           {insufficientLive ? <p className="text-sm text-destructive">That&apos;s more than your available Cash.</p> : null}
         </div>
 
-        {error ? <p className="text-sm text-destructive">{error}</p> : null}
+        {error && error !== recipientProblem ? <p className="text-sm text-destructive">{error}</p> : null}
 
         <Button type="submit" size="lg" className="h-12 w-full">
           Review
@@ -134,9 +189,16 @@ export function RealPayForm() {
     return (
       <div className="flex flex-col gap-4" data-testid="real-pay-review">
         <div className="flex flex-col gap-2 rounded-xl bg-muted/60 px-4 py-3.5">
-          <div className="flex items-center justify-between text-sm">
-            <span className="text-muted-foreground">Recipient</span>
-            <span className="font-medium">{short(normalizeAddress(recipientInput) ?? recipientInput.trim())}</span>
+          <div className="flex items-start justify-between gap-4 text-sm">
+            <span className="text-muted-foreground">To</span>
+            {recipient.kind === "found" ? (
+              <span className="flex flex-col items-end text-right">
+                <span className="font-medium">{recipient.displayName ?? formatHandle(recipient.handle)}</span>
+                {recipient.displayName ? <span className="text-xs text-muted-foreground">{formatHandle(recipient.handle)}</span> : null}
+              </span>
+            ) : (
+              <span className="font-medium">{short(recipient.kind === "address" ? recipient.recipient : recipientInput.trim())}</span>
+            )}
           </div>
           <div className="flex items-center justify-between text-sm">
             <span className="text-muted-foreground">Amount</span>
@@ -193,7 +255,15 @@ export function RealPayForm() {
                   authorized, so the real risk is the legitimate user later
                   approving something they didn't start without a clear look
                   at exactly where it's going. */}
-              <p className="break-all font-mono text-xs text-muted-foreground">To: {attempt.recipient}</p>
+              {/* Slice C: a payment THIS session just prepared by @name shows
+                  that name. The label is memory-only and tied to this attempt
+                  id, so an attempt this session didn't start (or any attempt
+                  after a reload) still shows the full address. */}
+              {paidTo ? (
+                <p className="text-sm text-muted-foreground">To: {nameWithHandle(paidTo)}</p>
+              ) : (
+                <p className="break-all font-mono text-xs text-muted-foreground">To: {attempt.recipient}</p>
+              )}
             </>
           ) : null}
           {isPastValidity ? (
@@ -238,6 +308,7 @@ export function RealPayForm() {
     return (
       <div className="flex flex-col items-center gap-2 rounded-xl bg-muted/60 px-4 py-6 text-center" role="status" data-testid="real-pay-sending">
         <p className="text-sm font-medium">Sending…</p>
+        {paidTo ? <p className="text-xs text-muted-foreground">To {nameWithHandle(paidTo)}</p> : null}
         {status === "submitted" ? (
           <Button variant="outline" size="sm" onClick={() => void checkStatus()}>
             Check status
@@ -253,7 +324,7 @@ export function RealPayForm() {
         <div className="flex flex-col gap-1 rounded-xl bg-muted/60 px-4 py-3.5" role="status">
           <p className="text-sm font-medium">Sent</p>
           <p className="text-sm text-muted-foreground">
-            {formatAmount(attempt.amountBaseUnits)} to {short(attempt.recipient)}
+            {formatAmount(attempt.amountBaseUnits)} to {paidTo ? nameWithHandle(paidTo) : short(attempt.recipient)}
           </p>
         </div>
         {attempt.transactionHash ? (
