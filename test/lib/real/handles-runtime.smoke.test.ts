@@ -38,11 +38,17 @@ import { freshRateLimiter } from "./fixtures/rate-limit";
  * The branch itself is the cleanup boundary. Nothing here ever updates,
  * deletes, or truncates the registry, or weakens its guard.
  *
- *   REAL_SMOKE_HANDLES_RUNTIME=1 pnpm exec vitest run test/lib/real/handles-runtime.smoke.test.ts
+ * Milestone 0 Pass B: the run also requires NEON_BRANCH_EXPECTED_ENDPOINT_ID —
+ * the branch's endpoint id, read by the operator from the Neon console — and
+ * refuses to connect unless it equals the URL's endpoint exactly. Differing
+ * from .env.local does not prove a branch is disposable; neither does this.
+ *
+ *   REAL_SMOKE_HANDLES_RUNTIME=1 NEON_BRANCH_DATABASE_URL="postgres://..." NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-..." \
+ *     pnpm exec vitest run test/lib/real/handles-runtime.smoke.test.ts
  */
 const GATE = "REAL_SMOKE_HANDLES_RUNTIME";
 const ALLOWED_GATES = [GATE] as const;
-const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);
+const enabled = process.env[GATE] === "1";
 
 const SEEDED_RESERVED = RESERVED_HANDLES.filter((name) => canonicalizeHandle(name).ok).sort();
 const ORIGIN = "http://localhost:3000";
@@ -66,7 +72,7 @@ describe("handles runtime smoke harness", () => {
   const source = readFileSync("test/lib/real/handles-runtime.smoke.test.ts", "utf8");
 
   it("is gated by its OWN variable and never reads DATABASE_URL", () => {
-    expect(source).toContain('const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);');
+    expect(source).toContain('const enabled = process.env[GATE] === "1";');
     expect(source.match(/process\.env\.DATABASE_URL/g)).toBeNull();
     // No other live suite is enabled by this gate (the migration smoke only names it as a gate it REFUSES to run beside).
     for (const other of ["test/lib/real/neon-smoke.test.ts", "test/lib/real/provisioning-dispatch-migration.smoke.test.ts", "test/lib/real/l2-identity-migration.smoke.test.ts", "test/lib/real/l2-identity-race.smoke.test.ts"]) {

@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readActiveEnvFiles } from "./fixtures/handles-smoke-db";
 import {
   abortable,
   bounded,
@@ -49,16 +50,28 @@ import {
  * Requires schema.sql's S5 L2 identity indexes to be APPLIED, and a DIRECT
  * (non-pooled) Neon endpoint — its own variable, never DATABASE_URL (normally
  * the pooled app URL). Every client here (production stores, holder,
- * monitor, sentinel, cleanup) uses that one URL:
+ * monitor, sentinel, cleanup) uses that one URL.
  *
- *   REAL_SMOKE_L2_INDEXES=1 REAL_SMOKE_L2_DIRECT_DATABASE_URL="postgres://...@ep-xxx.<region>.aws.neon.tech/..." \
- *     pnpm exec vitest run test/lib/real/l2-identity-race.smoke.test.ts
+ * TARGET SAFETY (Milestone 0 Pass B). DISPOSABLE NEON BRANCH ONLY. The gate
+ * is this suite's own, REAL_SMOKE_L2_RACE — REAL_SMOKE_L2_INDEXES no longer
+ * enables it, and setting that (or any other smoke/admin gate) beside this
+ * one is a refusal. The direct URL keeps its own variable because the suite
+ * needs one real Postgres session per client, which a pooled branch URL
+ * cannot give. NEON_BRANCH_EXPECTED_ENDPOINT_ID must equal that URL's
+ * endpoint id exactly, the endpoint must not be the real database's, and
+ * DATABASE_URL must not be exported. Read the expected endpoint id from the
+ * Neon console for the branch you created; the harness cannot prove a branch
+ * is disposable.
  *
- * With the gate on, beforeAll REFUSES — before patching fetch or writing
- * anything — a missing/unparseable/pooled URL, or a session whose
+ *   REAL_SMOKE_L2_RACE=1 REAL_SMOKE_L2_DIRECT_DATABASE_URL="postgres://...@ep-xxx.<region>.aws.neon.tech/..." \
+ *     NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-xxx" pnpm exec vitest run test/lib/real/l2-identity-race.smoke.test.ts
+ *
+ * With the gate on, beforeAll REFUSES — before opening a session, patching
+ * fetch, or writing anything — a missing/unparseable/pooled URL, a target
+ * that fails the provenance check above, or a session whose
  * application_name and timeouts the server did not actually apply.
  */
-const enabled = process.env.REAL_SMOKE_L2_INDEXES === "1";
+const enabled = process.env.REAL_SMOKE_L2_RACE === "1";
 const COLUMNS = ["sub_organization_id", "owner_address", "safe_address"] as const;
 type Column = (typeof COLUMNS)[number];
 /** Last-resort runner guard only; every case's own deadlines and teardown finish well before it (worstCaseCaseMs). */
@@ -112,6 +125,7 @@ describe.skipIf(!enabled)("S5 L2 post-index: finalize crosses the identity 23505
     const applicationName = `l2race_${runId}_preflight`;
     await prepareRaceSuite({
       env: process.env,
+      envFiles: readActiveEnvFiles(),
       applicationName,
       msSettings: { statement_timeout: RACE_LIMITS.statementTimeoutMs, lock_timeout: RACE_LIMITS.rowLockTimeoutMs, idle_in_transaction_session_timeout: RACE_LIMITS.holderIdleInTransactionMs },
       readSessionSettings: (url) =>

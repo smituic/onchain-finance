@@ -58,10 +58,18 @@ describe("the operator poller is unreachable at runtime", () => {
     const runner = read(RUNNER);
     expect(runner).toMatch(/describe\.skipIf\(!enabled\)/);
     expect(runner).toMatch(/REAL_ADMIN_POLL_PROVISIONING_ACTIVITY === "1"/);
-    expect(runner).toMatch(/const commit = process\.env\.REAL_ADMIN_POLL_COMMIT === "1"/);
-    // The only identifiers an operator can pass: one credential id, optionally one dispatch sequence number.
+    // Dry run unless the shared commit decision says otherwise: the commit flag alone is no longer enough (it must be
+    // exactly "1" AND carry a confirmation naming this runner, the target, and the one dispatch) — test/admin/admin-target.ts.
+    // ...and a commit must name one explicit dispatch sequence ("latest" is dry-run only) — requirePollCommitDecision.
+    expect(code(RUNNER)).toMatch(/const \{ commit, dispatchSeq \} = requirePollCommitDecision\(\{ env: process\.env, runner: RUNNER, target, credentialId, rawSeq \}\);/);
+    expect(code(RUNNER)).not.toMatch(/Number\(rawSeq\)|"latest"\]/);
+    expect(code(RUNNER)).toContain("const RUNNER = ADMIN_RUNNERS.poll;");
+    expect(read("test/admin/admin-target.ts")).toMatch(/poll: \{\s*name: "poll-provisioning-activity",\s*primaryGate: "REAL_ADMIN_POLL_PROVISIONING_ACTIVITY",\s*commitGate: "REAL_ADMIN_POLL_COMMIT",\s*variables: \["REAL_ADMIN_CREDENTIAL_ID", "REAL_ADMIN_DISPATCH_SEQ"\],/);
+    // The only identifiers an operator can pass: one credential id, optionally one dispatch sequence number. The
+    // runner itself reads nothing else from the environment; the database URL reaches it only as the confirmed target.
     const envNames = [...new Set([...code(RUNNER).matchAll(/process\.env\.([A-Z0-9_]+)/g)].map((match) => match[1]))].sort();
-    expect(envNames).toEqual(["DATABASE_URL", "REAL_ADMIN_CREDENTIAL_ID", "REAL_ADMIN_DISPATCH_SEQ", "REAL_ADMIN_POLL_COMMIT", "REAL_ADMIN_POLL_PROVISIONING_ACTIVITY"]);
+    expect(envNames).toEqual(["REAL_ADMIN_CREDENTIAL_ID", "REAL_ADMIN_DISPATCH_SEQ", "REAL_ADMIN_POLL_PROVISIONING_ACTIVITY"]);
+    expect(code(RUNNER)).toContain("createNeonRegistrationAttemptStore(createNeonSqlClient(target.url))");
     expect(code(RUNNER)).not.toMatch(/ACTIVITY_ID|FORCE|ADOPT|RESOLVE|SWEEP|activityId/);
   });
 });
@@ -460,15 +468,18 @@ describe("M1: schema.sql's dispatch-table migration is fail-closed (static)", ()
 
 describe("L5: the provisioning adapter smoke refuses BEFORE its first write, and its cleanup cannot strand fixtures (static)", () => {
   const source = read("test/lib/real/neon-smoke.test.ts");
-  const block = source.slice(source.indexOf('describe.skipIf(!process.env.DATABASE_URL || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1")'));
+  const block = source.slice(source.indexOf('describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1")'));
   const code = block
     .split("\n")
     .filter((line) => !line.trim().startsWith("//"))
     .join("\n");
 
-  it("is gated on DATABASE_URL AND its own opt-in", () => {
+  it("is gated on the adapter smoke's gate AND its own opt-in, never on DATABASE_URL, and checks the confirmed target before its preflight", () => {
     expect(block.length).toBeGreaterThan(0);
-    expect(block).toMatch(/^describe\.skipIf\(!process\.env\.DATABASE_URL \|\| process\.env\.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"\)/);
+    expect(source).toContain('const enabled = process.env[GATE] === "1";');
+    expect(block).toMatch(/^describe\.skipIf\(!enabled \|\| process\.env\.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"\)\([^\n]*\n  beforeAll\(refuseUnlessTargetConfirmed\);\n/);
+    expect(code).not.toMatch(/process\.env\.DATABASE_URL/);
+    expect(code.match(/createNeonSqlClient\([^\n]*/g)).toEqual(["createNeonSqlClient(targetUrl());"]);
   });
 
   it("a read-only beforeAll preflight checks the table and throws before anything is written; the flag is set only after it passes", () => {

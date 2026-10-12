@@ -35,12 +35,18 @@ import { checkDisposableTarget, connectSmokeDb, connectSmokeStores, requireDispo
  * live network round trips, and an infrastructure timeout must never be read as
  * a limiter failure):
  *
- *   REAL_SMOKE_RATE_LIMIT=1 REAL_SMOKE_RATE_LIMIT_PUBLIC=1 pnpm exec vitest run test/lib/real/rate-limit.smoke.test.ts --testTimeout=30000 --hookTimeout=30000
+ * Milestone 0 Pass B: the run also requires NEON_BRANCH_EXPECTED_ENDPOINT_ID —
+ * the branch's endpoint id, read by the operator from the Neon console — and
+ * refuses to connect unless it equals the URL's endpoint exactly. Differing
+ * from .env.local does not prove a branch is disposable; neither does this.
+ *
+ *   REAL_SMOKE_RATE_LIMIT=1 REAL_SMOKE_RATE_LIMIT_PUBLIC=1 NEON_BRANCH_DATABASE_URL="postgres://..." NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-..." \
+ *     pnpm exec vitest run test/lib/real/rate-limit.smoke.test.ts --testTimeout=30000 --hookTimeout=30000
  */
 const GATE = "REAL_SMOKE_RATE_LIMIT";
 const PUBLIC_GATE = "REAL_SMOKE_RATE_LIMIT_PUBLIC";
 const ALLOWED_GATES = [GATE, PUBLIC_GATE] as const;
-const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);
+const enabled = process.env[GATE] === "1";
 const publicEnabled = enabled && process.env[PUBLIC_GATE] === "1";
 
 const SCHEMA_PATH = "lib/real/server/schema.sql";
@@ -75,7 +81,7 @@ describe("rate-limit smoke harness", () => {
     .join("\n");
 
   it("is gated by its OWN variables and never reads DATABASE_URL", () => {
-    expect(source).toContain('const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);');
+    expect(source).toContain('const enabled = process.env[GATE] === "1";');
     expect(source).toContain('const publicEnabled = enabled && process.env[PUBLIC_GATE] === "1";');
     expect(source.match(/process\.env\.DATABASE_URL/g)).toBeNull();
     for (const other of [

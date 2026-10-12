@@ -13,7 +13,7 @@ import type { DispatchTerminalObservation } from "@/lib/real/server/registration
  * the write-once WHERE guards, no statement that could rewrite request
  * evidence — and how each server answer is interpreted. That the SQL behaves
  * as intended against real Postgres (atomicity under a race, the CHECKs, the
- * unique and partial indexes) is for the DATABASE_URL-gated neon-smoke suite.
+ * unique and partial indexes) is for the gated, disposable-branch neon-smoke suite.
  */
 const DATABASE_URL = "postgresql://user:pass@ep-dispatch-test-000000.us-east-2.aws.neon.tech/neondb";
 const CREDENTIAL_ID = "Y3JlZGVudGlhbC1pZA";

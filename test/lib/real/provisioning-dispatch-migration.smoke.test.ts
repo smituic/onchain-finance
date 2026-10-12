@@ -1,7 +1,8 @@
 // @vitest-environment node
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { requireConfirmedDisposableTargetUrl } from "./fixtures/handles-smoke-db";
 
 /**
  * MANUAL, LIVE-DATABASE behavioral proof of schema.sql's "Provisioning
@@ -9,8 +10,17 @@ import { afterAll, describe, expect, it } from "vitest";
  * `target_schema` constant swapped — against throwaway scratch schemas
  * (`pdmig_<run>_<case>`), each holding a minimal registration_attempts table,
  * then drops them. It never touches `public` (asserted). Never runs in normal
- * `pnpm test`: it needs DATABASE_URL AND an explicit opt-in. Use a disposable
- * Neon BRANCH, never the application database.
+ * `pnpm test`: it needs its own explicit opt-in.
+ *
+ * TARGET SAFETY (Milestone 0 Pass B). DISPOSABLE NEON BRANCH ONLY. The
+ * application's DATABASE_URL is never read, never a target, and never a
+ * fallback: the only target is NEON_BRANCH_DATABASE_URL. With the gate set,
+ * the first hook refuses — before any connection, and cleanup then connects
+ * to nothing — unless NEON_BRANCH_EXPECTED_ENDPOINT_ID equals that URL's
+ * endpoint id exactly, the endpoint is not the real database's, DATABASE_URL
+ * is not exported, and no admin gate or other smoke gate is set. Read the
+ * expected endpoint id from the Neon console for the branch you created; the
+ * harness cannot prove a branch is disposable.
  *
  * What it must prove: a correct object is accepted (clean creation, and an
  * idempotent rerun that changes nothing); every same-named object of the
@@ -18,10 +28,20 @@ import { afterAll, describe, expect, it } from "vitest";
  * merely that `IF NOT EXISTS` skips. It also settles the one PROVISIONAL
  * item: whether Neon accepts and enforces the body-digest CHECK.
  *
- *   REAL_SMOKE_PROVISIONING_MIGRATION=1 DATABASE_URL="<disposable branch>" \
+ *   REAL_SMOKE_PROVISIONING_MIGRATION=1 NEON_BRANCH_DATABASE_URL="<disposable branch>" NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-..." \
  *     pnpm exec vitest run test/lib/real/provisioning-dispatch-migration.smoke.test.ts
  */
-const enabled = process.env.REAL_SMOKE_PROVISIONING_MIGRATION === "1" && Boolean(process.env.DATABASE_URL);
+const GATE = "REAL_SMOKE_PROVISIONING_MIGRATION";
+const ALLOWED_GATES = [GATE] as const;
+const enabled = process.env[GATE] === "1";
+
+/** Set only by targetUrl(), after the confirmed-target check passed; cleanup connects only when it is set. */
+let confirmedTargetUrl: string | null = null;
+/** The ONLY source of a connection string in this file. Throws before anything connects. */
+function targetUrl(): string {
+  if (!confirmedTargetUrl) confirmedTargetUrl = requireConfirmedDisposableTargetUrl(GATE, ALLOWED_GATES);
+  return confirmedTargetUrl;
+}
 const TABLE = "registration_provisioning_dispatches";
 const ONE_OPEN = "registration_provisioning_dispatches_one_open_idx";
 const FK = "registration_provisioning_dispatches_credential_id_fkey";
@@ -74,11 +94,12 @@ describe("provisioning dispatch migration smoke harness", () => {
 const LIVE_TIMEOUT_MS = 90_000;
 
 describe.skipIf(!enabled)("Provisioning Evidence Capture migration — behavior against scratch schemas (live)", () => {
+  beforeAll(() => void targetUrl());
   const runId = randomUUID().replace(/-/g, "").slice(0, 8);
   const schemas = new Set<string>();
   const sqlFn = async () => {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    return createNeonSqlClient(process.env.DATABASE_URL!);
+    return createNeonSqlClient(targetUrl());
   };
   const q = async (text: string, params: unknown[] = []) => (await sqlFn()).query(text, params) as Promise<Array<Record<string, unknown>>>;
   /** Runs statements in ONE transaction, so a hostile SET LOCAL governs everything after it. */
@@ -90,6 +111,7 @@ describe.skipIf(!enabled)("Provisioning Evidence Capture migration — behavior 
   let publicBefore: unknown = "unread";
 
   afterAll(async () => {
+    if (!confirmedTargetUrl) return;
     for (const schema of schemas) await q(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
     const left = await q(`SELECT nspname FROM pg_namespace WHERE nspname LIKE $1`, [`pdmig_${runId}_%`]);
     expect(left).toEqual([]);

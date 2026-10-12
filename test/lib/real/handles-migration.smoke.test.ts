@@ -32,12 +32,17 @@ import { checkDisposableTarget as checkTarget, connectSmokeDb, requireDisposable
  * nothing. This file never claims a handle — the runtime smoke
  * (handles-runtime.smoke.test.ts) does that, on the same disposable branch.
  *
- *   REAL_SMOKE_HANDLES_MIGRATION=1 REAL_SMOKE_HANDLES_MIGRATION_PUBLIC=1 \
- *     pnpm exec vitest run test/lib/real/handles-migration.smoke.test.ts
+ * Milestone 0 Pass B: the run also requires NEON_BRANCH_EXPECTED_ENDPOINT_ID —
+ * the branch's endpoint id, read by the operator from the Neon console — and
+ * refuses to connect unless it equals the URL's endpoint exactly. Differing
+ * from .env.local does not prove a branch is disposable; neither does this.
+ *
+ *   REAL_SMOKE_HANDLES_MIGRATION=1 REAL_SMOKE_HANDLES_MIGRATION_PUBLIC=1 NEON_BRANCH_DATABASE_URL="postgres://..." \
+ *     NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-..." pnpm exec vitest run test/lib/real/handles-migration.smoke.test.ts
  */
 const GATE = "REAL_SMOKE_HANDLES_MIGRATION";
 const PUBLIC_GATE = "REAL_SMOKE_HANDLES_MIGRATION_PUBLIC";
-const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);
+const enabled = process.env[GATE] === "1";
 const publicEnabled = process.env[PUBLIC_GATE] === "1";
 
 const TABLE = "real_account_handles";
@@ -141,13 +146,22 @@ describe("handles migration smoke harness", () => {
 
   it("the gate is handle-specific: DATABASE_URL alone, or another smoke's gate, never enables this file", () => {
     const source = readFileSync("test/lib/real/handles-migration.smoke.test.ts", "utf8");
-    expect(source).toContain('const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);');
+    expect(source).toContain('const enabled = process.env[GATE] === "1";');
     expect(source.match(/process\.env\.DATABASE_URL/g)).toBeNull(); // never read as a connection target
     for (const other of ["test/lib/real/neon-smoke.test.ts", "test/lib/real/provisioning-dispatch-migration.smoke.test.ts", "test/lib/real/l2-identity-migration.smoke.test.ts", "test/lib/real/l2-identity-race.smoke.test.ts"]) {
       const text = readFileSync(other, "utf8");
       expect(text, other).not.toContain(GATE);
-      expect(text, other).not.toContain("NEON_BRANCH_DATABASE_URL");
+      // Since Milestone 0 Pass B the migration smokes target a branch too — but none of these reads the branch
+      // variable (or DATABASE_URL) itself: each gets its URL only from the shared confirmed-target check.
+      expect(text, other).not.toMatch(/process\.env\.(NEON_BRANCH_DATABASE_URL|DATABASE_URL)/);
     }
+    // The adapter smoke now targets a branch too, but only through the operator-confirmed check and its own gate: it
+    // never reads the branch variable (or DATABASE_URL) directly, so this file's gate and target check cannot enable it.
+    const adapter = readFileSync("test/lib/real/neon-smoke.test.ts", "utf8");
+    expect(adapter).toContain('const GATE = "REAL_SMOKE_NEON_ADAPTER";');
+    expect(adapter).toContain("confirmedTargetUrl = requireConfirmedDisposableTargetUrl(GATE, ALLOWED_GATES);");
+    expect(adapter).not.toMatch(/process\.env\.(NEON_BRANCH_DATABASE_URL|DATABASE_URL)/);
+    expect(adapter).not.toMatch(/\brequireDisposableTargetUrl\(/);
   });
 
   describe("target safety check", () => {

@@ -11,7 +11,7 @@ import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
  * both INSERTs fed only by the CAS's own RETURNING rows — and how finalize
  * interprets each server answer. That the SQL behaves as intended against
  * real Postgres (lost CAS writes nothing, the same-statement FK holds,
- * concurrency) is proven by the DATABASE_URL-gated neon-smoke suite.
+ * concurrency) is proven by the gated, disposable-branch neon-smoke suite.
  */
 const DATABASE_URL = "postgresql://user:pass@ep-finalize-test-000000.us-east-2.aws.neon.tech/neondb";
 const CREDENTIAL_ID = "Y3JlZGVudGlhbC1pZA";

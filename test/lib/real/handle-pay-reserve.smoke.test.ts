@@ -33,11 +33,17 @@ import { PAIR_INTEGRITY_AUDIT_SQL } from "./fixtures/payment-recipient-audit";
  * Nothing here updates, deletes, or truncates the handle registry, alters a
  * table, or touches a trigger.
  *
- *   REAL_SMOKE_HANDLE_PAY_RESERVE=1 pnpm exec vitest run test/lib/real/handle-pay-reserve.smoke.test.ts
+ * Milestone 0 Pass B: the run also requires NEON_BRANCH_EXPECTED_ENDPOINT_ID —
+ * the branch's endpoint id, read by the operator from the Neon console — and
+ * refuses to connect unless it equals the URL's endpoint exactly. Differing
+ * from .env.local does not prove a branch is disposable; neither does this.
+ *
+ *   REAL_SMOKE_HANDLE_PAY_RESERVE=1 NEON_BRANCH_DATABASE_URL="postgres://..." NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-..." \
+ *     pnpm exec vitest run test/lib/real/handle-pay-reserve.smoke.test.ts
  */
 const GATE = "REAL_SMOKE_HANDLE_PAY_RESERVE";
 const ALLOWED_GATES = [GATE] as const;
-const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);
+const enabled = process.env[GATE] === "1";
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 const SEEDED_RESERVED = RESERVED_HANDLES.filter((name) => canonicalizeHandle(name).ok).sort();
 
@@ -50,7 +56,7 @@ describe("handle-pay reserve smoke harness", () => {
     .join("\n");
 
   it("is gated by its OWN variable and never reads DATABASE_URL", () => {
-    expect(source).toContain('const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);');
+    expect(source).toContain('const enabled = process.env[GATE] === "1";');
     expect(source.match(/process\.env\.DATABASE_URL/g)).toBeNull();
     for (const other of [
       "test/lib/real/neon-smoke.test.ts",

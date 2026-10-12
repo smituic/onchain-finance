@@ -36,12 +36,17 @@ import { PAIR_INTEGRITY_AUDIT_SQL, pairIntegrityAuditFor } from "./fixtures/paym
  * can receive whether or not its account has an active passkey, so nothing in
  * this schema looks at passkey status.
  *
- *   REAL_SMOKE_PAYMENT_RECIPIENT_MIGRATION=1 REAL_SMOKE_PAYMENT_RECIPIENT_MIGRATION_PUBLIC=1 \
- *     pnpm exec vitest run test/lib/real/payment-recipient-identity-migration.smoke.test.ts
+ * Milestone 0 Pass B: the run also requires NEON_BRANCH_EXPECTED_ENDPOINT_ID —
+ * the branch's endpoint id, read by the operator from the Neon console — and
+ * refuses to connect unless it equals the URL's endpoint exactly. Differing
+ * from .env.local does not prove a branch is disposable; neither does this.
+ *
+ *   REAL_SMOKE_PAYMENT_RECIPIENT_MIGRATION=1 REAL_SMOKE_PAYMENT_RECIPIENT_MIGRATION_PUBLIC=1 NEON_BRANCH_DATABASE_URL="postgres://..." \
+ *     NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-..." pnpm exec vitest run test/lib/real/payment-recipient-identity-migration.smoke.test.ts
  */
 const GATE = "REAL_SMOKE_PAYMENT_RECIPIENT_MIGRATION";
 const PUBLIC_GATE = "REAL_SMOKE_PAYMENT_RECIPIENT_MIGRATION_PUBLIC";
-const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);
+const enabled = process.env[GATE] === "1";
 const publicEnabled = process.env[PUBLIC_GATE] === "1";
 
 const TABLE = "payment_attempts";
@@ -113,7 +118,7 @@ describe("payment recipient identity migration smoke harness", () => {
 
   it("the gate is its own: DATABASE_URL alone never enables this file, and it is never read as a connection target", () => {
     const source = readFileSync("test/lib/real/payment-recipient-identity-migration.smoke.test.ts", "utf8");
-    expect(source).toContain('const enabled = process.env[GATE] === "1" && Boolean(process.env.NEON_BRANCH_DATABASE_URL);');
+    expect(source).toContain('const enabled = process.env[GATE] === "1";');
     expect(source.match(/process\.env\.DATABASE_URL/g)).toBeNull();
     for (const other of ["test/lib/real/neon-smoke.test.ts", "test/lib/real/provisioning-dispatch-migration.smoke.test.ts", "test/lib/real/l2-identity-migration.smoke.test.ts", "test/lib/real/handles-migration.smoke.test.ts", "test/lib/real/handles-runtime.smoke.test.ts"]) {
       expect(readFileSync(other, "utf8"), other).not.toContain(GATE);

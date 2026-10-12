@@ -12,6 +12,7 @@
  * observed finished or terminated. When termination cannot be proven, the
  * shared Poison trips and every later case refuses to touch the database.
  */
+import { resolveConfirmedDirectTarget, type ActiveEnvFiles } from "./handles-smoke-db";
 
 /** All harness budgets, in ms. `outerTestMs` is the Vitest timeout — a last-resort guard that normal teardown always beats. */
 export const RACE_LIMITS = {
@@ -474,6 +475,8 @@ export async function runRaceCase(input: { limits: RaceLimits; poison: Poison; r
  * falls back to DATABASE_URL — that is normally the pooled application URL.
  */
 export const DIRECT_DATABASE_URL_ENV = "REAL_SMOKE_L2_DIRECT_DATABASE_URL";
+/** The race suite's own primary gate. REAL_SMOKE_L2_INDEXES no longer enables it (that is only the adapter smoke's sub-gate). */
+export const RACE_GATE = "REAL_SMOKE_L2_RACE";
 
 export type DirectUrlCheck = { ok: true; url: string; hostname: string } | { ok: false; reason: string };
 
@@ -562,10 +565,19 @@ export async function prepareRaceSuite(input: {
   /** Opens a session on `url` with those settings and returns its pg_settings rows. Must not write. */
   readSessionSettings: (url: string) => Promise<SessionSetting[]>;
   activate: (url: string) => void;
+  /** The application's env files, so the real endpoint can be refused (readActiveEnvFiles() for a live run). */
+  envFiles: ActiveEnvFiles;
 }): Promise<void> {
   const check = resolveDirectDatabaseUrl(input.env);
   if (!check.ok) throw new Error(`race suite refused before any database work: ${check.reason}`);
-  const problems = sessionSettingProblems(await input.readSessionSettings(check.url), { applicationName: input.applicationName, msSettings: input.msSettings });
+  // Provenance, before the probe opens a session: the suite's own gate, no exported DATABASE_URL, no other
+  // gate, a direct URL that is not the real endpoint, and the operator's expected endpoint id matching exactly.
+  const provenance = resolveConfirmedDirectTarget({ env: input.env, ...input.envFiles, gate: RACE_GATE, allowedGates: [RACE_GATE], urlEnv: DIRECT_DATABASE_URL_ENV });
+  if (!provenance.ok) throw new Error(`race suite refused before any database work: ${provenance.reason}`);
+  // From here on the ONLY url is the one provenance validated — never `check.url`, which is a separate reading
+  // of the variable (it only decided the URL's shape, and names the hostname in the message below).
+  const url = provenance.url;
+  const problems = sessionSettingProblems(await input.readSessionSettings(url), { applicationName: input.applicationName, msSettings: input.msSettings });
   if (problems.length > 0) throw new Error(`race suite refused before any write: the ${check.hostname} session did not apply its settings (${problems.join("; ")})`);
-  input.activate(check.url);
+  input.activate(url);
 }

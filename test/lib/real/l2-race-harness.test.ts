@@ -6,6 +6,7 @@ import {
   DeadlineError,
   HARNESS_REQUEST,
   DIRECT_DATABASE_URL_ENV,
+  RACE_GATE,
   observe,
   openHolder,
   Poison,
@@ -609,10 +610,15 @@ describe("M3: prepareRaceSuite refuses BEFORE anything is patched or written", (
     { name: "lock_timeout", setting: "2000", unit: "ms" },
     { name: "idle_in_transaction_session_timeout", setting: "40000", unit: "ms" },
   ];
-  function prepare(env: Record<string, string | undefined>, rows: SessionSetting[] = applied) {
+  // The application's own env files, synthetic: a real endpoint that is NOT the race target.
+  const envFiles = { envLocalText: 'DATABASE_URL="postgresql://app:secret@ep-real-000001-pooler.us-east-2.aws.neon.tech/neondb"\n', otherEnvFiles: {} };
+  /** What an operator sets besides the direct URL: the suite's own gate and the endpoint id they read from the Neon console. */
+  const confirmed = { [RACE_GATE]: "1", NEON_BRANCH_EXPECTED_ENDPOINT_ID: "ep-cool-name-123456" };
+  function prepare(env: Record<string, string | undefined>, rows: SessionSetting[] = applied, files: { envLocalText: string | null; otherEnvFiles: Record<string, string> } = envFiles) {
     const log: string[] = [];
     const result = prepareRaceSuite({
       env,
+      envFiles: files,
       applicationName,
       msSettings,
       readSessionSettings: async (url) => (log.push(`probe:${new URL(url).hostname}`), rows),
@@ -637,7 +643,7 @@ describe("M3: prepareRaceSuite refuses BEFORE anything is patched or written", (
   });
 
   it("settings the server did not apply: the read-only probe ran, but the suite is never activated", async () => {
-    const { log, result } = prepare({ [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, applied.map((row) => (row.name === "idle_in_transaction_session_timeout" ? { ...row, setting: "0" } : row)));
+    const { log, result } = prepare({ ...confirmed, [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, applied.map((row) => (row.name === "idle_in_transaction_session_timeout" ? { ...row, setting: "0" } : row)));
     await expect(result).rejects.toThrow(/refused before any write: the ep-cool-name-123456\.us-east-2\.aws\.neon\.tech session did not apply its settings \(idle_in_transaction_session_timeout is 0 ms/);
     expect(log).toEqual([`probe:${DIRECT_HOST}`]);
     await result.catch((error: Error) => expect(error.message).not.toContain(PASSWORD));
@@ -646,7 +652,8 @@ describe("M3: prepareRaceSuite refuses BEFORE anything is patched or written", (
   it("a probe that fails (e.g. the endpoint rejects the startup settings) also leaves the suite unactivated", async () => {
     const log: string[] = [];
     const result = prepareRaceSuite({
-      env: { [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) },
+      env: { ...confirmed, [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) },
+      envFiles,
       applicationName,
       msSettings,
       readSessionSettings: async () => Promise.reject(new Error("unsupported startup parameter")),
@@ -657,9 +664,86 @@ describe("M3: prepareRaceSuite refuses BEFORE anything is patched or written", (
   });
 
   it("a valid direct URL whose session applied everything: probe first, THEN activate — with that exact URL", async () => {
-    const { log, result } = prepare({ DATABASE_URL: urlFor(POOLED_HOST), [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) });
+    const { log, result } = prepare({ ...confirmed, [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) });
     await result;
     expect(log).toEqual([`probe:${DIRECT_HOST}`, `activate:${DIRECT_HOST}`]);
+  });
+
+  // L3: the URL that passed provenance is the URL the probe and the activation receive — the same string, not a re-reading.
+  function prepareCapturing(raw: string) {
+    const used: Array<[string, string]> = [];
+    const result = prepareRaceSuite({
+      env: { ...confirmed, [DIRECT_DATABASE_URL_ENV]: raw },
+      envFiles,
+      applicationName,
+      msSettings,
+      readSessionSettings: async (url) => (used.push(["probe", url]), applied),
+      activate: (url) => void used.push(["activate", url]),
+    });
+    return { used, result };
+  }
+
+  it.each<[string, string]>([
+    ["as written", urlFor(DIRECT_HOST)],
+    ["surrounding whitespace", `  ${urlFor(DIRECT_HOST)} \t`],
+  ])("validated URL === used URL (%s): probe and activation get the one canonical string", async (_label, raw) => {
+    const { used, result } = prepareCapturing(raw);
+    await result;
+    expect(used).toEqual([
+      ["probe", urlFor(DIRECT_HOST)],
+      ["activate", urlFor(DIRECT_HOST)],
+    ]);
+  });
+
+  it.each<[string, string]>([
+    ["a trailing quote", `${urlFor(DIRECT_HOST)}"`],
+    ["a trailing single quote", `${urlFor(DIRECT_HOST)}'`],
+    ["a leading quote", `"${urlFor(DIRECT_HOST)}`],
+    ["mismatched quotes", `"${urlFor(DIRECT_HOST)}'`],
+    ["a trailing quote and surrounding whitespace", ` ${urlFor(DIRECT_HOST)}" `],
+    ["a trailing quote hiding an options override", `${urlFor(DIRECT_HOST, USER, PASSWORD, "/neondb?sslmode=require")}&options=endpoint%3Dep-real-000001"`],
+  ])("ambiguous quoting — %s: refused before the session probe; nothing is probed or activated with ANY url", async (_label, raw) => {
+    const { used, result } = prepareCapturing(raw);
+    await expect(result).rejects.toThrow(/refused before any database work/);
+    expect(used).toEqual([]);
+    await result.catch((error: Error) => {
+      expect(error.message).not.toContain(PASSWORD);
+      expect(error.message).not.toMatch(/postgres(ql)?:\/\/\S/);
+    });
+  });
+
+  it("the trailing-quote case is refused by PROVENANCE, not merely by the URL-shape check (which accepts it)", async () => {
+    const raw = `${urlFor(DIRECT_HOST)}"`;
+    expect(resolveDirectDatabaseUrl({ [DIRECT_DATABASE_URL_ENV]: raw }).ok).toBe(true); // the old gap: this reading would have been connected to
+    await expect(prepareCapturing(raw).result).rejects.toThrow(/REAL_SMOKE_L2_DIRECT_DATABASE_URL has unbalanced or stray quotes/);
+  });
+
+  // Milestone 0 Pass B: provenance. A well-formed DIRECT url is not enough — each of these is refused before the probe.
+  const REAL_DIRECT = "ep-real-000001.us-east-2.aws.neon.tech";
+  it.each<[string, Record<string, string | undefined>, RegExp, { envLocalText: string | null; otherEnvFiles: Record<string, string> }]>([
+    ["no race gate (the direct URL alone)", { [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /REAL_SMOKE_L2_RACE is not set/, envFiles],
+    ["REAL_SMOKE_L2_INDEXES instead of the race gate", { REAL_SMOKE_L2_INDEXES: "1", NEON_BRANCH_EXPECTED_ENDPOINT_ID: "ep-cool-name-123456", [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /REAL_SMOKE_L2_RACE is not set/, envFiles],
+    ["REAL_SMOKE_L2_INDEXES beside the race gate", { ...confirmed, REAL_SMOKE_L2_INDEXES: "1", [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /an unrelated smoke gate is set/, envFiles],
+    ["the adapter smoke's gate beside the race gate", { ...confirmed, REAL_SMOKE_NEON_ADAPTER: "1", [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /an unrelated smoke gate is set/, envFiles],
+    ["an admin gate", { ...confirmed, REAL_ADMIN_RESOLVE_PASSKEY_REVOCATION: "1", [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /an admin gate is set/, envFiles],
+    ["DATABASE_URL exported beside a valid direct URL", { ...confirmed, DATABASE_URL: urlFor(POOLED_HOST), [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /DATABASE_URL is exported/, envFiles],
+    ["no expected endpoint id", { [RACE_GATE]: "1", [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /NEON_BRANCH_EXPECTED_ENDPOINT_ID is not set/, envFiles],
+    ["another branch's expected endpoint id", { ...confirmed, NEON_BRANCH_EXPECTED_ENDPOINT_ID: "ep-other-name-654321", [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /does not match/, envFiles],
+    ["the REAL endpoint's direct form, confirmed as itself", { [RACE_GATE]: "1", NEON_BRANCH_EXPECTED_ENDPOINT_ID: "ep-real-000001", [DIRECT_DATABASE_URL_ENV]: urlFor(REAL_DIRECT) }, /equals the real database's/, envFiles],
+    ["a mixed-case hostname", { ...confirmed, [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST.replace("ep-cool", "EP-Cool")) }, /mixed-case hostname/, envFiles],
+    ["an options= routing override", { ...confirmed, [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST, USER, PASSWORD, "/neondb?options=endpoint%3Dep-real-000001") }, /unsupported or repeated connection parameter/, envFiles],
+    ["an unreadable .env.local", { ...confirmed, [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /\.env\.local is not readable/, { envLocalText: null, otherEnvFiles: {} }],
+    ["two DATABASE_URL definitions in .env.local", { ...confirmed, [DIRECT_DATABASE_URL_ENV]: urlFor(DIRECT_HOST) }, /more than once/, { envLocalText: `${envFiles.envLocalText}DATABASE_URL="postgresql://app:secret@ep-other-000009.us-east-2.aws.neon.tech/neondb"\n`, otherEnvFiles: {} }],
+  ])("provenance — %s: no session is opened and the suite is never activated", async (_label, env, reason, files) => {
+    const { log, result } = prepare(env, applied, files);
+    await expect(result).rejects.toThrow(/refused before any database work/);
+    await expect(result).rejects.toThrow(reason);
+    expect(log).toEqual([]);
+    await result.catch((error: Error) => {
+      expect(error.message).not.toContain(PASSWORD);
+      expect(error.message).not.toContain(USER);
+      expect(error.message).not.toMatch(/postgres(ql)?:\/\//);
+    });
   });
 });
 
@@ -672,13 +756,17 @@ describe("8: the race smoke reads ONLY the dedicated direct variable for its dat
 
   it("never reads DATABASE_URL, and its gate does not depend on it", () => {
     expect(code).not.toMatch(/DATABASE_URL(?!_ENV)/);
-    expect(code).not.toMatch(/process\.env\.(?!REAL_SMOKE_L2_INDEXES\b)\w+/);
-    expect(code).toContain('const enabled = process.env.REAL_SMOKE_L2_INDEXES === "1";');
+    // Its ONLY environment read is its own gate — REAL_SMOKE_L2_INDEXES (the adapter smoke's sub-gate) no longer enables it.
+    expect(code).not.toMatch(/process\.env\.(?!REAL_SMOKE_L2_RACE\b)\w+/);
+    expect(code).toContain('const enabled = process.env.REAL_SMOKE_L2_RACE === "1";');
+    expect(code).not.toContain("REAL_SMOKE_L2_INDEXES");
+    expect(RACE_GATE).toBe("REAL_SMOKE_L2_RACE");
   });
 
   it("gets its URL only through prepareRaceSuite(process.env), and activation is the only place that sets it or patches fetch", () => {
     expect(code).toContain("await prepareRaceSuite({");
     expect(code).toContain("env: process.env,");
+    expect(code).toContain("envFiles: readActiveEnvFiles(),");
     expect(code.match(/directUrl = /g)).toHaveLength(1);
     expect(code.match(/globalThis\.fetch = recordingFetch\(/g)).toHaveLength(1);
     const activate = code.slice(code.indexOf("activate: (url) => {"));

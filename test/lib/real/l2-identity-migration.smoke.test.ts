@@ -1,7 +1,8 @@
 // @vitest-environment node
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { requireConfirmedDisposableTargetUrl } from "./fixtures/handles-smoke-db";
 
 /**
  * MANUAL, LIVE-DATABASE behavioral proof of schema.sql's S5 L2
@@ -9,13 +10,32 @@ import { afterAll, describe, expect, it } from "vitest";
  * `target_schema` constant swapped — against throwaway scratch schemas
  * (`l2mig_<run>_<case>`), each holding a minimal real_accounts table, then
  * drops them. It never touches `public` (asserted). Never runs in normal
- * `pnpm test`: it needs DATABASE_URL AND an explicit opt-in. Prefer a Neon
- * branch.
+ * `pnpm test`: it needs its own explicit opt-in.
  *
- *   REAL_SMOKE_L2_MIGRATION=1 DATABASE_URL="postgres://..." \
+ * TARGET SAFETY (Milestone 0 Pass B). DISPOSABLE NEON BRANCH ONLY. The
+ * application's DATABASE_URL is never read, never a target, and never a
+ * fallback: the only target is NEON_BRANCH_DATABASE_URL. With the gate set,
+ * the first hook refuses — before any connection, and cleanup then connects
+ * to nothing — unless NEON_BRANCH_EXPECTED_ENDPOINT_ID equals that URL's
+ * endpoint id exactly, the endpoint is not the real database's, DATABASE_URL
+ * is not exported, and no admin gate or other smoke gate is set. Read the
+ * expected endpoint id from the Neon console for the branch you created; the
+ * harness cannot prove a branch is disposable.
+ *
+ *   REAL_SMOKE_L2_MIGRATION=1 NEON_BRANCH_DATABASE_URL="postgres://..." NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-..." \
  *     pnpm exec vitest run test/lib/real/l2-identity-migration.smoke.test.ts
  */
-const enabled = process.env.REAL_SMOKE_L2_MIGRATION === "1" && Boolean(process.env.DATABASE_URL);
+const GATE = "REAL_SMOKE_L2_MIGRATION";
+const ALLOWED_GATES = [GATE] as const;
+const enabled = process.env[GATE] === "1";
+
+/** Set only by targetUrl(), after the confirmed-target check passed; cleanup connects only when it is set. */
+let confirmedTargetUrl: string | null = null;
+/** The ONLY source of a connection string in this file. Throws before anything connects. */
+function targetUrl(): string {
+  if (!confirmedTargetUrl) confirmedTargetUrl = requireConfirmedDisposableTargetUrl(GATE, ALLOWED_GATES);
+  return confirmedTargetUrl;
+}
 const NAMES = ["real_accounts_sub_organization_id_lower_key", "real_accounts_owner_address_lower_key", "real_accounts_safe_address_lower_key"];
 
 const schemaSql = readFileSync("lib/real/server/schema.sql", "utf8");
@@ -72,15 +92,17 @@ describe("S5 L2 migration smoke harness: scratch schema names", () => {
 const LIVE_TIMEOUT_MS = 60_000;
 
 describe.skipIf(!enabled)("S5 L2 identity-index migration — behavior against scratch schemas (live)", () => {
+  beforeAll(() => void targetUrl());
   const runId = randomUUID().replace(/-/g, "").slice(0, 8);
   const schemas = new Set<string>();
   const sqlFn = async () => {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    return createNeonSqlClient(process.env.DATABASE_URL!);
+    return createNeonSqlClient(targetUrl());
   };
   const q = async (text: string, params: unknown[] = []) => (await sqlFn()).query(text, params) as Promise<Array<Record<string, unknown>>>;
 
   afterAll(async () => {
+    if (!confirmedTargetUrl) return;
     for (const schema of schemas) await q(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
   }, LIVE_TIMEOUT_MS);
 

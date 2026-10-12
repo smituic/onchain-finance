@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { EXPECTED_ENDPOINT_ENV, checkConfirmedDisposableTarget, confirmedDisposableTargetUrl, requireConfirmedDisposableTargetUrl } from "./fixtures/handles-smoke-db";
+import { assertRunSmokeIds, isRunSmokeId, smokeFinalizeCredentialId } from "./fixtures/smoke-run-ids";
 
 /**
  * Deterministic, per-fixture account identity derived from a run-specific
@@ -21,9 +24,10 @@ function smokeIdentity(userId: string) {
 }
 
 /**
- * MANUAL, LIVE-DATABASE SMOKE TEST — never runs in normal `pnpm test` /
- * CI unless DATABASE_URL is set (describe.skipIf below), and never invents
- * or reads a credential from anywhere but that one environment variable.
+ * MANUAL, LIVE-DATABASE SMOKE TEST — DISPOSABLE NEON BRANCH ONLY. It never
+ * runs in normal `pnpm test` / CI: every live block is skipped unless
+ * REAL_SMOKE_NEON_ADAPTER=1, and the application's DATABASE_URL is never
+ * read, never a target, and never a fallback (see "target safety" below).
  * Nothing here is a substitute for the mocked/in-memory reconciliation
  * tests elsewhere in test/lib/real/ (those cover the state-machine logic
  * exhaustively without touching a network) — this file's only job is to
@@ -37,19 +41,149 @@ function smokeIdentity(userId: string) {
  * transaction-scoped advisory lock and the partial unique index need to be
  * proven against real Postgres concurrency, not just JS's.
  *
- * Run manually, after applying lib/real/server/schema.sql to a Neon
- * database, with:
+ * TARGET SAFETY. With the gate set, the suite refuses — in beforeAll, before
+ * any connection, and with no other URL tried — unless ALL of these hold:
+ *   - NEON_BRANCH_DATABASE_URL is set (the only target);
+ *   - NEON_BRANCH_EXPECTED_ENDPOINT_ID is set and equals that URL's endpoint
+ *     id exactly (`ep-...`, without "-pooler");
+ *   - that endpoint is not the real database's (.env.local's DATABASE_URL);
+ *   - DATABASE_URL is not exported, and no admin gate or other smoke gate is
+ *     set (this file's own two sub-gates below are allowed).
+ * The expected endpoint id is the OPERATOR's confirmation: read it from the
+ * Neon console for the branch you created for this run, never out of the URL.
+ * The harness can check that the URL is the endpoint you named and is not
+ * the configured real one; it cannot prove a branch is disposable.
  *
- *   DATABASE_URL="postgres://..." pnpm test:neon-smoke
+ * Run manually, on a disposable branch with lib/real/server/schema.sql
+ * applied, with DATABASE_URL unset:
+ *
+ *   REAL_SMOKE_NEON_ADAPTER=1 NEON_BRANCH_DATABASE_URL="postgres://..." \
+ *     NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-..." pnpm test:neon-smoke
+ *
+ * Sub-gates (each only adds cases; neither enables anything on its own):
+ * REAL_SMOKE_PROVISIONING_DISPATCH=1 and REAL_SMOKE_L2_INDEXES=1.
  *
  * Every row this test writes is prefixed with a random run id and deleted
- * in afterAll (best-effort, even on failure) — safe to run repeatedly
- * against a shared dev database. Never targets a production database: this
- * is Phase 2 testnet infrastructure, and DATABASE_URL should only ever
- * point at a dev/test Neon project.
+ * in afterAll (best-effort, even on failure).
  */
-describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live database)", () => {
-  const databaseUrl = process.env.DATABASE_URL;
+const GATE = "REAL_SMOKE_NEON_ADAPTER";
+const ALLOWED_GATES = [GATE, "REAL_SMOKE_PROVISIONING_DISPATCH", "REAL_SMOKE_L2_INDEXES"] as const;
+const enabled = process.env[GATE] === "1";
+
+/** Set only by targetUrl(), after the confirmed-target check passed; cleanup connects only when it is set. */
+let confirmedTargetUrl: string | null = null;
+/** The ONLY source of a connection string in this file. Throws before anything connects. */
+function targetUrl(): string {
+  if (!confirmedTargetUrl) confirmedTargetUrl = requireConfirmedDisposableTargetUrl(GATE, ALLOWED_GATES);
+  return confirmedTargetUrl;
+}
+/** First hook of every live block: a refused target fails the block here, before any test body runs. */
+const refuseUnlessTargetConfirmed = () => void targetUrl();
+
+// Offline (never gated): the gate and the target check, over synthetic values only.
+describe("Neon adapter smoke: target safety (offline)", () => {
+  const source = readFileSync("test/lib/real/neon-smoke.test.ts", "utf8");
+  const uncommented = source
+    .split("\n")
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+  // Everything except this offline block (whose own assertions quote the code they look for).
+  const code = uncommented.slice(0, uncommented.indexOf('\ndescribe("Neon adapter smoke: target safety')) + uncommented.slice(uncommented.indexOf("\ndescribe.skipIf("));
+
+  const BRANCH_ID = "ep-smoke-branch-000002";
+  const branch = `postgresql://app:secret@${BRANCH_ID}.neon.invalid/neondb`;
+  const real = 'DATABASE_URL="postgresql://app:secret@ep-real-000001-pooler.neon.invalid/neondb"\n';
+  const env = (extra: Record<string, string | undefined> = {}) => ({ [GATE]: "1", NEON_BRANCH_DATABASE_URL: branch, [EXPECTED_ENDPOINT_ENV]: BRANCH_ID, ...extra });
+  const input = (e: Record<string, string | undefined>, envLocalText: string | null = real) => ({ env: e, envLocalText, gate: GATE, allowedGates: ALLOWED_GATES });
+
+  const refusals: Array<[string, ReturnType<typeof input>, RegExp]> = [
+    ["nothing is set", input({}), /REAL_SMOKE_NEON_ADAPTER is not set/],
+    ["DATABASE_URL alone", input({ DATABASE_URL: branch }), /REAL_SMOKE_NEON_ADAPTER is not set/],
+    ["NEON_BRANCH_DATABASE_URL alone", input({ NEON_BRANCH_DATABASE_URL: branch }), /REAL_SMOKE_NEON_ADAPTER is not set/],
+    ["the branch URL and expected endpoint without the gate", input(env({ [GATE]: undefined })), /REAL_SMOKE_NEON_ADAPTER is not set/],
+    ["a sub-gate alone", input({ REAL_SMOKE_PROVISIONING_DISPATCH: "1", NEON_BRANCH_DATABASE_URL: branch, [EXPECTED_ENDPOINT_ENV]: BRANCH_ID }), /REAL_SMOKE_NEON_ADAPTER is not set/],
+    ["the gate with no target at all", input({ [GATE]: "1" }), /NEON_BRANCH_DATABASE_URL is missing/],
+    ["the gate with only DATABASE_URL (no fallback)", input({ [GATE]: "1", [EXPECTED_ENDPOINT_ENV]: BRANCH_ID, DATABASE_URL: branch }), /DATABASE_URL is exported/],
+    ["DATABASE_URL exported beside a valid branch", input(env({ DATABASE_URL: branch })), /DATABASE_URL is exported/],
+    ["an admin gate is set", input(env({ REAL_ADMIN_POLL_PROVISIONING_ACTIVITY: "1" })), /an admin gate is set/],
+    ["an unrelated smoke gate is set", input(env({ REAL_SMOKE_L2_MIGRATION: "1" })), /an unrelated smoke gate is set/],
+    ["the branch URL is not a URL", input(env({ NEON_BRANCH_DATABASE_URL: "not a url" })), /missing or not a URL/],
+    [".env.local is unreadable", input(env(), null), /\.env\.local is not readable/],
+    [".env.local names no DATABASE_URL", input(env(), "OTHER=1\n"), /names no DATABASE_URL/],
+    ["the expected endpoint is missing", input(env({ [EXPECTED_ENDPOINT_ENV]: undefined })), /NEON_BRANCH_EXPECTED_ENDPOINT_ID is not set/],
+    ["the expected endpoint is empty", input(env({ [EXPECTED_ENDPOINT_ENV]: "" })), /NEON_BRANCH_EXPECTED_ENDPOINT_ID is not set/],
+    ["the expected endpoint is another branch", input(env({ [EXPECTED_ENDPOINT_ENV]: "ep-other-branch-000003" })), /does not match/],
+    ["the expected endpoint is a prefix of the branch's", input(env({ [EXPECTED_ENDPOINT_ENV]: "ep-smoke-branch" })), /does not match/],
+    ["the expected endpoint differs only in case", input(env({ [EXPECTED_ENDPOINT_ENV]: BRANCH_ID.toUpperCase() })), /not a bare endpoint id/],
+    ["the expected endpoint is padded", input(env({ [EXPECTED_ENDPOINT_ENV]: ` ${BRANCH_ID}` })), /not a bare endpoint id/],
+    ["the expected endpoint is the pooled form", input(env({ [EXPECTED_ENDPOINT_ENV]: `${BRANCH_ID}-pooler` })), /not a bare endpoint id/],
+    ["the expected endpoint is a hostname", input(env({ [EXPECTED_ENDPOINT_ENV]: `${BRANCH_ID}.neon.invalid` })), /not a bare endpoint id/],
+    ["the expected endpoint is the whole URL", input(env({ [EXPECTED_ENDPOINT_ENV]: branch })), /not a bare endpoint id/],
+    ["the branch IS the real endpoint, and so is the expected id", input(env({ NEON_BRANCH_DATABASE_URL: "postgresql://app:secret@ep-real-000001-pooler.neon.invalid/neondb", [EXPECTED_ENDPOINT_ENV]: "ep-real-000001" })), /equals the real database's/],
+    ["the branch is the real endpoint's direct form", input(env({ NEON_BRANCH_DATABASE_URL: "postgresql://app:secret@ep-real-000001.neon.invalid/neondb", [EXPECTED_ENDPOINT_ENV]: "ep-real-000001" })), /equals the real database's/],
+    ["the expected id names the real endpoint while the URL names a branch", input(env({ [EXPECTED_ENDPOINT_ENV]: "ep-real-000001" })), /names the real database's endpoint/],
+  ];
+
+  it("accepts only the gate + a branch URL + the operator's matching endpoint id (pooled or direct URL, with or without this file's sub-gates)", () => {
+    expect(checkConfirmedDisposableTarget(input(env()))).toEqual({ ok: true });
+    expect(checkConfirmedDisposableTarget(input(env({ NEON_BRANCH_DATABASE_URL: `postgresql://app:secret@${BRANCH_ID}-pooler.neon.invalid/neondb` })))).toEqual({ ok: true });
+    expect(checkConfirmedDisposableTarget(input(env({ REAL_SMOKE_PROVISIONING_DISPATCH: "1", REAL_SMOKE_L2_INDEXES: "1" })))).toEqual({ ok: true });
+  });
+
+  it.each(refusals)("refuses when %s — and never echoes a URL or credential", (_name, refused, reason) => {
+    const result = checkConfirmedDisposableTarget(refused);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(reason);
+      expect(result.reason).not.toMatch(/secret|postgres|neon\.invalid|00000\d|branch-|ep-real/);
+    }
+  });
+
+  it.each(refusals)("when %s, the refusal throws BEFORE the connector is called, and no other URL is tried", (_name, refused) => {
+    const connect = vi.fn();
+    expect(() => connect(confirmedDisposableTargetUrl(refused))).toThrow(/^Neon smoke refused to connect: /);
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it("a confirmed target hands the connector the branch URL and nothing else", () => {
+    const connect = vi.fn();
+    connect(confirmedDisposableTargetUrl(input(env())));
+    expect(connect.mock.calls).toEqual([[branch]]);
+  });
+
+  it("the file is enabled by its own gate ONLY, and never reads DATABASE_URL (no legacy fallback)", () => {
+    expect(code).toContain('const enabled = process.env[GATE] === "1";');
+    expect(code.match(/process\.env\.DATABASE_URL/g)).toBeNull();
+    expect(code.match(/\bdatabaseUrl\b/g)).toBeNull();
+    // Every environment read in the file: the gate, the two sub-gates, and one round count.
+    expect(code.match(/process\.env\[\w+\]/g)).toEqual(["process.env[GATE]"]);
+    expect([...new Set(code.match(/process\.env\.\w+/g))].sort()).toEqual(["process.env.NEON_SMOKE_AB_ROUNDS", "process.env.REAL_SMOKE_L2_INDEXES", "process.env.REAL_SMOKE_PROVISIONING_DISPATCH"]);
+  });
+
+  it("every live block is skipped without the gate and checks the target in its FIRST hook", () => {
+    const blocks = code.match(/^describe\.skipIf\([^\n]*\n[^\n]*/gm) ?? [];
+    expect(blocks).toHaveLength(5);
+    for (const block of blocks) expect(block).toMatch(/^describe\.skipIf\(!enabled( \|\| process\.env\.REAL_SMOKE_PROVISIONING_DISPATCH !== "1")?\)\([^\n]*\n  beforeAll\(refuseUnlessTargetConfirmed\);$/);
+    // No ungated block other than this offline one.
+    expect(uncommented.match(/^describe\(/gm)).toHaveLength(1);
+    expect(code.match(/^describe\(/gm)).toBeNull();
+  });
+
+  it("the confirmed check is the only source of a connection string, and every connector is handed exactly that", () => {
+    expect(code.match(/requireConfirmedDisposableTargetUrl\(/g)).toHaveLength(1);
+    expect(code).toContain("if (!confirmedTargetUrl) confirmedTargetUrl = requireConfirmedDisposableTargetUrl(GATE, ALLOWED_GATES);");
+    expect(code.match(/confirmedTargetUrl = /g)).toHaveLength(1);
+    const connectors = code.match(/\b(createNeonSqlClient|createNeonDurableStores|neon)\(/g) ?? [];
+    expect(connectors.length).toBeGreaterThan(30);
+    expect(code.match(/\b(createNeonSqlClient|createNeonDurableStores|neon)\(targetUrl\(\)\)/g)).toHaveLength(connectors.length);
+    // Cleanup never connects for a target that was never confirmed.
+    for (const cleanup of code.match(/afterAll\(async \(\) => \{\n[^\n]*/g) ?? []) expect(cleanup).toMatch(/if \(!confirmedTargetUrl\b/);
+    expect(code.match(/afterAll\(/g)).toHaveLength(5);
+  });
+});
+
+describe.skipIf(!enabled)("Neon adapter smoke test (live database)", () => {
+  beforeAll(refuseUnlessTargetConfirmed);
   const runId = randomUUID().slice(0, 8);
   const credentialId = (suffix: string) => `smoke-${runId}-cred-${suffix}`;
   const appUserId = (suffix: string) => `smoke-${runId}-user-${suffix}`;
@@ -65,9 +199,9 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
    * suite's L3/finalize cases need the post-create state without assuming that migration is applied.
    */
   async function seedTurnkeyCreatedRow(credId: string, identity: { subOrganizationId: string; turnkeyUserId: string; walletId: string; walletAccountId: string; ownerAddress: string }) {
-    if (!credId.startsWith(`smoke-${runId}-`)) throw new Error("refusing to seed a non-smoke row");
+    if (!isRunSmokeId(runId, credId)) throw new Error("refusing to seed a non-smoke row");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const rows = (await createNeonSqlClient(databaseUrl!)`
+    const rows = (await createNeonSqlClient(targetUrl())`
       UPDATE registration_attempts
       SET state = 'turnkey_created', external_outcome = 'confirmed_created', sub_organization_id = ${identity.subOrganizationId},
           turnkey_user_id = ${identity.turnkeyUserId}, wallet_id = ${identity.walletId}, wallet_account_id = ${identity.walletAccountId},
@@ -80,9 +214,11 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   }
 
   afterAll(async () => {
-    if (!databaseUrl) return;
+    if (!confirmedTargetUrl) return;
+    // Every id below was generated by this run; anything else aborts the cleanup before its first DELETE.
+    assertRunSmokeIds(runId, [...cleanupCredentialIds, ...cleanupAppUserIds, ...cleanupChallenges]);
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl);
+    const sql = createNeonSqlClient(targetUrl());
     for (const id of cleanupCredentialIds) {
       await sql`DELETE FROM real_passkeys WHERE credential_id = ${id}`;
       await sql`DELETE FROM registration_attempts WHERE credential_id = ${id}`;
@@ -97,7 +233,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
   it("schema applies: all core tables exist", async () => {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     for (const table of ["webauthn_challenges", "registration_attempts", "real_accounts", "real_passkeys", "backup_passkey_enrollments", "passkey_revocation_attempts"]) {
       const rows = (await sql`SELECT to_regclass(${table}) AS exists`) as { exists: string | null }[];
       expect(rows[0]?.exists, `table "${table}" is missing — apply lib/real/server/schema.sql first`).toBe(table);
@@ -107,7 +243,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   it("challenge create + atomic consume works against the real database, including under real concurrent requests", async () => {
     const { createNeonChallengeStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonChallengeStore(sql);
     const value = challenge("consume");
     cleanupChallenges.add(value);
@@ -130,7 +266,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
     const { createNeonRealAccountRegistry } = await import("@/lib/real/server/neon-store");
     const { DuplicateCredentialError } = await import("@/lib/real/server/registry");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const registry = createNeonRealAccountRegistry(sql);
 
     const credId = credentialId("account");
@@ -188,7 +324,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
   it("registration_attempts state transitions are CAS-safe and finalize() atomically activates the account", async () => {
     const { createNeonDurableStores } = await import("@/lib/real/server/neon-store");
-    const stores = createNeonDurableStores(databaseUrl!);
+    const stores = createNeonDurableStores(targetUrl());
 
     const credId = credentialId("attempt");
     const userId = appUserId("attempt");
@@ -253,12 +389,12 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   /** A durable attempt walked to turnkey_created through the adapter's own CAS transitions, registered for cleanup. */
   async function seedTurnkeyCreated(suffix: string, identityOf: (userId: string) => ReturnType<typeof smokeIdentity> = smokeIdentity) {
     const { createNeonDurableStores, createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const stores = createNeonDurableStores(databaseUrl!);
-    const sql = createNeonSqlClient(databaseUrl!);
+    const stores = createNeonDurableStores(targetUrl());
+    const sql = createNeonSqlClient(targetUrl());
     // Canonical base64url (accountMatchesAttempt compares decoded bytes and
-    // fails closed on anything undecodable): "smokeL3A" decodes to exactly 6
-    // bytes, so the id keeps that prefix for cleanup/residue detection.
-    const credId = Buffer.concat([Buffer.from("smokeL3A", "base64url"), createHash("sha256").update(`${runId}:${suffix}`).digest()]).toString("base64url");
+    // fails closed on anything undecodable) that still starts `smoke-<runId>-`,
+    // so the seed guard, cleanup, and residue detection all treat it as this run's.
+    const credId = smokeFinalizeCredentialId(runId, suffix);
     const userId = appUserId(suffix);
     cleanupCredentialIds.add(credId);
     cleanupAppUserIds.add(userId);
@@ -421,7 +557,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   it.skipIf(!process.env.REAL_SMOKE_L2_INDEXES)("S5 L2 post-index: exactly the three intended unique indexes exist, and the registry maps their 23505 to IdentityConflictError", async () => {
     const { createNeonSqlClient, createNeonRealAccountRegistry, ACCOUNT_IDENTITY_UNIQUE_INDEXES } = await import("@/lib/real/server/neon-store");
     const { IdentityConflictError } = await import("@/lib/real/server/registry");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const rows = (await sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'real_accounts' AND indexname = ANY(${[...ACCOUNT_IDENTITY_UNIQUE_INDEXES]})`) as { indexname: string; indexdef: string }[];
     expect(rows.map((r) => r.indexname).sort()).toEqual([...ACCOUNT_IDENTITY_UNIQUE_INDEXES].sort());
     for (const row of rows) expect(row.indexdef).toMatch(/^CREATE UNIQUE INDEX \S+ ON public\.real_accounts USING btree \(lower\((sub_organization_id|owner_address|safe_address)\)\)$/);
@@ -457,7 +593,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
   it("S4: real_accounts.session_epoch is BIGINT NOT NULL DEFAULT 0 (migration applied)", async () => {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const rows = (await sql`
       SELECT data_type, is_nullable, column_default FROM information_schema.columns
       WHERE table_name = 'real_accounts' AND column_name = 'session_epoch'
@@ -470,7 +606,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   it("S4: a new account starts at epoch 0; concurrent increments over real HTTP requests never lose an update; an unknown account is null", async () => {
     const { createNeonRealAccountRegistry } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const registry = createNeonRealAccountRegistry(createNeonSqlClient(databaseUrl!));
+    const registry = createNeonRealAccountRegistry(createNeonSqlClient(targetUrl()));
     const credId = credentialId("epoch");
     const userId = appUserId("epoch");
     cleanupCredentialIds.add(credId);
@@ -490,7 +626,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
   it("S4: challenge create purges already-expired rows and keeps live ones", async () => {
     const { createNeonChallengeStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const [expired, live, trigger] = [challenge("purge-expired"), challenge("purge-live"), challenge("purge-trigger")];
     for (const value of [expired, live, trigger]) cleanupChallenges.add(value);
     await sql`INSERT INTO webauthn_challenges (challenge, purpose, expires_at) VALUES (${expired}, 'login', now() - interval '1 hour')`;
@@ -504,7 +640,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
 
   it("the database layer never stores signing/private material — a direct row read contains no such fields", async () => {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const credId = credentialId("boundary");
     const userId = appUserId("boundary");
     cleanupCredentialIds.add(credId);
@@ -539,12 +675,10 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test (live databa
  * block already does for challenge consumption).
  *
  * Requires `payment_attempts` (Batch 2d's schema.sql addition) to already
- * be applied. Run manually with:
- *
- *   DATABASE_URL="postgres://..." pnpm test:neon-smoke
+ * be applied. Run manually as described at the top of this file.
  */
-describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (live database) — Batch 2d", () => {
-  const databaseUrl = process.env.DATABASE_URL;
+describe.skipIf(!enabled)("Neon payment_attempts smoke test (live database) — Batch 2d", () => {
+  beforeAll(refuseUnlessTargetConfirmed);
   const runId = randomUUID().slice(0, 8);
   const appUserId = (suffix: string) => `smoke-pay-${runId}-user-${suffix}`;
   const RECIPIENT = "0x2222222222222222222222222222222222222222";
@@ -554,9 +688,9 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   const cleanupAppUserIds = new Set<string>();
 
   afterAll(async () => {
-    if (!databaseUrl) return;
+    if (!confirmedTargetUrl) return;
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl);
+    const sql = createNeonSqlClient(targetUrl());
     for (const id of cleanupAppUserIds) {
       await sql`DELETE FROM payment_attempts WHERE app_user_id = ${id}`;
       await sql`DELETE FROM real_passkeys WHERE app_user_id = ${id}`;
@@ -569,7 +703,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   async function seedRealAccount(userId: string) {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const identity = smokeIdentity(userId);
     await sql`
       INSERT INTO real_accounts (app_user_id, sub_organization_id, turnkey_user_id, wallet_id, wallet_account_id, owner_address, safe_address, account_config_version)
@@ -587,7 +721,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("A: the payment_attempts table exists", async () => {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const rows = (await sql`SELECT to_regclass('payment_attempts') AS exists`) as { exists: string | null }[];
     expect(rows[0]?.exists, "table payment_attempts is missing — apply the Batch 2d schema addition first").toBe("payment_attempts");
   });
@@ -595,7 +729,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("B/F: several concurrent reserve() calls for the same account — exactly one succeeds under real concurrent HTTP requests, atomically", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("concurrency");
     cleanupAppUserIds.add(userId);
@@ -610,7 +744,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("C: the partial unique index itself — independent of reserve()'s advisory lock — prevents two active attempts for one account", async () => {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const userId = appUserId("unique-index");
     cleanupAppUserIds.add(userId);
     await seedRealAccount(userId);
@@ -635,7 +769,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("D: a cancelled (terminal) attempt frees the slot for a later reservation", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("terminal");
     cleanupAppUserIds.add(userId);
@@ -658,7 +792,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("E: the hourly quota (10/hour) is enforced by the real database, not merely in-process logic", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("quota");
     cleanupAppUserIds.add(userId);
@@ -678,7 +812,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("K: finite expiry — valid_until / prepare_block_number persist as numbers, survive later transitions, and a full uint256 nonce round-trips exactly", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("expiry");
     cleanupAppUserIds.add(userId);
@@ -700,7 +834,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("S2: an explicit failureReason: null clears a stale failure_reason on unknown -> confirmed; an omitted key leaves it alone", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("clear-reason");
     cleanupAppUserIds.add(userId);
@@ -726,7 +860,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("G/H: CAS state transitions and expected_user_operation_hash persistence work against the real database", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("cas");
     cleanupAppUserIds.add(userId);
@@ -768,7 +902,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 
   it("I: the database row never contains signing/private material — direct read, not just the mapped type", async () => {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const userId = appUserId("no-secrets");
     cleanupAppUserIds.add(userId);
     await seedRealAccount(userId);
@@ -790,7 +924,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("J: findRecentByAppUserId (Batch 2e history read) — newest-first, limit honored, scoped to the requesting account, against the real database", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("history");
     const otherUserId = appUserId("history-other");
@@ -834,7 +968,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { DuplicateSignActivityError } = await import("@/lib/real/server/payment-attempts");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("attribution");
     cleanupAppUserIds.add(userId);
@@ -875,7 +1009,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("S1: beginDispatch claims signed -> submitting only while the bound passkey is active", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("dispatch-claim");
     cleanupAppUserIds.add(userId);
@@ -895,7 +1029,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
   it("S1: a removal holding the account lock is serialized BEFORE a concurrent beginDispatch — which then sees 'revoking' and refuses", async () => {
     const { createNeonPaymentAttemptStore } = await import("@/lib/real/server/neon-store");
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    const sql = createNeonSqlClient(databaseUrl!);
+    const sql = createNeonSqlClient(targetUrl());
     const store = createNeonPaymentAttemptStore(sql);
     const userId = appUserId("dispatch-lock");
     cleanupAppUserIds.add(userId);
@@ -917,28 +1051,28 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon payment_attempts smoke test (li
 });
 
 /**
- * Batch 2g live proofs — same explicit gate as above (skipped unless
- * DATABASE_URL is set). These exist to prove, against REAL Postgres through
+ * Batch 2g live proofs — same explicit gate and target check as above.
+ * These exist to prove, against REAL Postgres through
  * the Neon HTTP transaction path, what the in-memory adapters can only
  * model: the account-row FOR UPDATE serialization, and that each
  * multi-statement sql.transaction() batch rolls back as a whole when its
  * guard statement aborts on a lost race. Every row is namespaced by a run id
  * and deleted in afterAll, children before parents.
  */
-describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g backup passkeys (live database)", () => {
-  const databaseUrl = process.env.DATABASE_URL;
+describe.skipIf(!enabled)("Neon adapter smoke test — Batch 2g backup passkeys (live database)", () => {
+  beforeAll(refuseUnlessTargetConfirmed);
   const runId = randomUUID().slice(0, 8);
   const users = new Set<string>();
   const id = (kind: string, n: number | string) => `smoke2g-${runId}-${kind}-${n}`;
 
   async function sqlFn() {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    return createNeonSqlClient(databaseUrl!);
+    return createNeonSqlClient(targetUrl());
   }
 
   async function stores() {
     const { createNeonDurableStores } = await import("@/lib/real/server/neon-store");
-    return createNeonDurableStores(databaseUrl!);
+    return createNeonDurableStores(targetUrl());
   }
 
   /**
@@ -986,7 +1120,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
   const dispatchPatch = { turnkeyRequestBody: "{}", turnkeyRequestBodySha256: "h", turnkeyRequestTimestampMs: Date.now(), turnkeyRequestStamp: "{}", externalAttemptedAt: new Date().toISOString() };
 
   afterAll(async () => {
-    if (!databaseUrl) return;
+    if (!confirmedTargetUrl) return;
     const sql = await sqlFn();
     for (const appUserId of users) {
       await sql`DELETE FROM passkey_revocation_attempts WHERE app_user_id = ${appUserId}`;
@@ -1355,27 +1489,27 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Batch 2g
 
 /**
  * Slice S3 — the operator resolution store's SQL (passkey-revocation-
- * resolution-store.ts). Same DATABASE_URL gate as above; NOT yet run live.
+ * resolution-store.ts). Same gate and target check as above; NOT yet run live.
  * Needs schema.sql's passkey_revocation_resolutions table applied first.
  * Covers only the Neon adapter (the account-locked commit batch, its CAS
  * predicates, its rollback guards, the audit uniqueness) — the resolver's
  * evidence logic is covered offline by passkey-revocation-resolver.test.ts.
  */
-describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Slice S3 blocked-removal resolution (live database)", () => {
-  const databaseUrl = process.env.DATABASE_URL;
+describe.skipIf(!enabled)("Neon adapter smoke test — Slice S3 blocked-removal resolution (live database)", () => {
+  beforeAll(refuseUnlessTargetConfirmed);
   const runId = randomUUID().slice(0, 8);
   const users = new Set<string>();
   const id = (kind: string, n: string) => `smokeS3-${runId}-${kind}-${n}`;
 
   async function sqlFn() {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    return createNeonSqlClient(databaseUrl!);
+    return createNeonSqlClient(targetUrl());
   }
 
   async function stores() {
     const { createNeonDurableStores } = await import("@/lib/real/server/neon-store");
     const { createNeonRevocationResolutionStore } = await import("@/lib/real/server/passkey-revocation-resolution-store");
-    return { ...createNeonDurableStores(databaseUrl!), resolution: createNeonRevocationResolutionStore(await sqlFn()) };
+    return { ...createNeonDurableStores(targetUrl()), resolution: createNeonRevocationResolutionStore(await sqlFn()) };
   }
 
   const sha = async (body: string) => (await import("@/lib/real/server/turnkey-signed-request")).sha256Hex(body);
@@ -1442,7 +1576,7 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Slice S3
   }
 
   afterAll(async () => {
-    if (!databaseUrl) return;
+    if (!confirmedTargetUrl) return;
     const sql = await sqlFn();
     for (const appUserId of users) {
       await sql`DELETE FROM passkey_revocation_resolutions WHERE app_user_id = ${appUserId}`;
@@ -1527,9 +1661,10 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Slice S3
  * operations against real Postgres. NEEDS schema.sql's "Provisioning Evidence
  * Capture" block applied to the target database (it is hand-applied, and was
  * NOT applied when this suite was written), so it has its own explicit
- * opt-in on top of DATABASE_URL:
+ * opt-in on top of this file's gate and target check:
  *
- *   REAL_SMOKE_PROVISIONING_DISPATCH=1 DATABASE_URL="postgres://..." pnpm test:neon-smoke
+ *   REAL_SMOKE_NEON_ADAPTER=1 REAL_SMOKE_PROVISIONING_DISPATCH=1 NEON_BRANCH_DATABASE_URL="postgres://..." \
+ *     NEON_BRANCH_EXPECTED_ENDPOINT_ID="ep-..." pnpm test:neon-smoke
  *
  * What only a real database can prove: the claim and the evidence INSERT
  * commit or roll back TOGETHER, real concurrent HTTP requests yield exactly
@@ -1538,8 +1673,8 @@ describe.skipIf(!process.env.DATABASE_URL)("Neon adapter smoke test — Slice S3
  * the `smoke` prefix and is deleted in afterAll (dispatch rows first — they
  * reference the attempt).
  */
-describe.skipIf(!process.env.DATABASE_URL || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1")("Neon adapter smoke test — Provisioning Evidence Capture (live database)", () => {
-  const databaseUrl = process.env.DATABASE_URL;
+describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1")("Neon adapter smoke test — Provisioning Evidence Capture (live database)", () => {
+  beforeAll(refuseUnlessTargetConfirmed);
   const runId = randomUUID().slice(0, 8);
   const cleanupCredentialIds = new Set<string>();
   const sha = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
@@ -1547,7 +1682,7 @@ describe.skipIf(!process.env.DATABASE_URL || process.env.REAL_SMOKE_PROVISIONING
 
   const sqlFn = async () => {
     const { createNeonSqlClient } = await import("@/lib/real/server/neon-store");
-    return createNeonSqlClient(databaseUrl!);
+    return createNeonSqlClient(targetUrl());
   };
   const storeFn = async () => {
     const { createNeonRegistrationAttemptStore } = await import("@/lib/real/server/neon-store");
@@ -1573,7 +1708,7 @@ describe.skipIf(!process.env.DATABASE_URL || process.env.REAL_SMOKE_PROVISIONING
   // attempted independently, so a failure removing dispatch rows never skips
   // the attempt rows (and vice versa); every failure is reported at the end.
   afterAll(async () => {
-    if (!databaseUrl || cleanupCredentialIds.size === 0) return;
+    if (!confirmedTargetUrl || cleanupCredentialIds.size === 0) return;
     const sql = await sqlFn();
     const failures: string[] = [];
     for (const id of cleanupCredentialIds) {
