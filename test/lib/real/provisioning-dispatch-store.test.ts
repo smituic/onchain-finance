@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { claimWithEvidence, completedObservation, failedObservation, seedTurnkeyCreatedThroughEvidence } from "./fixtures/provisioning-seed";
+import { claimWithEvidence, claimed, completedObservation, failedObservation, seedTurnkeyCreatedThroughEvidence } from "./fixtures/provisioning-seed";
 import {
   createInMemoryRegistrationAttemptStore,
   type DispatchTerminalObservation,
@@ -73,15 +73,15 @@ describe("beginProvisioningDispatch: ONE step — the claim and the evidence row
   it("claims verified -> provisioning_in_flight / unknown and inserts exactly one row holding the exact body", async () => {
     const store = createInMemoryRegistrationAttemptStore();
     const attempt = await verified(store);
-    const begun = await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: "2026-09-24T00:00:00.000Z", evidence: evidence("body-A") });
+    const begun = claimed(await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: "2026-09-24T00:00:00.000Z", evidence: evidence("body-A") }));
 
-    expect(begun?.attempt).toMatchObject({ state: "provisioning_in_flight", externalOutcome: "unknown", externalProvisioningAttemptedAt: "2026-09-24T00:00:00.000Z" });
-    expect(begun?.dispatch).toMatchObject({ credentialId: attempt.credentialId, dispatchSeq: 1, requestBody: "body-A", requestBodySha256: sha("body-A"), turnkeyActivityId: null, terminalStatus: null, lastObservedStatus: null });
-    expect(await store.findByCredentialId(attempt.credentialId)).toEqual(begun?.attempt);
-    expect(await store.findDispatchesByCredentialId(attempt.credentialId)).toEqual([begun?.dispatch]);
+    expect(begun.attempt).toMatchObject({ state: "provisioning_in_flight", externalOutcome: "unknown", externalProvisioningAttemptedAt: "2026-09-24T00:00:00.000Z" });
+    expect(begun.dispatch).toMatchObject({ credentialId: attempt.credentialId, dispatchSeq: 1, requestBody: "body-A", requestBodySha256: sha("body-A"), turnkeyActivityId: null, terminalStatus: null, lastObservedStatus: null });
+    expect(await store.findByCredentialId(attempt.credentialId)).toEqual(begun.attempt);
+    expect(await store.findDispatchesByCredentialId(attempt.credentialId)).toEqual([begun.dispatch]);
   });
 
-  it.each(["provisioning_in_flight", "turnkey_created", "blocked"] as const)("an attempt that is not 'verified' (%s): null, no new row", async (state) => {
+  it.each(["provisioning_in_flight", "turnkey_created", "blocked"] as const)("an attempt that is not 'verified' (%s): claim_lost, no new row", async (state) => {
     const store = createInMemoryRegistrationAttemptStore();
     const attempt = await verified(store);
     if (state === "provisioning_in_flight") await claimWithEvidence(store, attempt.credentialId);
@@ -90,9 +90,9 @@ describe("beginProvisioningDispatch: ONE step — the claim and the evidence row
       if (state === "blocked") await store.transition({ credentialId: attempt.credentialId, from: "turnkey_created", to: "blocked", patch: { blockReason: "x" } });
     }
     const before = await store.findDispatchesByCredentialId(attempt.credentialId);
-    expect(await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence(`body-${state}`) })).toBeNull();
+    expect(await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence(`body-${state}`) })).toEqual({ outcome: "claim_lost" });
     expect(await store.findDispatchesByCredentialId(attempt.credentialId)).toEqual(before);
-    expect(await store.beginProvisioningDispatch({ credentialId: "no-such-credential", attemptedAt: new Date().toISOString(), evidence: evidence("body-x") })).toBeNull();
+    expect(await store.beginProvisioningDispatch({ credentialId: "no-such-credential", attemptedAt: new Date().toISOString(), evidence: evidence("body-x") })).toEqual({ outcome: "claim_lost" });
   });
 
   it.each([
@@ -124,7 +124,7 @@ describe("beginProvisioningDispatch: ONE step — the claim and the evidence row
     const { dispatchId, activityId } = await claimWithEvidence(store, attempt.credentialId);
     await expect(store.transition({ credentialId: attempt.credentialId, from: "provisioning_in_flight", to: "verified" })).rejects.toThrow(/provisioning_in_flight/);
     expect(await store.revertProvisioningAfterDefinitiveFailure({ credentialId: attempt.credentialId, dispatchId, activityId })).toBeNull(); // not terminal
-    expect(await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("open-2") })).toBeNull();
+    expect(await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("open-2") })).toEqual({ outcome: "claim_lost" });
     expect((await store.findByCredentialId(attempt.credentialId))?.state).toBe("provisioning_in_flight");
     expect(await store.findDispatchesByCredentialId(attempt.credentialId)).toHaveLength(1);
   });
@@ -132,13 +132,13 @@ describe("beginProvisioningDispatch: ONE step — the claim and the evidence row
   it("dispatch_seq counts up per attempt; a later dispatch never overwrites or alters an earlier one", async () => {
     const store = createInMemoryRegistrationAttemptStore();
     const attempt = await verified(store);
-    const one = (await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("seq-1") }))!.dispatch;
+    const one = claimed(await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("seq-1") })).dispatch;
     await store.recordDispatchActivity({ dispatchId: one.id, activityId: "activity-1", fingerprint: null });
     await store.recordDispatchTerminal({ dispatchId: one.id, activityId: "activity-1", observation: failed });
     expect(await store.revertProvisioningAfterDefinitiveFailure({ credentialId: attempt.credentialId, dispatchId: one.id, activityId: "activity-1" })).toMatchObject({ state: "verified", externalOutcome: "definitive_failure" });
     const firstAfterFailure = (await store.findDispatchesByCredentialId(attempt.credentialId))[0];
 
-    const two = (await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("seq-2") }))!.dispatch;
+    const two = claimed(await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("seq-2") })).dispatch;
     expect(two.dispatchSeq).toBe(2);
     expect(two.id).not.toBe(one.id);
     const rows = await store.findDispatchesByCredentialId(attempt.credentialId);
@@ -146,14 +146,14 @@ describe("beginProvisioningDispatch: ONE step — the claim and the evidence row
     expect(rows[0]).toEqual(firstAfterFailure);
     // Another attempt's sequence is independent.
     const other = await verified(store);
-    expect((await store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("other-1") }))!.dispatch.dispatchSeq).toBe(1);
+    expect(claimed(await store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("other-1") })).dispatch.dispatchSeq).toBe(1);
   });
 
   it("concurrent claims for one attempt: exactly one wins", async () => {
     const store = createInMemoryRegistrationAttemptStore();
     const attempt = await verified(store);
     const results = await Promise.all(["c1", "c2", "c3", "c4"].map((body) => store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence(body) })));
-    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(results.filter((result) => result.outcome === "claimed")).toHaveLength(1);
     expect(await store.findDispatchesByCredentialId(attempt.credentialId)).toHaveLength(1);
   });
 });
@@ -161,7 +161,7 @@ describe("beginProvisioningDispatch: ONE step — the claim and the evidence row
 async function begun(body = `body-${Math.random()}`) {
   const store = createInMemoryRegistrationAttemptStore();
   const attempt = await verified(store);
-  const { dispatch } = (await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence(body) }))!;
+  const { dispatch } = claimed(await store.beginProvisioningDispatch({ credentialId: attempt.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence(body) }));
   const row = async () => (await store.findDispatchesByCredentialId(attempt.credentialId))[0]!;
   return { store, attempt, dispatch, row };
 }
@@ -193,7 +193,7 @@ describe("recordDispatchActivity: first writer wins", () => {
     expect(await w.store.recordDispatchActivity({ dispatchId: "00000000-0000-4000-8000-000000000000", activityId: "a", fingerprint: null })).toEqual({ outcome: "not_found" });
     await w.store.recordDispatchActivity({ dispatchId: w.dispatch.id, activityId: "activity-shared", fingerprint: null });
     const other = await verified(w.store);
-    const second = (await w.store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("another-body") }))!.dispatch;
+    const second = claimed(await w.store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidence("another-body") })).dispatch;
     await expect(w.store.recordDispatchActivity({ dispatchId: second.id, activityId: "activity-shared", fingerprint: null })).rejects.toThrow(/unique/);
     expect((await w.store.findDispatchesByCredentialId(other.credentialId))[0]!.turnkeyActivityId).toBeNull();
   });

@@ -242,7 +242,7 @@ describe("ordering invariants", () => {
       ...w.attempts,
       async beginProvisioningDispatch(input) {
         const begun = await w.attempts.beginProvisioningDispatch(input);
-        return begun && { ...begun, dispatch: { ...begun.dispatch, ...tamper(begun.dispatch) } };
+        return begun.outcome === "claimed" ? { ...begun, dispatch: { ...begun.dispatch, ...tamper(begun.dispatch) } } : begun;
       },
     };
     expect(await w.dispatch(store)).toEqual({ kind: "review" });

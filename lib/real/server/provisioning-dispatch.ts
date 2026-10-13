@@ -36,10 +36,14 @@ import { sha256Hex, type TurnkeyActivitySummary } from "./turnkey-signed-request
 export type ProvisioningDispatchOutcome =
   /** Another request already moved the attempt off "verified": nothing was inserted, stamped, or sent. */
   | { kind: "claim_lost" }
+  /** A global dispatch ceiling is full: nothing was inserted, stamped, or sent, and the attempt is still "verified". Temporary. */
+  | { kind: "capacity_reached" }
+  /** This attempt has used every dispatch it is allowed: nothing was inserted, stamped, or sent. Permanent for this attempt. */
+  | { kind: "attempt_budget_exhausted" }
   /** A validated COMPLETED response to our own create, plus the wallet-account read. `dispatchId`/`activityId` name the evidence the store's own CAS re-checks. */
   | { kind: "created"; provisioned: ProvisionedTurnkeyAccount; dispatchId: string; activityId: string }
   /** Turnkey's ledger resolved THIS dispatch's exact activity to FAILED/REJECTED, and that is durably recorded. */
-  | { kind: "definitive_failure"; dispatchId: string; activityId: string }
+  | { kind: "definitive_failure"; dispatchId: string; activityId: string; dispatchSeq: number }
   | { kind: "review" };
 
 const POLLABLE_STATUSES = new Set(["ACTIVITY_STATUS_CREATED", "ACTIVITY_STATUS_PENDING"]);
@@ -101,7 +105,9 @@ export async function runProvisioningDispatch(input: {
   // that TRANSACTION fails (e.g. a constraint), it throws out of here with the
   // attempt still "verified". If it committed but its response was lost, it
   // also throws — then the claim and evidence are durable, nothing was sent,
-  // and the attempt is in review (fail closed).
+  // and the attempt is in review (fail closed). The claim is also where the
+  // dispatch ceilings are enforced: a refusal wrote nothing and ends here,
+  // before any stamp or fetch.
   const begun = await attempts.beginProvisioningDispatch({
     credentialId: attempt.credentialId,
     attemptedAt: new Date(timestampMs).toISOString(),
@@ -114,7 +120,9 @@ export async function runProvisioningDispatch(input: {
       requestBodySha256: bodySha256,
     },
   });
-  if (!begun) return { kind: "claim_lost" };
+  if (begun.outcome === "claim_lost") return { kind: "claim_lost" };
+  if (begun.outcome === "global_capacity_reached") return { kind: "capacity_reached" };
+  if (begun.outcome === "attempt_budget_exhausted") return { kind: "attempt_budget_exhausted" };
   const dispatch: ProvisioningDispatch = begun.dispatch;
 
   // 5. From here on only the PERSISTED body is used. It must be the string we
@@ -189,7 +197,7 @@ export async function runProvisioningDispatch(input: {
   // body. Anything else — including a mismatch — acts on neither outcome.
   const decision = classifyTerminalEvidence(evaluation);
   if (decision.kind === "review") return { kind: "review" };
-  if (decision.kind === "definitive_failure") return { kind: "definitive_failure", dispatchId: dispatch.id, activityId };
+  if (decision.kind === "definitive_failure") return { kind: "definitive_failure", dispatchId: dispatch.id, activityId, dispatchSeq: dispatch.dispatchSeq };
   const result = decision.result;
 
   // 16. The one follow-up read, bounded, bound to exactly the account the

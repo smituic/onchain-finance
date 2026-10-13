@@ -148,6 +148,17 @@ See ARCHITECTURE.md's "Handle Pay Slice D — Durable Handle Identity in History
 
 See ARCHITECTURE.md's "Handle Pay Slice E — Rate Limiting / Privacy Hardening".
 
+**Registration Abuse Protection / Registration Provisioning Limits (Milestone 1) — IMPLEMENTED AND LIVE-VERIFIED ON DISPOSABLE NEON; FINAL AUDIT PASSED; MANUAL GIT CHECKPOINT PENDING.** Creating an account makes the server ask Turnkey to create a child organization under our parent, so the number of those create requests is now capped on the server — independent of how many passkeys or registration attempts exist.
+- **Limits:** 5 committed provisioning dispatches per rolling hour and 20 per rolling 24 hours, across all registrations; and 2 committed dispatches per registration attempt (the first, plus one more only after a proven definitive failure). They are code constants, with no runtime override.
+- **No refunds:** a dispatch counts the moment its claim commits, before anything is sent, and is never given back — not after a definitive failure, a timeout, an uncertain outcome, a crash, or a success. A rolled-back claim consumes nothing.
+- **Enforcement:** inside the durable Neon claim transaction itself (a dedicated transaction-scoped advisory lock, then one statement that counts, decides, claims, and inserts), so the limits hold across concurrent requests, instances, and restarts. No in-process or best-effort counter.
+- **What people see:** when a ceiling is full, "We can't open new accounts right now. Your passkey is saved…" (temporary; the same attempt is admitted later through "I already have an account"); when an attempt has used its dispatches, "We couldn't finish setting up this account. Trying again with this passkey won't work." (permanent for that attempt). No counts, limits, or automatic retry.
+- **Verification:** both authorized disposable-Neon runs passed — the dedicated ten-case concurrency smoke (run `a630d8ff`, evidence file hashed) and the legacy adapter-smoke regression (118 passed, 2 skipped). Independent code and component audits passed, and the final independent whole-milestone audit passed (GO for the operator's Git checkpoint; 0 Critical, 0 High, 0 Medium, 2 Low, 5 Info).
+- **Not done, and not implied:** this is not a launch gate. It does not stop attempt/passkey creation, abusive or multi-account registration, or per-IP abuse; there is no invitation, CAPTCHA, or per-IP control yet. Provider-side registration under the ceilings has not been live-run. The manual Git checkpoint is pending; nothing is committed, pushed, or deployed. Public registration is **not** declared safe for unrestricted launch.
+- **Accepted availability residual:** the ceilings are global, so a malicious actor can exhaust the shared capacity and temporarily keep legitimate users from completing registration. That is accepted for controlled testnet use and is not a complete public-registration abuse defense; invitation-based, per-IP, or equivalent admission controls remain necessary before unrestricted public registration.
+
+See ARCHITECTURE.md's "Public Readiness Milestone 1 — Registration Abuse Protection".
+
 **Goal:** Introduce Real Mode, backed by real (testnet) infrastructure, one area at a time, while Practice Mode remains fully available for everything — including areas Real Mode doesn't support yet. Prove one real end-to-end path before broadening.
 
 ### Sequencing decision (September 2026)

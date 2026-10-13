@@ -24,8 +24,9 @@ const SUITES: Array<[string, string]> = [
   [`${R}payment-recipient-identity-migration.smoke.test.ts`, "REAL_SMOKE_PAYMENT_RECIPIENT_MIGRATION"],
   [`${R}handle-pay-reserve.smoke.test.ts`, "REAL_SMOKE_HANDLE_PAY_RESERVE"],
   [`${R}rate-limit.smoke.test.ts`, "REAL_SMOKE_RATE_LIMIT"],
+  [`${R}provisioning-limits.smoke.test.ts`, "REAL_SMOKE_PROVISIONING_LIMITS"],
 ];
-/** The five suites finding L1 was about: they used to skip when their gate was set without a branch URL. */
+/** The five suites finding L1 was about (they used to skip when their gate was set without a branch URL), and every disposable-branch suite added since. */
 const L1_SUITES = SUITES.slice(4);
 const SYNTHETIC_URL = "postgresql://app:synthetic@ep-synthetic-000009.c-1.neon.invalid/neondb";
 const PROCESS_TIMEOUT_MS = 120_000;

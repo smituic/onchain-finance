@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { DispatchTerminalObservation, ProvisionedIdentity, RegistrationAttempt, RegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
+import type { BeginProvisioningDispatchResult, DispatchTerminalObservation, ProvisionedIdentity, RegistrationAttempt, RegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
 
 /**
  * "provisioning_in_flight" is claim-only: a test can no longer push an
@@ -10,6 +10,12 @@ import type { DispatchTerminalObservation, ProvisionedIdentity, RegistrationAtte
  */
 const sha256 = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
 
+/** Narrows a claim result to the won claim; anything else fails the test by name. */
+export function claimed(result: BeginProvisioningDispatchResult): Extract<BeginProvisioningDispatchResult, { outcome: "claimed" }> {
+  if (result.outcome !== "claimed") throw new Error(`expected a claimed provisioning dispatch, got "${result.outcome}"`);
+  return result;
+}
+
 export async function claimWithEvidence(attempts: RegistrationAttemptStore, credentialId: string) {
   const body = JSON.stringify({ seed: credentialId, nonce: randomUUID() });
   const begun = await attempts.beginProvisioningDispatch({
@@ -17,7 +23,7 @@ export async function claimWithEvidence(attempts: RegistrationAttemptStore, cred
     attemptedAt: new Date().toISOString(),
     evidence: { evidenceVersion: 1, organizationId: "parent-org", stampPublicKey: "pub", requestTimestampMs: Date.now(), requestBody: body, requestBodySha256: sha256(body) },
   });
-  if (!begun) throw new Error("seed: the attempt was not 'verified'");
+  if (begun.outcome !== "claimed") throw new Error(`seed: the claim was refused (${begun.outcome})`);
   const activityId = `activity-${randomUUID()}`;
   const recorded = await attempts.recordDispatchActivity({ dispatchId: begun.dispatch.id, activityId, fingerprint: `sha256:${sha256(body)}` });
   if (recorded.outcome !== "recorded") throw new Error("seed: activity id not recorded");

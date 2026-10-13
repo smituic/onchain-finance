@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { EXPECTED_ENDPOINT_ENV, checkConfirmedDisposableTarget, confirmedDisposableTargetUrl, requireConfirmedDisposableTargetUrl } from "./fixtures/handles-smoke-db";
 import { assertRunSmokeIds, isRunSmokeId, smokeFinalizeCredentialId } from "./fixtures/smoke-run-ids";
+import { claimed } from "./fixtures/provisioning-seed";
 
 /**
  * Deterministic, per-fixture account identity derived from a run-specific
@@ -64,7 +65,9 @@ function smokeIdentity(userId: string) {
  * REAL_SMOKE_PROVISIONING_DISPATCH=1 and REAL_SMOKE_L2_INDEXES=1.
  *
  * Every row this test writes is prefixed with a random run id and deleted
- * in afterAll (best-effort, even on failure).
+ * in afterAll (best-effort, even on failure). The Provisioning Evidence
+ * Capture block also removes its own fixtures after each case, because its
+ * claims are admitted against the production dispatch ceilings.
  */
 const GATE = "REAL_SMOKE_NEON_ADAPTER";
 const ALLOWED_GATES = [GATE, "REAL_SMOKE_PROVISIONING_DISPATCH", "REAL_SMOKE_L2_INDEXES"] as const;
@@ -1670,8 +1673,11 @@ describe.skipIf(!enabled)("Neon adapter smoke test — Slice S3 blocked-removal 
  * commit or roll back TOGETHER, real concurrent HTTP requests yield exactly
  * one dispatch, the constraints fire, the body round-trips byte for byte,
  * and the write-once guards hold under a race. Everything it writes carries
- * the `smoke` prefix and is deleted in afterAll (dispatch rows first — they
- * reference the attempt).
+ * the `smoke` prefix and is deleted by exact id (dispatch rows first — they
+ * reference the attempt): after EACH case, in afterEach — because every claim
+ * here is admitted against the production dispatch ceilings, so the ledger
+ * must be empty again before the next case — with afterAll as the remaining
+ * safeguard for anything still registered when the block ends.
  */
 describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1")("Neon adapter smoke test — Provisioning Evidence Capture (live database)", () => {
   beforeAll(refuseUnlessTargetConfirmed);
@@ -1701,14 +1707,23 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
     if (rows[0]?.t !== "registration_provisioning_dispatches") {
       throw new Error("Provisioning dispatch smoke refused: registration_provisioning_dispatches does not exist in this database (apply schema.sql's Provisioning Evidence Capture block first). Nothing was written.");
     }
+    // Read-only, still before any write. Every claim is now admitted against the production dispatch
+    // ceilings (5 per rolling hour, 20 per rolling 24 hours — never raised or bypassed for a test), which
+    // count EVERY ledger row. A dispatch committed in the last 24 hours that this run does not own would
+    // make a refusal here mean nothing, and this suite never alters a row it did not create — so refuse.
+    const recent = (await (await sqlFn())`SELECT count(*)::int AS n FROM registration_provisioning_dispatches WHERE created_at > now() - interval '25 hours'`) as { n: number }[];
+    if (recent[0]?.n !== 0) {
+      throw new Error("Provisioning dispatch smoke refused: this database already holds provisioning dispatches from the last 25 hours, so the dispatch ceilings would decide these cases. Use a fresh disposable branch. Nothing was written.");
+    }
     prerequisitesMet = true;
   });
 
-  // Cleanup touches ONLY this run's smoke-prefixed fixtures. Each delete is
-  // attempted independently, so a failure removing dispatch rows never skips
-  // the attempt rows (and vice versa); every failure is reported at the end.
-  afterAll(async () => {
-    if (!confirmedTargetUrl || cleanupCredentialIds.size === 0) return;
+  // Removes ONLY this run's own fixtures: exactly the credential ids this run registered in
+  // cleanupCredentialIds (each checked against this run's prefix before anything is sent), one exact id
+  // per statement — never a pattern, a timestamp, or a status. Each delete is attempted independently,
+  // so a failure removing dispatch rows never skips the attempt rows (and vice versa); every failure is
+  // reported at the end.
+  async function removeRunFixtures(): Promise<void> {
     const sql = await sqlFn();
     const failures: string[] = [];
     for (const id of cleanupCredentialIds) {
@@ -1727,6 +1742,21 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
     expect(failures).toEqual([]);
     const residue = (await sql`SELECT count(*)::int AS n FROM registration_attempts WHERE credential_id LIKE ${`smoke-${runId}-pd-%`}`) as { n: number }[];
     expect(residue[0]?.n).toBe(0);
+    cleanupCredentialIds.clear();
+  }
+
+  // Registration Abuse Protection: these cases make 13 committed claims between them, more than the
+  // hourly ceiling allows. No case depends on another's rows, so each case's fixtures are removed as
+  // soon as it ends — the ledger is empty again for the next one, and no case makes more than two
+  // claims. Nothing is aged or re-dated: no created_at is ever modified here.
+  afterEach(async () => {
+    if (!confirmedTargetUrl || cleanupCredentialIds.size === 0) return;
+    await removeRunFixtures();
+  });
+
+  afterAll(async () => {
+    if (!confirmedTargetUrl || cleanupCredentialIds.size === 0) return;
+    await removeRunFixtures();
   });
 
   /** A fresh 'verified' attempt with a run-unique, smoke-only id. Refuses unless the preflight passed. */
@@ -1778,10 +1808,10 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
   it("claim + evidence commit together: the attempt is in flight / unknown and the row holds the exact body, byte for byte", async () => {
     const { store, credentialId } = await verifiedAttempt("claim");
     const body = bodyFor("claim");
-    const begun = await store.beginProvisioningDispatch({ credentialId, attemptedAt: "2026-09-24T00:00:00.000Z", evidence: evidenceFor(body) });
+    const begun = claimed(await store.beginProvisioningDispatch({ credentialId, attemptedAt: "2026-09-24T00:00:00.000Z", evidence: evidenceFor(body) }));
 
-    expect(begun?.attempt).toMatchObject({ credentialId, state: "provisioning_in_flight", externalOutcome: "unknown", externalProvisioningAttemptedAt: "2026-09-24T00:00:00.000Z" });
-    expect(begun?.dispatch).toMatchObject({ credentialId, dispatchSeq: 1, evidenceVersion: 1, requestTimestampMs: 1_790_204_988_123, requestBody: body, requestBodySha256: sha(body), turnkeyActivityId: null, terminalStatus: null });
+    expect(begun.attempt).toMatchObject({ credentialId, state: "provisioning_in_flight", externalOutcome: "unknown", externalProvisioningAttemptedAt: "2026-09-24T00:00:00.000Z" });
+    expect(begun.dispatch).toMatchObject({ credentialId, dispatchSeq: 1, evidenceVersion: 1, requestTimestampMs: 1_790_204_988_123, requestBody: body, requestBodySha256: sha(body), turnkeyActivityId: null, terminalStatus: null });
     const [row] = await rawRows(credentialId);
     expect(row!.request_body).toBe(body);
     const [digest] = (await (await sqlFn())`SELECT octet_length(request_body) AS bytes, encode(sha256(convert_to(request_body, 'UTF8')), 'hex') AS db_digest FROM registration_provisioning_dispatches WHERE credential_id = ${credentialId}`) as Array<{ bytes: number; db_digest: string }>;
@@ -1792,13 +1822,13 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
   it("five racing claims over real HTTP: exactly one wins, exactly one dispatch row exists", async () => {
     const { store, credentialId } = await verifiedAttempt("race");
     const results = await Promise.all([1, 2, 3, 4, 5].map((n) => store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor(`race-${n}`)) })));
-    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(results.filter((result) => result.outcome === "claimed")).toHaveLength(1);
     const rows = await rawRows(credentialId);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.dispatch_seq).toBe(1);
     expect((await store.findByCredentialId(credentialId))?.state).toBe("provisioning_in_flight");
-    // A later claim on the now in-flight attempt: null, still one row.
-    expect(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("race-late")) })).toBeNull();
+    // A later claim on the now in-flight attempt: { outcome: "claim_lost" }, still one row.
+    expect(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("race-late")) })).toEqual({ outcome: "claim_lost" });
     expect(await rawRows(credentialId)).toHaveLength(1);
   });
 
@@ -1806,7 +1836,7 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
     const first = await verifiedAttempt("rollback-a");
     const second = await verifiedAttempt("rollback-b");
     const body = bodyFor("rollback-shared");
-    await first.store.beginProvisioningDispatch({ credentialId: first.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(body) });
+    expect(claimed(await first.store.beginProvisioningDispatch({ credentialId: first.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(body) })).dispatch.dispatchSeq).toBe(1);
 
     // The same body digest on another attempt: the unique constraint aborts the statement, and the claim with it.
     await expect(second.store.beginProvisioningDispatch({ credentialId: second.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(body) })).rejects.toThrow(/registration_provisioning_dispatches_body_sha256_key/);
@@ -1821,12 +1851,12 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
     expect(await rawRows(second.credentialId)).toEqual([]);
 
     // And the attempt is still usable: a valid claim now succeeds.
-    expect((await second.store.beginProvisioningDispatch({ credentialId: second.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(other) }))?.dispatch.dispatchSeq).toBe(1);
+    expect(claimed(await second.store.beginProvisioningDispatch({ credentialId: second.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(other) })).dispatch.dispatchSeq).toBe(1);
   });
 
   it("one open dispatch per attempt: with the attempt forced back to 'verified', a second open row is still refused and the claim rolls back", async () => {
     const { store, credentialId } = await verifiedAttempt("one-open");
-    await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("one-open-1")) });
+    expect(claimed(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("one-open-1")) })).dispatch.dispatchSeq).toBe(1);
     // No API can return an attempt with an open dispatch to 'verified' (claim-only); simulate a buggy
     // writer on THIS smoke row directly, to prove the index itself refuses a second open dispatch.
     await expect(store.transition({ credentialId, from: "provisioning_in_flight", to: "verified" })).rejects.toThrow(/only through beginProvisioningDispatch/);
@@ -1838,7 +1868,7 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
 
   it("write-once activity id under a race: two different ids -> exactly one is recorded and never replaced; a replay of it is idempotent", async () => {
     const { store, credentialId } = await verifiedAttempt("activity");
-    const { dispatch } = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("activity")) }))!;
+    const { dispatch } = claimed(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("activity")) }));
     const ids = [`smoke-${runId}-act-A`, `smoke-${runId}-act-B`];
     const results = await Promise.all(ids.map((activityId) => store.recordDispatchActivity({ dispatchId: dispatch.id, activityId, fingerprint: `sha256:${sha(activityId)}` })));
     expect(results.map((r) => r.outcome).sort()).toEqual(["mismatch", "recorded"]);
@@ -1853,13 +1883,13 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
 
     // The same activity id on ANOTHER dispatch is refused by the unique constraint.
     const other = await verifiedAttempt("activity-other");
-    const second = (await other.store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("activity-other")) }))!.dispatch;
+    const second = claimed(await other.store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("activity-other")) })).dispatch;
     await expect(other.store.recordDispatchActivity({ dispatchId: second.id, activityId: winner, fingerprint: null })).rejects.toThrow(/registration_provisioning_dispatches_activity_id_key/);
   });
 
   it("write-once terminal observation: needs the recorded id; two racing terminals -> one recorded; observations stop after it; the request evidence never changes", async () => {
     const { store, credentialId } = await verifiedAttempt("terminal");
-    const { dispatch } = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("terminal")) }))!;
+    const { dispatch } = claimed(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("terminal")) }));
     const [before] = await rawRows(credentialId);
     const activityId = `smoke-${runId}-act-terminal`;
 
@@ -1886,13 +1916,13 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
 
   it("a definitive failure then a new dispatch: sequence 2, and the first row is preserved exactly", async () => {
     const { store, credentialId } = await verifiedAttempt("retry");
-    const one = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("retry-1")) }))!.dispatch;
+    const one = claimed(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("retry-1")) })).dispatch;
     await store.recordDispatchActivity({ dispatchId: one.id, activityId: `smoke-${runId}-act-retry-1`, fingerprint: null });
     await store.recordDispatchTerminal({ dispatchId: one.id, activityId: `smoke-${runId}-act-retry-1`, observation: failed });
     expect(await store.revertProvisioningAfterDefinitiveFailure({ credentialId, dispatchId: one.id, activityId: `smoke-${runId}-act-retry-1` })).toMatchObject({ state: "verified", externalOutcome: "definitive_failure" });
     const [firstBefore] = await rawRows(credentialId);
 
-    const two = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("retry-2")) }))!.dispatch;
+    const two = claimed(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("retry-2")) })).dispatch;
     expect(two.dispatchSeq).toBe(2);
     const rows = await rawRows(credentialId);
     expect(rows.map((row) => row.dispatch_seq)).toEqual([1, 2]);
@@ -1903,7 +1933,7 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
   it("L1: the evidence-bound exits against real Postgres — an operator-recorded FAILED cannot revert; a stale dispatch cannot advance; the exact in-process evidence can", async () => {
     const identity = { subOrganizationId: `smoke-${runId}-sub`, turnkeyUserId: `smoke-${runId}-user`, walletId: `smoke-${runId}-wallet`, walletAccountId: `smoke-${runId}-wa`, ownerAddress: "0xF6C3FE6DE636f0d8f421d5485D1a64fF3628CFaF" };
     const { store, credentialId } = await verifiedAttempt("exits");
-    const one = (await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("exits-1")) }))!.dispatch;
+    const one = claimed(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("exits-1")) })).dispatch;
     const act1 = `smoke-${runId}-act-exits-1`;
     await store.recordDispatchActivity({ dispatchId: one.id, activityId: act1, fingerprint: null });
     await store.recordDispatchTerminal({ dispatchId: one.id, activityId: act1, observation: { ...failed, observedBy: "operator_poll" } });
@@ -1912,7 +1942,7 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
     expect((await store.findByCredentialId(credentialId))?.state).toBe("provisioning_in_flight");
 
     const other = await verifiedAttempt("exits-ok");
-    const two = (await other.store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("exits-2")) }))!.dispatch;
+    const two = claimed(await other.store.beginProvisioningDispatch({ credentialId: other.credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("exits-2")) })).dispatch;
     const act2 = `smoke-${runId}-act-exits-2`;
     await other.store.recordDispatchActivity({ dispatchId: two.id, activityId: act2, fingerprint: null });
     await other.store.recordDispatchTerminal({ dispatchId: two.id, activityId: act2, observation: { ...completed, observedSubOrganizationId: identity.subOrganizationId, observedRootUserId: identity.turnkeyUserId, observedWalletId: identity.walletId, observedOwnerAddress: identity.ownerAddress } });
@@ -1923,7 +1953,7 @@ describe.skipIf(!enabled || process.env.REAL_SMOKE_PROVISIONING_DISPATCH !== "1"
 
   it("the row never contains a stamp, a signature, or private key material — direct read, not just the mapped type", async () => {
     const { store, credentialId } = await verifiedAttempt("columns");
-    await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("columns")) });
+    expect(claimed(await store.beginProvisioningDispatch({ credentialId, attemptedAt: new Date().toISOString(), evidence: evidenceFor(bodyFor("columns")) })).dispatch.dispatchSeq).toBe(1);
     const [row] = await rawRows(credentialId);
     expect(Object.keys(row!).filter((column) => /stamp|signature|private|secret|api_key/.test(column) && !/timestamp/.test(column))).toEqual(["stamp_public_key"]);
   });

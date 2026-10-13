@@ -213,6 +213,46 @@ export type RecordDispatchTerminalResult =
   | { outcome: "recorded" | "already_terminal" | "activity_mismatch"; dispatch: ProvisioningDispatch }
   | { outcome: "not_found" };
 
+/**
+ * Registration Abuse Protection (Milestone 1, Slice 1): ceilings on external
+ * CREATE_SUB_ORGANIZATION dispatches. Code constants — no runtime override.
+ * The ledger is the dispatch evidence table itself: a dispatch consumes
+ * capacity the instant its claim commits (before anything is sent) and is
+ * never refunded, whatever the provider later answers.
+ *
+ * The two global windows are ROLLING and half-open: a dispatch counts toward
+ * a window while `createdAt > admission - window`, so a row exactly one
+ * window old no longer counts. "admission" is one clock reading taken by the
+ * store after it holds its claim lock; the same reading becomes the new
+ * row's createdAt.
+ */
+export const PROVISIONING_GLOBAL_HOURLY_DISPATCH_LIMIT = 5;
+export const PROVISIONING_GLOBAL_DAILY_DISPATCH_LIMIT = 20;
+/** Total committed dispatches one registration attempt may ever have: the first, plus one more after a proven definitive failure. */
+export const PROVISIONING_ATTEMPT_DISPATCH_BUDGET = 2;
+export const PROVISIONING_HOURLY_WINDOW_MS = 60 * 60 * 1000;
+export const PROVISIONING_DAILY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * What a provisioning claim decided. Only "claimed" wrote anything; the three
+ * refusals leave the attempt, its externalOutcome, and the ledger exactly as
+ * they were. A database failure is none of these — it throws.
+ *
+ *   claim_lost                the attempt is missing or not "verified".
+ *   attempt_budget_exhausted  this attempt already has its full budget of
+ *                             dispatches. Permanent: waiting restores nothing.
+ *   global_capacity_reached   an hourly or daily ceiling is full. Temporary:
+ *                             the attempt stays "verified" and may claim later.
+ *
+ * Checked in that order, so an attempt that is both out of budget and behind
+ * a full ceiling is told the permanent truth.
+ */
+export type BeginProvisioningDispatchResult =
+  | { outcome: "claimed"; attempt: RegistrationAttempt; dispatch: ProvisioningDispatch }
+  | { outcome: "claim_lost" }
+  | { outcome: "attempt_budget_exhausted" }
+  | { outcome: "global_capacity_reached" };
+
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 function sha256HexOfUtf8(value: string): string {
@@ -268,8 +308,10 @@ export interface RegistrationAttemptStore {
    * The pre-dispatch durability point. ONE atomic operation: the
    * "verified" -> "provisioning_in_flight" CAS (externalOutcome "unknown")
    * and the INSERT of exactly one evidence row, the next dispatch_seq for
-   * this attempt. No network call. Returns null when the CAS is lost —
-   * nothing was inserted and the caller must not dispatch. Throws when the
+   * this attempt — admitted only while this attempt has dispatch budget left
+   * and both global ceilings have room (BeginProvisioningDispatchResult). No
+   * network call. Any outcome but "claimed" means nothing was inserted or
+   * changed and the caller must not dispatch. Throws when the
    * evidence violates a constraint (malformed/wrong digest, a body digest or
    * an open dispatch that already exists): that transaction rolls back, the
    * claim is NOT made, the attempt stays "verified", and nothing may be
@@ -282,7 +324,7 @@ export interface RegistrationAttemptStore {
     credentialId: string;
     attemptedAt: string;
     evidence: ProvisioningDispatchEvidence;
-  }): Promise<{ attempt: RegistrationAttempt; dispatch: ProvisioningDispatch } | null>;
+  }): Promise<BeginProvisioningDispatchResult>;
 
   /** First writer wins: records the activity id (and Turnkey's fingerprint, verbatim) once. A different id never replaces a recorded one. */
   recordDispatchActivity(input: { dispatchId: string; activityId: string; fingerprint: string | null }): Promise<RecordDispatchActivityResult>;
@@ -444,7 +486,9 @@ function assertTerminalObservation(observation: DispatchTerminalObservation): vo
   if (observation.failureMessage !== null && observation.failureMessage.length > DISPATCH_FAILURE_MESSAGE_MAX_LENGTH) throw new Error("Provisioning dispatch terminal: failure_message is too long.");
 }
 
-export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptStore {
+/** `now` is a test seam for the dispatch ceilings' clock (the admission time and the new row's createdAt); production passes nothing. */
+export function createInMemoryRegistrationAttemptStore(options: { now?: () => number } = {}): RegistrationAttemptStore {
+  const admissionClock = options.now ?? Date.now;
   const attempts = new Map<string, RegistrationAttempt>();
   const appUserIndex = new Map<string, string>(); // appUserId -> credentialId
   const dispatches = new Map<string, ProvisioningDispatch>(); // dispatch id -> row, insertion-ordered
@@ -519,19 +563,33 @@ export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptSto
       // constraint violation throws BEFORE the claim: the attempt stays
       // "verified", as a failed statement would leave it.
       const current = attempts.get(credentialId);
-      if (!current || current.state !== "verified") return null;
-      assertDispatchEvidence(evidence);
+      if (!current || current.state !== "verified") return { outcome: "claim_lost" };
       const existing = [...dispatches.values()];
-      if (existing.some((row) => row.requestBodySha256 === evidence.requestBodySha256)) throw new Error("Provisioning dispatch evidence: this request body was already recorded (request_body_sha256 is unique).");
       const own = existing.filter((row) => row.credentialId === credentialId);
+
+      // The ceilings, decided before anything is written — the twin of the
+      // Neon statement's `decision`. Every row counts, whatever its terminal
+      // status. An attempt whose sequence numbers are not exactly 1..n is an
+      // inconsistent ledger: an error, never extra capacity.
+      const ownMaxSeq = own.reduce((max, row) => Math.max(max, row.dispatchSeq), 0);
+      if (ownMaxSeq !== own.length) throw new Error("Provisioning dispatch ledger is inconsistent for this attempt.");
+      if (own.length >= PROVISIONING_ATTEMPT_DISPATCH_BUDGET) return { outcome: "attempt_budget_exhausted" };
+      const admissionMs = admissionClock();
+      const within = (windowMs: number) => existing.filter((row) => Date.parse(row.createdAt) > admissionMs - windowMs).length;
+      if (within(PROVISIONING_HOURLY_WINDOW_MS) >= PROVISIONING_GLOBAL_HOURLY_DISPATCH_LIMIT || within(PROVISIONING_DAILY_WINDOW_MS) >= PROVISIONING_GLOBAL_DAILY_DISPATCH_LIMIT) {
+        return { outcome: "global_capacity_reached" };
+      }
+
+      assertDispatchEvidence(evidence);
+      if (existing.some((row) => row.requestBodySha256 === evidence.requestBodySha256)) throw new Error("Provisioning dispatch evidence: this request body was already recorded (request_body_sha256 is unique).");
       if (own.some((row) => row.terminalStatus === null)) throw new Error("Provisioning dispatch evidence: this attempt already has an open dispatch.");
 
-      const now = new Date().toISOString();
+      const now = new Date(admissionMs).toISOString();
       const claimed: RegistrationAttempt = { ...current, state: "provisioning_in_flight", externalOutcome: "unknown", externalProvisioningAttemptedAt: attemptedAt, updatedAt: now };
       const dispatch: ProvisioningDispatch = {
         id: randomUUID(),
         credentialId,
-        dispatchSeq: own.reduce((max, row) => Math.max(max, row.dispatchSeq), 0) + 1,
+        dispatchSeq: ownMaxSeq + 1,
         evidenceVersion: evidence.evidenceVersion,
         organizationId: evidence.organizationId,
         stampPublicKey: evidence.stampPublicKey,
@@ -561,7 +619,7 @@ export function createInMemoryRegistrationAttemptStore(): RegistrationAttemptSto
       };
       attempts.set(credentialId, claimed);
       dispatches.set(dispatch.id, dispatch);
-      return { attempt: claimed, dispatch: { ...dispatch } };
+      return { outcome: "claimed", attempt: claimed, dispatch: { ...dispatch } };
     },
 
     async recordDispatchActivity({ dispatchId, activityId, fingerprint }) {

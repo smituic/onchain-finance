@@ -505,10 +505,36 @@ describe("L5: the provisioning adapter smoke refuses BEFORE its first write, and
   });
 
   it("cleanup deletes dispatch rows and attempt rows in SEPARATE try blocks, only for smoke ids, and reports every failure", () => {
-    const cleanup = /afterAll\(async \(\) => \{([\s\S]*?)\n  \}\);/.exec(code)?.[1] ?? "";
+    const cleanup = /async function removeRunFixtures\(\): Promise<void> \{([\s\S]*?)\n  \}/.exec(code)?.[1] ?? "";
     expect(cleanup).toMatch(/if \(!id\.startsWith\(`smoke-\$\{runId\}-pd-`\)\) throw/);
     const tries = cleanup.match(/try \{\s*await sql`DELETE FROM (\w+)/g) ?? [];
     expect(tries.map((t) => t.split("DELETE FROM ")[1])).toEqual(["registration_provisioning_dispatches", "registration_attempts"]);
     expect(cleanup).toContain("expect(failures).toEqual([]);");
+    // One exact registered id per statement — never a pattern, a timestamp, or a status.
+    expect(cleanup.match(/DELETE FROM \w+ WHERE [^`]*/g)).toEqual(["DELETE FROM registration_provisioning_dispatches WHERE credential_id = ${id}", "DELETE FROM registration_attempts WHERE credential_id = ${id}"]);
+    expect(cleanup.indexOf("throw new Error")).toBeLessThan(cleanup.indexOf("DELETE FROM"));
+  });
+
+  it("Registration Abuse Protection: fixtures are removed after EVERY case by that same guarded cleanup — nothing is aged, and the ceilings are never bypassed", () => {
+    // The same function, behind the same "never connect for an unconfirmed target" guard, after each case and at the end.
+    for (const hook of ["afterEach", "afterAll"]) {
+      expect(code, hook).toContain(`${hook}(async () => {\n    if (!confirmedTargetUrl || cleanupCredentialIds.size === 0) return;\n    await removeRunFixtures();\n  });`);
+    }
+    expect(code.match(/removeRunFixtures\(\)/g)).toHaveLength(3); // its definition and the two hooks
+    // No timestamp is ever modified by this block, and no row is deleted anywhere but in that cleanup.
+    expect(code).not.toMatch(/SET\s+created_at|created_at\s*=|make_interval/);
+    expect(code.match(/DELETE FROM/g)).toHaveLength(2);
+    // The read-only preflight refuses a ledger that is not quiet, before any write.
+    const preflight = /beforeAll\(async \(\) => \{([\s\S]*?)\n  \}\);/.exec(code)?.[1] ?? "";
+    const quiet = preflight.indexOf("FROM registration_provisioning_dispatches WHERE created_at > now() - interval '25 hours'");
+    expect(quiet).toBeGreaterThan(0);
+    expect(quiet).toBeLessThan(preflight.indexOf("prerequisitesMet = true"));
+    expect(preflight).toContain("if (recent[0]?.n !== 0) {");
+    // No claim's result is left unchecked: every call is asserted, awaited into a comparison, or expected to throw.
+    const calls = code.match(/[^\n]*\.beginProvisioningDispatch\(/g) ?? [];
+    expect(calls.length).toBeGreaterThan(15);
+    for (const call of calls) expect(call).toMatch(/claimed\(await \w+(\.store)?\.beginProvisioningDispatch\($|expect\(await store\.beginProvisioningDispatch\($|await expect\((\w+\.)?store\.beginProvisioningDispatch\($|\.map\(\(n\) => store\.beginProvisioningDispatch\($/);
+    // The production limits are imported nowhere here to be changed, and no production module is mocked.
+    expect(code).not.toMatch(/PROVISIONING_GLOBAL_|PROVISIONING_ATTEMPT_|vi\.mock|vi\.doMock/);
   });
 });

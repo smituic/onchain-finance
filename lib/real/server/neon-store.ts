@@ -4,6 +4,9 @@ import { DuplicateAccountError, DuplicateCredentialError, IdentityConflictError,
 import { type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentPatch, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { PasskeyRevocationAttempt, PasskeyRevocationStore, RevocationAttemptPatch, RevocationAttemptState } from "./passkey-revocation-attempts";
 import {
+  PROVISIONING_ATTEMPT_DISPATCH_BUDGET,
+  PROVISIONING_GLOBAL_DAILY_DISPATCH_LIMIT,
+  PROVISIONING_GLOBAL_HOURLY_DISPATCH_LIMIT,
   REGISTRATION_IDENTITY_CONFLICT_REASON,
   assertGenericTransition,
   type ExternalProvisioningOutcome,
@@ -316,6 +319,22 @@ export function isAccountIdentityUniqueViolation(error: unknown): boolean {
  */
 export const ACCOUNT_HANDLE_PRIMARY_KEY = "real_account_handles_pkey";
 export const ACCOUNT_HANDLE_OWNER_KEY = "real_account_handles_app_user_id_key";
+
+/**
+ * Registration Abuse Protection: the ONE advisory lock every provisioning
+ * claim takes (beginProvisioningDispatch), so the dispatch ceilings are
+ * evaluated by one claimer at a time across every process.
+ *
+ * The value is the ASCII bytes "OCF_PROV" read as a signed 64-bit integer.
+ * It is dedicated: the only other advisory locks in this codebase are the
+ * per-account payment locks, `hashtext(app_user_id)::bigint`, and hashtext
+ * returns a 32-bit integer — this key is far outside that range, so no
+ * account's lock can ever equal it. Nothing else (handles, finalize, admin
+ * tooling) takes an advisory lock. A string, so it reaches Postgres exactly
+ * (it does not fit a JS number). Always taken with pg_advisory_xact_lock —
+ * never the session-scoped variant — and always AFTER the attempt's row lock.
+ */
+export const PROVISIONING_DISPATCH_ADVISORY_LOCK_KEY = "5711486127619329878";
 
 export function createNeonChallengeStore(sql: NeonQueryFunction<false, false>): ChallengeStore {
   return {
@@ -1024,55 +1043,115 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
       await sql`UPDATE registration_attempts SET counter = ${counter}, updated_at = now() WHERE credential_id = ${credentialId}`;
     },
 
-    // Provisioning Evidence Capture: the pre-dispatch durability point. ONE
-    // batch, no read before it, no network inside it.
+    // Provisioning Evidence Capture: the pre-dispatch durability point, and
+    // (Registration Abuse Protection) the ONLY admission gate for an external
+    // create. ONE batch = one READ COMMITTED transaction (createNeonSqlClient),
+    // no read before it, no network inside it. The statement ORDER is the
+    // invariant — each statement takes its own snapshot when it starts:
     //
-    //  1. ONE statement: the verified -> provisioning_in_flight CAS is the
-    //     `claimed` CTE and the evidence INSERT selects FROM claimed — so a
-    //     lost CAS has nothing to insert, and an INSERT that violates any
-    //     constraint (digest CHECK, body-digest / sequence / one-open
-    //     uniqueness) aborts the transaction and the claim with it: the
-    //     attempt stays 'verified'. (A batch that COMMITTED but whose HTTP
-    //     response was lost also throws here — with the claim and evidence
-    //     durable and nothing sent: review, fail closed.) dispatch_seq is MAX + 1 for this
-    //     attempt; only the CAS winner computes it, and UNIQUE
-    //     (credential_id, dispatch_seq) rejects a collision instead of ever
-    //     overwriting a row. The guard aborts if a won CAS did not insert
-    //     exactly one row.
-    //  2. Read the row back in the same transaction: what the caller stamps
+    //  1. Lock this attempt's row. Same-attempt claimers queue here, before
+    //     the global lock, so the lock order is always row -> global.
+    //  2. Take PROVISIONING_DISPATCH_ADVISORY_LOCK_KEY, transaction-scoped:
+    //     every claimer in every process queues here, and it is released only
+    //     when this transaction ends. A statement of its own, never a CTE of
+    //     statement 3 — a statement that waited on a lock keeps the snapshot
+    //     it started with and could miss what the previous holder committed.
+    //  3. ONE statement, started after both locks are held, so its snapshot
+    //     contains every dispatch any earlier claimer committed:
+    //       admission  one clock_timestamp() reading: the admission time.
+    //       ledger     this attempt's state, the rolling hour / 24-hour counts
+    //                  of ALL dispatch rows (`created_at > admission - window`,
+    //                  whatever their terminal status), and this attempt's own
+    //                  row count and highest sequence.
+    //       verdict    the decision, made once: claim_lost,
+    //                  ledger_inconsistent (own rows are not exactly 1..n),
+    //                  attempt_budget_exhausted, global_capacity_reached, or
+    //                  admit.
+    //       claimed    the verified -> provisioning_in_flight CAS, only on
+    //                  'admit'.
+    //       inserted   the evidence INSERT, selecting FROM claimed — so a
+    //                  refused or lost claim has nothing to insert — with
+    //                  created_at set to the admission time the counts used.
+    //     An INSERT that violates any constraint (digest CHECK, body-digest /
+    //     sequence / one-open uniqueness) aborts the transaction and the claim
+    //     with it: the attempt stays 'verified' and no capacity is consumed.
+    //     (A batch that COMMITTED but whose HTTP response was lost also throws
+    //     here — with the claim and evidence durable, the capacity consumed,
+    //     and nothing sent: review, fail closed.) dispatch_seq is MAX + 1 for
+    //     this attempt; UNIQUE (credential_id, dispatch_seq) rejects a
+    //     collision instead of ever overwriting a row. The guard aborts if a
+    //     won CAS did not insert exactly one row.
+    //  4. Read the row back in the same transaction: what the caller stamps
     //     and sends is this PERSISTED body, never its own copy.
+    //
+    // A refusal writes nothing: no row, no sequence number, no state change.
     async beginProvisioningDispatch({ credentialId, attemptedAt, evidence }) {
       const results = await sql.transaction([
+        sql`SELECT credential_id FROM registration_attempts WHERE credential_id = ${credentialId} FOR UPDATE`,
+        sql`SELECT pg_catalog.pg_advisory_xact_lock(${PROVISIONING_DISPATCH_ADVISORY_LOCK_KEY}::bigint)`,
         sql`
-          WITH claimed AS (
-            UPDATE registration_attempts
+          WITH admission AS MATERIALIZED (
+            SELECT pg_catalog.clock_timestamp() AS at
+          ),
+          ledger AS MATERIALIZED (
+            SELECT
+              admission.at,
+              (SELECT a.state FROM registration_attempts a WHERE a.credential_id = ${credentialId}) AS attempt_state,
+              (SELECT count(*) FROM registration_provisioning_dispatches d WHERE d.created_at > admission.at - interval '1 hour') AS hour_count,
+              (SELECT count(*) FROM registration_provisioning_dispatches d WHERE d.created_at > admission.at - interval '24 hours') AS day_count,
+              (SELECT count(*) FROM registration_provisioning_dispatches d WHERE d.credential_id = ${credentialId}) AS own_count,
+              (SELECT COALESCE(MAX(d.dispatch_seq), 0) FROM registration_provisioning_dispatches d WHERE d.credential_id = ${credentialId}) AS own_max_seq
+            FROM admission
+          ),
+          verdict AS MATERIALIZED (
+            SELECT
+              l.at,
+              CASE
+                WHEN l.attempt_state IS DISTINCT FROM 'verified' THEN 'claim_lost'
+                WHEN l.own_max_seq <> l.own_count THEN 'ledger_inconsistent'
+                WHEN l.own_count >= ${PROVISIONING_ATTEMPT_DISPATCH_BUDGET}::int THEN 'attempt_budget_exhausted'
+                WHEN l.hour_count >= ${PROVISIONING_GLOBAL_HOURLY_DISPATCH_LIMIT}::int OR l.day_count >= ${PROVISIONING_GLOBAL_DAILY_DISPATCH_LIMIT}::int THEN 'global_capacity_reached'
+                ELSE 'admit'
+              END AS decision
+            FROM ledger l
+          ),
+          claimed AS (
+            UPDATE registration_attempts a
             SET state = 'provisioning_in_flight', external_outcome = 'unknown',
                 external_provisioning_attempted_at = ${attemptedAt}::timestamptz, updated_at = now()
-            WHERE credential_id = ${credentialId} AND state = 'verified'
-            RETURNING *
+            FROM verdict v
+            WHERE a.credential_id = ${credentialId} AND a.state = 'verified' AND v.decision = 'admit'
+            RETURNING a.*
           ),
           inserted AS (
             INSERT INTO registration_provisioning_dispatches
-              (credential_id, dispatch_seq, evidence_version, organization_id, stamp_public_key, request_timestamp_ms, request_body, request_body_sha256)
+              (credential_id, dispatch_seq, evidence_version, organization_id, stamp_public_key, request_timestamp_ms, request_body, request_body_sha256, created_at, updated_at)
             SELECT c.credential_id,
                    (SELECT COALESCE(MAX(d.dispatch_seq), 0) + 1 FROM registration_provisioning_dispatches d WHERE d.credential_id = c.credential_id),
                    ${evidence.evidenceVersion}::int, ${evidence.organizationId}, ${evidence.stampPublicKey},
-                   ${evidence.requestTimestampMs}::bigint, ${evidence.requestBody}, ${evidence.requestBodySha256}
-            FROM claimed c
+                   ${evidence.requestTimestampMs}::bigint, ${evidence.requestBody}, ${evidence.requestBodySha256}, v.at, v.at
+            FROM claimed c CROSS JOIN verdict v
             RETURNING id
           )
-          SELECT c.*,
-                 (SELECT (c.state || ':provisioning_dispatch_mismatch')::int WHERE (SELECT count(*) FROM inserted) <> 1) AS guard
-          FROM claimed c
+          SELECT c.*, v.decision,
+                 (SELECT (x.state || ':provisioning_dispatch_mismatch')::int FROM claimed x WHERE (SELECT count(*) FROM inserted) <> 1) AS guard
+          FROM verdict v LEFT JOIN claimed c ON true
         `,
         sql`SELECT * FROM registration_provisioning_dispatches WHERE credential_id = ${credentialId} AND request_body_sha256 = ${evidence.requestBodySha256}`,
       ]);
-      const attemptRow = (results[0] as Row[])[0];
-      if (!attemptRow) return null; // lost the CAS: nothing was inserted, nothing may be dispatched
-      const dispatchRow = (results[1] as Row[])[0];
+      const verdictRow = (results[2] as Row[])[0];
+      const decision = verdictRow?.decision;
+      if (decision === "claim_lost" || decision === "attempt_budget_exhausted" || decision === "global_capacity_reached") {
+        // Nothing was inserted or changed; nothing may be dispatched.
+        return { outcome: decision };
+      }
+      // Anything but an admitted, claimed row is an error — never a refusal, never capacity.
+      if (decision === "ledger_inconsistent") throw new Error("Provisioning dispatch ledger is inconsistent for this attempt.");
+      if (decision !== "admit" || !verdictRow || verdictRow.credential_id !== credentialId) throw new Error("Provisioning dispatch claim returned no usable decision.");
+      const dispatchRow = (results[3] as Row[])[0];
       // Unreachable while the guard holds; never dispatch without the persisted row.
       if (!dispatchRow) throw new Error("Provisioning dispatch claim committed without its evidence row.");
-      return { attempt: toAttempt(attemptRow), dispatch: toDispatch(dispatchRow) };
+      return { outcome: "claimed", attempt: toAttempt(verdictRow), dispatch: toDispatch(dispatchRow) };
     },
 
     // First writer wins. The WHERE clause is the write-once guard; a row that

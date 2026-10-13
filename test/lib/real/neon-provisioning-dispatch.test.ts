@@ -2,8 +2,13 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createNeonDurableStores } from "@/lib/real/server/neon-store";
-import type { DispatchTerminalObservation } from "@/lib/real/server/registration-attempts";
+import { PROVISIONING_DISPATCH_ADVISORY_LOCK_KEY, createNeonDurableStores } from "@/lib/real/server/neon-store";
+import {
+  PROVISIONING_ATTEMPT_DISPATCH_BUDGET,
+  PROVISIONING_GLOBAL_DAILY_DISPATCH_LIMIT,
+  PROVISIONING_GLOBAL_HOURLY_DISPATCH_LIMIT,
+  type DispatchTerminalObservation,
+} from "@/lib/real/server/registration-attempts";
 
 /**
  * Provisioning Evidence Capture: the Neon adapter's dispatch-evidence SQL,
@@ -119,59 +124,128 @@ const flat = (query: string) => query.replace(/\s+/g, " ").trim();
 
 const IMMUTABLE_COLUMNS = ["id", "credential_id", "dispatch_seq", "evidence_version", "organization_id", "stamp_public_key", "request_timestamp_ms", "request_body", "request_body_sha256", "created_at"];
 
-describe("Neon beginProvisioningDispatch: the claim and the evidence INSERT are ONE statement", () => {
-  it("sends exactly ONE ReadCommitted batch — no read before it — of two statements: claim+insert, then the read-back", async () => {
-    respond = () => Response.json({ results: [result([attemptRow]), result([dispatchRow()])] });
+/** The claim batch's four answers, in order: the row lock, the advisory lock, the decision (+ the claimed row), the read-back. */
+function claimBatch(decision: string, options: { claimedRow?: boolean; readBack?: Array<Record<string, unknown>> } = {}) {
+  const claimedRow = options.claimedRow ?? decision === "admit";
+  const verdict = claimedRow ? { ...attemptRow, decision } : { ...Object.fromEntries(Object.keys(attemptRow).map((key) => [key, null])), decision };
+  // An all-NULL row still needs its column names, so the fields come from the full attempt row.
+  const verdictResult = { fields: Object.keys(verdict).map((name) => ({ name, dataTypeID: 25 })), rows: [Object.values(verdict).map((value) => (value === null ? null : String(value)))] };
+  return Response.json({ results: [result([{ credential_id: CREDENTIAL_ID }]), result([{ pg_advisory_xact_lock: "" }]), verdictResult, result(options.readBack ?? [dispatchRow()])] });
+}
+
+describe("Neon beginProvisioningDispatch: lock, then decide and claim and insert in ONE statement", () => {
+  it("sends exactly ONE ReadCommitted batch — no read before it — of four statements", async () => {
+    respond = () => claimBatch("admit");
     await begin();
     expect(sent).toHaveLength(1);
     expect(sent[0]!.single).toBeNull();
     expect(sent[0]!.isolation).toBe("ReadCommitted");
-    expect(sent[0]!.queries).toHaveLength(2);
+    expect(sent[0]!.queries).toHaveLength(4);
   });
 
-  it("the CAS is the `claimed` CTE; the INSERT selects FROM claimed (never VALUES), so a lost CAS has nothing to insert", async () => {
-    respond = () => Response.json({ results: [result([attemptRow]), result([dispatchRow()])] });
+  it("lock order: the attempt's row lock FIRST, then the dedicated transaction-scoped advisory lock — each a statement of its own", async () => {
+    respond = () => claimBatch("admit");
     await begin();
-    const statement = flat(sent[0]!.queries![0]!.query);
-    expect(statement).toMatch(/^WITH claimed AS \( UPDATE registration_attempts SET state = 'provisioning_in_flight', external_outcome = 'unknown', external_provisioning_attempted_at = \$1::timestamptz, updated_at = now\(\) WHERE credential_id = \$2 AND state = 'verified' RETURNING \* \)/);
-    expect(statement).toMatch(/inserted AS \( INSERT INTO registration_provisioning_dispatches \(credential_id, dispatch_seq, evidence_version, organization_id, stamp_public_key, request_timestamp_ms, request_body, request_body_sha256\) SELECT c\.credential_id, .* FROM claimed c RETURNING id \)/);
+    const [rowLock, advisoryLock, claim, readBack] = sent[0]!.queries!.map((query) => ({ text: flat(query.query), params: query.params }));
+    expect(rowLock).toEqual({ text: "SELECT credential_id FROM registration_attempts WHERE credential_id = $1 FOR UPDATE", params: [CREDENTIAL_ID] });
+    expect(advisoryLock).toEqual({ text: "SELECT pg_catalog.pg_advisory_xact_lock($1::bigint)", params: [PROVISIONING_DISPATCH_ADVISORY_LOCK_KEY] });
+    // The lock is taken nowhere else: not inside the statement that counts (a
+    // statement that waited on a lock keeps the snapshot it started with).
+    expect(claim!.text).not.toMatch(/advisory/i);
+    expect(claim!.text).not.toMatch(/FOR UPDATE/i);
+    expect(readBack!.text).not.toMatch(/advisory|FOR UPDATE/i);
+    // Transaction-scoped only: a session lock would outlive the batch.
+    for (const query of sent[0]!.queries!) expect(query.query).not.toMatch(/pg_advisory_lock|pg_try_advisory|pg_advisory_unlock/);
+  });
+
+  it("the advisory key is one fixed bigint outside the 32-bit range every hashtext()-keyed payment lock lives in", () => {
+    expect(PROVISIONING_DISPATCH_ADVISORY_LOCK_KEY).toBe("5711486127619329878");
+    expect(BigInt(PROVISIONING_DISPATCH_ADVISORY_LOCK_KEY)).toBe(BigInt(`0x${Buffer.from("OCF_PROV", "ascii").toString("hex")}`));
+    const key = BigInt(PROVISIONING_DISPATCH_ADVISORY_LOCK_KEY);
+    expect(key > BigInt(2) ** BigInt(31) - BigInt(1)).toBe(true);
+    expect(key <= BigInt(2) ** BigInt(63) - BigInt(1)).toBe(true);
+  });
+
+  it("the ceilings are counted in the claim statement, from the ledger, against ONE post-lock clock reading that is also the new row's created_at", async () => {
+    respond = () => claimBatch("admit");
+    await begin();
+    const statement = flat(sent[0]!.queries![2]!.query);
+    expect(statement).toMatch(/^WITH admission AS MATERIALIZED \( SELECT pg_catalog\.clock_timestamp\(\) AS at \), ledger AS MATERIALIZED \(/);
+    expect(statement.match(/clock_timestamp\(\)/g)).toHaveLength(1);
+    // Rolling, half-open windows over EVERY dispatch row: no status, outcome, or account filter.
+    expect(statement).toContain("(SELECT count(*) FROM registration_provisioning_dispatches d WHERE d.created_at > admission.at - interval '1 hour') AS hour_count");
+    expect(statement).toContain("(SELECT count(*) FROM registration_provisioning_dispatches d WHERE d.created_at > admission.at - interval '24 hours') AS day_count");
+    expect(statement).toContain("(SELECT count(*) FROM registration_provisioning_dispatches d WHERE d.credential_id = $2) AS own_count");
+    expect(statement).not.toMatch(/terminal_status|external_outcome = 'confirmed|real_accounts|real_rate_limits/);
+    // The window never uses the transaction-start clock, and no client timestamp reaches it.
+    expect(statement).not.toMatch(/created_at > now\(\)|statement_timestamp|transaction_timestamp/);
+    expect(statement).toContain("WHEN l.attempt_state IS DISTINCT FROM 'verified' THEN 'claim_lost' WHEN l.own_max_seq <> l.own_count THEN 'ledger_inconsistent' WHEN l.own_count >= $4::int THEN 'attempt_budget_exhausted' WHEN l.hour_count >= $5::int OR l.day_count >= $6::int THEN 'global_capacity_reached' ELSE 'admit' END AS decision");
+  });
+
+  it("the CAS is the `claimed` CTE and fires only on 'admit'; the INSERT selects FROM claimed (never VALUES), so a refused or lost claim has nothing to insert", async () => {
+    respond = () => claimBatch("admit");
+    await begin();
+    const statement = flat(sent[0]!.queries![2]!.query);
+    expect(statement).toContain(
+      "claimed AS ( UPDATE registration_attempts a SET state = 'provisioning_in_flight', external_outcome = 'unknown', external_provisioning_attempted_at = $7::timestamptz, updated_at = now() FROM verdict v WHERE a.credential_id = $8 AND a.state = 'verified' AND v.decision = 'admit' RETURNING a.* )",
+    );
+    expect(statement).toMatch(
+      /inserted AS \( INSERT INTO registration_provisioning_dispatches \(credential_id, dispatch_seq, evidence_version, organization_id, stamp_public_key, request_timestamp_ms, request_body, request_body_sha256, created_at, updated_at\) SELECT c\.credential_id, .*, v\.at, v\.at FROM claimed c CROSS JOIN verdict v RETURNING id \)/,
+    );
     expect(statement).not.toMatch(/\bVALUES\b/i);
     expect(statement).not.toMatch(/ON CONFLICT/i); // a collision must abort the statement, never be skipped or overwrite a row
     // The next sequence number for THIS attempt, computed inside the same statement.
     expect(statement).toContain("(SELECT COALESCE(MAX(d.dispatch_seq), 0) + 1 FROM registration_provisioning_dispatches d WHERE d.credential_id = c.credential_id)");
     // A won CAS that did not insert exactly one row aborts the whole statement.
-    expect(statement).toMatch(/:provisioning_dispatch_mismatch'\)::int WHERE \(SELECT count\(\*\) FROM inserted\) <> 1\) AS guard FROM claimed c$/);
-    // Exactly one UPDATE (the claim) and one INSERT; the read-back writes nothing.
-    expect(statement.match(/\bUPDATE\b/g)).toHaveLength(1);
-    expect(statement.match(/\bINSERT\b/g)).toHaveLength(1);
-    expect(flat(sent[0]!.queries![1]!.query)).toBe("SELECT * FROM registration_provisioning_dispatches WHERE credential_id = $1 AND request_body_sha256 = $2");
+    expect(statement).toMatch(/:provisioning_dispatch_mismatch'\)::int FROM claimed x WHERE \(SELECT count\(\*\) FROM inserted\) <> 1\) AS guard FROM verdict v LEFT JOIN claimed c ON true$/);
+    // Exactly one UPDATE (the claim) and one INSERT in the whole batch; the locks and the read-back write nothing.
+    const whole = sent[0]!.queries!.map((query) => flat(query.query)).join(" ; ");
+    expect(whole.match(/\bUPDATE\b/g)).toHaveLength(2); // the claim, and the row lock's "FOR UPDATE"
+    expect(whole.match(/\bINSERT\b/g)).toHaveLength(1);
+    expect(whole).not.toMatch(/\bDELETE\b/i);
+    expect(flat(sent[0]!.queries![3]!.query)).toBe("SELECT * FROM registration_provisioning_dispatches WHERE credential_id = $1 AND request_body_sha256 = $2");
   });
 
-  it("the exact body string is a bound parameter, byte for byte — never interpolated, trimmed, or re-serialized", async () => {
-    respond = () => Response.json({ results: [result([attemptRow]), result([dispatchRow()])] });
+  it("the limits are the code constants and the exact body string is a bound parameter, byte for byte — never interpolated, trimmed, or re-serialized", async () => {
+    respond = () => claimBatch("admit");
     await begin();
-    const { query, params } = sent[0]!.queries![0]!;
-    expect(params).toEqual(["2026-09-24T00:00:00.000Z", CREDENTIAL_ID, "1", "parent-org", "02abc", "1790204988123", BODY, SHA]);
+    const { query, params } = sent[0]!.queries![2]!;
+    expect([PROVISIONING_ATTEMPT_DISPATCH_BUDGET, PROVISIONING_GLOBAL_HOURLY_DISPATCH_LIMIT, PROVISIONING_GLOBAL_DAILY_DISPATCH_LIMIT]).toEqual([2, 5, 20]);
+    expect(params).toEqual([CREDENTIAL_ID, CREDENTIAL_ID, CREDENTIAL_ID, "2", "5", "20", "2026-09-24T00:00:00.000Z", CREDENTIAL_ID, "1", "parent-org", "02abc", "1790204988123", BODY, SHA]);
     expect(query).not.toContain(BODY);
     expect(query).not.toContain(SHA);
-    expect(sent[0]!.queries![1]!.params).toEqual([CREDENTIAL_ID, SHA]);
+    expect(sent[0]!.queries![3]!.params).toEqual([CREDENTIAL_ID, SHA]);
   });
 
-  it("won claim -> the claimed attempt and the PERSISTED dispatch row (body returned verbatim)", async () => {
-    respond = () => Response.json({ results: [result([attemptRow]), result([dispatchRow()])] });
+  it("admitted claim -> the claimed attempt and the PERSISTED dispatch row (body returned verbatim)", async () => {
+    respond = () => claimBatch("admit");
     const begun = await begin();
-    expect(begun?.attempt).toMatchObject({ credentialId: CREDENTIAL_ID, state: "provisioning_in_flight", externalOutcome: "unknown" });
-    expect(begun?.dispatch).toMatchObject({ id: DISPATCH_ID, dispatchSeq: 1, evidenceVersion: 1, requestTimestampMs: 1790204988123, requestBody: BODY, requestBodySha256: SHA, turnkeyActivityId: null, terminalStatus: null });
+    expect(begun).toMatchObject({
+      outcome: "claimed",
+      attempt: { credentialId: CREDENTIAL_ID, state: "provisioning_in_flight", externalOutcome: "unknown" },
+      dispatch: { id: DISPATCH_ID, dispatchSeq: 1, evidenceVersion: 1, requestTimestampMs: 1790204988123, requestBody: BODY, requestBodySha256: SHA, turnkeyActivityId: null, terminalStatus: null },
+    });
   });
 
-  it("lost CAS -> null, even if the read-back returned a row (nothing was claimed, so nothing may be dispatched)", async () => {
-    respond = () => Response.json({ results: [result([]), result([dispatchRow()])] });
-    expect(await begin()).toBeNull();
+  it.each(["claim_lost", "attempt_budget_exhausted", "global_capacity_reached"] as const)("decision %s -> exactly that outcome and nothing else, even if the read-back returned a row; no follow-up statement", async (decision) => {
+    respond = () => claimBatch(decision);
+    expect(await begin()).toEqual({ outcome: decision });
+    expect(sent).toHaveLength(1);
+  });
+
+  it.each([
+    ["an inconsistent ledger", () => claimBatch("ledger_inconsistent"), /ledger is inconsistent/],
+    ["a decision this code does not know", () => claimBatch("something_else"), /no usable decision/],
+    ["'admit' with no claimed row", () => claimBatch("admit", { claimedRow: false }), /no usable decision/],
+    ["no decision row at all", () => Response.json({ results: [result([]), result([]), result([]), result([dispatchRow()])] }), /no usable decision/],
+  ])("%s is THROWN — never read as a refusal, and never as capacity", async (_label, answer, message) => {
+    respond = answer;
+    await expect(begin()).rejects.toThrow(message);
     expect(sent).toHaveLength(1);
   });
 
   it("won claim but no evidence row in the read-back -> throws; never dispatches without the persisted row", async () => {
-    respond = () => Response.json({ results: [result([attemptRow]), result([])] });
+    respond = () => claimBatch("admit", { readBack: [] });
     await expect(begin()).rejects.toThrow(/without its evidence row/);
   });
 
@@ -181,8 +255,18 @@ describe("Neon beginProvisioningDispatch: the claim and the evidence INSERT are 
     ["the digest CHECK", { message: 'new row for relation "registration_provisioning_dispatches" violates check constraint "registration_provisioning_dispatches_body_digest_check"', code: "23514" }],
     ["the in-statement guard", { message: 'invalid input syntax for type integer: "provisioning_in_flight:provisioning_dispatch_mismatch"', code: "22P02" }],
     ["a missing table (migration not applied)", { message: 'relation "registration_provisioning_dispatches" does not exist', code: "42P01" }],
-  ])("a database error from %s is THROWN (the batch rolled back: the attempt is still 'verified') — never null, never a retry, never a follow-up write", async (_label, body) => {
+    ["a lock timeout / cancelled statement", { message: "canceling statement due to statement timeout", code: "57014" }],
+    ["a deadlock", { message: "deadlock detected", code: "40P01" }],
+  ])("a database error from %s is THROWN (the batch rolled back: the attempt is still 'verified', no capacity consumed) — never a refusal, never a retry, never a follow-up write", async (_label, body) => {
     respond = () => new Response(JSON.stringify(body), { status: 400 });
+    await expect(begin()).rejects.toThrow();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("a network failure is thrown too — never mistaken for 'capacity reached'", async () => {
+    respond = () => {
+      throw new TypeError("fetch failed");
+    };
     await expect(begin()).rejects.toThrow();
     expect(sent).toHaveLength(1);
   });

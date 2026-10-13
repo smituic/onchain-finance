@@ -3,7 +3,7 @@ import { createRealPublicClient } from "../chain/client";
 import { createRealSafeAccount, type SafeAccountPublicClient } from "../account/safe";
 import { createVerifiedTurnkeyOwnerAccount } from "../signing/verified-account";
 import type { RealAccountRecord, RealAccountRegistry } from "./registry";
-import { accountMatchesAttempt, type ProvisionedIdentity, type RegistrationAttempt, type RegistrationAttemptStore } from "./registration-attempts";
+import { PROVISIONING_ATTEMPT_DISPATCH_BUDGET, accountMatchesAttempt, type ProvisionedIdentity, type RegistrationAttempt, type RegistrationAttemptStore } from "./registration-attempts";
 import type { RealServerConfig } from "./config";
 import { runProvisioningDispatch } from "./provisioning-dispatch";
 import type { ParentTurnkeyDeps } from "./turnkey-provisioning";
@@ -16,7 +16,11 @@ export type OnboardingOutcome =
   /** Positively known not to be safely completable (an identity conflict at finalize) — never guessed; manual review. */
   | { outcome: "blocked"; reason: string }
   /** No durable onboarding state exists for this attempt (or it can never proceed) — distinct from "pending". */
-  | { outcome: "rejected"; reason: string };
+  | { outcome: "rejected"; reason: string }
+  /** A global account-opening ceiling is full. Nothing was dispatched; the attempt is still "verified" and a later sign-in may continue it. Temporary — never retried automatically. */
+  | { outcome: "capacity_reached"; reason: string }
+  /** This attempt has used every provisioning dispatch it is allowed. Nothing was dispatched, and waiting restores nothing — never presented as a temporary limit. */
+  | { outcome: "setup_exhausted"; reason: string };
 
 /**
  * S5 L2 (Option 3): the honest answer for an attempt whose
@@ -25,6 +29,14 @@ export type OnboardingOutcome =
  */
 export const PROVISIONING_NEEDS_REVIEW_REASON =
   "Account setup couldn't be confirmed, so it needs review before it can continue. Trying again won't resolve it.";
+
+/**
+ * Registration Abuse Protection: the two ceiling refusals, in ordinary
+ * language. Neither names a limit, a count, or a window.
+ */
+export const REGISTRATION_CAPACITY_REACHED_REASON =
+  'We can\'t open new accounts right now. Your passkey is saved. Please try again later using "I already have an account."';
+export const REGISTRATION_SETUP_EXHAUSTED_REASON = "We couldn't finish setting up this account. Trying again with this passkey won't work.";
 
 function issueSession(account: RealAccountRecord, credentialId: string, config: RealServerConfig): string {
   return serializeSession(createSessionPayload({ appUserId: account.appUserId, credentialId, sessionEpoch: account.sessionEpoch }), config.sessionSecret);
@@ -151,6 +163,12 @@ export async function runProvisioningPipeline(input: {
       return runProvisioningPipeline({ ...input, attempt: fresh });
     }
 
+    // The dispatch ceilings refused the claim: nothing was written or sent,
+    // and the attempt is exactly as it was. No re-read, no retry, no new
+    // registration — just the honest answer.
+    if (dispatched.kind === "capacity_reached") return { outcome: "capacity_reached", reason: REGISTRATION_CAPACITY_REACHED_REASON };
+    if (dispatched.kind === "attempt_budget_exhausted") return { outcome: "setup_exhausted", reason: REGISTRATION_SETUP_EXHAUSTED_REASON };
+
     if (dispatched.kind === "definitive_failure") {
       // Turnkey's own activity ledger resolved this dispatch's exact activity
       // to a terminal FAILED/REJECTED status (already recorded on its
@@ -162,6 +180,10 @@ export async function runProvisioningPipeline(input: {
         provisioningDiagnostic("warn", "definitive_failure_revert_refused");
         return { outcome: "pending", reason: PROVISIONING_NEEDS_REVIEW_REASON };
       }
+      // That was this attempt's last allowed dispatch: say so now rather than
+      // inviting a retry the claim will refuse. Messaging only — the claim
+      // itself is what enforces the budget.
+      if (dispatched.dispatchSeq >= PROVISIONING_ATTEMPT_DISPATCH_BUDGET) return { outcome: "setup_exhausted", reason: REGISTRATION_SETUP_EXHAUSTED_REASON };
       return { outcome: "pending", reason: "Account setup failed and can be retried. Try again in a moment." };
     }
 

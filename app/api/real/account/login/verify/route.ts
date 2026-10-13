@@ -29,6 +29,13 @@ export async function POST(request: Request) {
     // "pending" outcome must never be mistaken for a successful account response.
     if (result.outcome === "pending") return jsonError(result.reason, 503);
 
+    // Registration Abuse Protection. Neither is a session, and neither is
+    // "pending": the first is temporary (503, like any not-now answer here),
+    // the second is final for this attempt (409, like "blocked"). The `code`
+    // tells them apart; no count, limit, or retry time is ever sent.
+    if (result.outcome === "capacity_reached") return Response.json({ error: result.reason, code: "registration_capacity_reached" }, { status: 503 });
+    if (result.outcome === "setup_exhausted") return Response.json({ error: result.reason, code: "registration_setup_exhausted" }, { status: 409 });
+
     const store = await cookies();
     store.set(REAL_SESSION_COOKIE_NAME, result.sessionCookie, realSessionCookieOptions());
 

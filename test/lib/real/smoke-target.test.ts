@@ -867,6 +867,7 @@ const DISPOSABLE_SMOKES: Array<[string, string[]]> = [
   [`${R}payment-recipient-identity-migration.smoke.test.ts`, ["REAL_SMOKE_PAYMENT_RECIPIENT_MIGRATION", "REAL_SMOKE_PAYMENT_RECIPIENT_MIGRATION_PUBLIC"]],
   [`${R}handle-pay-reserve.smoke.test.ts`, ["REAL_SMOKE_HANDLE_PAY_RESERVE"]],
   [`${R}rate-limit.smoke.test.ts`, ["REAL_SMOKE_RATE_LIMIT", "REAL_SMOKE_RATE_LIMIT_PUBLIC"]],
+  [`${R}provisioning-limits.smoke.test.ts`, ["REAL_SMOKE_PROVISIONING_LIMITS"]],
 ];
 /** Every live suite family: its file, and the smoke gates it may run with. */
 const FAMILIES: Array<[string, string[]]> = [
@@ -939,7 +940,7 @@ describe("the race smoke (static)", () => {
   });
 });
 
-describe("the five disposable smokes (static)", () => {
+describe("the disposable-branch smokes (static)", () => {
   it.each(DISPOSABLE_SMOKES)("%s: every connection comes from the shared, now-confirmed helper; the header documents the new variable", (file, gates) => {
     const source = read(file);
     const code = codeOf(file);
