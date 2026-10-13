@@ -31,11 +31,22 @@
  * NOT IN THIS SLICE: per-IP or global limits. These endpoints are
  * authenticated, so resistance to many accounts (Sybil) belongs at
  * registration; this slice does not by itself make a public deployment ready.
+ *
+ * PROVIDER BUDGETS (Milestone 3, Slice 3A-0 — the second half of this file):
+ * a SIBLING limiter for requests that make the server call a provider. Same
+ * subject, algorithm, one-decision rule, and fail-closed behaviour, but its own
+ * six buckets, its own store type, and its own table (real_provider_budgets).
+ * The two never mix: each limiter refuses the other's bucket names. It is
+ * FOUNDATION ONLY — no numeric limit is approved, nothing here names one, and
+ * no route consults it yet.
  */
 export const RATE_LIMIT_BUCKETS = ["pay_prepare_day", "pay_prepare_short", "recipient_probe_day", "recipient_probe_short"] as const;
 export type RateLimitBucket = (typeof RATE_LIMIT_BUCKETS)[number];
 
-export type RateLimitPolicy = { readonly bucket: RateLimitBucket; readonly limit: number; readonly windowSeconds: number };
+/** One fixed-window budget: at most `limit` requests per `windowSeconds` in `bucket`. */
+type WindowPolicy<B extends string> = { readonly bucket: B; readonly limit: number; readonly windowSeconds: number };
+
+export type RateLimitPolicy = WindowPolicy<RateLimitBucket>;
 
 const TEN_MINUTES_SECONDS = 10 * 60;
 const ONE_DAY_SECONDS = 24 * 60 * 60;
@@ -74,7 +85,7 @@ export interface RateLimiter {
   consume(input: { subject: string; policies: readonly RateLimitPolicy[] }): Promise<RateLimitDecision>;
 }
 
-const isKnownBucket = (value: unknown): value is RateLimitBucket => typeof value === "string" && (RATE_LIMIT_BUCKETS as readonly string[]).includes(value);
+const RATE_LIMIT_REFUSED = "Rate limit refused";
 const isPositiveInt = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
 
 /** Byte order — the same order Postgres gives `COLLATE "C"`, which is how the Neon statement orders its rows. */
@@ -89,13 +100,18 @@ const byBucket = (a: { bucket: string }, b: { bucket: string }) => (a.bucket < b
  * charged twice or silently dropped).
  */
 export function normalizeRateLimitPolicies(policies: readonly RateLimitPolicy[]): RateLimitPolicy[] {
-  if (!Array.isArray(policies) || policies.length === 0) throw new Error("Rate limit refused: no policy was given.");
+  return normalizePolicies(RATE_LIMIT_REFUSED, RATE_LIMIT_BUCKETS, policies);
+}
+
+/** Shared by both limiters; `allowed` is the ONE bucket list this limiter may charge, and `refused` prefixes its errors. */
+function normalizePolicies<B extends string>(refused: string, allowed: readonly B[], policies: readonly WindowPolicy<B>[]): WindowPolicy<B>[] {
+  if (!Array.isArray(policies) || policies.length === 0) throw new Error(`${refused}: no policy was given.`);
   const seen = new Set<string>();
-  const normalized: RateLimitPolicy[] = [];
+  const normalized: WindowPolicy<B>[] = [];
   for (const policy of policies) {
-    if (!policy || !isKnownBucket(policy.bucket)) throw new Error("Rate limit refused: unknown bucket.");
-    if (!isPositiveInt(policy.limit) || !isPositiveInt(policy.windowSeconds)) throw new Error("Rate limit refused: a limit and a window must be positive whole numbers.");
-    if (seen.has(policy.bucket)) throw new Error("Rate limit refused: the same bucket was named twice.");
+    if (!policy || typeof policy.bucket !== "string" || !(allowed as readonly string[]).includes(policy.bucket)) throw new Error(`${refused}: unknown bucket.`);
+    if (!isPositiveInt(policy.limit) || !isPositiveInt(policy.windowSeconds)) throw new Error(`${refused}: a limit and a window must be positive whole numbers.`);
+    if (seen.has(policy.bucket)) throw new Error(`${refused}: the same bucket was named twice.`);
     seen.add(policy.bucket);
     normalized.push({ bucket: policy.bucket, limit: policy.limit, windowSeconds: policy.windowSeconds });
   }
@@ -110,13 +126,17 @@ export function normalizeRateLimitPolicies(policies: readonly RateLimitPolicy[])
  * not reported.
  */
 export function decideRateLimit(policies: readonly RateLimitPolicy[], states: readonly RateLimitBucketState[]): RateLimitDecision {
-  if (!Array.isArray(states) || states.length !== policies.length) throw new Error("Rate limit refused: the store did not report every bucket.");
+  return decide(RATE_LIMIT_REFUSED, policies, states);
+}
+
+function decide(refused: string, policies: readonly WindowPolicy<string>[], states: readonly RateLimitBucketState[]): RateLimitDecision {
+  if (!Array.isArray(states) || states.length !== policies.length) throw new Error(`${refused}: the store did not report every bucket.`);
   let retryAfterSeconds = 0;
   for (const policy of policies) {
     const matching = states.filter((state) => state.bucket === policy.bucket);
-    if (matching.length !== 1) throw new Error("Rate limit refused: the store did not report every bucket.");
+    if (matching.length !== 1) throw new Error(`${refused}: the store did not report every bucket.`);
     const { hits, secondsUntilReset } = matching[0]!;
-    if (!isPositiveInt(hits) || typeof secondsUntilReset !== "number" || !Number.isFinite(secondsUntilReset)) throw new Error("Rate limit refused: the store reported an unusable bucket state.");
+    if (!isPositiveInt(hits) || typeof secondsUntilReset !== "number" || !Number.isFinite(secondsUntilReset)) throw new Error(`${refused}: the store reported an unusable bucket state.`);
     if (hits > policy.limit) retryAfterSeconds = Math.max(retryAfterSeconds, Math.max(1, Math.ceil(secondsUntilReset)));
   }
   return retryAfterSeconds === 0 ? { allowed: true } : { allowed: false, retryAfterSeconds };
@@ -141,9 +161,15 @@ export function createRateLimiter(store: RateLimitStore): RateLimiter {
  * injectable so tests control time.
  */
 export function createInMemoryRateLimitStore(nowMs: () => number = Date.now): RateLimitStore {
+  return createInMemoryWindowStore(nowMs);
+}
+
+/** One private set of rows per call. `allowed`, when given, plays the table's bucket CHECK: a bucket outside it throws before anything is charged. */
+function createInMemoryWindowStore(nowMs: () => number, allowed?: readonly string[]) {
   const rows = new Map<string, { windowStartMs: number; hits: number }>();
   return {
-    async consume({ subject, policies }) {
+    async consume({ subject, policies }: { subject: string; policies: readonly WindowPolicy<string>[] }): Promise<RateLimitBucketState[]> {
+      if (allowed && policies.some((policy) => !allowed.includes(policy.bucket))) throw new Error("In-memory budget store refused: a bucket outside this store's list.");
       const now = nowMs();
       return policies.map((policy) => {
         const key = JSON.stringify([policy.bucket, subject]);
@@ -158,4 +184,76 @@ export function createInMemoryRateLimitStore(nowMs: () => number = Date.now): Ra
       });
     },
   };
+}
+
+/**
+ * PROVIDER BUDGETS — Milestone 3, Slice 3A-0. FOUNDATION ONLY.
+ *
+ * Three families of provider-backed work, each with a short and a daily bucket:
+ *   chain_read          reads that make the server call the chain RPC
+ *   turnkey_reconcile   reconciliation that makes the server read Turnkey
+ *   pay_submit          a payment submit
+ *
+ * NO NUMERIC LIMIT IS APPROVED. This module deliberately exports no provider
+ * budget policy table: a caller has to pass each bucket's limit and window, and
+ * no caller exists yet. No route, and no server module, consults this limiter.
+ *
+ * Everything else is the limiter above, unchanged in meaning: the subject is
+ * the authenticated account's app_user_id; one store operation charges every
+ * bucket of a request in byte order; the request is admitted only if every
+ * bucket is within its limit; a denied request has still been charged; nothing
+ * is ever refunded (there is no operation that lowers a count); and a store
+ * that throws or mis-reports makes consume() throw, so the caller must do no
+ * provider work.
+ *
+ * SEPARATE FROM THE SLICE E LIMITER: these six names are accepted only here
+ * and stored only in real_provider_budgets (schema.sql); the four Slice E names
+ * are refused here, as these are refused there.
+ */
+export const PROVIDER_BUDGET_FAMILIES = ["chain_read", "pay_submit", "turnkey_reconcile"] as const;
+export type ProviderBudgetFamily = (typeof PROVIDER_BUDGET_FAMILIES)[number];
+
+export const PROVIDER_BUDGET_BUCKETS = ["chain_read_day", "chain_read_short", "pay_submit_day", "pay_submit_short", "turnkey_reconcile_day", "turnkey_reconcile_short"] as const;
+export type ProviderBudgetBucket = (typeof PROVIDER_BUDGET_BUCKETS)[number];
+
+export type ProviderBudgetPolicy = WindowPolicy<ProviderBudgetBucket>;
+
+/** Same seam as RateLimitStore, for the sibling table. */
+export interface ProviderBudgetStore {
+  consume(input: { subject: string; policies: readonly ProviderBudgetPolicy[] }): Promise<RateLimitBucketState[]>;
+}
+
+export interface ProviderBudgetLimiter {
+  consume(input: { subject: string; policies: readonly ProviderBudgetPolicy[] }): Promise<RateLimitDecision>;
+}
+
+const PROVIDER_BUDGET_REFUSED = "Provider budget refused";
+
+/**
+ * normalizeRateLimitPolicies' rules against the six provider buckets, plus one:
+ * a family is always charged on BOTH its short and its daily bucket, so a
+ * request can never be admitted on one window while skipping the other.
+ */
+export function normalizeProviderBudgetPolicies(policies: readonly ProviderBudgetPolicy[]): ProviderBudgetPolicy[] {
+  const normalized = normalizePolicies(PROVIDER_BUDGET_REFUSED, PROVIDER_BUDGET_BUCKETS, policies);
+  const named = new Set<string>(normalized.map((policy) => policy.bucket));
+  for (const family of PROVIDER_BUDGET_FAMILIES) {
+    if (named.has(`${family}_short`) !== named.has(`${family}_day`)) throw new Error(`${PROVIDER_BUDGET_REFUSED}: a family must be charged on both its short and its daily bucket.`);
+  }
+  return normalized;
+}
+
+export function createProviderBudgetLimiter(store: ProviderBudgetStore): ProviderBudgetLimiter {
+  return {
+    async consume({ subject, policies }) {
+      if (typeof subject !== "string" || subject === "") throw new Error(`${PROVIDER_BUDGET_REFUSED}: no subject.`);
+      const normalized = normalizeProviderBudgetPolicies(policies);
+      return decide(PROVIDER_BUDGET_REFUSED, normalized, await store.consume({ subject, policies: normalized }));
+    },
+  };
+}
+
+/** Unit tests and local development ONLY, like createInMemoryRateLimitStore — its own rows, and only the six provider buckets. */
+export function createInMemoryProviderBudgetStore(nowMs: () => number = Date.now): ProviderBudgetStore {
+  return createInMemoryWindowStore(nowMs, PROVIDER_BUDGET_BUCKETS);
 }

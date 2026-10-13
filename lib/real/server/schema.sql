@@ -1690,6 +1690,243 @@ BEGIN
 END $$;
 -- END Handle Pay Rate Limits
 
+-- BEGIN Provider Budgets
+-- Milestone 3, Slice 3A-0 (provider budget foundation). Hand-applied,
+-- idempotent, FAIL-CLOSED.
+--
+-- VERIFIED ON ONE DISPOSABLE NEON BRANCH; NOT APPLIED TO THE REAL DATABASE.
+-- One controlled verification on 2026-10-13 (PostgreSQL 18.6, pooled
+-- connection, smoke run 6d32fdf8, independently audited) applied this block to
+-- that branch: in scratch schemas, then to its own public schema — first apply
+-- and idempotent rerun. The real application database has NOT received this
+-- migration. Applying it there is a separate step that needs its own explicit
+-- authorization, and it must come before any code that consults a provider
+-- budget is deployed (see below).
+--
+-- What was executed there is the single DO block that follows these comments
+-- (its text starts at the line that begins with DO and ends at its closing END
+-- line): SHA-256
+-- 8213b46c2f859fb3c8c5457d34d3dff682508d401fcf82b9169b84333c67a5f5, 11820
+-- characters. That statement is unchanged since and is evidence-bearing: do not
+-- change it without re-running its smoke on a fresh disposable branch. Later
+-- edits to the comments ABOVE it (like this one, made after the run) change the
+-- BEGIN..END text but not that statement; these comments must never spell out
+-- the statement's opening token. It is the Handle Pay Rate Limits statement
+-- above with only the table / constraint / reference names, the refusal
+-- prefix, and the bucket list changed (provider-budget.test.ts proves that
+-- equivalence offline).
+--
+-- NOTHING CHARGES THIS TABLE YET. Slice 3A-0 is foundation only: no route
+-- consults a provider budget and no numeric limit is approved, so this code
+-- can run without the table. That stops being true the moment a later slice
+-- makes a route consult one: from then on the table must be applied BEFORE
+-- that code is deployed, because the limiter statement FAILS CLOSED without it
+-- (it throws, and the route must do no provider work).
+--
+-- A SIBLING of real_rate_limits, never a replacement or an extension of it. A
+-- second table keeps the evidence-bearing block above, and its four-bucket
+-- CHECK, exactly as executed. This block does not read, alter, or copy from
+-- real_rate_limits or any other table, and there is no backfill.
+--
+-- One row per (bucket, subject): a first-request-anchored FIXED WINDOW counter.
+--   bucket        one of the six budgets named in the CHECK below: the families
+--                 chain_read, turnkey_reconcile, and pay_submit, each with a
+--                 short and a daily window
+--   subject       the authenticated account's app_user_id — the ONLY thing a
+--                 budget is keyed by; never a login-session id, a browser
+--                 token, a network address, or an account id the client sent
+--   window_start  the database's now() at the first request of the window
+--   hits          requests charged in this window, capped by the writer at
+--                 limit + 1; nothing ever lowers it (no refund)
+--
+-- PRIVACY — the table holds nothing about the request: no payment, attempt,
+-- recipient, address, activity, or request body. Deliberately no foreign key
+-- (the limiter must never lock or depend on real_accounts), no secondary index
+-- (every statement addresses rows by the full primary key), no trigger, and no
+-- default.
+--
+-- ONE WRITER, ONE STATEMENT: the Neon adapter's consume() charges every bucket
+-- of a request in a single multi-row INSERT ... ON CONFLICT DO UPDATE, rows in
+-- byte order of bucket name, so concurrent requests for one subject take their
+-- row locks in the same order. It runs in no transaction, and no provider is
+-- called while it runs: a provider call can only follow an admitted answer.
+--
+-- ROLLBACK (never run automatically): this block creates only this table, so
+-- `DROP TABLE real_provider_budgets` removes everything it adds. Any code that
+-- consults a provider budget must be rolled back first.
+--
+-- FAIL-CLOSED, by the same six catalog proofs listed in the Handle Pay Rate
+-- Limits block above (pinned search_path and one target-schema constant; an
+-- ordinary permanent table with no inheritance, row security, trigger, or rule
+-- and only built-in types; exactly the reference's columns; exactly the
+-- reference's constraints and no foreign key in either direction; only the
+-- primary key's index; no outside dependency). Anything else under this name
+-- RAISEs, which rolls the whole block back — nothing is ever dropped, rebuilt,
+-- or repaired.
+DO $$
+DECLARE
+  -- Declared types are resolved BEFORE the search_path pin below, so each is schema-qualified.
+  target_schema CONSTANT pg_catalog.text := 'public';
+  table_name CONSTANT pg_catalog.text := 'real_provider_budgets';
+  reference_name CONSTANT pg_catalog.text := 'real_provider_budgets_reference';
+  -- Every column and constraint, each constraint explicitly named.
+  definition CONSTANT pg_catalog.text := $definition$
+    bucket        TEXT COLLATE "C" NOT NULL,
+    subject       TEXT NOT NULL,
+    window_start  TIMESTAMPTZ NOT NULL,
+    hits          INTEGER NOT NULL,
+    CONSTRAINT real_provider_budgets_pkey PRIMARY KEY (bucket, subject),
+    CONSTRAINT real_provider_budgets_bucket_check
+      CHECK (bucket IN ('chain_read_short', 'chain_read_day', 'turnkey_reconcile_short', 'turnkey_reconcile_day', 'pay_submit_short', 'pay_submit_day')),
+    CONSTRAINT real_provider_budgets_hits_check CHECK (hits >= 1)
+  $definition$;
+  ns pg_catalog.oid;
+  tbl pg_catalog.oid;
+  ref pg_catalog.oid;
+  t record;
+  r record;
+  k record;
+  bad pg_catalog.text;
+BEGIN
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+
+  SELECT n.oid INTO ns FROM pg_catalog.pg_namespace n WHERE n.nspname = target_schema;
+  IF ns IS NULL THEN
+    RAISE EXCEPTION 'Provider budget migration refused: schema % does not exist.', target_schema;
+  END IF;
+
+  -- Create what is missing (IF NOT EXISTS trusts the name — everything below does not).
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I.%I (%s)', target_schema, table_name, definition);
+
+  -- 2. The relation under that name.
+  SELECT c.oid, c.relkind, c.relpersistence, c.relispartition, c.relrowsecurity, c.relforcerowsecurity
+    INTO t FROM pg_catalog.pg_class c WHERE c.relnamespace = ns AND c.relname = table_name;
+  IF t.oid IS NULL OR t.relkind IS DISTINCT FROM 'r' OR t.relpersistence IS DISTINCT FROM 'p' OR t.relispartition IS NOT FALSE THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% is not an ordinary, permanent, non-partition table. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  tbl := t.oid;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = tbl OR i.inhparent = tbl) THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% takes part in table inheritance (as a child or a parent). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF t.relrowsecurity IS NOT FALSE OR t.relforcerowsecurity IS NOT FALSE OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol WHERE pol.polrelid = tbl) THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% has row-level security enabled or forced, or a policy. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger g WHERE g.tgrelid = tbl AND NOT g.tgisinternal)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite w WHERE w.ev_class = tbl)
+  THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% has a user trigger or a rule. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  SELECT pg_catalog.string_agg(a.attname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
+    WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
+      AND (ty.typnamespace IS DISTINCT FROM (SELECT n2.oid FROM pg_catalog.pg_namespace n2 WHERE n2.nspname = 'pg_catalog')
+        OR ty.typtype IS DISTINCT FROM 'b' OR ty.oid >= 16384 OR a.attcollation >= 16384);
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% column(s) % use a type or collation that is not a built-in base type/collation. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- The reference: the same definition, deparsed by this server, in this transaction.
+  EXECUTE format('DROP TABLE IF EXISTS pg_temp.%I', reference_name);
+  EXECUTE format('CREATE TEMPORARY TABLE %I (%s) ON COMMIT DROP', reference_name, definition);
+  SELECT c.oid INTO ref FROM pg_catalog.pg_class c WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname = reference_name;
+
+  -- 3. Columns: exactly the reference's — no more, no fewer, each identical.
+  IF (SELECT pg_catalog.count(*) FROM pg_catalog.pg_attribute a WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped)
+    IS DISTINCT FROM (SELECT pg_catalog.count(*) FROM pg_catalog.pg_attribute a WHERE a.attrelid = ref AND a.attnum > 0 AND NOT a.attisdropped)
+  THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% does not have exactly the intended columns (bucket, subject, window_start, hits). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  SELECT pg_catalog.string_agg(rc.attname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_attribute rc
+    LEFT JOIN pg_catalog.pg_attrdef rd ON rd.adrelid = rc.attrelid AND rd.adnum = rc.attnum
+    WHERE rc.attrelid = ref AND rc.attnum > 0 AND NOT rc.attisdropped
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute tc
+        LEFT JOIN pg_catalog.pg_attrdef td ON td.adrelid = tc.attrelid AND td.adnum = tc.attnum
+        WHERE tc.attrelid = tbl AND tc.attname = rc.attname AND NOT tc.attisdropped AND tc.attnum > 0
+          AND tc.atttypid = rc.atttypid AND tc.atttypmod = rc.atttypmod AND tc.attcollation = rc.attcollation
+          AND tc.attnotnull = rc.attnotnull AND tc.attidentity = rc.attidentity AND tc.attgenerated = rc.attgenerated
+          AND pg_catalog.pg_get_expr(td.adbin, td.adrelid) IS NOT DISTINCT FROM pg_catalog.pg_get_expr(rd.adbin, rd.adrelid));
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% column(s) % differ from the intended definition. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- 4. Constraints: exactly the reference's CHECK and PRIMARY KEY constraints —
+  --    so no foreign key, no extra CHECK, and nothing else references this
+  --    table. (PostgreSQL 18 also records each NOT NULL as a constraint row;
+  --    those are proven by the column comparison above, on every version.)
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl AND NOT c.convalidated) THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% has a constraint that is not validated.', target_schema, table_name;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl AND c.contype NOT IN ('c', 'p', 'n'))
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.confrelid = tbl)
+  THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% has, or is the target of, a foreign key (or another unintended kind of constraint). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF (SELECT pg_catalog.count(*) FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl AND c.contype IN ('c', 'p'))
+    IS DISTINCT FROM (SELECT pg_catalog.count(*) FROM pg_catalog.pg_constraint c WHERE c.conrelid = ref AND c.contype IN ('c', 'p'))
+  THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% does not have exactly the intended constraints. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  FOR r IN
+    SELECT c.conname, c.contype, c.condeferrable, c.condeferred, c.connoinherit,
+           pg_catalog.pg_get_constraintdef(c.oid) AS def,
+           (SELECT pg_catalog.array_agg(a.attname ORDER BY u.ord) FROM pg_catalog.unnest(c.conkey) WITH ORDINALITY u(attnum, ord)
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum) AS key_names,
+           c.conindid
+      FROM pg_catalog.pg_constraint c WHERE c.conrelid = ref AND c.contype IN ('c', 'p')
+  LOOP
+    SELECT c.oid, c.conindid INTO k
+      FROM pg_catalog.pg_constraint c
+      WHERE c.conrelid = tbl AND c.conname = r.conname AND c.contype = r.contype AND c.convalidated
+        AND c.condeferrable = r.condeferrable AND c.condeferred = r.condeferred AND c.connoinherit = r.connoinherit
+        AND pg_catalog.pg_get_constraintdef(c.oid) = r.def
+        AND (SELECT pg_catalog.array_agg(a.attname ORDER BY u.ord) FROM pg_catalog.unnest(c.conkey) WITH ORDINALITY u(attnum, ord)
+              JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum) IS NOT DISTINCT FROM r.key_names;
+    IF k.oid IS NULL THEN
+      RAISE EXCEPTION 'Provider budget migration refused: constraint % on %.% is missing or not the intended definition. Nothing was changed; review and resolve by hand (never auto-dropped).', r.conname, target_schema, table_name;
+    END IF;
+    -- 5. The primary key's backing index, structurally.
+    IF r.contype = 'p' AND NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_index ti, pg_catalog.pg_index ri, pg_catalog.pg_class tic, pg_catalog.pg_class ric
+      WHERE ti.indexrelid = k.conindid AND ri.indexrelid = r.conindid AND tic.oid = ti.indexrelid AND ric.oid = ri.indexrelid
+        AND ti.indrelid = tbl AND tic.relam = ric.relam
+        AND ti.indisunique AND ti.indisunique = ri.indisunique AND ti.indisprimary AND ti.indisprimary = ri.indisprimary
+        AND ti.indisvalid AND ti.indisready AND ti.indimmediate AND NOT ti.indisexclusion
+        AND ti.indnullsnotdistinct = ri.indnullsnotdistinct
+        AND ti.indnatts = ri.indnatts AND ti.indnkeyatts = ri.indnkeyatts
+        AND ti.indexprs IS NULL AND ti.indpred IS NULL AND ri.indexprs IS NULL AND ri.indpred IS NULL
+        AND ti.indclass::pg_catalog.text = ri.indclass::pg_catalog.text
+        AND ti.indcollation::pg_catalog.text = ri.indcollation::pg_catalog.text
+        AND ti.indoption::pg_catalog.text = ri.indoption::pg_catalog.text)
+    THEN
+      RAISE EXCEPTION 'Provider budget migration refused: the index behind % on %.% is not the intended one.', r.conname, target_schema, table_name;
+    END IF;
+  END LOOP;
+
+  -- 5 (continued). No index on the table but the primary key's.
+  SELECT pg_catalog.string_agg(c.relname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+    WHERE i.indrelid = tbl
+      AND i.indexrelid NOT IN (SELECT c2.conindid FROM pg_catalog.pg_constraint c2 WHERE c2.conrelid = tbl AND c2.contype = 'p');
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% has unexpected index(es) %. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- 6. Dependencies: only on this table.
+  SELECT pg_catalog.string_agg(DISTINCT d.classid::pg_catalog.regclass::pg_catalog.text || ':' || d.objid::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_depend d
+    WHERE ((d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid IN (SELECT c.oid FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl))
+        OR (d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid IN (SELECT ad.oid FROM pg_catalog.pg_attrdef ad WHERE ad.adrelid = tbl)))
+      AND NOT (d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = tbl);
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Provider budget migration refused: %.% has a constraint or default depending on an object other than its own columns (%). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  EXECUTE format('DROP TABLE pg_temp.%I', reference_name);
+END $$;
+-- END Provider Budgets
+
 -- BEGIN Provisioning Evidence Capture
 -- Hand-applied, idempotent, FAIL-CLOSED. Already applied (and its idempotent
 -- rerun proven) on a disposable Neon branch and on the REAL Neon database's

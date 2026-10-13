@@ -868,6 +868,7 @@ const DISPOSABLE_SMOKES: Array<[string, string[]]> = [
   [`${R}handle-pay-reserve.smoke.test.ts`, ["REAL_SMOKE_HANDLE_PAY_RESERVE"]],
   [`${R}rate-limit.smoke.test.ts`, ["REAL_SMOKE_RATE_LIMIT", "REAL_SMOKE_RATE_LIMIT_PUBLIC"]],
   [`${R}provisioning-limits.smoke.test.ts`, ["REAL_SMOKE_PROVISIONING_LIMITS"]],
+  [`${R}provider-budget.smoke.test.ts`, ["REAL_SMOKE_PROVIDER_BUDGET"]],
 ];
 /** Every live suite family: its file, and the smoke gates it may run with. */
 const FAMILIES: Array<[string, string[]]> = [

@@ -16,7 +16,7 @@ import {
   type RegistrationAttemptStore,
 } from "./registration-attempts";
 import type { AccountHandleRecord, AccountHandleStore } from "./account-handles";
-import type { RateLimitBucketState, RateLimitStore } from "./rate-limit";
+import type { ProviderBudgetStore, RateLimitBucketState, RateLimitStore } from "./rate-limit";
 import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveHandlePaymentResult, type ReserveResult } from "./payment-attempts";
 
 /**
@@ -1706,6 +1706,54 @@ export function createNeonRateLimitStore(sql: NeonQueryFunction<false, false>): 
   };
 }
 
+/**
+ * Milestone 3, Slice 3A-0 — the durable provider-budget counters
+ * (real_provider_budgets). FOUNDATION ONLY: nothing calls this yet.
+ *
+ * Deliberately the SAME statement as createNeonRateLimitStore above, against
+ * the sibling table: one multi-row INSERT ... ON CONFLICT DO UPDATE per
+ * request, rows in byte order of bucket name, database time, the count capped
+ * at limit + 1, a window moved only once it has elapsed. No transaction, no
+ * read-then-write, and nothing external while a row lock is held — a provider
+ * is only ever called after this statement has returned and the request was
+ * admitted. It is written out a second time rather than sharing a table-name
+ * parameter so each statement stays a fixed, separately reviewable text and
+ * neither can ever be pointed at the other's table.
+ *
+ * Nothing lowers a count: an admitted request is never refunded, whatever the
+ * provider call then does.
+ *
+ * FAIL CLOSED: a missing table, a bucket the table's CHECK refuses, or any
+ * database error throws out of consume(). Rows are mapped field by field.
+ */
+export function createNeonProviderBudgetStore(sql: NeonQueryFunction<false, false>): ProviderBudgetStore {
+  return {
+    async consume({ subject, policies }) {
+      const budgets = JSON.stringify(Object.fromEntries(policies.map((policy) => [policy.bucket, { limit: policy.limit, windowSeconds: policy.windowSeconds }])));
+      const rows = (await sql`
+        INSERT INTO real_provider_budgets AS r (bucket, subject, window_start, hits)
+        SELECT p.key, ${subject}::text, now(), 1
+        FROM jsonb_each(${budgets}::jsonb) AS p
+        ORDER BY p.key COLLATE "C"
+        ON CONFLICT (bucket, subject) DO UPDATE SET
+          window_start = CASE
+            WHEN r.window_start + make_interval(secs => (${budgets}::jsonb -> r.bucket ->> 'windowSeconds')::int) <= now() THEN now()
+            ELSE r.window_start
+          END,
+          hits = CASE
+            WHEN r.window_start + make_interval(secs => (${budgets}::jsonb -> r.bucket ->> 'windowSeconds')::int) <= now() THEN 1
+            ELSE LEAST(r.hits + 1, (${budgets}::jsonb -> r.bucket ->> 'limit')::int + 1)
+          END
+        RETURNING
+          r.bucket,
+          r.hits,
+          GREATEST(1, ceil(extract(epoch FROM (r.window_start + make_interval(secs => (${budgets}::jsonb -> r.bucket ->> 'windowSeconds')::int) - now()))))::int AS seconds_until_reset
+      `) as Row[];
+      return rows.map((row): RateLimitBucketState => ({ bucket: row.bucket as string, hits: Number(row.hits), secondsUntilReset: Number(row.seconds_until_reset) }));
+    },
+  };
+}
+
 export type NeonDurableStores = {
   challengeStore: ChallengeStore;
   registry: RealAccountRegistry;
@@ -1715,6 +1763,7 @@ export type NeonDurableStores = {
   revocations: PasskeyRevocationStore;
   handles: AccountHandleStore;
   rateLimits: RateLimitStore;
+  providerBudgets: ProviderBudgetStore;
 };
 
 /**
@@ -1739,7 +1788,7 @@ export function createNeonSqlClient(databaseUrl: string): NeonQueryFunction<fals
   return neon(databaseUrl, { isolationLevel: NEON_TRANSACTION_ISOLATION_LEVEL });
 }
 
-/** One connection (Neon's HTTP query function is stateless/per-request-safe), eight adapters. */
+/** One connection (Neon's HTTP query function is stateless/per-request-safe), nine adapters. */
 export function createNeonDurableStores(databaseUrl: string): NeonDurableStores {
   const sql = createNeonSqlClient(databaseUrl);
   return {
@@ -1751,5 +1800,6 @@ export function createNeonDurableStores(databaseUrl: string): NeonDurableStores 
     revocations: createNeonPasskeyRevocationStore(sql),
     handles: createNeonAccountHandleStore(sql),
     rateLimits: createNeonRateLimitStore(sql),
+    providerBudgets: createNeonProviderBudgetStore(sql),
   };
 }

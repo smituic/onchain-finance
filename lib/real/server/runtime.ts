@@ -5,7 +5,7 @@ import { createInMemoryPaymentAttemptStore, type PaymentAttemptStore } from "./p
 import { createInMemoryBackupPasskeyEnrollmentStore, type BackupPasskeyEnrollmentStore } from "./backup-passkey-enrollment";
 import { createInMemoryPasskeyRevocationStore, type PasskeyRevocationStore } from "./passkey-revocation-attempts";
 import { createInMemoryAccountHandleStore, type AccountHandleStore } from "./account-handles";
-import { createInMemoryRateLimitStore, createRateLimiter, type RateLimiter } from "./rate-limit";
+import { createInMemoryProviderBudgetStore, createInMemoryRateLimitStore, createProviderBudgetLimiter, createRateLimiter, type ProviderBudgetLimiter, type RateLimiter } from "./rate-limit";
 import { createNeonDurableStores } from "./neon-store";
 
 /**
@@ -33,9 +33,11 @@ let revocationStore: PasskeyRevocationStore | null = null;
 let handleStore: AccountHandleStore | null = null;
 // Slice E: selected with the other stores — Neon whenever a database is configured, in-memory only for local development. Production without a database throws below, so it can never silently run on process-local counters.
 let rateLimiter: RateLimiter | null = null;
+// Slice 3A-0: selected exactly like the rate limiter — Neon whenever a database is configured, in-memory only for local development, never in production. Nothing consults it yet.
+let providerBudgetLimiter: ProviderBudgetLimiter | null = null;
 
 function ensureStoresInitialized(): void {
-  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore && handleStore && rateLimiter) return;
+  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore && handleStore && rateLimiter && providerBudgetLimiter) return;
 
   const databaseUrl = process.env.DATABASE_URL?.trim();
   if (databaseUrl) {
@@ -48,6 +50,7 @@ function ensureStoresInitialized(): void {
     revocationStore = durable.revocations;
     handleStore = durable.handles;
     rateLimiter = createRateLimiter(durable.rateLimits);
+    providerBudgetLimiter = createProviderBudgetLimiter(durable.providerBudgets);
     return;
   }
 
@@ -69,6 +72,7 @@ function ensureStoresInitialized(): void {
   revocationStore = createInMemoryPasskeyRevocationStore(registry);
   handleStore = createInMemoryAccountHandleStore(registry);
   rateLimiter = createRateLimiter(createInMemoryRateLimitStore());
+  providerBudgetLimiter = createProviderBudgetLimiter(createInMemoryProviderBudgetStore());
 }
 
 export function getRealAccountRegistry(): RealAccountRegistry {
@@ -110,4 +114,10 @@ export function getAccountHandleStore(): AccountHandleStore {
 export function getRateLimiter(): RateLimiter {
   ensureStoresInitialized();
   return rateLimiter!;
+}
+
+/** Slice 3A-0: the per-account provider-budget limiter (rate-limit.ts). Foundation only — no route calls this yet, and no numeric limit is approved. */
+export function getProviderBudgetLimiter(): ProviderBudgetLimiter {
+  ensureStoresInitialized();
+  return providerBudgetLimiter!;
 }
