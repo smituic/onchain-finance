@@ -409,6 +409,7 @@ describe("Slice D — recipientIdentity on every payer-facing read surface", () 
       ...session(w),
       pimlicoApiKey: "pim_test_key",
       config: {} as never,
+      providerBudgetLimiter: openBudget(),
       attemptId: prepared.id,
       signature: "0x00",
       activityId: "01a12620-1c25-7329-86d4-f8a86a1d8d90",

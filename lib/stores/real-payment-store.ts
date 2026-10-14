@@ -3,6 +3,7 @@ import { exceedsAvailableBalance, exceedsPaymentCeiling, isZeroBaseUnits, MAX_PA
 import { formatCashBaseUnits } from "@/lib/real/display/cash";
 import { REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { signPreparedPayment } from "@/lib/real/payments/client-sign";
+import { hasEnoughValidityToDispatch } from "@/lib/real/payments/validity";
 import { isWebAuthnCancellation } from "@/lib/real/signing/passkey";
 import type { WirePreparedFields } from "@/lib/real/payments/prepared-operation";
 import { ownHandleMessage, resolveRecipientView, type RecipientLookup, type RecipientView } from "@/lib/real/recipient-input";
@@ -141,6 +142,25 @@ export type RealPaymentStore = {
   isStatusDeferred: boolean;
   /** The server's validated delay for that deferral, in whole seconds; null when none (or an unusable one — a local fallback deadline is then in force). */
   statusRetryAfterSeconds: number | null;
+  /**
+   * 3A-2 Stage 2: the server refused THIS submit because the account's submit
+   * budget is spent. It was decided before any provider work: nothing was sent
+   * and nothing changed, so the payment is exactly as it was (still waiting for
+   * approval) and the same approval may be sent again once the wait is over.
+   * True only while the wait runs; flipped by a store timer, never derived from
+   * Date.now() in a render. The wait ending only re-enables the manual action —
+   * nothing is ever sent automatically.
+   */
+  isSubmitCoolingDown: boolean;
+  /** Whole seconds the wait was (about) when it was set or restored — for plain-language copy only; null when there is none. */
+  submitCooldownSeconds: number | null;
+  /**
+   * True when the wait ends too late for this approval to still be dispatched
+   * (judged with the same validity margin the server enforces). The approval
+   * is then not offered again: Cancel and the existing expiry/recovery paths
+   * remain. It says nothing about the payment having failed.
+   */
+  isSubmitRetryBeyondApproval: boolean;
   /** Reload/restore: never signs, never submits, never resends — see server/payments.ts's resolveLatestPayment. */
   init: () => Promise<void>;
   setRecipientInput: (value: string) => void;
@@ -172,6 +192,10 @@ class ApiError extends Error {
     message: string,
     readonly retryable: boolean,
     readonly status: number,
+    /** The body's machine-readable `code`, when it has one. */
+    readonly code: string | null = null,
+    /** The raw Retry-After header, unparsed — null when absent. Validated only where it is used. */
+    readonly retryAfter: string | null = null,
   ) {
     super(message);
   }
@@ -183,8 +207,16 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
   });
-  const json = (await response.json()) as T & { error?: string; retryable?: boolean };
-  if (!response.ok) throw new ApiError(json.error ?? `Request failed (${response.status}).`, json.retryable === true, response.status);
+  const json = (await response.json()) as T & { error?: string; retryable?: boolean; code?: unknown };
+  if (!response.ok) {
+    throw new ApiError(
+      json.error ?? `Request failed (${response.status}).`,
+      json.retryable === true,
+      response.status,
+      typeof json.code === "string" ? json.code : null,
+      response.headers?.get("Retry-After") ?? null,
+    );
+  }
   return json;
 }
 
@@ -227,6 +259,28 @@ export const STATUS_REQUEST_DEADLINE_MS = 45_000;
 export const MAX_STATUS_RETRY_AFTER_SECONDS = 86_400;
 /** Stage 2C-2: applied when a deferral's delay is missing or unusable — never "retry now". */
 export const STATUS_FALLBACK_DEADLINE_MS = 60_000;
+/** 3A-2 Stage 2: the longest delay the submit policy can issue (its daily window); anything above is not a delay the server could have meant. */
+export const MAX_SUBMIT_RETRY_AFTER_SECONDS = 86_400;
+/** 3A-2 Stage 2: applied when a submit denial's Retry-After is missing or unusable — never "retry now". */
+export const SUBMIT_FALLBACK_COOLDOWN_MS = 60_000;
+
+/**
+ * Reads a Retry-After header as whole seconds, strictly: ASCII digits only (no
+ * sign, whitespace, fraction, exponent, leading zero or HTTP-date), from 1
+ * through MAX_SUBMIT_RETRY_AFTER_SECONDS. Anything else is null — the caller
+ * then uses the local fallback wait, never an immediate retry.
+ */
+export function parseSubmitRetryAfter(header: string | null | undefined): number | null {
+  if (typeof header !== "string" || !/^[1-9][0-9]{0,4}$/.test(header)) return null;
+  const seconds = Number(header);
+  return seconds <= MAX_SUBMIT_RETRY_AFTER_SECONDS ? seconds : null;
+}
+
+/** A submit-budget denial, and nothing else: 429, code exactly "rate_limited", retryable exactly true. Any other 429 is not one. */
+function isSubmitBudgetDenial(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.status === 429 && error.code === "rate_limited" && error.retryable === true;
+}
+
 /** Stage 2C-2: how many times one caller waits behind an older-epoch read before giving up (each wait is itself bounded by the request deadline). */
 const MAX_STALE_READ_WAITS = 2;
 
@@ -331,11 +385,22 @@ function currentSubject(): string | null {
   return useRealAccountStore.getState().account?.appUserId ?? null;
 }
 
+/** What authorizeAndSubmit needs from its store closure: the lifecycle it runs under, and the submit wait. */
+type SubmitHooks = {
+  generation: () => number;
+  detached: () => boolean;
+  /** True (and the wait's flags are published) while a submit wait for this attempt and account is running. */
+  isSubmitWaiting: (attemptId: string) => boolean;
+  /** Records a valid submit-budget denial for this attempt and account (header unparsed). */
+  noteSubmitDenied: (attempt: RealPaymentAttempt, retryAfterHeader: string | null) => void;
+};
+
 async function authorizeAndSubmit(
   set: (partial: Partial<RealPaymentStore>) => void,
   get: () => RealPaymentStore,
   scheduleExpiryCheck: () => Promise<void>,
   markTransition: () => void,
+  hooks: SubmitHooks,
 ): Promise<void> {
   const { attempt, subOrganizationId, authorizingCredentialId, pendingSubmission, clockOffsetSeconds } = get();
   const account = useRealAccountStore.getState().account;
@@ -347,6 +412,19 @@ async function authorizeAndSubmit(
     set({ status: "stranded", error: OTHER_PASSKEY_MESSAGE });
     return;
   }
+  // The server said to wait: no passkey prompt, no signature, no request —
+  // checked on the action itself, not only on the button.
+  if (hooks.isSubmitWaiting(attempt.id)) return;
+
+  // The context this call belongs to. After EVERY await below it must still be
+  // the current one — the same lifecycle (no reset / account switch / unmount /
+  // remount), the same attempt, the same account — or the call ends without
+  // touching the store or the network. Dropping an answer is not evidence about
+  // the payment: nothing is cancelled, resent or finalized on its account.
+  const myGeneration = hooks.generation();
+  const subject = account.appUserId;
+  const attemptId = attempt.id;
+  const isCurrent = () => !hooks.detached() && hooks.generation() === myGeneration && get().attempt?.id === attemptId && currentSubject() === subject;
 
   let signed = pendingSubmission?.attemptId === attempt.id ? pendingSubmission : null;
   if (!signed) {
@@ -364,8 +442,11 @@ async function authorizeAndSubmit(
         // refuse a payment the server would still accept.
         nowSeconds: Math.floor(Date.now() / 1000) + clockOffsetSeconds,
       });
+      // A signature for a context that is gone is discarded: never kept, never submitted.
+      if (!isCurrent()) return;
       signed = { attemptId: attempt.id, ...result };
     } catch (error) {
+      if (!isCurrent()) return;
       if (isWebAuthnCancellation(error)) {
         // No signature, no submission, no balance mutation — but the durable
         // row is still awaiting_authorization and still holds the account's
@@ -380,20 +461,53 @@ async function authorizeAndSubmit(
       await scheduleExpiryCheck();
       return;
     }
+    // A wait that began while the ceremony was open (another denial for this
+    // attempt) applies before anything is sent. The fresh approval is kept.
+    if (hooks.isSubmitWaiting(attempt.id)) {
+      set({ status: "awaiting_authorization", isAuthorizing: false, pendingSubmission: signed, error: null });
+      return;
+    }
   }
 
   // Any status read already on its way predates the submit: its answer must not be applied after it.
   markTransition();
   set({ status: "submitting", isAuthorizing: false, pendingSubmission: signed, error: null });
+  // Another handler may have changed the payment while this one awaited: only
+  // an attempt still waiting for approval, or still being sent, may be moved.
+  const stillOpen = () => {
+    const shown = get().status;
+    return shown === "submitting" || shown === "awaiting_authorization";
+  };
   try {
     const result = await api<{ attempt: RealPaymentAttempt }>("/api/real/payments/submit", {
       method: "POST",
       body: JSON.stringify({ attemptId: signed.attemptId, signature: signed.signature, activityId: signed.activityId }),
     });
+    // The server did answer, so its answer is the payment's state — but only
+    // for the context that asked. (After an unmount the next init() reads it.)
+    if (!isCurrent()) return;
+    const nextStatus = mapAttemptStateToStatus(result.attempt.state);
+    const shown = get().status;
+    // Terminal is final: a late answer never moves a confirmed or failed payment to anything else.
+    if ((shown === "confirmed" || shown === "failed") && nextStatus !== shown) {
+      set({ pendingSubmission: null });
+      return;
+    }
     markTransition();
-    set({ status: mapAttemptStateToStatus(result.attempt.state), attempt: result.attempt, pendingSubmission: null, error: null });
+    set({ status: nextStatus, attempt: result.attempt, pendingSubmission: null, error: null });
     if (result.attempt.state === "confirmed") void useRealBalanceStore.getState().fetchBalance();
   } catch (error) {
+    if (!isCurrent() || !stillOpen()) return;
+    if (isSubmitBudgetDenial(error)) {
+      // Decided before any provider work: nothing changed, nothing was sent.
+      // The same approval stays in memory; the wait is bound to this account
+      // and attempt, and the displayed wording comes from it — not from the
+      // server's sentence, which says "tap Continue" whatever the wait is.
+      hooks.noteSubmitDenied(get().attempt!, error.retryAfter);
+      set({ status: "awaiting_authorization", isAuthorizing: false, error: null });
+      await scheduleExpiryCheck();
+      return;
+    }
     if (error instanceof ApiError && error.retryable) {
       // The server changed nothing and sent nothing. Keep the same approval
       // so "Continue" re-sends it — no second passkey prompt.
@@ -469,6 +583,14 @@ export function createRealPaymentStore() {
   // delivered the server's own "submitted" has done that check's job. Any
   // later local transition moves the epoch, which makes the marker stale.
   let submittedByRead: { attemptId: string; epoch: number } | null = null;
+  // 3A-2 Stage 2: the server's "come back after" for a refused SUBMIT, for ONE
+  // attempt of ONE account, as an absolute deadline. Like statusDeadline it
+  // sits outside clearFollowUpState and survives init/detach for that same
+  // account and attempt (a remount must not become a way around it), and is
+  // dropped by reset(), a successful cancel, a different account or attempt, or
+  // its own expiry. Memory only: a hard reload loses it (accepted, as in 3A-1).
+  let submitCooldown: { subject: string; attemptId: string; untilMs: number } | null = null;
+  let submitCooldownTimerId: ReturnType<typeof setTimeout> | null = null;
 
   /** Milliseconds left on the retry deadline for this attempt and the signed-in account; 0 when none. A deadline that no longer applies is dropped on sight. */
   function remainingDeadlineMs(attemptId: string): number {
@@ -476,6 +598,24 @@ export function createRealPaymentStore() {
     const remaining = statusDeadline.untilMs - Date.now();
     if (statusDeadline.attemptId !== attemptId || statusDeadline.subject !== currentSubject() || remaining <= 0) {
       statusDeadline = null;
+      return 0;
+    }
+    return remaining;
+  }
+
+  function clearSubmitCooldownTimer() {
+    if (submitCooldownTimerId !== null) {
+      clearTimeout(submitCooldownTimerId);
+      submitCooldownTimerId = null;
+    }
+  }
+
+  /** Milliseconds left on the submit wait for this attempt and the signed-in account; 0 when none. A wait that no longer applies is dropped on sight. */
+  function remainingSubmitCooldownMs(attemptId: string): number {
+    if (!submitCooldown) return 0;
+    const remaining = submitCooldown.untilMs - Date.now();
+    if (submitCooldown.attemptId !== attemptId || submitCooldown.subject !== currentSubject() || remaining <= 0) {
+      submitCooldown = null;
       return 0;
     }
     return remaining;
@@ -499,6 +639,8 @@ export function createRealPaymentStore() {
   function clearFollowUpState() {
     clearExpiryTimeout();
     clearCooldownTimeout();
+    // Only the TIMER goes with the lifecycle; the deadline itself (submitCooldown) is re-armed by init() for the same account and attempt.
+    clearSubmitCooldownTimer();
     manualCooldownUntilMs = 0;
     followUp = null;
     followUpSuspended = false;
@@ -829,6 +971,67 @@ export function createRealPaymentStore() {
       return Promise.resolve();
     }
 
+    /**
+     * Publishes the submit wait for the CURRENT attempt to the store and arms
+     * the one timer that ends it. The timer only flips the flag: it never
+     * signs, submits, resends or checks anything — a valid user action is
+     * required afterwards.
+     */
+    function publishSubmitCooldown(attempt: RealPaymentAttempt) {
+      const remaining = remainingSubmitCooldownMs(attempt.id);
+      if (remaining <= 0 || !submitCooldown) return;
+      const untilMs = submitCooldown.untilMs;
+      // Would the wait end too late for this approval to still be dispatched? Same margin the server applies.
+      const validUntil = attempt.prepared?.validUntil;
+      const retryAtSeconds = Math.ceil(untilMs / 1000) + get().clockOffsetSeconds;
+      const beyondApproval = !hasEnoughValidityToDispatch(typeof validUntil === "number" ? validUntil : null, retryAtSeconds);
+      set({ isSubmitCoolingDown: true, submitCooldownSeconds: Math.ceil(remaining / 1000), isSubmitRetryBeyondApproval: beyondApproval });
+      clearSubmitCooldownTimer();
+      const myGeneration = generation;
+      const attemptId = attempt.id;
+      submitCooldownTimerId = setTimeout(
+        () => {
+          submitCooldownTimerId = null;
+          if (detached || myGeneration !== generation || get().attempt?.id !== attemptId) return;
+          // A delay above the timer ceiling fires early: wait out the rest.
+          const current = get().attempt;
+          if (current && remainingSubmitCooldownMs(attemptId) > 0) {
+            publishSubmitCooldown(current);
+            return;
+          }
+          set({ isSubmitCoolingDown: false });
+        },
+        Math.min(Math.max(0, remaining), 2_147_483_647),
+      );
+    }
+
+    /** A valid submit-budget denial: the later of any running wait and the server's delay (or the local fallback for unusable metadata). */
+    function noteSubmitDenied(attempt: RealPaymentAttempt, retryAfterHeader: string | null) {
+      const subject = currentSubject();
+      if (subject === null) return;
+      const seconds = parseSubmitRetryAfter(retryAfterHeader);
+      const ms = seconds === null ? SUBMIT_FALLBACK_COOLDOWN_MS : seconds * 1000;
+      const now = Date.now();
+      const running = remainingSubmitCooldownMs(attempt.id) > 0 && submitCooldown ? submitCooldown.untilMs : 0;
+      submitCooldown = { subject, attemptId: attempt.id, untilMs: Math.max(now + ms, running) };
+      publishSubmitCooldown(attempt);
+    }
+
+    /** True while a wait for this attempt and account is running; also re-publishes its flags, so a remount or a handler that raced a denial agrees with the record. */
+    function isSubmitWaiting(attemptId: string): boolean {
+      if (remainingSubmitCooldownMs(attemptId) <= 0) return false;
+      const attempt = get().attempt;
+      if (attempt?.id === attemptId) publishSubmitCooldown(attempt);
+      return true;
+    }
+
+    const submitHooks: SubmitHooks = {
+      generation: () => generation,
+      detached: () => detached,
+      isSubmitWaiting,
+      noteSubmitDenied,
+    };
+
     function currentRecipientView(): RecipientView {
       return resolveRecipientView(get().recipientInput, get().recipientLookup, useRealAccountStore.getState().account?.handle ?? null);
     }
@@ -920,6 +1123,9 @@ export function createRealPaymentStore() {
       isFollowUpExhausted: false,
       isStatusDeferred: false,
       statusRetryAfterSeconds: null,
+      isSubmitCoolingDown: false,
+      submitCooldownSeconds: null,
+      isSubmitRetryBeyondApproval: false,
       clockOffsetSeconds: 0,
       isAttemptPastValidity: false,
       error: null,
@@ -935,7 +1141,7 @@ export function createRealPaymentStore() {
         // this (see components/real/real-pay-form.tsx's account-change
         // effect). Without this, a stale recipient/amount typed under one
         // account could survive into a different signed-in account.
-        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
+        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
         try {
           const response = await fetch("/api/real/payments/latest");
           if (response.status === 401) {
@@ -972,6 +1178,8 @@ export function createRealPaymentStore() {
               set({ isStatusDeferred: true, statusRetryAfterSeconds: statusDeadline?.serverSeconds ?? null });
               beginManualCooldown(waiting);
             }
+            // Same account, same attempt: the submit wait the server gave still applies. A different attempt or account finds none.
+            if (json.attempt.state === "awaiting_authorization") publishSubmitCooldown(json.attempt);
             await scheduleOrRunExpiryCheck();
           }
         } catch {
@@ -1025,17 +1233,28 @@ export function createRealPaymentStore() {
         const body = view.kind === "address" ? { recipient: view.recipient, amountBaseUnits } : { recipientHandle: view.handle, amountBaseUnits };
 
         set({ status: "preparing", error: null });
+        // A prepare answer applies only to the lifecycle and account that asked,
+        // and nothing may be signed for a context that has since been replaced.
+        const myGeneration = generation;
+        const preparedFor = currentSubject();
         try {
           const result = await api<{ attempt: RealPaymentAttempt; subOrganizationId: string; authorizingCredentialId: string; serverNowSeconds: number }>("/api/real/payments/prepare", {
             method: "POST",
             body: JSON.stringify(body),
           });
+          if (detached || myGeneration !== generation || currentSubject() !== preparedFor) return;
+          submitCooldown = null;
+          clearSubmitCooldownTimer();
           set({
             status: "awaiting_authorization",
             attempt: result.attempt,
             subOrganizationId: result.subOrganizationId,
             authorizingCredentialId: result.authorizingCredentialId,
             pendingSubmission: null,
+            // The previous attempt's wait (if any) was dropped above; what the screen published for it goes too.
+            isSubmitCoolingDown: false,
+            submitCooldownSeconds: null,
+            isSubmitRetryBeyondApproval: false,
             clockOffsetSeconds: computeClockOffsetSeconds(result.serverNowSeconds),
             error: null,
           });
@@ -1043,6 +1262,7 @@ export function createRealPaymentStore() {
           endManualCooldown();
           await scheduleOrRunExpiryCheck();
         } catch (error) {
+          if (detached || myGeneration !== generation || currentSubject() !== preparedFor) return;
           // The server no longer finds the name (404) or refused the request
           // itself (400, e.g. paying yourself): the earlier lookup answer is
           // stale, so drop it. The typed text stays for the user to fix.
@@ -1056,12 +1276,15 @@ export function createRealPaymentStore() {
           return;
         }
 
-        await authorizeAndSubmit(set, get, scheduleOrRunExpiryCheck, markTransition);
+        // scheduleOrRunExpiryCheck above awaited: the context may have moved on.
+        if (detached || myGeneration !== generation || currentSubject() !== preparedFor) return;
+        await authorizeAndSubmit(set, get, scheduleOrRunExpiryCheck, markTransition, submitHooks);
       },
 
       resumeAuthorization: async () => {
-        if (get().status !== "awaiting_authorization") return;
-        await authorizeAndSubmit(set, get, scheduleOrRunExpiryCheck, markTransition);
+        // One approval at a time: a second press while the passkey sheet is open does nothing.
+        if (get().status !== "awaiting_authorization" || get().isAuthorizing) return;
+        await authorizeAndSubmit(set, get, scheduleOrRunExpiryCheck, markTransition, submitHooks);
       },
 
       cancel: async () => {
@@ -1091,6 +1314,8 @@ export function createRealPaymentStore() {
           clearExpiryTimeout();
           endManualCooldown();
           clearDeadline();
+          submitCooldown = null;
+          clearSubmitCooldownTimer();
           cancelRead = null;
           followUp = null;
           submittedCheckPendingFor = null;
@@ -1109,6 +1334,9 @@ export function createRealPaymentStore() {
             isFollowUpExhausted: false,
             isStatusDeferred: false,
             statusRetryAfterSeconds: null,
+            isSubmitCoolingDown: false,
+            submitCooldownSeconds: null,
+            isSubmitRetryBeyondApproval: false,
             error: null,
           });
           return;
@@ -1226,7 +1454,8 @@ export function createRealPaymentStore() {
         generation++;
         lookupSequence++;
         clearFollowUpState();
-        set({ isManualCheckCoolingDown: false, isStatusDeferred: false });
+        // The submit wait's deadline is kept for the same account and attempt; only what the screen showed goes.
+        set({ isManualCheckCoolingDown: false, isStatusDeferred: false, isSubmitCoolingDown: false });
       },
 
       reset: () => {
@@ -1235,7 +1464,8 @@ export function createRealPaymentStore() {
         clearFollowUpState();
         // A new compose flow / sign-out: the previous attempt's deadline has nothing left to govern.
         clearDeadline();
-        set({ isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, status: "editing", recipientLookup: { status: "idle" }, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
+        submitCooldown = null;
+        set({ isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, status: "editing", recipientLookup: { status: "idle" }, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
       },
     };
   });

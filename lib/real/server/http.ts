@@ -47,6 +47,21 @@ export function rateLimitedResponse(message: string, retryAfterSeconds: number):
 }
 
 /**
+ * Payment-submit budget denial (Milestone 3, Slice 3A-2): the same shape as
+ * rateLimitedResponse PLUS `retryable: true`. A client treats a non-retryable
+ * submit error as a possibly-uncertain dispatch, but a budget denial is decided
+ * before any provider work — nothing changed and nothing was sent — so it must
+ * say so. Kept separate so rateLimitedResponse's body (used by the probe and
+ * prepare routes) is untouched. The delay is validated upstream; a value that
+ * is not a positive safe integer is a bug, so it throws (the route's generic
+ * 500) rather than inventing a Retry-After.
+ */
+export function retryableRateLimitedResponse(message: string, retryAfterSeconds: number): Response {
+  if (!Number.isSafeInteger(retryAfterSeconds) || retryAfterSeconds < 1) throw new Error("Rate-limited response needs a positive whole-second delay.");
+  return Response.json({ error: message, code: "rate_limited", retryable: true }, { status: 429, headers: { "Retry-After": String(retryAfterSeconds) } });
+}
+
+/**
  * Parses a request body as JSON, returning null on any parse failure
  * instead of throwing — so a malformed body becomes a clean 400 at the
  * call site, never an uncaught exception that would otherwise fall through

@@ -19,6 +19,7 @@ import { DuplicateSignActivityError, toPublicRecipientIdentity, type PaymentAtte
 import { isWellFormedActivityId, verifyPaymentAuthorization } from "./payment-authorization";
 import { ADDRESS_PREPARE_POLICIES, HANDLE_PREPARE_POLICIES, type ProviderBudgetLimiter, type RateLimiter } from "./rate-limit";
 import { consumeChainReadBudget } from "./chain-read-budget";
+import { consumePaySubmitBudget } from "./pay-submit-budget";
 import type { RealServerConfig } from "./config";
 import type { PrepareRecipientSelector } from "./handle-recipient";
 
@@ -390,6 +391,8 @@ export type SubmitPaymentOutcome =
   | { outcome: "wrong_passkey" }
   /** Turnkey couldn't confirm the approval right now. Nothing changes and nothing is sent; the SAME signature may be retried — no new passkey prompt needed. */
   | { outcome: "authorization_unavailable" }
+  /** The account's submit budget is spent. Decided BEFORE any provider work: nothing changed, nothing was sent, the payment slot is still held, and the SAME signature may be retried after the delay. */
+  | { outcome: "rate_limited"; retryAfterSeconds: number }
   | { outcome: "submitted"; attempt: PublicPaymentAttempt }
   | { outcome: "failed"; attempt: PublicPaymentAttempt }
   | { outcome: "unknown"; attempt: PublicPaymentAttempt };
@@ -471,6 +474,13 @@ export async function resolveSubmitPayment(input: {
   pimlicoApiKey: string;
   /** Parent-key, read-only Turnkey access for the attribution proof. */
   config: RealServerConfig;
+  /**
+   * REQUIRED: the per-account provider budget (the submit family), charged once
+   * per provider-bound submit immediately before the first Turnkey read — and
+   * not at all on a branch that returns before one. Its policy comes from
+   * pay-submit-budget.ts, never from a caller.
+   */
+  providerBudgetLimiter: ProviderBudgetLimiter;
   attemptId: unknown;
   signature: unknown;
   /** The Turnkey signRawPayload activity id the browser got back — a locator only; verified server-side before anything is trusted. */
@@ -513,6 +523,16 @@ export async function resolveSubmitPayment(input: {
   } catch {
     return failBeforeClaim(input.paymentStore, attempt, SAFE_INTERNAL_ERROR);
   }
+
+  // The ONE charge of this request, made after every database-only and offline
+  // refusal above and immediately before the first provider call; it covers
+  // the Turnkey reads below and the permitted downstream dispatch. A limiter
+  // failure throws out of here (the route's generic 500) — before any provider
+  // call and before any transition, so the row stays awaiting_authorization.
+  // A denial changes nothing: no transition, no read, no dispatch, and the
+  // active payment slot stays held; the same signature may be retried.
+  const budget = await consumePaySubmitBudget(input.providerBudgetLimiter, authenticated.account.appUserId);
+  if (!budget.allowed) return { outcome: "rate_limited", retryAfterSeconds: budget.retryAfterSeconds };
 
   const authorization = await verifyPaymentAuthorization({
     config: input.config,

@@ -7,6 +7,7 @@ import {
   MANUAL_CHECK_COOLDOWN_MS,
   MAX_AUTOMATIC_FOLLOW_UPS,
   MAX_FOLLOW_UP_INTERVAL_MS,
+  parseSubmitRetryAfter,
   STATUS_FALLBACK_DEADLINE_MS,
   STATUS_REQUEST_DEADLINE_MS,
 } from "@/lib/stores/real-payment-store";
@@ -3288,5 +3289,860 @@ describe("real-payment-store — 3A-1 closeout: cooldown floor, cancel-read cont
     expect(s.requests).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(24 * HOUR);
     expect(s.requests).toHaveLength(1);
+  });
+});
+
+/**
+ * 3A-2 Stage 2: the client side of the server's per-account SUBMIT budget
+ * (HTTP 429, code "rate_limited", retryable true, Retry-After), and isolation of
+ * every submit/signing answer from a context that has since been replaced. A
+ * budget denial is decided before any provider work: nothing was sent and
+ * nothing changed. Everything here is a fake server on fake timers — no network,
+ * no Turnkey, no bundler.
+ */
+describe("real-payment-store — 3A-2 Stage 2: submit cooldown and submit-response isolation", () => {
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const T0_MS = 1_800_000_000_000; // a whole second, so boundary arithmetic is exact
+  const HOUR = 60 * 60 * 1000;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  const denial = (retryAfter: string | null | undefined, body: Record<string, unknown> = { error: "Too many tries right now. Wait a moment, then tap Continue.", code: "rate_limited", retryable: true }) =>
+    new Response(JSON.stringify(body), { status: 429, headers: { "content-type": "application/json", ...(retryAfter === null || retryAfter === undefined ? {} : { "Retry-After": retryAfter }) } });
+  const submittedBody = () => jsonResponse(200, { attempt: { ...baseAttempt(), state: "submitted", prepared: null } });
+
+  type HeldSubmit = { body: { attemptId: string; signature: string; activityId: string }; respond: (response: Response) => void; fail: () => void };
+
+  function lab(options: { secondsBeforeExpiry?: number; latestId?: string; latestState?: string; statusState?: string } = {}) {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0_MS);
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: "0xsig", activityId: "activity-1" } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+    const offset = VALID_UNTIL - (options.secondsBeforeExpiry ?? 1000) - Math.floor(T0_MS / 1000);
+    const serverNow = () => Math.floor(Date.now() / 1000) + offset;
+    const log: { url: string; method: string; body: unknown; at: number }[] = [];
+    const script: Array<Response | "hold"> = [];
+    const held: HeldSubmit[] = [];
+    let latestId = options.latestId ?? "attempt-1";
+    let statusState = options.statusState ?? "awaiting_authorization";
+    let cancelOk = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const body = init?.body ? (JSON.parse(init.body as string) as unknown) : undefined;
+        log.push({ url, method, body, at: Date.now() });
+        if (url.includes("/latest")) {
+          const state = options.latestState ?? "awaiting_authorization";
+          return jsonResponse(200, {
+            attempt: { ...baseAttempt(), id: latestId, state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null },
+            subOrganizationId: "sub-org-1",
+            authorizingCredentialId: "credential-1",
+            serverNowSeconds: serverNow(),
+          });
+        }
+        if (url.includes("/submit")) {
+          const next = script.shift() ?? submittedBody();
+          if (next !== "hold") return next;
+          return new Promise<Response>((resolve, reject) => {
+            held.push({ body: body as HeldSubmit["body"], respond: resolve, fail: () => reject(new TypeError("Failed to fetch")) });
+          });
+        }
+        if (url.includes("/cancel")) return cancelOk ? jsonResponse(200, { attempt: { ...baseAttempt(), state: "cancelled", prepared: null } }) : jsonResponse(409, { error: "wrong_state" });
+        if (url.includes("/status")) {
+          return jsonResponse(200, {
+            attempt: { ...baseAttempt(), id: url.split("/")[4]!, state: statusState, prepared: statusState === "awaiting_authorization" ? PREPARED_FIELDS : null },
+            serverNowSeconds: serverNow(),
+            reconciliationDeferred: false,
+          });
+        }
+        throw new Error(`unexpected fetch: ${method} ${url}`);
+      }),
+    );
+    return {
+      log,
+      held,
+      offset,
+      script: (...steps: Array<Response | "hold">) => script.push(...steps),
+      count: (fragment: string) => log.filter((c) => c.url.includes(fragment)).length,
+      submits: () => log.filter((c) => c.url.includes("/submit")),
+      setLatestId: (id: string) => {
+        latestId = id;
+      },
+      setStatusState: (state: string) => {
+        statusState = state;
+      },
+      setCancelOk: (ok: boolean) => {
+        cancelOk = ok;
+      },
+      settle: () => vi.advanceTimersByTimeAsync(0),
+    };
+  }
+
+  function awaiting(store: ReturnType<typeof createRealPaymentStore>, offset: number, id = "attempt-1") {
+    store.setState({ attempt: { ...baseAttempt(), id }, status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: offset });
+  }
+
+  /** One Continue that ends in a 429 with the given Retry-After; returns the store, awaiting. */
+  async function denied(retryAfter: string | null | undefined, secondsBeforeExpiry = 100_000) {
+    const s = lab({ secondsBeforeExpiry });
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    s.script(denial(retryAfter));
+    await store.getState().resumeAuthorization();
+    return { s, store };
+  }
+
+  // ---- the header --------------------------------------------------------
+
+  it("parseSubmitRetryAfter: whole seconds 1…86400 as plain digits only; everything else is null", () => {
+    for (const [header, seconds] of [["1", 1], ["120", 120], ["86400", 86_400], ["59", 59]] as const) expect(parseSubmitRetryAfter(header), header).toBe(seconds);
+    for (const bad of [null, undefined, "", " ", "0", "-1", "+5", "1.5", "1e2", "NaN", "Infinity", "-Infinity", "86401", "99999", "100000", "007", "0120", " 30", "30 ", "30s", "abc", "Wed, 21 Oct 2026 07:28:00 GMT", "1,2", "٣٠", String(2 ** 53)]) {
+      expect(parseSubmitRetryAfter(bad as string | null), String(bad)).toBeNull();
+    }
+  });
+
+  // ---- a valid denial ----------------------------------------------------
+
+  it("1. a valid 429 (rate_limited, retryable, Retry-After 120) keeps the payment awaiting approval, keeps the approval, and starts a 120 s wait", async () => {
+    const { s, store } = await denied("120");
+
+    expect(store.getState()).toMatchObject({
+      status: "awaiting_authorization",
+      isSubmitCoolingDown: true,
+      submitCooldownSeconds: 120,
+      isSubmitRetryBeyondApproval: false,
+      isAuthorizing: false,
+      error: null,
+      pendingSubmission: { attemptId: "attempt-1", signature: "0xsig", activityId: "activity-1" },
+    });
+    expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "awaiting_authorization", failureReason: null });
+    expect(s.submits()).toHaveLength(1);
+    expect(s.count("/cancel")).toBe(0);
+    store.getState().detach();
+  });
+
+  it("2. rapid Continue presses during the wait send nothing and open no passkey prompt", async () => {
+    const { s, store } = await denied("120");
+    const signs = vi.mocked(signPreparedPayment).mock.calls.length;
+
+    await Promise.all([1, 2, 3, 4, 5].map(() => store.getState().resumeAuthorization()));
+    await vi.advanceTimersByTimeAsync(60_000);
+    await Promise.all([1, 2, 3].map(() => store.getState().resumeAuthorization()));
+
+    expect(s.submits()).toHaveLength(1);
+    expect(vi.mocked(signPreparedPayment).mock.calls.length).toBe(signs);
+    store.getState().detach();
+  });
+
+  it("3/4/5. one millisecond before the end nothing is sent; the end only re-enables Continue; one explicit press re-sends the SAME approval", async () => {
+    const { s, store } = await denied("120");
+
+    await vi.advanceTimersByTimeAsync(119_999);
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(1);
+    expect(store.getState().isSubmitCoolingDown).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1);
+    // Timer expiry: the control is eligible again — and NOTHING was sent or signed by itself.
+    expect(store.getState().isSubmitCoolingDown).toBe(false);
+    expect(s.submits()).toHaveLength(1);
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(s.submits()).toHaveLength(1);
+
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(2);
+    expect(s.submits()[1]!.body).toEqual({ attemptId: "attempt-1", signature: "0xsig", activityId: "activity-1" });
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(1);
+    expect(store.getState()).toMatchObject({ status: "submitted", pendingSubmission: null });
+    store.getState().detach();
+  });
+
+  it("6. a missing or unusable Retry-After is a 60 s local wait — never an immediate retry", async () => {
+    for (const header of [undefined, null, "", "0", "-5", "1.5", "NaN", "Infinity", "Wed, 21 Oct 2026 07:28:00 GMT", "soon", "86401", "0120", "12s"]) {
+      const { s, store } = await denied(header);
+      expect(store.getState(), String(header)).toMatchObject({ isSubmitCoolingDown: true, submitCooldownSeconds: 60, status: "awaiting_authorization" });
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      await store.getState().resumeAuthorization();
+      expect(s.submits(), String(header)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.getState().isSubmitCoolingDown).toBe(false);
+      store.getState().detach();
+      vi.useRealTimers();
+    }
+  });
+
+  it("7. the maximum Retry-After (86400 s) is honored exactly: no early retry, one after", async () => {
+    const { s, store } = await denied("86400");
+    expect(store.getState().submitCooldownSeconds).toBe(86_400);
+
+    await vi.advanceTimersByTimeAsync(86_399_999);
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(store.getState().isSubmitCoolingDown).toBe(false);
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(2);
+    store.getState().detach();
+  });
+
+  // ---- remount, account, attempt ----------------------------------------
+
+  it("8. a remount for the same account and attempt keeps the wait; Continue is refused before any signing; a new approval is needed only after it", async () => {
+    const { s, store } = await denied("120");
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    store.getState().detach();
+    await store.getState().init(); // the Pay form mounts again
+    expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isSubmitCoolingDown: true, submitCooldownSeconds: 100, pendingSubmission: null });
+
+    await store.getState().resumeAuthorization();
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(1); // no new passkey prompt
+    expect(s.submits()).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(100_000);
+    expect(store.getState().isSubmitCoolingDown).toBe(false);
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(1);
+    expect(s.submits()).toHaveLength(1);
+
+    // The discarded signature is not promised back: the user approves again.
+    await store.getState().resumeAuthorization();
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(2);
+    expect(s.submits()).toHaveLength(2);
+    store.getState().detach();
+  });
+
+  it("8. a Strict-Mode style mount/cleanup/mount keeps the wait too", async () => {
+    const { s, store } = await denied("300");
+    store.getState().detach();
+    void store.getState().init();
+    store.getState().detach();
+    await store.getState().init();
+
+    expect(store.getState().isSubmitCoolingDown).toBe(true);
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(1);
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(1);
+    store.getState().detach();
+  });
+
+  it("9. reset() clears the wait; another account does not inherit it, even for an attempt with the same id", async () => {
+    const { s, store } = await denied("600");
+
+    store.getState().reset();
+    expect(store.getState()).toMatchObject({ isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false });
+
+    useRealAccountStore.setState({ account: ACCOUNT_B });
+    await store.getState().init();
+    expect(store.getState().isSubmitCoolingDown).toBe(false);
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(2); // account B's own first Continue went out
+    store.getState().detach();
+  });
+
+  it("9. an account switch WITHOUT a reset still does not inherit the wait (the deadline is bound to the account)", async () => {
+    const { s, store } = await denied("600");
+    store.getState().detach();
+
+    useRealAccountStore.setState({ account: ACCOUNT_B });
+    await store.getState().init();
+
+    expect(store.getState().isSubmitCoolingDown).toBe(false);
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(2);
+    store.getState().detach();
+  });
+
+  it("10. a different attempt inherits nothing", async () => {
+    const { s, store } = await denied("600");
+    store.getState().detach();
+
+    s.setLatestId("attempt-2");
+    await store.getState().init();
+    expect(store.getState().attempt?.id).toBe("attempt-2");
+    expect(store.getState().isSubmitCoolingDown).toBe(false);
+
+    await store.getState().resumeAuthorization();
+    expect(s.submits().at(-1)!.body).toMatchObject({ attemptId: "attempt-2" });
+    expect(s.submits()).toHaveLength(2);
+    store.getState().detach();
+  });
+
+  it("a successful cancel drops the wait; a refused one leaves it (and the payment) alone", async () => {
+    const { s, store } = await denied("600");
+    s.setCancelOk(false);
+    await store.getState().cancel();
+    expect(store.getState().isSubmitCoolingDown).toBe(true);
+    expect(store.getState().attempt?.id).toBe("attempt-1");
+
+    s.setCancelOk(true);
+    await store.getState().cancel();
+    expect(store.getState()).toMatchObject({ status: "editing", attempt: null, isSubmitCoolingDown: false, submitCooldownSeconds: null });
+    store.getState().detach();
+  });
+
+  it("detach() leaves no timer behind and a later deadline passing changes nothing", async () => {
+    const { s, store } = await denied("120");
+    store.getState().detach();
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(s.submits()).toHaveLength(1);
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(1);
+    expect(store.getState().status).toBe("awaiting_authorization");
+  });
+
+  // ---- late answers ------------------------------------------------------
+
+  it("11/A/B/C/D. a submit answer — success, 429, retryable or unknown — arriving after the account changed touches nothing of the new context", async () => {
+    const answers: Array<{ name: string; settle: (h: HeldSubmit) => void }> = [
+      { name: "success", settle: (h) => h.respond(submittedBody()) },
+      { name: "429", settle: (h) => h.respond(denial("900")) },
+      { name: "retryable 503", settle: (h) => h.respond(jsonResponse(503, { error: "We couldn't confirm your passkey approval yet. Try again in a moment.", retryable: true })) },
+      { name: "network failure", settle: (h) => h.fail() },
+      { name: "generic 500", settle: (h) => h.respond(jsonResponse(500, { error: "Something went wrong. Please try again." })) },
+    ];
+    for (const answer of answers) {
+      const s = lab();
+      const store = createRealPaymentStore();
+      awaiting(store, s.offset);
+      s.script("hold");
+      const sending = store.getState().resumeAuthorization();
+      await s.settle();
+      expect(s.held).toHaveLength(1);
+
+      // The account changes; the new account has its own payment awaiting approval.
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+      store.getState().reset();
+      s.setLatestId("attempt-b");
+      await store.getState().init();
+      const before = store.getState();
+      const snapshot = { status: before.status, attempt: before.attempt, error: before.error, pendingSubmission: before.pendingSubmission, cooling: before.isSubmitCoolingDown };
+
+      answer.settle(s.held[0]!);
+      await sending;
+      await s.settle();
+
+      const after = store.getState();
+      expect({ status: after.status, attempt: after.attempt, error: after.error, pendingSubmission: after.pendingSubmission, cooling: after.isSubmitCoolingDown }, answer.name).toEqual(snapshot);
+      expect(after.attempt?.id).toBe("attempt-b");
+      // B's payment is still free to be continued: the stale answer started no wait for it.
+      s.script(submittedBody());
+      await store.getState().resumeAuthorization();
+      expect(s.submits().at(-1)!.body).toMatchObject({ attemptId: "attempt-b" });
+      store.getState().detach();
+      vi.useRealTimers();
+    }
+  });
+
+  it("12/I. an answer from a previous mount of the SAME attempt is dropped too — it neither applies nor suppresses the newer outcome", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    s.script("hold");
+    const first = store.getState().resumeAuthorization();
+    await s.settle();
+
+    store.getState().detach();
+    await store.getState().init(); // remount: the old handler's lifecycle is over
+    s.script(submittedBody());
+    await store.getState().resumeAuthorization(); // a new approval and a new submit: submitted
+    expect(store.getState().status).toBe("submitted");
+    const settled = { status: store.getState().status, attempt: store.getState().attempt };
+
+    s.held[0]!.respond(denial("900")); // the old request's 429, now far too late
+    await first;
+    await s.settle();
+
+    expect(store.getState().status).toBe(settled.status);
+    expect(store.getState().attempt).toEqual(settled.attempt);
+    expect(store.getState().isSubmitCoolingDown).toBe(false);
+    store.getState().detach();
+  });
+
+  it("12. a late success after a remount does not overwrite what the new lifecycle read", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    s.script("hold");
+    const first = store.getState().resumeAuthorization();
+    await s.settle();
+    store.getState().detach();
+    s.setStatusState("awaiting_authorization");
+    await store.getState().init();
+    const before = store.getState().attempt;
+
+    s.held[0]!.respond(jsonResponse(200, { attempt: { ...baseAttempt(), state: "confirmed", prepared: null } }));
+    await first;
+
+    expect(store.getState().attempt).toEqual(before);
+    expect(store.getState().status).toBe("awaiting_authorization");
+    store.getState().detach();
+  });
+
+  it("13/E. a passkey ceremony that finishes after reset, detach/remount, or the attempt being replaced starts no submit and keeps no signature", async () => {
+    const ways: Array<{ name: string; end: (store: ReturnType<typeof createRealPaymentStore>, s: ReturnType<typeof lab>) => Promise<void> }> = [
+      { name: "reset", end: async (store) => store.getState().reset() },
+      {
+        name: "detach and remount",
+        end: async (store) => {
+          store.getState().detach();
+          await store.getState().init();
+        },
+      },
+      {
+        name: "attempt replaced",
+        end: async (store, s) => {
+          awaiting(store, s.offset, "attempt-2");
+        },
+      },
+      {
+        name: "account switched",
+        end: async () => {
+          useRealAccountStore.setState({ account: ACCOUNT_B });
+        },
+      },
+    ];
+    for (const way of ways) {
+      const s = lab();
+      let finish: (value: { signature: string; activityId: string }) => void = () => {};
+      vi.mocked(signPreparedPayment).mockReset();
+      vi.mocked(signPreparedPayment).mockImplementation(() => new Promise((resolve) => (finish = resolve as typeof finish)) as never);
+      const store = createRealPaymentStore();
+      awaiting(store, s.offset);
+
+      const approving = store.getState().resumeAuthorization();
+      await s.settle();
+      expect(store.getState().isAuthorizing).toBe(true);
+      await way.end(store, s);
+      finish({ signature: "0xsig", activityId: "activity-1" });
+      await approving;
+      await s.settle();
+
+      expect(s.submits(), way.name).toHaveLength(0);
+      expect(store.getState().pendingSubmission, way.name).toBeNull();
+      store.getState().detach();
+      vi.useRealTimers();
+    }
+  });
+
+  it("13. a passkey ceremony that fails after the context changed does not write an error into the new one", async () => {
+    const s = lab();
+    let fail: (error: Error) => void = () => {};
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockImplementation(() => new Promise((_resolve, reject) => (fail = reject)) as never);
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    const approving = store.getState().resumeAuthorization();
+    await s.settle();
+
+    store.getState().reset();
+    fail(new Error("device went away"));
+    await approving;
+
+    expect(store.getState()).toMatchObject({ status: "editing", error: null, attempt: null });
+  });
+
+  it("an overlapping Continue while the passkey sheet is open opens no second ceremony", async () => {
+    const s = lab();
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockImplementation(() => new Promise(() => {}) as never);
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+
+    void store.getState().resumeAuthorization();
+    await s.settle();
+    await Promise.all([store.getState().resumeAuthorization(), store.getState().resumeAuthorization()]);
+
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(1);
+    expect(s.submits()).toHaveLength(0);
+    store.getState().detach();
+  });
+
+  it("a wait that begins while another handler is signing applies before that handler sends anything", async () => {
+    const s = lab();
+    let finish: (value: { signature: string; activityId: string }) => void = () => {};
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockImplementation(() => new Promise((resolve) => (finish = resolve as typeof finish)) as never);
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    const approving = store.getState().resumeAuthorization();
+    await s.settle();
+
+    // A denial for this same attempt lands meanwhile (e.g. a request from a sibling handler).
+    s.script(denial("300"));
+    // Simulated through the only public door: a prior approval for this attempt is submitted and refused.
+    store.setState({ pendingSubmission: { attemptId: "attempt-1", signature: "0xold", activityId: "activity-old" } });
+    store.setState({ isAuthorizing: false });
+    await store.getState().resumeAuthorization();
+    expect(store.getState().isSubmitCoolingDown).toBe(true);
+
+    finish({ signature: "0xsig", activityId: "activity-1" });
+    await approving;
+
+    expect(s.submits()).toHaveLength(1); // the ceremony's result was NOT sent into the wait
+    expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isSubmitCoolingDown: true, error: null });
+    expect(store.getState().pendingSubmission).toMatchObject({ signature: "0xsig" }); // kept for after the wait
+    store.getState().detach();
+  });
+
+  // ---- races -------------------------------------------------------------
+
+  it("a 429 for a payment a status read already finished is dropped — a confirmed payment is never turned back into a wait", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    s.script("hold");
+    const sending = store.getState().resumeAuthorization();
+    await s.settle();
+
+    s.setStatusState("confirmed");
+    await store.getState().checkStatus(); // a read begun AFTER the submit started applies
+    expect(store.getState().status).toBe("confirmed");
+
+    s.held[0]!.respond(denial("600"));
+    await sending;
+
+    expect(store.getState()).toMatchObject({ status: "confirmed", isSubmitCoolingDown: false });
+    expect(store.getState().attempt?.state).toBe("confirmed");
+    store.getState().detach();
+  });
+
+  it("a late 'submitted' never regresses a payment a read already showed as confirmed", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    s.script("hold");
+    const sending = store.getState().resumeAuthorization();
+    await s.settle();
+    s.setStatusState("confirmed");
+    await store.getState().checkStatus();
+
+    s.held[0]!.respond(submittedBody());
+    await sending;
+
+    expect(store.getState().status).toBe("confirmed");
+    expect(store.getState().attempt?.state).toBe("confirmed");
+    expect(store.getState().pendingSubmission).toBeNull();
+    store.getState().detach();
+  });
+
+  it("a manual cancel that succeeds while the submit is pending: the late 429 does not resurrect the payment or start a wait", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    s.script("hold");
+    const sending = store.getState().resumeAuthorization();
+    await s.settle();
+
+    await store.getState().cancel();
+    expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
+
+    s.held[0]!.respond(denial("600"));
+    await sending;
+
+    expect(store.getState()).toMatchObject({ status: "editing", attempt: null, isSubmitCoolingDown: false, pendingSubmission: null });
+    store.getState().detach();
+  });
+
+  it("two overlapping denials: the later deadline wins, and a shorter one never shortens it", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    s.script("hold", "hold");
+    const first = store.getState().resumeAuthorization();
+    await s.settle();
+    // A read shows the row still awaiting, so a second submit is possible: two requests are in flight.
+    await store.getState().checkStatus();
+    expect(store.getState().status).toBe("awaiting_authorization");
+    const second = store.getState().resumeAuthorization();
+    await s.settle();
+    expect(s.held).toHaveLength(2);
+
+    s.held[1]!.respond(denial("600"));
+    await second;
+    s.held[0]!.respond(denial("30"));
+    await first;
+
+    expect(store.getState().submitCooldownSeconds).toBe(600);
+    await vi.advanceTimersByTimeAsync(599_999);
+    expect(store.getState().isSubmitCoolingDown).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(store.getState().isSubmitCoolingDown).toBe(false);
+    store.getState().detach();
+  });
+
+  it("a late prepare answer after an account switch applies nothing and signs nothing", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+    store.setState({ status: "reviewing", recipientInput: "0x3333333333333333333333333333333333333333", amountInput: "1" });
+    let prepared: (response: Response) => void = () => {};
+    const baseFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => (String(input).includes("/prepare") ? new Promise<Response>((resolve) => (prepared = resolve)) : baseFetch(input, init))),
+    );
+
+    const sending = store.getState().confirmAndSend();
+    await s.settle();
+    useRealAccountStore.setState({ account: ACCOUNT_B });
+    store.getState().reset();
+    prepared(jsonResponse(200, { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) }));
+    await sending;
+
+    expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
+    expect(vi.mocked(signPreparedPayment)).not.toHaveBeenCalled();
+    store.getState().detach();
+  });
+
+  // ---- expiry ------------------------------------------------------------
+
+  it("14. the approval expiring during the wait fabricates no failure or finality, and Cancel still works", async () => {
+    const { s, store } = await denied("120", 200);
+    expect(store.getState().isSubmitRetryBeyondApproval).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(201_000);
+
+    expect(store.getState().isAttemptPastValidity).toBe(true);
+    expect(store.getState()).toMatchObject({ status: "awaiting_authorization" });
+    expect(store.getState().attempt).toMatchObject({ state: "awaiting_authorization", failureReason: null, transactionHash: null });
+    expect(s.count("/cancel")).toBe(0);
+    expect(s.submits()).toHaveLength(1);
+
+    await store.getState().cancel();
+    expect(s.count("/cancel")).toBe(1);
+    expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
+    store.getState().detach();
+  });
+
+  it("15. a wait that ends after the approval can still be dispatched is flagged — with the server's 60 s margin as the exact boundary", async () => {
+    // validUntil is 180 s away; a 120 s wait leaves exactly 60 s: still dispatchable.
+    expect((await denied("120", 180)).store.getState().isSubmitRetryBeyondApproval).toBe(false);
+    vi.useRealTimers();
+    // One second less, and it is not.
+    const tooLate = await denied("120", 179);
+    expect(tooLate.store.getState()).toMatchObject({ isSubmitCoolingDown: true, isSubmitRetryBeyondApproval: true, status: "awaiting_authorization" });
+    // Nothing is fabricated: the payment is exactly as it was.
+    expect(tooLate.store.getState().attempt).toMatchObject({ state: "awaiting_authorization", failureReason: null });
+    expect(tooLate.store.getState().pendingSubmission).not.toBeNull();
+    tooLate.store.getState().detach();
+  });
+
+  it("15. the flag survives a remount, and the 60 s fallback is judged the same way", async () => {
+    const { store } = await denied(undefined, 100); // 60 s fallback, 100 s left -> 40 s < margin
+    expect(store.getState()).toMatchObject({ submitCooldownSeconds: 60, isSubmitRetryBeyondApproval: true });
+
+    store.getState().detach();
+    await store.getState().init();
+    expect(store.getState()).toMatchObject({ isSubmitCoolingDown: true, isSubmitRetryBeyondApproval: true });
+    store.getState().detach();
+  });
+
+  // ---- what must not change ---------------------------------------------
+
+  it("16. the existing retryable 503 is unchanged: message shown, no wait, the same approval re-sent at once", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    s.script(jsonResponse(503, { error: "We couldn't confirm your passkey approval yet. Try again in a moment.", retryable: true }));
+    await store.getState().resumeAuthorization();
+
+    expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isSubmitCoolingDown: false, error: "We couldn't confirm your passkey approval yet. Try again in a moment." });
+    expect(store.getState().pendingSubmission).toMatchObject({ signature: "0xsig" });
+
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(2);
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(1);
+    store.getState().detach();
+  });
+
+  it("17. a generic 500 stays conservative: unknown, never a wait, never a resend", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, s.offset);
+    s.script(jsonResponse(500, { error: "Something went wrong. Please try again." }));
+    await store.getState().resumeAuthorization();
+
+    expect(store.getState()).toMatchObject({ status: "unknown", isSubmitCoolingDown: false, error: "Something went wrong. Please try again." });
+    store.getState().detach();
+  });
+
+  it("18. a 429 that is not the submit budget's denial does not impersonate it", async () => {
+    const cases: Array<{ name: string; response: Response; expectStatus: string }> = [
+      { name: "no retryable flag (e.g. a payment quota)", response: denial("60", { error: "You've reached the payment limit.", code: "rate_limited" }), expectStatus: "unknown" },
+      { name: "retryable but another code", response: denial("60", { error: "Slow down.", code: "quota", retryable: true }), expectStatus: "awaiting_authorization" },
+      { name: "retryable false", response: denial("60", { error: "Slow down.", code: "rate_limited", retryable: false }), expectStatus: "unknown" },
+      { name: "no code at all", response: denial("60", { error: "Slow down.", retryable: true }), expectStatus: "awaiting_authorization" },
+      { name: "right body, wrong status", response: new Response(JSON.stringify({ error: "x", code: "rate_limited", retryable: true }), { status: 503, headers: { "Retry-After": "600" } }), expectStatus: "awaiting_authorization" },
+    ];
+    for (const c of cases) {
+      const s = lab();
+      const store = createRealPaymentStore();
+      awaiting(store, s.offset);
+      s.script(c.response);
+      await store.getState().resumeAuthorization();
+      expect(store.getState().status, c.name).toBe(c.expectStatus);
+      expect(store.getState().isSubmitCoolingDown, c.name).toBe(false);
+      expect(store.getState().submitCooldownSeconds, c.name).toBeNull();
+      store.getState().detach();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a late /prepare FAILURE after an account switch or a remount changes nothing in the current context and signs nothing", async () => {
+    const failures: Array<{ name: string; end: (settle: { resolve: (r: Response) => void; reject: (e: Error) => void }) => void }> = [
+      { name: "404 for a found name", end: ({ resolve }) => resolve(jsonResponse(404, { error: "We couldn't find that name." })) },
+      { name: "400", end: ({ resolve }) => resolve(jsonResponse(400, { error: "That payment can't be sent." })) },
+      { name: "500", end: ({ resolve }) => resolve(jsonResponse(500, { error: "Something went wrong. Please try again." })) },
+      { name: "network failure", end: ({ reject }) => reject(new TypeError("Failed to fetch")) },
+    ];
+    for (const way of ["account switched", "detach and remount"] as const) {
+      for (const failure of failures) {
+        const s = lab();
+        const store = createRealPaymentStore();
+        store.setState({ status: "reviewing", recipientInput: "@maya", recipientLookup: { status: "found", handle: "maya", displayName: "Maya", isSelf: false }, amountInput: "1" });
+        const baseFetch = globalThis.fetch;
+        let prepare: { resolve: (r: Response) => void; reject: (e: Error) => void } = { resolve: () => {}, reject: () => {} };
+        vi.stubGlobal(
+          "fetch",
+          vi.fn((input: RequestInfo | URL, init?: RequestInit) => (String(input).includes("/prepare") ? new Promise<Response>((resolve, reject) => (prepare = { resolve, reject })) : baseFetch(input, init))),
+        );
+
+        const sending = store.getState().confirmAndSend();
+        await s.settle();
+        expect(store.getState().status).toBe("preparing");
+
+        if (way === "account switched") {
+          useRealAccountStore.setState({ account: ACCOUNT_B });
+          store.getState().reset();
+          s.setLatestId("attempt-b");
+        } else {
+          store.getState().detach();
+        }
+        await store.getState().init();
+        // The current context has its own, different found name — a stale 404 must not wipe it.
+        store.setState({ recipientInput: "@zed", recipientLookup: { status: "found", handle: "zed", displayName: null, isSelf: false } });
+        const pick = (state: ReturnType<typeof store.getState>) => ({ status: state.status, attempt: state.attempt, error: state.error, recipientInput: state.recipientInput, recipientLookup: state.recipientLookup, pendingSubmission: state.pendingSubmission });
+        const before = pick(store.getState());
+
+        failure.end(prepare);
+        await sending;
+        await s.settle();
+
+        expect(pick(store.getState()), `${way}: ${failure.name}`).toEqual(before);
+        expect(vi.mocked(signPreparedPayment)).not.toHaveBeenCalled();
+        expect(s.submits()).toHaveLength(0);
+        store.getState().detach();
+        vi.useRealTimers();
+      }
+    }
+  });
+
+  it("a wait that outlasts the approval ends without making the approval offerable again: the flag stays, nothing is sent", async () => {
+    // 30 s of approval left, a 1 s wait: the margin (60 s) is already gone, so the wait can never lead to a usable retry.
+    const { s, store } = await denied("1", 30);
+    expect(store.getState()).toMatchObject({ isSubmitCoolingDown: true, isSubmitRetryBeyondApproval: true });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(store.getState()).toMatchObject({ isSubmitCoolingDown: false, isSubmitRetryBeyondApproval: true, status: "awaiting_authorization" });
+    expect(store.getState().attempt).toMatchObject({ state: "awaiting_authorization", failureReason: null });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(s.submits()).toHaveLength(1);
+    expect(vi.mocked(signPreparedPayment)).toHaveBeenCalledTimes(1);
+    store.getState().detach();
+  });
+
+  it("a NEW payment prepared after the previous one was cancelled elsewhere does not inherit that attempt's published wait", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    const address = "0x3333333333333333333333333333333333333333";
+    const baseFetch = globalThis.fetch;
+    const preparedIds = ["attempt-1", "attempt-new"];
+    const prepareCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (!String(input).includes("/prepare")) return baseFetch(input, init);
+        const id = preparedIds.shift()!;
+        prepareCalls.push(id);
+        return Promise.resolve(jsonResponse(200, { attempt: { ...baseAttempt(), id }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) + s.offset }));
+      }),
+    );
+    // First approval is signed (then refused by the server's budget); the new payment's passkey sheet is dismissed.
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment)
+      .mockResolvedValueOnce({ signature: "0xsig", activityId: "activity-1" } as never)
+      .mockRejectedValueOnce(Object.assign(new Error("dismissed"), { name: "NotAllowedError" }))
+      .mockResolvedValue({ signature: "0xsig-new", activityId: "activity-new" } as never);
+
+    // 1-3. Prepare, get a valid submit-budget denial (Retry-After 600), and see the wait published.
+    store.getState().setRecipientInput(address);
+    store.getState().setAmountInput("1");
+    await store.getState().review();
+    expect(store.getState().status).toBe("reviewing");
+    s.script(denial("600"));
+    await store.getState().confirmAndSend();
+    expect(store.getState().attempt?.id).toBe("attempt-1");
+    expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isSubmitCoolingDown: true, submitCooldownSeconds: 600, isSubmitRetryBeyondApproval: false });
+
+    // 4-5. The attempt is cancelled elsewhere; the existing status read observes it and the store returns to editing.
+    s.setStatusState("cancelled");
+    await store.getState().checkStatus();
+    expect(store.getState().status).toBe("editing");
+    expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "cancelled" });
+    const submitsBefore = s.submits().length;
+    const signsBefore = vi.mocked(signPreparedPayment).mock.calls.length;
+
+    // 6-7. A NEW payment is prepared through the public actions, without reset().
+    store.getState().setRecipientInput(address);
+    store.getState().setAmountInput("2");
+    await store.getState().review();
+    await store.getState().confirmAndSend();
+    expect(prepareCalls).toEqual(["attempt-1", "attempt-new"]);
+    expect(store.getState().attempt?.id).toBe("attempt-new");
+    expect(store.getState().status).toBe("awaiting_authorization");
+
+    // 8. The old attempt's published wait is gone — all three fields.
+    expect(store.getState()).toMatchObject({ isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false });
+    // 10. Preparing is the user's own action: exactly one passkey ceremony for it (dismissed), and no submit of any kind.
+    expect(vi.mocked(signPreparedPayment).mock.calls.length).toBe(signsBefore + 1);
+    expect(s.submits()).toHaveLength(submitsBefore);
+    expect(store.getState().pendingSubmission).toBeNull();
+    expect(s.count("/cancel")).toBe(0);
+
+    // 9. The previous wait does not gate the new attempt: its Continue signs and submits at once.
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(submitsBefore + 1);
+    expect(s.submits().at(-1)!.body).toMatchObject({ attemptId: "attempt-new", signature: "0xsig-new", activityId: "activity-new" });
+    store.getState().detach();
+  });
+
+  it("the SAME attempt keeps its published wait across a remount — only a newly prepared attempt clears it", async () => {
+    const { s, store } = await denied("600");
+    store.getState().detach();
+    await store.getState().init();
+    expect(store.getState()).toMatchObject({ isSubmitCoolingDown: true, submitCooldownSeconds: 600 });
+    await store.getState().resumeAuthorization();
+    expect(s.submits()).toHaveLength(1);
+    store.getState().detach();
+  });
+
+  it("a denial never calls cancel, status, prepare or the balance, and never invents a transaction", async () => {
+    const { s, store } = await denied("120");
+    await vi.advanceTimersByTimeAsync(119_000);
+    expect(s.count("/cancel") + s.count("/prepare")).toBe(0);
+    expect(store.getState().attempt?.transactionHash).toBeNull();
+    store.getState().detach();
   });
 });

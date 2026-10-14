@@ -8,6 +8,7 @@ import { createInMemoryAccountHandleStore } from "@/lib/real/server/account-hand
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import type { PaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
+import { openBudget, scriptedBudget } from "./fixtures/chain-read-budget";
 
 /**
  * Pre-2f hardening: this repo's other tests exercise the resolveX functions
@@ -188,7 +189,7 @@ describe("POST /api/real/payments/submit — Slice S1 attribution contract (actu
 
   const SIGNATURE = `0x${"00".repeat(12)}${"11".repeat(64)}1b`;
 
-  async function setup(sessionCredentialId: string) {
+  async function setup(sessionCredentialId: string, limiter: ReturnType<typeof openBudget> = openBudget()) {
     vi.resetModules();
     stubRequiredConfigEnv();
     const registry = await seedRegistry();
@@ -207,12 +208,14 @@ describe("POST /api/real/payments/submit — Slice S1 attribution contract (actu
     const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
     const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: sessionCredentialId, sessionEpoch: 0 }), REAL_SESSION_SECRET_VALUE);
     vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar({ [REAL_SESSION_COOKIE_NAME]: cookieValue }) }));
-    vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => registry, getPaymentAttemptStore: () => paymentStore }));
+    vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => registry, getPaymentAttemptStore: () => paymentStore, getProviderBudgetLimiter: () => limiter }));
+    const turnkeyReads = { count: 0 };
     // Turnkey is unreachable: the parent-key read-back throws.
     vi.doMock("@turnkey/http", () => ({
       TurnkeyClient: vi.fn().mockImplementation(function TurnkeyClientMock() {
         return {
           getActivity: async () => {
+            turnkeyReads.count += 1;
             throw new Error("ECONNRESET api.turnkey.com");
           },
           getUsers: async () => ({ users: [] }),
@@ -221,8 +224,36 @@ describe("POST /api/real/payments/submit — Slice S1 attribution contract (actu
     }));
     const { POST } = await import("@/app/api/real/payments/submit/route");
     const submit = (body: object) => POST(new Request("http://localhost/api/real/payments/submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
-    return { submit, paymentStore, attemptId: reserved.attempt.id };
+    return { submit, paymentStore, attemptId: reserved.attempt.id, turnkeyReads };
   }
+
+  it("Slice 3A-2: an exhausted submit budget is 429 { code: 'rate_limited', retryable: true } with Retry-After — no Turnkey read, the row unchanged", async () => {
+    const { limiter, calls } = scriptedBudget({ allowed: false, retryAfterSeconds: 90 });
+    const { submit, paymentStore, attemptId, turnkeyReads } = await setup("credential-1", limiter);
+    const before = structuredClone(await paymentStore.findById(attemptId));
+
+    const response = await submit({ attemptId, signature: SIGNATURE, activityId: "activity-1" });
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("90");
+    expect(await response.json()).toEqual({ error: "Too many tries right now. Wait a moment, then tap Continue.", code: "rate_limited", retryable: true });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.subject).toBe("app-user-1");
+    expect(turnkeyReads.count).toBe(0);
+    expect(await paymentStore.findById(attemptId)).toEqual(before);
+  });
+
+  it("Slice 3A-2: a failing budget (e.g. its table is missing) is the generic 500 — no Turnkey read, the row unchanged, no database text", async () => {
+    const { limiter } = scriptedBudget(new Error('relation "real_provider_budgets" does not exist'));
+    const { submit, paymentStore, attemptId, turnkeyReads } = await setup("credential-1", limiter);
+
+    const response = await submit({ attemptId, signature: SIGNATURE, activityId: "activity-1" });
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: GENERIC_SERVER_ERROR_MESSAGE });
+    expect(turnkeyReads.count).toBe(0);
+    expect((await paymentStore.findById(attemptId))?.state).toBe("awaiting_authorization");
+  });
 
   it("no activity id: 400 before the row is touched — a signature alone is never enough", async () => {
     const { submit, paymentStore, attemptId } = await setup("credential-1");

@@ -41,6 +41,9 @@ export function RealPayForm() {
   const isCoolingDown = useRealPaymentStore((s) => s.isManualCheckCoolingDown);
   const isFollowUpExhausted = useRealPaymentStore((s) => s.isFollowUpExhausted);
   const isStatusDeferred = useRealPaymentStore((s) => s.isStatusDeferred);
+  const isSubmitCoolingDown = useRealPaymentStore((s) => s.isSubmitCoolingDown);
+  const submitCooldownSeconds = useRealPaymentStore((s) => s.submitCooldownSeconds);
+  const isSubmitRetryBeyondApproval = useRealPaymentStore((s) => s.isSubmitRetryBeyondApproval);
   const balanceStatus = useRealBalanceStore((s) => s.status);
   const error = useRealPaymentStore((s) => s.error);
   const init = useRealPaymentStore((s) => s.init);
@@ -286,8 +289,20 @@ export function RealPayForm() {
           ) : null}
           {isPastValidity ? (
             <p className="text-xs text-muted-foreground">We&apos;re waiting for final confirmation before showing the final result. This can take a while.</p>
+          ) : isSubmitRetryBeyondApproval ? (
+            // The wait outlasts this approval: no promise it can still be used, no Continue to follow.
+            <p className="text-sm text-muted-foreground" data-testid="real-pay-approval-expiring">
+              {APPROVAL_EXPIRES_BEFORE_RETRY_MESSAGE}
+            </p>
           ) : (
-            <p className="text-xs font-medium text-destructive">Only continue if you started this payment.</p>
+            <>
+              {isSubmitCoolingDown ? (
+                <p className="text-sm text-muted-foreground" data-testid="real-pay-submit-wait">
+                  {submitWaitMessage(submitCooldownSeconds)}
+                </p>
+              ) : null}
+              <p className="text-xs font-medium text-destructive">Only continue if you started this payment.</p>
+            </>
           )}
           {isFollowUpExhausted ? (
             <p className="text-xs text-muted-foreground">{STILL_WAITING_MESSAGE}</p>
@@ -297,8 +312,8 @@ export function RealPayForm() {
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
         <div className="flex flex-col gap-2">
           {isFollowUpExhausted ? <CheckStatusButton onClick={() => void checkStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} /> : null}
-          {isPastValidity ? null : (
-            <Button size="lg" className="h-12 w-full" onClick={() => void resumeAuthorization()}>
+          {isPastValidity || isSubmitRetryBeyondApproval ? null : (
+            <Button size="lg" className="h-12 w-full" disabled={isSubmitCoolingDown} onClick={() => void resumeAuthorization()}>
               Continue
             </Button>
           )}
@@ -405,6 +420,19 @@ const CHECK_LATER_LABEL = "Check available later";
 // The server declined to look right now (not a verdict on the payment). Plain words only.
 const STATUS_DEFERRED_MESSAGE = "We can’t check for an update right now. You can check again later.";
 const STATUS_DEFERRED_AUTOMATIC_MESSAGE = "We can’t check for an update right now. We’ll look again later.";
+
+// A refused send (the account's own limit, not a verdict on the payment): nothing was sent and nothing changed.
+const APPROVAL_EXPIRES_BEFORE_RETRY_MESSAGE =
+  "This payment approval will expire before you can try again. You can cancel this payment and start a new one later.";
+
+/** Plain-language, approximate wait — never a countdown and never a promise that the approval will still be usable. */
+function submitWaitMessage(seconds: number | null): string {
+  const base = "Too many attempts right now.";
+  if (seconds === null || seconds < 120) return `${base} You can try again shortly.`;
+  if (seconds < 3_600) return `${base} You can try again in about ${Math.ceil(seconds / 60)} minutes.`;
+  const hours = Math.ceil(seconds / 3_600);
+  return `${base} You can try again in about ${hours} ${hours === 1 ? "hour" : "hours"}.`;
+}
 
 /** What the amount line says while there is no balance to show — never a number, never zero. */
 function balanceUnavailableLabel(status: "idle" | "loading" | "ready" | "unauthenticated" | "rate_limited" | "error"): string {

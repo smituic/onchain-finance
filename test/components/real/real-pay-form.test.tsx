@@ -1352,3 +1352,232 @@ describe("RealPayForm — 3A-1 Stage 2C-2: deferral and balance line", () => {
     expect(counter.calls).toBe(2);
   });
 });
+
+/**
+ * 3A-2 Stage 2: what the person sees when the server refuses a send because the
+ * account has tried too often. The refusal is decided before any provider work,
+ * so the payment is exactly as it was: still waiting for their approval.
+ */
+describe("RealPayForm — 3A-2 Stage 2: submit wait", () => {
+  const JARGON = /turnkey|pimlico|provider|bucket|budget|rate.?limit|\b429\b|useroperation|bundler|entrypoint|retry-after/i;
+
+  beforeEach(() => {
+    useRealPaymentStore.getState().reset();
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.setState({ status: "idle", attempt: null, pendingSubmission: null, isAuthorizing: false, error: null });
+    signPreparedPaymentMock.mockReset();
+    signPreparedPaymentMock.mockResolvedValue({ signature: "0xsig", activityId: "activity-1" });
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    useRealPaymentStore.getState().reset();
+    vi.unstubAllGlobals();
+  });
+
+  function stubServer(options: { secondsToExpiry: number; retryAfter: string | null }) {
+    const now = Math.floor(Date.now() / 1000);
+    const validUntil = now + options.secondsToExpiry;
+    const calls = { submit: 0, cancel: 0 };
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, {
+          attempt: attemptFixture({ prepared: { ...PREPARED_FIELDS, validUntil } }),
+          subOrganizationId: "sub-org-1",
+          authorizingCredentialId: "credential-1",
+          serverNowSeconds: now,
+        });
+      }
+      if (url.endsWith("/api/real/payments/submit") && method === "POST") {
+        calls.submit += 1;
+        return new Response(
+          JSON.stringify({ error: "Too many tries right now. Wait a moment, then tap Continue.", code: "rate_limited", retryable: true }),
+          { status: 429, headers: { "content-type": "application/json", ...(options.retryAfter === null ? {} : { "Retry-After": options.retryAfter }) } },
+        );
+      }
+      if (url.endsWith("/cancel") && method === "POST") {
+        calls.cancel += 1;
+        return jsonResponse(200, { attempt: attemptFixture({ state: "cancelled", prepared: null }) });
+      }
+      if (url.includes("/status")) return jsonResponse(200, { attempt: attemptFixture({ prepared: { ...PREPARED_FIELDS, validUntil } }), serverNowSeconds: Math.floor(Date.now() / 1000), reconciliationDeferred: false });
+      return null;
+    });
+    return calls;
+  }
+
+  it("a short wait: Continue is disabled, the wording is plain, Cancel stays available, and nothing is sent again", async () => {
+    const calls = stubServer({ secondsToExpiry: 1000, retryAfter: "30" });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-submit-wait")).toBeInTheDocument());
+
+    expect(screen.getByTestId("real-pay-submit-wait")).toHaveTextContent("Too many attempts right now. You can try again shortly.");
+    expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+    expect(screen.queryByText(/tap Continue/i)).toBeNull();
+    expect(screen.getByTestId("real-pay-resume").textContent).not.toMatch(JARGON);
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "awaiting_authorization", pendingSubmission: { signature: "0xsig" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(calls.submit).toBe(1);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a longer wait says roughly how long, without a countdown and without jargon", async () => {
+    stubServer({ secondsToExpiry: 100_000, retryAfter: "1500" });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-submit-wait")).toBeInTheDocument());
+
+    expect(screen.getByTestId("real-pay-submit-wait")).toHaveTextContent("You can try again in about 25 minutes.");
+    expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    expect(screen.getByTestId("real-pay-resume").textContent).not.toMatch(JARGON);
+  });
+
+  it("a day-long wait is described in hours", async () => {
+    stubServer({ secondsToExpiry: 200_000, retryAfter: "86400" });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-submit-wait")).toBeInTheDocument());
+    expect(screen.getByTestId("real-pay-submit-wait")).toHaveTextContent("about 24 hours");
+  });
+
+  it("when the wait outlasts the approval: says so, promises nothing, offers no Continue — Cancel remains and works", async () => {
+    const calls = stubServer({ secondsToExpiry: 100, retryAfter: "600" });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-approval-expiring")).toBeInTheDocument());
+
+    expect(screen.getByTestId("real-pay-approval-expiring")).toHaveTextContent("This payment approval will expire before you can try again. You can cancel this payment and start a new one later.");
+    expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+    expect(screen.queryByText(/Only continue if you started this payment/)).toBeNull();
+    expect(screen.queryByText(/sent|failed/i)).toBeNull();
+    expect(screen.getByTestId("real-pay-resume").textContent).not.toMatch(JARGON);
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+    await waitFor(() => expect(calls.cancel).toBe(1));
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+  });
+
+  it("when the wait ends, Continue is available again and nothing was sent on its own", async () => {
+    const calls = stubServer({ secondsToExpiry: 1000, retryAfter: "1" });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled());
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled(), { timeout: 3000 });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+
+    expect(calls.submit).toBe(1);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("real-pay-submit-wait")).toBeNull();
+  });
+
+  it("when the wait ends but the approval cannot be used any more, Continue is NOT offered again — Cancel remains", async () => {
+    // 30 s of approval left, a 1 s wait: the dispatch margin is already gone.
+    const calls = stubServer({ secondsToExpiry: 30, retryAfter: "1" });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-approval-expiring")).toBeInTheDocument());
+
+    // Wait out the 1 s wait (real timers), then a little more.
+    await waitFor(() => expect(useRealPaymentStore.getState().isSubmitCoolingDown).toBe(false), { timeout: 3000 });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+
+    expect(screen.getByTestId("real-pay-approval-expiring")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+    expect(calls.submit).toBe(1);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a new payment after the old one was cancelled elsewhere shows no wait, and Continue is not held by the old attempt", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const validUntil = now + 1000;
+    const calls = { submit: 0 };
+    routeFetch((url, method, body) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, { attempt: attemptFixture({ prepared: { ...PREPARED_FIELDS, validUntil } }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: now });
+      }
+      if (url.endsWith("/api/real/payments/submit") && method === "POST") {
+        calls.submit += 1;
+        return new Response(JSON.stringify({ error: "Too many tries right now. Wait a moment, then tap Continue.", code: "rate_limited", retryable: true }), { status: 429, headers: { "content-type": "application/json", "Retry-After": "600" } });
+      }
+      if (url.includes("/payment-attempt-1/status")) {
+        return jsonResponse(200, { attempt: attemptFixture({ state: "cancelled", prepared: null }), serverNowSeconds: Math.floor(Date.now() / 1000), reconciliationDeferred: false });
+      }
+      if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
+        expect(body).toMatchObject({ recipient: RECIPIENT });
+        return jsonResponse(200, {
+          attempt: attemptFixture({ id: "payment-attempt-2", prepared: { ...PREPARED_FIELDS, validUntil } }),
+          subOrganizationId: "sub-org-1",
+          authorizingCredentialId: "credential-1",
+          serverNowSeconds: Math.floor(Date.now() / 1000),
+        });
+      }
+      return null;
+    });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-submit-wait")).toBeInTheDocument());
+
+    // The payment is cancelled elsewhere and the existing status read sees it.
+    await act(async () => {
+      await useRealPaymentStore.getState().checkStatus();
+    });
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+
+    // A new payment, through the form, with the passkey sheet dismissed so it waits for approval.
+    signPreparedPaymentMock.mockReset();
+    signPreparedPaymentMock.mockRejectedValue(Object.assign(new Error("dismissed"), { name: "NotAllowedError" }));
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+
+    expect(useRealPaymentStore.getState().attempt?.id).toBe("payment-attempt-2");
+    expect(screen.queryByTestId("real-pay-submit-wait")).toBeNull();
+    expect(screen.queryByTestId("real-pay-approval-expiring")).toBeNull();
+    expect(screen.queryByText(/Too many attempts/)).toBeNull();
+    // Ordinary rules still apply: the safety line, Cancel, and a live Continue.
+    expect(screen.getByText("Only continue if you started this payment.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+    expect(calls.submit).toBe(1); // only the first attempt's refused submit; the new one was never sent on its own
+  });
+
+  it("a remount during the wait keeps Continue disabled", async () => {
+    const calls = stubServer({ secondsToExpiry: 1000, retryAfter: "300" });
+    const first = render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-submit-wait")).toBeInTheDocument());
+    first.unmount();
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-submit-wait")).toBeInTheDocument());
+
+    expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(calls.submit).toBe(1);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+  });
+});

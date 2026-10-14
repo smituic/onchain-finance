@@ -467,26 +467,31 @@ describe("static boundaries — who may consult a provider budget (3A-0 foundati
       .map((file) => file.split(path.sep).join("/"))
       .sort();
 
-  it("ONLY the two chain-read routes (and their resolvers) consult a provider budget — no other route, store, or component", () => {
-    // The limiter is handed out by the runtime to exactly these two routes.
+  it("ONLY the two chain-read routes and the submit route (and their resolvers) consult a provider budget — no other route, store, or component", () => {
+    // The limiter is handed out by the runtime to exactly these three routes.
     expect(naming(/getProviderBudgetLimiter\b/)).toEqual([
       "app/api/real/account/balance/route.ts",
       "app/api/real/payments/[id]/status/route.ts",
+      "app/api/real/payments/submit/route.ts",
       "lib/real/server/runtime.ts",
     ]);
     expect(naming(/ProviderBudget/i)).toEqual([
       "app/api/real/account/balance/route.ts",
       "app/api/real/payments/[id]/status/route.ts",
+      "app/api/real/payments/submit/route.ts",
       "lib/real/server/balance.ts",
       "lib/real/server/chain-read-budget.ts",
       "lib/real/server/neon-store.ts",
+      "lib/real/server/pay-submit-budget.ts",
       "lib/real/server/payments.ts",
       "lib/real/server/rate-limit.ts",
       "lib/real/server/runtime.ts",
     ]);
     expect(naming(/real_provider_budgets/)).toEqual(["lib/real/server/neon-store.ts", "lib/real/server/rate-limit.ts"]);
-    // The other two families are still unused: named only by the limiter module. A browser-reachable file never names a bucket.
-    expect(naming(/turnkey_reconcile|pay_submit/)).toEqual(["lib/real/server/rate-limit.ts"]);
+    // turnkey_reconcile is still unused: named only by the limiter module. A browser-reachable file never names a bucket.
+    expect(naming(/turnkey_reconcile/)).toEqual(["lib/real/server/rate-limit.ts"]);
+    // pay_submit is named by the limiter and by the ONE policy module — nowhere else (so the submit resolver and route carry no number).
+    expect(naming(/pay_submit/)).toEqual(["lib/real/server/pay-submit-budget.ts", "lib/real/server/rate-limit.ts"]);
     // chain_read is named by the limiter and by the ONE policy module — nowhere else (so no resolver can carry its own number).
     expect(naming(/chain_read/)).toEqual(["lib/real/server/chain-read-budget.ts", "lib/real/server/rate-limit.ts"]);
   });

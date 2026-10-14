@@ -365,13 +365,14 @@ describe("static boundaries", () => {
   const limiterSource = readFileSync("lib/real/server/rate-limit.ts", "utf8");
 
   it("the limiter is SERVER-ONLY: it is imported only by server modules and the three protected routes — never a component, a store, lib/real's browser code, or Practice", () => {
-    // Stage 2B: balance.ts and chain-read-budget.ts import only the provider-budget TYPES (the sibling limiter's interface) — never this file's Slice E policies.
+    // Stage 2B: balance.ts and chain-read-budget.ts import only the provider-budget TYPES (the sibling limiter's interface) — never this file's Slice E policies. Slice 3A-2: so does pay-submit-budget.ts.
     expect(naming(/from\s+["'][^"']*\/rate-limit["']/)).toEqual([
       "lib/real/server/balance.ts",
       "lib/real/server/chain-read-budget.ts",
       "lib/real/server/handle-claim.ts",
       "lib/real/server/handle-recipient.ts",
       "lib/real/server/neon-store.ts",
+      "lib/real/server/pay-submit-budget.ts",
       "lib/real/server/payments.ts",
       "lib/real/server/runtime.ts",
     ]);

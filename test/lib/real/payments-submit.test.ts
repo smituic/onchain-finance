@@ -10,7 +10,8 @@ import type { RealServerConfig } from "@/lib/real/server/config";
 import { SAFE_OP_VALIDITY_SECONDS } from "@/lib/real/payments/validity";
 import { createFakeEntryPoint } from "./fixtures/entry-point-fake";
 import { FakeTurnkey } from "./fixtures/turnkey-fake";
-import { openBudget } from "./fixtures/chain-read-budget";
+import { openBudget, realBudget, scriptedBudget } from "./fixtures/chain-read-budget";
+import { PAY_SUBMIT_POLICIES } from "@/lib/real/server/pay-submit-budget";
 
 const SECRET = "test-session-secret";
 
@@ -216,7 +217,7 @@ describe("resolveSubmitPayment", () => {
     const { registry, paymentStore, attemptId, signature, cookieValue, expectedUserOperationHash } = await setup();
     sendPreparedUserOperationMock.mockResolvedValueOnce(expectedUserOperationHash);
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("submitted");
     expect(sendPreparedUserOperationMock).toHaveBeenCalledTimes(1);
@@ -233,6 +234,7 @@ describe("resolveSubmitPayment", () => {
       paymentStore,
       pimlicoApiKey: "pim_test_key",
       config: CONFIG,
+      providerBudgetLimiter: openBudget(),
       activityId: currentActivityId,
       attemptId,
       signature: "0xnotarealsignature",
@@ -254,7 +256,7 @@ describe("resolveSubmitPayment", () => {
     // replaced by a non-hex digit.
     const malformed = `${signature.slice(0, 10)}z${signature.slice(11)}`;
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature: malformed });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature: malformed });
 
     expect(outcome.outcome).toBe("invalid_signature");
     expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
@@ -267,7 +269,7 @@ describe("resolveSubmitPayment", () => {
     const { registry, paymentStore, signature, cookieValue } = await setup();
     const findByIdSpy = vi.spyOn(paymentStore, "findById");
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId: "not-a-uuid", signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId: "not-a-uuid", signature });
 
     expect(outcome.outcome).toBe("not_found");
     expect(findByIdSpy).not.toHaveBeenCalled();
@@ -282,7 +284,7 @@ describe("resolveSubmitPayment", () => {
     // any real code path that could introduce it.
     await paymentStore.transition({ id: attemptId, from: "awaiting_authorization", to: "awaiting_authorization", patch: { nonce: "not-a-number" } });
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("failed");
     expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
@@ -322,7 +324,7 @@ describe("resolveSubmitPayment", () => {
       patch: { expectedUserOperationHash: `0x${"ab".repeat(32)}` },
     });
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("failed");
     // Nothing was ever dispatched — the mismatch is caught purely locally,
@@ -357,6 +359,7 @@ describe("resolveSubmitPayment", () => {
       paymentStore,
       pimlicoApiKey: "pim_test_key",
       config: CONFIG,
+      providerBudgetLimiter: openBudget(),
       activityId: currentActivityId,
       attemptId,
       signature: impostorSignature,
@@ -371,7 +374,7 @@ describe("resolveSubmitPayment", () => {
     const { registry, paymentStore, attemptId, signature, cookieValue } = await setup();
     sendPreparedUserOperationMock.mockResolvedValueOnce("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("unknown");
   });
@@ -381,7 +384,7 @@ describe("resolveSubmitPayment", () => {
     sendPreparedUserOperationMock.mockRejectedValueOnce(new Error("fetch failed"));
     const { registry, paymentStore, attemptId, signature, cookieValue } = await setup();
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("unknown");
     // The precomputed hash survives the lost response — reconciliation still has a key to look up.
@@ -394,7 +397,7 @@ describe("resolveSubmitPayment", () => {
     const { registry, paymentStore, attemptId, signature, cookieValue, expectedUserOperationHash } = await setup();
     sendPreparedUserOperationMock.mockResolvedValueOnce(expectedUserOperationHash);
 
-    await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     const persisted = await paymentStore.findById(attemptId);
     expect(JSON.stringify(persisted)).not.toContain(signature);
@@ -412,7 +415,7 @@ describe("resolveSubmitPayment", () => {
       return expectedUserOperationHash;
     });
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("submitted");
     expect(sendPreparedUserOperationMock).toHaveBeenCalledTimes(1);
@@ -427,7 +430,7 @@ describe("resolveSubmitPayment", () => {
     await paymentStore.transition({ id: attemptId, from: "awaiting_authorization", to: "signed" });
     await paymentStore.transition({ id: attemptId, from: "signed", to: "submitting" });
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("wrong_state");
     expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
@@ -465,8 +468,8 @@ describe("resolveSubmitPayment", () => {
     sendPreparedUserOperationMock.mockResolvedValue(expectedUserOperationHash);
 
     const [first, second] = await Promise.all([
-      resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature }),
-      resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature }),
+      resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature }),
+      resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature }),
     ]);
 
     const outcomes = [first.outcome, second.outcome];
@@ -496,7 +499,7 @@ describe("resolveSubmitPayment", () => {
     const { registry, paymentStore, attemptId, signature, cookieValue } = await setup();
     sendPreparedUserOperationMock.mockResolvedValueOnce("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("unknown");
     const persisted = await paymentStore.findById(attemptId);
@@ -510,7 +513,7 @@ describe("resolveSubmitPayment", () => {
     const rpcRejection = Object.assign(new Error("rejected"), { name: "RpcRequestError", cause: bundlerRejection });
     sendPreparedUserOperationMock.mockRejectedValueOnce(rpcRejection);
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("failed");
     const persisted = await paymentStore.findById(attemptId);
@@ -523,7 +526,7 @@ describe("resolveSubmitPayment", () => {
     const timeoutError = Object.assign(new Error("The request took too long to respond."), { name: "TimeoutError" });
     sendPreparedUserOperationMock.mockRejectedValueOnce(timeoutError);
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("unknown");
     const persisted = await paymentStore.findById(attemptId);
@@ -560,7 +563,7 @@ describe("cancel-vs-submit races (pre-2f hardening)", () => {
       return result;
     });
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(outcome.outcome).toBe("wrong_state");
     expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
@@ -589,7 +592,7 @@ describe("cancel-vs-submit races (pre-2f hardening)", () => {
       return result;
     });
 
-    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, activityId: currentActivityId, attemptId, signature });
+    const outcome = await resolveSubmitPayment({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", config: CONFIG, providerBudgetLimiter: openBudget(), activityId: currentActivityId, attemptId, signature });
 
     expect(cancelAttempted).toBe(true);
     expect(outcome.outcome).toBe("submitted");
@@ -607,6 +610,7 @@ describe("finite SafeOp expiry at submit", () => {
       paymentStore: ctx.paymentStore,
       pimlicoApiKey: "pim_test_key",
       config: CONFIG,
+      providerBudgetLimiter: openBudget(),
       activityId: ctx.activityId,
       attemptId: ctx.attemptId,
       signature: overrides.signature ?? ctx.signature,
@@ -687,6 +691,7 @@ describe("Slice S1 — payment credential attribution", () => {
       paymentStore: ctx.paymentStore,
       pimlicoApiKey: "pim_test_key",
       config: CONFIG,
+      providerBudgetLimiter: openBudget(),
       attemptId: ctx.attemptId,
       signature: overrides.signature ?? ctx.signature,
       activityId: "activityId" in overrides ? overrides.activityId : ctx.activityId,
@@ -1319,5 +1324,287 @@ describe("Slice S1 — payment credential attribution", () => {
     expect((await submitAs(ctx)).outcome).toBe("wrong_state"); // A can no longer be used
     expect(sendPreparedUserOperationMock).toHaveBeenCalledTimes(1);
     expect((await row(ctx))?.turnkeySignActivityId).toBe(resumed.activityId);
+  });
+});
+
+/**
+ * Milestone 3, Slice 3A-2 Stage 1 — the pay_submit provider budget. One
+ * provider-bound submit request is charged ONCE, after every database-only /
+ * offline refusal and immediately before the first Turnkey read; a denial or a
+ * limiter failure does no provider work and writes nothing.
+ */
+describe("Slice 3A-2 Stage 1 — pay_submit provider budget", () => {
+  type Ctx = Awaited<ReturnType<typeof setup>>;
+  const ALLOW = { allowed: true } as const;
+  const deny = (retryAfterSeconds: number) => ({ allowed: false, retryAfterSeconds }) as const;
+  const FOREIGN_UUID = "11111111-2222-4333-8444-555555555555";
+
+  const submitWith = (ctx: Ctx, limiter: Parameters<typeof resolveSubmitPayment>[0]["providerBudgetLimiter"], overrides: { cookieValue?: string | undefined; attemptId?: unknown; signature?: unknown; activityId?: unknown; now?: () => number } = {}) =>
+    resolveSubmitPayment({
+      cookieValue: "cookieValue" in overrides ? overrides.cookieValue : ctx.cookieValue,
+      sessionSecret: SECRET,
+      registry: ctx.registry,
+      paymentStore: ctx.paymentStore,
+      pimlicoApiKey: "pim_test_key",
+      config: CONFIG,
+      providerBudgetLimiter: limiter,
+      attemptId: "attemptId" in overrides ? overrides.attemptId : ctx.attemptId,
+      signature: "signature" in overrides ? overrides.signature : ctx.signature,
+      activityId: "activityId" in overrides ? overrides.activityId : ctx.activityId,
+      now: overrides.now,
+    });
+
+  /** Counts every Turnkey read the server makes, in order, together with other events. */
+  function trace(ctx: Ctx) {
+    const events: string[] = [];
+    const getActivity = ctx.fake.getActivity;
+    const getUsers = ctx.fake.getUsers;
+    ctx.fake.getActivity = async (request) => {
+      events.push("getActivity");
+      return getActivity(request);
+    };
+    ctx.fake.getUsers = async (request) => {
+      events.push("getUsers");
+      return getUsers(request);
+    };
+    sendPreparedUserOperationMock.mockReset();
+    sendPreparedUserOperationMock.mockImplementation(async () => {
+      events.push("send");
+      return ctx.expectedUserOperationHash;
+    });
+    return events;
+  }
+  const traced = (events: string[], limiter: ReturnType<typeof scriptedBudget>["limiter"]) => ({
+    consume: async (input: Parameters<typeof limiter.consume>[0]) => {
+      events.push("budget");
+      return limiter.consume(input);
+    },
+  });
+  const turnkeyReads = (events: string[]) => events.filter((event) => event === "getActivity" || event === "getUsers");
+
+  it("FREE PATHS: no budget is consumed — and no provider is touched — on any refusal that happens before provider work", async () => {
+    const cases: Array<{ name: string; options?: Parameters<typeof setup>[0]; run: (ctx: Ctx, limiter: ReturnType<typeof scriptedBudget>["limiter"]) => ReturnType<typeof submitWith>; expected: string }> = [
+      { name: "unauthenticated", run: (ctx, l) => submitWith(ctx, l, { cookieValue: undefined }), expected: "unauthenticated" },
+      { name: "attemptId is not a string", run: (ctx, l) => submitWith(ctx, l, { attemptId: 7 }), expected: "not_found" },
+      { name: "attemptId is not a UUID", run: (ctx, l) => submitWith(ctx, l, { attemptId: "not-a-uuid" }), expected: "not_found" },
+      { name: "signature is not a string", run: (ctx, l) => submitWith(ctx, l, { signature: 7 }), expected: "not_found" },
+      { name: "signature is not hex", run: (ctx, l) => submitWith(ctx, l, { signature: "0xnotarealsignature" }), expected: "invalid_signature" },
+      { name: "activity id is malformed", run: (ctx, l) => submitWith(ctx, l, { activityId: "../etc/passwd" }), expected: "invalid_signature" },
+      { name: "no such attempt", run: (ctx, l) => submitWith(ctx, l, { attemptId: FOREIGN_UUID }), expected: "not_found" },
+      { name: "wrong state (cancelled)", run: async (ctx, l) => (await resolveCancelPayment({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, attemptId: ctx.attemptId }), submitWith(ctx, l)), expected: "wrong_state" },
+      { name: "bound to a different passkey", run: (ctx, l) => submitWith(ctx, l, { cookieValue: ctx.cookieFor(S) }), expected: "wrong_passkey" },
+      { name: "legacy row with no binding", options: { boundTo: null }, run: (ctx, l) => submitWith(ctx, l), expected: "failed" },
+      { name: "legacy row with no window", options: { storedValidUntil: null }, run: (ctx, l) => submitWith(ctx, l), expected: "failed" },
+      { name: "signature too short to be a Safe signature", run: (ctx, l) => submitWith(ctx, l, { signature: "0x1234" }), expected: "failed" },
+    ];
+    for (const c of cases) {
+      const ctx = await setup(c.options);
+      const events = trace(ctx);
+      const { limiter, calls } = scriptedBudget(ALLOW);
+      const outcome = await c.run(ctx, traced(events, limiter));
+      expect(outcome.outcome, c.name).toBe(c.expected);
+      expect(calls, c.name).toHaveLength(0);
+      expect(events, c.name).toEqual([]);
+    }
+  });
+
+  it("FREE PATHS: another account's attempt is not_found and consumes nothing", async () => {
+    const ctx = await setup();
+    const primary = (await ctx.registry.findPasskeyByCredentialId(P))!;
+    await ctx.registry.createAccountWithPasskey({
+      account: {
+        appUserId: "app-user-2",
+        subOrganizationId: "sub-org-2",
+        turnkeyUserId: "turnkey-user-2",
+        walletId: "wallet-2",
+        walletAccountId: "wallet-account-2",
+        ownerAddress: impostor.address,
+        safeAddress: "0x3333333333333333333333333333333333333333",
+        accountConfigVersion: 1,
+      },
+      passkey: { ...primary, credentialId: "other-credential", appUserId: "app-user-2", userHandle: "user-handle-2", credentialPublicKey: "cose-key-2", role: "primary", turnkeyAuthenticatorId: null } as never,
+    });
+    const other = serializeSession(createSessionPayload({ appUserId: "app-user-2", credentialId: "other-credential", sessionEpoch: 0 }), SECRET);
+    const events = trace(ctx);
+    const { limiter, calls } = scriptedBudget(ALLOW);
+
+    const outcome = await submitWith(ctx, traced(events, limiter), { cookieValue: other });
+
+    expect(outcome.outcome).toBe("not_found");
+    expect(calls).toHaveLength(0);
+    expect(events).toEqual([]);
+    expect((await ctx.paymentStore.findById(ctx.attemptId))?.state).toBe("awaiting_authorization");
+  });
+
+  it("PROVIDER-BOUND: charged exactly once, BEFORE the first Turnkey read, covering getUsers and the dispatch — against the one frozen policy, for the session's account", async () => {
+    const ctx = await setup();
+    const events = trace(ctx);
+    const { limiter, calls } = scriptedBudget(ALLOW);
+
+    const outcome = await submitWith(ctx, traced(events, limiter));
+
+    expect(outcome.outcome).toBe("submitted");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.subject).toBe("app-user-1");
+    expect(calls[0]!.policies).toBe(PAY_SUBMIT_POLICIES);
+    expect(events[0]).toBe("budget");
+    expect(events.filter((event) => event === "budget")).toHaveLength(1);
+    expect(events).toContain("getActivity");
+    expect(events).toContain("getUsers");
+    expect(events.filter((event) => event === "send")).toHaveLength(1);
+    expect(events.indexOf("send")).toBeGreaterThan(events.lastIndexOf("getUsers"));
+  });
+
+  it("PROVIDER-BOUND: an unconfirmed approval (Turnkey unavailable) was still one charge; nothing changes and the same signature is retryable", async () => {
+    const ctx = await setup();
+    const events = trace(ctx);
+    const working = ctx.fake.getActivity;
+    ctx.fake.getActivity = async () => {
+      events.push("getActivity");
+      throw new Error("turnkey down");
+    };
+    const { limiter, calls } = scriptedBudget(ALLOW);
+
+    const first = await submitWith(ctx, traced(events, limiter));
+
+    expect(first.outcome).toBe("authorization_unavailable");
+    expect(calls).toHaveLength(1);
+    expect((await ctx.paymentStore.findById(ctx.attemptId))?.state).toBe("awaiting_authorization");
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+
+    ctx.fake.getActivity = working;
+    expect((await submitWith(ctx, traced(events, limiter))).outcome).toBe("submitted");
+    expect(calls).toHaveLength(2);
+  });
+
+  it("DENIAL: no Turnkey read, no bundler call, no transition, the stored row is byte-identical, the slot is held — and the SAME signature then works", async () => {
+    const ctx = await setup();
+    const events = trace(ctx);
+    const before = structuredClone(await ctx.paymentStore.findById(ctx.attemptId));
+    const { limiter, calls } = scriptedBudget(deny(42), ALLOW);
+
+    const denied = await submitWith(ctx, traced(events, limiter));
+
+    expect(denied).toEqual({ outcome: "rate_limited", retryAfterSeconds: 42 });
+    expect(calls).toHaveLength(1);
+    expect(turnkeyReads(events)).toEqual([]);
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+    expect(await ctx.paymentStore.findById(ctx.attemptId)).toEqual(before);
+    const nextPayment = await ctx.paymentStore.reserve({
+      appUserId: "app-user-1",
+      safeAddress: before!.safeAddress,
+      recipient: "0x4444444444444444444444444444444444444444",
+      amountBaseUnits: "1",
+      chainId: baseSepolia.id,
+      tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      authorizingCredentialId: P,
+    });
+    expect(nextPayment).toEqual({ ok: false, reason: "payment_in_progress" });
+
+    // Same signature, same activity id, no new ceremony.
+    expect((await submitWith(ctx, traced(events, limiter))).outcome).toBe("submitted");
+    expect(sendPreparedUserOperationMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("DENIAL: an expired-but-unclaimed row is NOT failed by a denied submit — expiry is judged only after the budget is spent", async () => {
+    const past = Math.floor(Date.now() / 1000) - 3600;
+    const ctx = await setup({ storedValidUntil: past, signedValidity: { validAfter: 0, validUntil: past } });
+    const events = trace(ctx);
+    const { limiter } = scriptedBudget(deny(30));
+
+    expect(await submitWith(ctx, traced(events, limiter))).toEqual({ outcome: "rate_limited", retryAfterSeconds: 30 });
+    expect((await ctx.paymentStore.findById(ctx.attemptId))?.state).toBe("awaiting_authorization");
+    expect(turnkeyReads(events)).toEqual([]);
+  });
+
+  it("LIMITER FAILURE: a throw, or any malformed answer, is not an allow — it propagates (generic 500 at the route), with zero provider calls and an untouched row", async () => {
+    const answers: unknown[] = [new Error('relation "real_provider_budgets" does not exist'), undefined, null, "allowed", {}, { allowed: "true" }, { allowed: false }, { allowed: false, retryAfterSeconds: 0 }, { allowed: false, retryAfterSeconds: -1 }, { allowed: false, retryAfterSeconds: 1.5 }, { allowed: false, retryAfterSeconds: "30" }, { allowed: false, retryAfterSeconds: Number.NaN }, { allowed: false, retryAfterSeconds: Number.POSITIVE_INFINITY }, { allowed: false, retryAfterSeconds: 86_401 }];
+    for (const answer of answers) {
+      const ctx = await setup();
+      const events = trace(ctx);
+      const before = structuredClone(await ctx.paymentStore.findById(ctx.attemptId));
+      const { limiter } = scriptedBudget(answer);
+
+      await expect(submitWith(ctx, traced(events, limiter)), JSON.stringify(answer) ?? String(answer)).rejects.toThrow();
+
+      expect(turnkeyReads(events)).toEqual([]);
+      expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+      expect(await ctx.paymentStore.findById(ctx.attemptId)).toEqual(before);
+    }
+  });
+
+  it("CONCURRENCY: two valid submits are each charged, and the state machine still allows exactly one dispatch", async () => {
+    const ctx = await setup();
+    const events = trace(ctx);
+    const { limiter, calls } = scriptedBudget(ALLOW);
+
+    const results = await Promise.all([submitWith(ctx, traced(events, limiter)), submitWith(ctx, traced(events, limiter))]);
+
+    expect(calls).toHaveLength(2);
+    expect(results.filter((result) => result.outcome === "submitted")).toHaveLength(1);
+    expect(events.filter((event) => event === "send")).toHaveLength(1);
+  });
+
+  it("CONCURRENCY: one allowed and one denied — the denied one writes nothing, the allowed one dispatches once", async () => {
+    const ctx = await setup();
+    const events = trace(ctx);
+    const { limiter, calls } = scriptedBudget(ALLOW, deny(60));
+
+    const results = await Promise.all([submitWith(ctx, traced(events, limiter)), submitWith(ctx, traced(events, limiter))]);
+
+    expect(calls).toHaveLength(2);
+    expect(results.map((result) => result.outcome).sort()).toEqual(["rate_limited", "submitted"]);
+    expect(events.filter((event) => event === "send")).toHaveLength(1);
+    expect((await ctx.paymentStore.findById(ctx.attemptId))?.state).toBe("submitted");
+  });
+
+  it("CONCURRENCY: simultaneous denials leave the row untouched and the slot held", async () => {
+    const ctx = await setup();
+    const events = trace(ctx);
+    const before = structuredClone(await ctx.paymentStore.findById(ctx.attemptId));
+    const { limiter } = scriptedBudget(deny(5));
+
+    const results = await Promise.all([submitWith(ctx, traced(events, limiter)), submitWith(ctx, traced(events, limiter)), submitWith(ctx, traced(events, limiter))]);
+
+    expect(results.every((result) => result.outcome === "rate_limited")).toBe(true);
+    expect(turnkeyReads(events)).toEqual([]);
+    expect(await ctx.paymentStore.findById(ctx.attemptId)).toEqual(before);
+  });
+
+  it("CONCURRENCY: a denied submit racing a status read and a cancel changes nothing by itself — only cancel's own transition lands", async () => {
+    const ctx = await setup();
+    const events = trace(ctx);
+    const { limiter } = scriptedBudget(deny(5));
+
+    const [submit, status, cancel] = await Promise.all([
+      submitWith(ctx, traced(events, limiter)),
+      resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: createFakeEntryPoint({}).reader, attemptId: ctx.attemptId }),
+      resolveCancelPayment({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, attemptId: ctx.attemptId }),
+    ]);
+
+    expect(submit.outcome).toBe("rate_limited");
+    expect(status.outcome).toBe("ok");
+    expect(cancel.outcome).toBe("cancelled");
+    expect((await ctx.paymentStore.findById(ctx.attemptId))?.state).toBe("cancelled");
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
+  });
+
+  it("INVENTED ACTIVITY IDS: each provider-bound attempt costs one unit, and the real budget then denies — without ever releasing the slot", async () => {
+    const ctx = await setup();
+    const events = trace(ctx);
+    const budget = realBudget();
+    const recorded: unknown[] = [];
+    const limiter = { consume: async (input: Parameters<typeof budget.consume>[0]) => (recorded.push(input), budget.consume(input)) };
+    const shortLimit = PAY_SUBMIT_POLICIES.find((policy) => policy.bucket === "pay_submit_short")!.limit;
+
+    const outcomes: string[] = [];
+    for (let i = 0; i < shortLimit + 1; i += 1) outcomes.push((await submitWith(ctx, limiter, { activityId: `invented-${i}` })).outcome);
+
+    expect(outcomes.slice(0, shortLimit).every((outcome) => outcome === "authorization_unavailable")).toBe(true);
+    expect(outcomes[shortLimit]).toBe("rate_limited");
+    expect(recorded).toHaveLength(shortLimit + 1);
+    expect(turnkeyReads(events).filter((event) => event === "getActivity")).toHaveLength(shortLimit);
+    expect((await ctx.paymentStore.findById(ctx.attemptId))?.state).toBe("awaiting_authorization");
+    expect(sendPreparedUserOperationMock).not.toHaveBeenCalled();
   });
 });

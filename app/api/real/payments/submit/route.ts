@@ -1,7 +1,8 @@
 import { cookies } from "next/headers";
-import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readJsonBody, requireRealServerConfig } from "@/lib/real/server/http";
+import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readJsonBody, requireRealServerConfig, retryableRateLimitedResponse } from "@/lib/real/server/http";
+import { PAY_SUBMIT_RATE_LIMITED_MESSAGE } from "@/lib/real/server/pay-submit-budget";
 import { resolveSubmitPayment } from "@/lib/real/server/payments";
-import { getPaymentAttemptStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
+import { getPaymentAttemptStore, getProviderBudgetLimiter, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
 
 /**
@@ -33,6 +34,7 @@ export async function POST(request: Request) {
       paymentStore: getPaymentAttemptStore(),
       pimlicoApiKey: config.pimlicoApiKey,
       config,
+      providerBudgetLimiter: getProviderBudgetLimiter(),
       attemptId: body.attemptId,
       signature: body.signature,
       activityId: body.activityId,
@@ -52,6 +54,10 @@ export async function POST(request: Request) {
       case "authorization_unavailable":
         // Nothing changed and nothing was sent — the same signature may be retried.
         return Response.json({ error: "We couldn't confirm your passkey approval yet. Try again in a moment.", retryable: true }, { status: 503 });
+      case "rate_limited":
+        // Decided before any provider work: nothing changed, nothing was sent,
+        // and the same signature may be retried — hence `retryable: true`.
+        return retryableRateLimitedResponse(PAY_SUBMIT_RATE_LIMITED_MESSAGE, outcome.retryAfterSeconds);
       case "submitted":
       case "failed":
       case "unknown":
