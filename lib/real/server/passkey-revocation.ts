@@ -19,7 +19,6 @@ import {
   verifyStampAuthorizedBy,
   type TurnkeyActivitySummary,
   type TurnkeyDispatchDeps,
-  type TurnkeyStamp,
 } from "./turnkey-signed-request";
 
 /**
@@ -182,6 +181,8 @@ export async function submitRevocation(input: {
   if (!claimed) return { outcome: "rejected", reason: "This removal can't proceed: it was already submitted, it needs a fresh approval, or your passkey or this one changed. Check status and try again." };
   await input.registry.updateAuthenticatorCounter({ credentialId: authorizer.credentialId, counter: stampCheck.newCounter });
 
+  // The ONLY send of this removal's signed DELETE: beginDispatch admits one
+  // claimant per attempt, and nothing after this ever forwards it again.
   const forwarded = await forwardSignedRequest({ config: input.config, endpoint: "delete_authenticators", body: signed.body, stamp: signed.stamp, fetchImpl: input.deps?.fetchImpl });
   if (forwarded.kind === "activity") {
     await input.revocations.recordActivity({ id: claimed.id, activityId: forwarded.activity.id, activityStatus: forwarded.activity.status });
@@ -230,9 +231,10 @@ async function describeLatest(revocations: PasskeyRevocationStore, attempt: Pass
 }
 
 /**
- * Reconciles an in-flight removal using only: a byte-identical replay while
- * fresh (never a re-stamp), read-only getActivity polling, and read-only
- * getUsers. Exactly two exits from 'dispatch_in_flight': 'confirmed' (BOTH
+ * Reconciles an in-flight removal using only read-only getActivity polling
+ * and read-only getUsers — it never forwards the signed DELETE (the single
+ * original forward lives in submitRevocation, after the beginDispatch claim).
+ * Exactly two exits from 'dispatch_in_flight': 'confirmed' (BOTH
  * halves of the deletion evidence) or 'blocked'. Never back to 'active'.
  * Every state change is a CAS from 'dispatch_in_flight', so concurrent
  * reconciles converge on whichever outcome committed first.
@@ -256,14 +258,12 @@ export async function reconcileRevocation(input: {
   const readAuthenticators = () => listTurnkeyUserAuthenticators({ config: input.config, subOrganizationId: account.subOrganizationId, turnkeyUserId: account.turnkeyUserId });
 
   if (!attempt.turnkeyActivityId) {
+    // No activity id was ever recorded. Reconcile never forwards the signed
+    // DELETE — the one original forward in submitRevocation is the only send.
+    // Inside the window the outcome is simply not known yet; the stored stamp
+    // is only cleared once the window has closed.
     const fresh = attempt.turnkeyRequestTimestampMs !== null && isFreshTimestamp(attempt.turnkeyRequestTimestampMs, deps.now());
-    if (fresh && attempt.turnkeyRequestBody && attempt.turnkeyRequestStamp) {
-      const stamp = JSON.parse(attempt.turnkeyRequestStamp) as TurnkeyStamp;
-      const replayed = await forwardSignedRequest({ config: input.config, endpoint: "delete_authenticators", body: attempt.turnkeyRequestBody, stamp, fetchImpl: deps.fetchImpl });
-      if (replayed.kind === "activity") {
-        await input.revocations.recordActivity({ id: attempt.id, activityId: replayed.activity.id, activityStatus: replayed.activity.status });
-      }
-    } else if (!fresh && attempt.turnkeyRequestStamp) {
+    if (!fresh && attempt.turnkeyRequestStamp) {
       await input.revocations.transition({ id: attempt.id, from: "dispatch_in_flight", to: "dispatch_in_flight", patch: { turnkeyRequestStamp: null } });
     }
     attempt = (await input.revocations.findById(attempt.id)) ?? attempt;
@@ -271,9 +271,9 @@ export async function reconcileRevocation(input: {
 
     if (!attempt.turnkeyActivityId) {
       if (fresh) return { outcome: "pending", reason: PENDING };
-      // The request can no longer be replayed and never yielded an activity
-      // id. It may have landed (response lost) — a getUsers read showing the
-      // target present may simply be stale, and a miss is no receipt. The
+      // The original forward never yielded an activity id and the window has
+      // closed. It may have landed (response lost) — a getUsers read showing
+      // the target present may simply be stale, and a miss is no receipt. The
       // outcome is unknowable from here: review, never Active, never Removed.
       return blockAttempt(input.revocations, attempt, "no_activity_receipt");
     }
@@ -295,8 +295,8 @@ export async function reconcileRevocation(input: {
 
   if (TERMINAL_FAILURE_STATUSES.has(activity.status)) {
     // This activity failed, but the same signed bytes may have reached Turnkey
-    // another way (a lost original, a concurrent replay, or the browser
-    // itself) — and a positive getUsers read may be stale. Not a restore signal.
+    // another way (a lost original, or the browser itself) — and a positive
+    // getUsers read may be stale. Not a restore signal.
     return blockAttempt(input.revocations, attempt, "delete_activity_failed");
   }
   if (activity.status !== COMPLETED_STATUS) return { outcome: "pending", reason: PENDING };

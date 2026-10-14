@@ -176,7 +176,7 @@ See ARCHITECTURE.md's "Public Readiness Milestone 1 — Registration Abuse Prote
 - **Not deployable yet:** the real database has not received the migration, so this code would answer a generic error against it. Production use needs, in order: explicit migration authorization, a controlled migration, independent verification, approved production limits, and a separate deployment authorization. None has happened.
 - **Accepted for controlled testnet development only:** balance and payment-status reads share one budget, so heavy balance refreshing can delay payment reconciliation (not approved as a public-launch guarantee); several smaller client-timing and cross-tab limitations are recorded in ARCHITECTURE.md.
 - **Still open:** production limits and windows (and the provider pricing and quotas that should inform them); the `turnkey_reconcile` work kind has no route; the real-database migration. Each needs its own authorization and verification. Milestone 2 stays deferred.
-- **Separate and unresolved:** a Medium finding from a separate audit, about replay/recovery in passkey removal, is not addressed by either slice and needs its own security slice.
+- **Separate item:** a Medium finding from a separate audit, about replay in passkey removal, was not addressed by either slice; its automatic-replay half has since been resolved by the separate security remediation R0 (below).
 - **Not a launch gate:** per-account control only; no per-IP, global, or registration-time control, and no public-launch prerequisite is closed.
 
 *3A-2 (independently accepted offline; not deployed).*
@@ -186,7 +186,13 @@ See ARCHITECTURE.md's "Public Readiness Milestone 1 — Registration Abuse Prote
 - **Not deployable yet:** same prerequisites as 3A-1 (the real database has not received the migration; no limits are approved; no deployment is authorized). Verified offline only — no live-browser or provider test.
 - **Accepted for controlled testnet development only:** the wait is not kept across a reload or another tab; retrying after leaving the page may need a new passkey approval; the note is approximate; per-account control only. A closeout Low (a stale paused Continue after a payment is cancelled elsewhere and a new one is started without reload) was found, fixed and regression-tested; see ARCHITECTURE.md.
 
-See ARCHITECTURE.md's "Public Readiness Milestone 3 — API Abuse Protection: Slice 3A-0 … Slice 3A-1 and Slice 3A-2".
+*Security remediation R0 — no automatic passkey-removal replay (prerequisite to 3A-3).*
+- **Status:** implementation complete; independent R0 audit **PASSED** (0 Critical, 0 High, 0 Medium, 0 Low, 5 Info); accepted for **offline** engineering. Manual Git checkpoint: **pending operator action**. No live-provider test, migration or deployment.
+- **What it does:** a removal's signed DELETE is forwarded at most once, by the original authorized submit. Reconciliation only reads. If the answer to that one send is lost, the removal waits in a grace window and then goes to review (`blocked` / `no_activity_receipt`); the existing operator-only recovery (S3) is unchanged. Backup-passkey enrollment keeps its own separate controlled replay.
+- **Still open:** lost-response recovery liveness (operator-only recovery, no explicit forward timeout, unverified provider retention and dedupe behavior, operator capacity and alerting) — public-launch recovery readiness is not claimed; the separate "FIX 3" ordering flake and the Practice timing flake.
+- **3A-3 (Turnkey reconciliation budgets):** **NOT implemented.** R0 removes the identified replay-design blocker but does not authorize 3A-3; provider-budget policy and recovery-liveness planning are separate decisions. Milestone 3 as a whole stays IN PROGRESS and Milestone 2 stays DEFERRED.
+
+See ARCHITECTURE.md's "Public Readiness Milestone 3 — API Abuse Protection: Slice 3A-0 … Slice 3A-1 and Slice 3A-2" and "Security Remediation R0".
 
 **Goal:** Introduce Real Mode, backed by real (testnet) infrastructure, one area at a time, while Practice Mode remains fully available for everything — including areas Real Mode doesn't support yet. Prove one real end-to-end path before broadening.
 

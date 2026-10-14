@@ -480,8 +480,8 @@ describe("revocation — one-way after dispatch: a dispatched target is never au
     expect(await reconcile(w, w.b, attemptId)).toEqual(result); // stable
   });
 
-  it("2: the same-body replay returns FAILED with the target present => blocked, target stays revoking", async () => {
-    // Whether or not the original actually landed, the outcome is the same.
+  it("2: a lost original response is NEVER replayed — whether or not the delete landed, reconcile forwards nothing and the outcome stays unknown until the window closes", async () => {
+    // R0: exactly one forward per claimed removal. The queued second mode must stay unconsumed.
     for (const firstMode of ["lose_response_after_apply", "lose_response_before_apply"] as const) {
       const w = await world();
       const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
@@ -489,31 +489,57 @@ describe("revocation — one-way after dispatch: a dispatched target is never au
       w.fake.dedupeByBody = false;
       w.fake.modeQueue = [firstMode, "fail_activity"];
       const result = await submit(w, w.b, w.a, attemptId, signed);
-      expect(w.fake.forwarded.map((f) => f.body)).toEqual([signed.body, signed.body]);
-      expect(result).toMatchObject({ outcome: "blocked" });
-      const attempt = (await w.revocations.findById(attemptId))!;
-      expect(attempt).toMatchObject({ state: "blocked", failureReason: "delete_activity_failed" });
-      expect(w.fake.activities.get(attempt.turnkeyActivityId!)?.status).toBe("ACTIVITY_STATUS_FAILED");
+      expect(w.fake.forwarded.map((f) => f.body)).toEqual([signed.body]);
+      expect(w.fake.modeQueue).toEqual(["fail_activity"]); // never consumed: no second forward was attempted
+      expect(result).toMatchObject({ outcome: "pending" });
+      expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "dispatch_in_flight", turnkeyActivityId: null });
       expect(await visibleAtTurnkey(w, "authenticator-b")).toBe(true);
+      expect(await status(w, w.b)).toBe("revoking");
+
+      // The window closes: the unknowable outcome is blocked for review — still never Active, never Removed, still one forward.
+      w.clock.now += TURNKEY_STAMP_FRESHNESS_WINDOW_MS + 1;
+      expect(await reconcile(w, w.b, attemptId)).toMatchObject({ outcome: "blocked" });
+      expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "blocked", failureReason: "no_activity_receipt", turnkeyActivityId: null, turnkeyRequestStamp: null });
+      expect(w.fake.forwarded.map((f) => f.body)).toEqual([signed.body]);
       expect(await status(w, w.b)).toBe("revoking");
     }
   });
 
-  it("a replay racing the first forward, with the first forward then reporting FAILED => blocked, target stays revoking", async () => {
+  it("R0 / TEST 3: a reconcile racing the original forward never forwards — at most ONE send in total, and the original's own FAILED answer still blocks", async () => {
     const w = await world();
     const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
     w.fake.lagReads = true;
     w.fake.dedupeByBody = false;
-    // Forward #1 (submit) triggers a concurrent reconcile whose replay lands the
-    // delete with its response lost; forward #1 itself then comes back FAILED.
-    w.fake.modeQueue = ["lose_response_after_apply", "fail_activity"];
+    w.fake.modeQueue = ["fail_activity"];
+    let racing: Awaited<ReturnType<typeof reconcile>> | null = null;
+    // The original forward is in flight (claimed, no activity id yet) when a reconcile arrives.
+    let raced = false;
     w.fake.onForward = async () => {
-      if (w.fake.forwarded.length === 1) await reconcile(w, w.b, attemptId);
+      if (raced) return; // fire once, so a replaying implementation fails by assertion, not by recursion
+      raced = true;
+      racing = await reconcile(w, w.b, attemptId);
     };
     expect((await submit(w, w.b, w.a, attemptId, signed)).outcome).toBe("blocked");
-    expect(w.fake.authenticators().map((a) => a.authenticatorId)).not.toContain("authenticator-b"); // really deleted...
-    expect(await visibleAtTurnkey(w, "authenticator-b")).toBe(true); // ...but a stale read shows it
+    expect(racing).toMatchObject({ outcome: "pending" });
+    expect(w.fake.forwarded.map((f) => f.body)).toEqual([signed.body]);
+    expect(await visibleAtTurnkey(w, "authenticator-b")).toBe(true);
     expect(await status(w, w.b)).toBe("revoking");
+  });
+
+  it("R0 / TEST 3: a reconcile racing an original forward that then succeeds converges on revoked with ONE send", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
+    let racing: Awaited<ReturnType<typeof reconcile>> | null = null;
+    let raced = false;
+    w.fake.onForward = async () => {
+      if (raced) return; // fire once, so a replaying implementation fails by assertion, not by recursion
+      raced = true;
+      racing = await reconcile(w, w.b, attemptId);
+    };
+    expect((await submit(w, w.b, w.a, attemptId, signed)).outcome).toBe("revoked");
+    expect(racing).toMatchObject({ outcome: "pending" });
+    expect(w.fake.forwarded).toHaveLength(1);
+    expect(await status(w, w.b)).toBe("revoked");
   });
 
   it("recordActivity is first-writer-wins: a concurrent replay's activity id never overwrites the recorded one", async () => {
@@ -569,13 +595,14 @@ describe("revocation — one-way after dispatch: a dispatched target is never au
     expect(w.fake.forwarded).toHaveLength(0);
   });
 
-  it("an unknown outcome still inside the replay window stays pending (replayed byte-for-byte, never re-stamped)", async () => {
+  it("an unknown outcome still inside the grace window stays pending — and sends nothing beyond the one original forward", async () => {
     const w = await world();
     const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
     w.fake.nextMode = "lose_response_before_apply";
     expect((await submit(w, w.b, w.a, attemptId, signed)).outcome).toBe("pending");
-    expect((await reconcile(w, w.b, attemptId)).outcome).toBe("pending");
-    expect(new Set(w.fake.forwarded.map((f) => f.body))).toEqual(new Set([signed.body]));
+    for (let i = 0; i < 3; i += 1) expect((await reconcile(w, w.b, attemptId)).outcome).toBe("pending");
+    expect(w.fake.forwarded.map((f) => f.body)).toEqual([signed.body]);
+    expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "dispatch_in_flight", turnkeyActivityId: null });
     expect(await status(w, w.b)).toBe("revoking");
   });
 
@@ -644,5 +671,114 @@ describe("revocation — duplicate JSON member names in the signed body", () => 
     expect(await status(w, w.b)).toBe("active");
     expect(await status(w, w.a)).toBe("active");
     expect((await w.revocations.findById(attemptId))?.state).toBe("authorization_needed");
+  });
+});
+
+describe("R0 — no automatic replay: one forward per claimed removal, reconcile is read-only", () => {
+  it("TEST 1: the original forward yields no activity id; repeated reconciles inside the grace window send nothing", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
+    w.fake.nextMode = "lose_response_before_apply";
+    expect((await submit(w, w.b, w.a, attemptId, signed)).outcome).toBe("pending");
+    expect(w.fake.forwarded).toHaveLength(1);
+    for (let i = 0; i < 5; i += 1) {
+      w.clock.now += 1_000; // still well inside the freshness window
+      expect((await reconcile(w, w.b, attemptId)).outcome).toBe("pending");
+    }
+    expect(w.fake.forwarded).toHaveLength(1); // the submit's own forward, nothing from reconcile
+    expect(w.fake.forwarded[0]!.body).toBe(signed.body);
+    expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "dispatch_in_flight", turnkeyActivityId: null });
+  });
+
+  it("TEST 2: many concurrent reconciles of an uncertain in-window attempt send nothing", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
+    w.fake.nextMode = "lose_response_before_apply";
+    await submit(w, w.b, w.a, attemptId, signed);
+    const results = await Promise.all(Array.from({ length: 12 }, () => reconcile(w, w.b, attemptId)));
+    expect(new Set(results.map((r) => r.outcome))).toEqual(new Set(["pending"]));
+    expect(w.fake.forwarded).toHaveLength(1);
+    await expectConsistent(w, attemptId, w.b);
+  });
+
+  it("two concurrent SUBMITs of the same signed removal: beginDispatch admits one claimant, so exactly one forward", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
+    const results = await Promise.all([submit(w, w.b, w.a, attemptId, signed), submit(w, w.b, w.a, attemptId, signed), submit(w, w.b, w.a, attemptId, signed)]);
+    expect(results.filter((r) => r.outcome === "rejected").length).toBeGreaterThanOrEqual(2);
+    expect(w.fake.forwarded).toHaveLength(1);
+  });
+
+  it("TEST 4: the delete is applied at Turnkey, its response is lost, dedupe is off — still ONE provider activity, no replay, blocked after the window (the S3 resolver suite resolves exactly this blocked shape)", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
+    w.fake.dedupeByBody = false; // never assume Turnkey same-body dedupe would have hidden a replay
+    w.fake.lagReads = true;
+    w.fake.nextMode = "lose_response_after_apply";
+    expect((await submit(w, w.b, w.a, attemptId, signed)).outcome).toBe("pending");
+    const deleteActivities = () => [...w.fake.activities.values()].filter((a) => a.type === "ACTIVITY_TYPE_DELETE_AUTHENTICATORS");
+    expect(deleteActivities()).toHaveLength(1);
+    expect(w.fake.authenticators().map((a) => a.authenticatorId)).not.toContain("authenticator-b"); // it really was deleted
+
+    expect((await reconcile(w, w.b, attemptId)).outcome).toBe("pending");
+    expect(w.fake.forwarded).toHaveLength(1);
+    expect(deleteActivities()).toHaveLength(1);
+
+    w.clock.now += TURNKEY_STAMP_FRESHNESS_WINDOW_MS + 1;
+    w.fake.propagate();
+    expect((await reconcile(w, w.b, attemptId)).outcome).toBe("blocked");
+    expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "blocked", failureReason: "no_activity_receipt", turnkeyActivityId: null, turnkeyRequestStamp: null });
+    expect(await status(w, w.b)).toBe("revoking");
+    expect(w.fake.forwarded).toHaveLength(1);
+    expect(deleteActivities()).toHaveLength(1);
+  });
+
+  it("TEST 5: a legacy in-flight row that still holds its stored signed stamp is never forwarded by reconcile — in the window it is pending, after it the stamp is dropped and the row is blocked", async () => {
+    const w = await world();
+    const { attemptId, signed } = await prepareAndSign(w, w.b, w.a);
+    const timestampMs = Number((JSON.parse(signed.body) as { timestampMs: string }).timestampMs);
+    // The pre-R0 shape: claimed, exact body + stamp stored, no activity id.
+    const claimed = await w.revocations.beginDispatch({
+      id: attemptId,
+      patch: {
+        turnkeyRequestBody: signed.body,
+        turnkeyRequestBodySha256: (await import("node:crypto")).createHash("sha256").update(signed.body, "utf8").digest("hex"),
+        turnkeyRequestTimestampMs: timestampMs,
+        turnkeyRequestStamp: JSON.stringify(signed.stamp),
+        externalAttemptedAt: new Date(w.clock.now).toISOString(),
+      },
+    });
+    expect(claimed).not.toBeNull();
+    expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "dispatch_in_flight", turnkeyActivityId: null });
+
+    expect((await reconcile(w, w.b, attemptId)).outcome).toBe("pending");
+    expect(w.fake.forwarded).toHaveLength(0);
+    expect((await w.revocations.findById(attemptId))?.turnkeyRequestStamp).not.toBeNull(); // untouched inside the window
+
+    w.clock.now += TURNKEY_STAMP_FRESHNESS_WINDOW_MS + 1;
+    expect((await reconcile(w, w.b, attemptId)).outcome).toBe("blocked");
+    expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "blocked", failureReason: "no_activity_receipt", turnkeyRequestStamp: null });
+    expect(w.fake.forwarded).toHaveLength(0);
+    expect(await status(w, w.b)).toBe("revoking");
+  });
+
+  it("TEST 6: source guard — forwardSignedRequest has exactly one call site in the revocation module, inside submitRevocation after beginDispatch", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const source = readFileSync(join(process.cwd(), "lib/real/server/passkey-revocation.ts"), "utf8");
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    const calls = [...code.matchAll(/\bforwardSignedRequest\s*\(/g)];
+    expect(calls).toHaveLength(1);
+
+    const submitStart = code.indexOf("export async function submitRevocation");
+    const reconcileStart = code.indexOf("export async function reconcileRevocation");
+    expect(submitStart).toBeGreaterThan(-1);
+    expect(reconcileStart).toBeGreaterThan(submitStart);
+    const submitBody = code.slice(submitStart, reconcileStart);
+    expect(submitBody.match(/\bforwardSignedRequest\s*\(/g)).toHaveLength(1);
+    expect(submitBody.indexOf("beginDispatch(")).toBeGreaterThan(-1);
+    expect(submitBody.indexOf("forwardSignedRequest(")).toBeGreaterThan(submitBody.indexOf("beginDispatch("));
+    // Nothing reconcile-side (or after it) can reach the forwarder.
+    expect(code.slice(reconcileStart)).not.toMatch(/forwardSignedRequest/);
   });
 });

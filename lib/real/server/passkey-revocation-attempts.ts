@@ -48,7 +48,7 @@ export type PasskeyRevocationAttempt = {
   turnkeyRequestBody: string | null;
   turnkeyRequestBodySha256: string | null;
   turnkeyRequestTimestampMs: number | null;
-  /** Live, body-bound bearer credential — cleared once an activity id is known or the replay window closes. */
+  /** Live, body-bound bearer credential — cleared once an activity id is known or the grace window closes. Reconcile never forwards it again (R0). */
   turnkeyRequestStamp: string | null;
   externalAttemptedAt: string | null;
   /** Written only by recordActivity (first writer wins). */
@@ -106,7 +106,8 @@ export interface PasskeyRevocationStore {
   /**
    * First writer wins: records the activity id only while
    * 'dispatch_in_flight' with no activity id yet, and clears the stamp. Null
-   * if another send (a concurrent byte-identical replay) already recorded one.
+   * if an activity id was already recorded (first writer wins; since R0 the one
+   * original forward in submitRevocation is the only send that records one).
    */
   recordActivity(input: { id: string; activityId: string; activityStatus: string }): Promise<PasskeyRevocationAttempt | null>;
   /**
