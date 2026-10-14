@@ -1708,7 +1708,9 @@ export function createNeonRateLimitStore(sql: NeonQueryFunction<false, false>): 
 
 /**
  * Milestone 3, Slice 3A-0 — the durable provider-budget counters
- * (real_provider_budgets). FOUNDATION ONLY: nothing calls this yet.
+ * (real_provider_budgets). Consumed (Slice 3A-1) only through the runtime's
+ * provider-budget limiter by the chain-read balance and payment-status routes;
+ * it fails closed if the table is missing.
  *
  * Deliberately the SAME statement as createNeonRateLimitStore above, against
  * the sibling table: one multi-row INSERT ... ON CONFLICT DO UPDATE per

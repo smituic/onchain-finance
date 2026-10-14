@@ -1716,10 +1716,11 @@ END $$;
 -- prefix, and the bucket list changed (provider-budget.test.ts proves that
 -- equivalence offline).
 --
--- NOTHING CHARGES THIS TABLE YET. Slice 3A-0 is foundation only: no route
--- consults a provider budget and no numeric limit is approved, so this code
--- can run without the table. That stops being true the moment a later slice
--- makes a route consult one: from then on the table must be applied BEFORE
+-- NOTHING IS DEPLOYED AGAINST THIS TABLE YET. Slice 3A-0 itself is foundation
+-- only. Slice 3A-1 Stage 2B has since made two routes (GET account/balance and
+-- GET payments/[id]/status) consult a provider budget in the working tree, at
+-- DEVELOPMENT limits that are not production limits; none of that code is
+-- deployed. The table must be applied and verified on the real database BEFORE
 -- that code is deployed, because the limiter statement FAILS CLOSED without it
 -- (it throws, and the route must do no provider work).
 --

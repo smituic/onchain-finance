@@ -365,7 +365,10 @@ describe("static boundaries", () => {
   const limiterSource = readFileSync("lib/real/server/rate-limit.ts", "utf8");
 
   it("the limiter is SERVER-ONLY: it is imported only by server modules and the three protected routes — never a component, a store, lib/real's browser code, or Practice", () => {
+    // Stage 2B: balance.ts and chain-read-budget.ts import only the provider-budget TYPES (the sibling limiter's interface) — never this file's Slice E policies.
     expect(naming(/from\s+["'][^"']*\/rate-limit["']/)).toEqual([
+      "lib/real/server/balance.ts",
+      "lib/real/server/chain-read-budget.ts",
       "lib/real/server/handle-claim.ts",
       "lib/real/server/handle-recipient.ts",
       "lib/real/server/neon-store.ts",
@@ -409,7 +412,9 @@ describe("static boundaries", () => {
   });
 
   it("the 429 body is built in ONE place and no route adds limiter internals to a response", () => {
+    // Stage 2B: the chain-read balance 429 reuses the same helper, so it has the same body shape.
     expect(naming(/rateLimitedResponse\(/)).toEqual([
+      "app/api/real/account/balance/route.ts",
       "app/api/real/account/handle/options/route.ts",
       "app/api/real/payments/prepare/route.ts",
       "app/api/real/recipients/lookup/route.ts",

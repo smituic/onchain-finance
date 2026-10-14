@@ -450,7 +450,7 @@ describe("I. the Slice E limiter is intact, and the two tables never mix", () =>
   });
 });
 
-describe("static boundaries — foundation only", () => {
+describe("static boundaries — who may consult a provider budget (3A-0 foundation, 3A-1 Stage 2B consumers)", () => {
   const walk = (dir: string, out: string[] = []): string[] => {
     for (const entry of readdirSync(dir)) {
       if (entry === "node_modules" || entry.startsWith(".")) continue;
@@ -467,12 +467,28 @@ describe("static boundaries — foundation only", () => {
       .map((file) => file.split(path.sep).join("/"))
       .sort();
 
-  it("NO route, server module, store, or component consults a provider budget yet", () => {
-    expect(naming(/getProviderBudgetLimiter\b/)).toEqual(["lib/real/server/runtime.ts"]);
-    expect(naming(/ProviderBudget/i)).toEqual(["lib/real/server/neon-store.ts", "lib/real/server/rate-limit.ts", "lib/real/server/runtime.ts"]);
+  it("ONLY the two chain-read routes (and their resolvers) consult a provider budget — no other route, store, or component", () => {
+    // The limiter is handed out by the runtime to exactly these two routes.
+    expect(naming(/getProviderBudgetLimiter\b/)).toEqual([
+      "app/api/real/account/balance/route.ts",
+      "app/api/real/payments/[id]/status/route.ts",
+      "lib/real/server/runtime.ts",
+    ]);
+    expect(naming(/ProviderBudget/i)).toEqual([
+      "app/api/real/account/balance/route.ts",
+      "app/api/real/payments/[id]/status/route.ts",
+      "lib/real/server/balance.ts",
+      "lib/real/server/chain-read-budget.ts",
+      "lib/real/server/neon-store.ts",
+      "lib/real/server/payments.ts",
+      "lib/real/server/rate-limit.ts",
+      "lib/real/server/runtime.ts",
+    ]);
     expect(naming(/real_provider_budgets/)).toEqual(["lib/real/server/neon-store.ts", "lib/real/server/rate-limit.ts"]);
-    // No bucket or family name appears outside the limiter module (so none is charged, and none can be sent to a browser).
-    expect(naming(/chain_read|turnkey_reconcile|pay_submit/)).toEqual(["lib/real/server/rate-limit.ts"]);
+    // The other two families are still unused: named only by the limiter module. A browser-reachable file never names a bucket.
+    expect(naming(/turnkey_reconcile|pay_submit/)).toEqual(["lib/real/server/rate-limit.ts"]);
+    // chain_read is named by the limiter and by the ONE policy module — nowhere else (so no resolver can carry its own number).
+    expect(naming(/chain_read/)).toEqual(["lib/real/server/chain-read-budget.ts", "lib/real/server/rate-limit.ts"]);
   });
 
   it("the limiter module still imports nothing", () => {
@@ -625,8 +641,10 @@ describe("schema.sql (static — no PostgreSQL has run any of this here)", () =>
     expect(raw.split("DO $$")).toHaveLength(2);
   });
 
-  it("says plainly that nothing charges the table yet, and that the table must precede any code that consults it", () => {
-    expect(raw).toContain("NOTHING CHARGES THIS TABLE YET");
+  it("says plainly that nothing is deployed against the table yet, and that the table must precede any code that consults it", () => {
+    expect(raw).toContain("NOTHING IS DEPLOYED AGAINST THIS TABLE YET");
+    expect(raw).toContain("Slice 3A-1 Stage 2B has since made two routes");
+    expect(raw).not.toContain("NOTHING CHARGES THIS TABLE YET");
     expect(raw).toContain("FAILS CLOSED without it");
     for (const marker of ["-- BEGIN Account Handles", "-- END Account Handles", "-- BEGIN Payment Attempt Recipient Identity", "-- END Payment Attempt Recipient Identity", "-- BEGIN Provisioning Evidence Capture"]) {
       expect(schema.split(marker), marker).toHaveLength(2);

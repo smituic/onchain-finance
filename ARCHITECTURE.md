@@ -969,16 +969,16 @@ The adapter smoke (`test/lib/real/neon-smoke.test.ts`) is the older, broader sui
 
 Milestone 2 is **invitation-only / beta registration admission controls**: deciding who may open an account, which is the admission-control residual that Milestone 1 records. It is deliberately **deferred until closer to public launch**. No work on it has started and nothing in this repository implements it — there is no invitation or beta gate today — and its detailed design is recorded here when it is taken up. The numbering is unchanged. Deferring it does not close any residual listed elsewhere in this document.
 
-### Public Readiness Milestone 3 — API Abuse Protection: Slice 3A-0, Provider Budget Foundation (LIVE-VERIFIED on disposable Neon; final closeout audit and manual Git checkpoint pending)
+### Public Readiness Milestone 3 — API Abuse Protection: Slice 3A-0 (Provider Budget Foundation, CLOSED at `423f00b`) and Slice 3A-1 (Authenticated Chain-Read Budgets, independently accepted offline; NOT deployable)
 
-**Status.** Milestone 3 — API Abuse Protection — is **IN PROGRESS**. Its first slice, 3A-0, is **foundation only**: a durable table and a server-only limiter for per-account budgets on requests that make the server call a provider. It is implemented, offline-verified, independently audited, and **live-verified once on one disposable Neon branch (run `6d32fdf8`, 2026-10-13; independent live-evidence audit: PASS — clean and evidenced)**. At the time of writing the work is in the working tree only: the final closeout audit and the operator's manual Git checkpoint are pending, so it is not committed, pushed, or deployed.
+**Status.** Milestone 3 — API Abuse Protection — is **IN PROGRESS**. Slice 3A-0 built a durable table and a server-only limiter for per-account budgets on requests that make the server call a provider; it is implemented, independently audited, **live-verified once on one disposable Neon branch (run `6d32fdf8`, 2026-10-13; independent live-evidence audit: PASS)**, and **CLOSED at `423f00b`**. Slice 3A-1 is the first consumer (see "Slice 3A-1" below); it has been independently accepted offline. Its Git checkpoint is the operator's own manual step (see `git log`); it is not deployed, and its migration has not been applied.
 
-**What 3A-0 does NOT do — read this first.**
+**What 3A-0 itself did and did not do.**
 
-- **No route uses it.** No API route, server module, store, or component consults a provider budget. `getProviderBudgetLimiter()` exists in `runtime.ts` and has no caller. No request is limited, delayed, or refused by this slice.
-- **No numeric limit is approved.** The module exports no provider-budget policy; a caller must pass each bucket's limit and window, and no caller exists. Every number used in tests and in the live run is a test value.
+- **3A-0 added no consumer.** The foundation shipped with `getProviderBudgetLimiter()` in `runtime.ts` and no caller; Slice 3A-1 (below) is the slice that gave it callers. No request was limited by 3A-0 alone.
+- **3A-0 approved no numeric limit.** The limiter module still exports no provider-budget policy; a caller passes each bucket's limit and window. The only policy table that exists is 3A-1's (development values), kept in its own module.
 - **The real application database has NOT received the migration.** `real_provider_budgets` exists only on the one disposable branch used for verification. Applying the block to the real database is a separate, separately authorized step.
-- **Route integration is future work.** Making any route consult a provider budget needs its own authorization, its own approved numbers, and its own verification — and from that moment the table must be applied *before* that code is deployed, because the limiter fails closed without it.
+- **From the moment a route consults a budget, the table must be applied *before* that code is deployed**, because the limiter fails closed without it. That is now true of 3A-1's code.
 
 **Design.**
 
@@ -1021,20 +1021,51 @@ Milestone 2 is **invitation-only / beta registration admission controls**: decid
 
 **Offline state at closeout preparation.** `tsc`, lint, and the full suite pass; the provider-budget tests, the harness tests, the child-process probes, and the smoke's own offline checks are part of that suite, and every live case is skipped without its gate.
 
-**Open — each a separate decision or piece of work.**
+**Open after 3A-0 — each a separate decision or piece of work** (the route-integration item is now partly answered by 3A-1 below).
 
-- **Production numbers.** Limits and windows for all six buckets; provider pricing and quotas, which should inform them, have not been gathered or decided.
-- **Route integration.** Which routes charge which family, whether one request may charge two, and what a denial looks like over HTTP (status, copy, `Retry-After`). Not started; needs separate authorization and verification.
+- **Production numbers.** Limits and windows for all six buckets; provider pricing and quotas, which should inform them, have not been gathered or decided. 3A-1's two chain-read values are development values only.
+- **Other families.** `pay_submit` and `turnkey_reconcile` have no consumer and no policy.
 - **The real-database migration.** Not applied; separately authorized when a route is about to depend on it.
 - **Low findings from the 3A-0 audit, accepted for the foundation:** a denied request is charged to every bucket it names; the pair rule does not check that the short window is shorter than the daily one; limits and windows have no upper bound (the live run showed an integer-sized limit and an over-integer window both fail closed).
-- **Not part of this slice, and unresolved:** a separate read-only audit reported a Medium finding concerning replay/recovery in passkey revocation that depends on provider behavior. Nothing in 3A-0 investigates or changes it; it needs its own separately authorized security slice.
-- **Unchanged by this slice:** every public-launch prerequisite already recorded — registration admission control, uncertain-provisioning recovery, script CSP, a host-specific RP ID/origin, the platform duration limit. 3A-0 does not make the product public- or mainnet-ready.
+- **Not part of this milestone's work, and unresolved:** a separate read-only audit reported a Medium finding concerning replay/recovery in passkey revocation that depends on provider behavior. Nothing in 3A-0 or 3A-1 investigates or changes it; it needs its own separately authorized security slice.
+- **Unchanged:** every public-launch prerequisite already recorded — registration admission control, uncertain-provisioning recovery, script CSP, a host-specific RP ID/origin, the platform duration limit. Neither slice makes the product public- or mainnet-ready.
+
+#### Slice 3A-1 — Authenticated Chain-Read Budgets (independently accepted offline; NOT deployable)
+
+**Scope.** Exactly two authenticated GET endpoints that make the server call a provider on a signed-in user's behalf: `GET /api/real/account/balance` and `GET /api/real/payments/[id]/status`. Both consume the `chain_read` family (`chain_read_short`, `chain_read_day`) of the 3A-0 foundation; no new bucket, no SQL change.
+
+**Policy (controlled-development values, not production limits).** `chain_read_short`: 30 per 600 s. `chain_read_day`: 200 per 86 400 s. They live in one module, `lib/real/server/chain-read-budget.ts` (frozen), and both resolvers call `consumeChainReadBudget(limiter, appUserId)` with no policy parameter — so the two endpoints cannot hold different limits for one bucket. That matters beyond tidiness: the accounting statement stores the counter against the limit it is handed. A source guard and an object-identity test pin it; the static-boundary tests pin which files may name `chain_read`, `getProviderBudgetLimiter`, or the limiter types.
+
+**What one unit is.** One provider-bound endpoint request, charged to the authenticated `app_user_id` (taken from the session-resolved account, never the request) on both buckets in one atomic limiter operation, immediately before the first provider call and after authentication, ownership, and Safe validation. Database-only responses consume nothing.
+
+**Balance.** Charge before `readCashBalance`, outside its `try`. Denial → HTTP 429, `Retry-After` (validated whole seconds), `{ error, code: "rate_limited" }` through the shared `rateLimitedResponse` helper; no RPC call, no balance. 401 / 409 / 502 / 500 are unchanged.
+
+**Payment status.** Only branches that actually reach a provider are charged: a reconcilable state (`submitting` / `submitted` / `unknown`) with a stored UserOperation hash (charged before the bundler read, and the same charge covers the EntryPoint fallback), and a pre-dispatch attempt past `validUntil` with complete stored proof evidence and a usable Safe (charged before the EntryPoint read; `now == validUntil` is still free). `entryPointProofTarget()` is the single test for "would this read happen", shared by the charge decision and the reconciliation itself. Everything else — terminal rows, `prepared`, unexpired pre-dispatch, legacy or incomplete rows — is free and stays readable for an exhausted account. Denial → HTTP 200 `{ attempt, serverNowSeconds, reconciliationDeferred: true, retryAfterSeconds }` plus `Retry-After`; the attempt object is the stored attempt, byte-identical to an ordinary answer (no metadata inside it), and nothing is transitioned, read, resent, or implied. Ordinary answers carry `reconciliationDeferred: false`.
+
+**Failure semantics.** A limiter that throws, answers a non-decision, or reports retry metadata that is not a whole number of seconds in 1…86 400 raises; the routes answer the generic 500 and no provider is contacted. There is no in-memory production fallback and no catch-as-allow.
+
+**Cross-site protection (Stage 1).** `lib/real/server/request-gate.ts` refuses the two GETs (HEAD included, raw and decoded paths) unless `Sec-Fetch-Site` is exactly `same-origin` or, absent that, the Referer's origin exactly matches a configured Real origin; a present `Origin` must match too. Trusted origins come only from `NEXT_PUBLIC_REAL_ORIGIN`. This runs before any charge, so a hostile page cannot spend a victim's budget.
+
+**Client (Stages 2A–2C.3, closeout).**
+
+- *Polling is bounded.* An expired pre-dispatch attempt gets one initial check and at most eight follow-ups at 75 s doubling to 10 min; none while the tab is hidden; timers are cleaned up on unmount; a refused cancel gets one reconciliation read per attempt per 30 s window (a repeat press does not discard it).
+- *Reads are fresh or discarded.* A `statusEpoch` marks every local transition (submit, prepare, refused cancel); a read begun under an older epoch is never applied and never joined by a caller that needs current state. Waiting behind an older read is bounded by the request deadline and re-checks lifecycle, account, attempt, and the server deadline; a single in-flight slot means waiters share one current-epoch read.
+- *Every read has a deadline.* 45 s, with an `AbortController` where fetch honors it and a bounded logical settlement where it does not; a timeout ends only the client's wait and is never evidence about the server.
+- *Server delays are honored.* A deferral's `retryAfterSeconds` (validated) becomes an absolute deadline bound to the `appUserId` and attempt; nothing provider-bound is sent before it, automatic follow-ups use the later of it and their schedule, and it survives navigation for that account and attempt. It can never shorten the 30 s manual cooldown. Malformed deferral metadata is not trusted — not even its attempt — and applies a 60 s local back-off.
+- *Honest copy.* "Check available later" (a server pause) is distinct from "Checked just now" (the ordinary cooldown); the balance line says "unavailable" rather than "checking" or zero; no provider vocabulary reaches the user. The balance store keeps no stale balance (account isolation) and keeps its cooldown only for the same `appUserId`.
+- *Never authority over payments.* The client schedules and displays reads; it never marks a payment finished, failed, or cancelled on a timeout or a deferral, never resends, and never releases a payment slot.
+
+**Verification.** Each stage was independently audited (Stage 1, 2A, 2A.1, 2B, 2C, 2C.3: no Critical, High, or Medium findings; accepted Lows recorded below), and the final independent whole-slice audit PASSED with 0 Critical, 0 High, 0 Medium, 0 Low and 4 Info, accepting the offline implementation. That audit re-ran 725 focused tests, `tsc --noEmit`, ESLint, and `git diff --check`, all passing. The Builder's last full Vitest run was 4169 passed / 322 skipped / **1 failed**: the failure was the previously observed, unrelated `simulation-store.test.ts` "starts from createInitialState()" (a Practice `Date.now()` race), which passed 28/28 when run alone; its root cause is not conclusively established, and it is recorded as a separate intermittent failure, as is the revocation test noted under the open items. The new behaviors are pinned by deterministic fake-timer / deferred-promise tests and were mutation-checked. No live Neon or provider test was run for 3A-1, and none is authorized: the server contracts are proven against fakes, not against the real table. Acceptance is of the offline code only — not a deployment authorization, not a migration, not approval of production limits, and not a statement that the milestone is production-ready.
+
+**Accepted limitations (controlled testnet development only).** Rapid visibility changes can consume bounded follow-up checks. Browser timer suspension can delay cooldown UI recovery. The balance wait copy can overstate the remaining time. **Balance and payment-status reads share one chain-read budget, so heavy balance polling can delay payment reconciliation; this is accepted only for controlled testnet development and is NOT approved as a public-launch recovery guarantee** (a background reconciler or operator recovery tooling would be separate work, and neither exists). A rare 86 401-second limiter result fails closed. A hard reload loses client-only retry deadlines, so the first read afterwards may be deferred again. An aborted browser request may continue server-side. Cross-tab stale-account display limitations remain. Per-account control only: no per-IP, global, or registration-time control.
+
+**Deployment prerequisites (none done).** (1) Explicit migration authorization; (2) controlled migration of `real_provider_budgets` to the real database; (3) independent verification of that migration; (4) approval of production provider policies and windows; (5) separate deployment authorization. Until then this code must not be deployed — against the unmigrated real database both routes would answer a generic 500. Milestone 2 remains deferred.
 
 ## Explicitly Not Yet Decided
 
 - How authentication and accounts work beyond a testnet account identity and its handle (Phase 2/3)
 - End-to-end testing framework (not yet justified by current surface area)
-- Provider-request budgets: the numeric limits and windows, which routes charge which family, and the HTTP behavior of a denial (Milestone 3; the 3A-0 foundation sets none of these)
+- Provider-request budgets: the production numeric limits and windows for all six buckets, and the other two families' routes (Milestone 3; 3A-1's chain-read values are development values only)
 - Anything in DESIGN.md's own "Deliberately Undecided" list (exact colors, typography, icon style, dark mode default)
 
 These should be decided when they're actually needed to move the project forward, with a preference for the smallest, most boring option that works — and recorded here once chosen.

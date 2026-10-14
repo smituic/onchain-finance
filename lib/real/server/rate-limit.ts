@@ -36,9 +36,12 @@
  * a SIBLING limiter for requests that make the server call a provider. Same
  * subject, algorithm, one-decision rule, and fail-closed behaviour, but its own
  * six buckets, its own store type, and its own table (real_provider_budgets).
- * The two never mix: each limiter refuses the other's bucket names. It is
- * FOUNDATION ONLY — no numeric limit is approved, nothing here names one, and
- * no route consults it yet.
+ * The two never mix: each limiter refuses the other's bucket names. This
+ * module names no numeric limit: a caller passes each bucket's limit and
+ * window. Its only consumers are the two chain-read routes' resolvers
+ * (Slice 3A-1), which take their policy from server/chain-read-budget.ts —
+ * development values, not production limits. The pay_submit and
+ * turnkey_reconcile families have no consumer yet.
  */
 export const RATE_LIMIT_BUCKETS = ["pay_prepare_day", "pay_prepare_short", "recipient_probe_day", "recipient_probe_short"] as const;
 export type RateLimitBucket = (typeof RATE_LIMIT_BUCKETS)[number];
@@ -187,16 +190,22 @@ function createInMemoryWindowStore(nowMs: () => number, allowed?: readonly strin
 }
 
 /**
- * PROVIDER BUDGETS — Milestone 3, Slice 3A-0. FOUNDATION ONLY.
+ * PROVIDER BUDGETS — Milestone 3: the foundation (Slice 3A-0) and its first
+ * consumers (Slice 3A-1: the chain-read balance and payment-status reads).
  *
  * Three families of provider-backed work, each with a short and a daily bucket:
  *   chain_read          reads that make the server call the chain RPC
  *   turnkey_reconcile   reconciliation that makes the server read Turnkey
  *   pay_submit          a payment submit
  *
- * NO NUMERIC LIMIT IS APPROVED. This module deliberately exports no provider
- * budget policy table: a caller has to pass each bucket's limit and window, and
- * no caller exists yet. No route, and no server module, consults this limiter.
+ * NO PRODUCTION LIMIT IS APPROVED. This module deliberately exports no provider
+ * budget policy table: a caller has to pass each bucket's limit and window.
+ * The one table that exists is chain-read-budget.ts's, holding controlled-
+ * development values for the chain_read family only; it is deliberately kept
+ * out of this module so the limiter can stay free of numbers, and so the two
+ * consuming resolvers cannot carry limits of their own (one bucket, one limit).
+ * The limiter itself is consulted only through that module; a caller must do
+ * no provider work when it denies or throws.
  *
  * Everything else is the limiter above, unchanged in meaning: the subject is
  * the authenticated account's app_user_id; one store operation charges every

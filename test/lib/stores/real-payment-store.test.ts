@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createRealPaymentStore, EXPIRY_FOLLOW_UP_MS } from "@/lib/stores/real-payment-store";
+import {
+  createRealPaymentStore,
+  EXPIRY_FOLLOW_UP_MS,
+  followUpDelayMs,
+  interpretStatusResult,
+  MANUAL_CHECK_COOLDOWN_MS,
+  MAX_AUTOMATIC_FOLLOW_UPS,
+  MAX_FOLLOW_UP_INTERVAL_MS,
+  STATUS_FALLBACK_DEADLINE_MS,
+  STATUS_REQUEST_DEADLINE_MS,
+} from "@/lib/stores/real-payment-store";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import { signPreparedPayment } from "@/lib/real/payments/client-sign";
 import type { WirePreparedFields } from "@/lib/real/payments/prepared-operation";
@@ -400,6 +410,9 @@ describe("real-payment-store — S2 delta: low-frequency expiry follow-up", () =
     expect(statusUrls).toHaveLength(1);
 
     await vi.advanceTimersByTimeAsync(1_000);
+    expect(statusUrls).toHaveLength(2);
+    // Stage 2A: the interval grows (75 s, then 150 s), so a second 75 s is not enough.
+    await vi.advanceTimersByTimeAsync(EXPIRY_FOLLOW_UP_MS);
     expect(statusUrls).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(EXPIRY_FOLLOW_UP_MS);
     expect(statusUrls).toHaveLength(3);
@@ -1215,5 +1228,2065 @@ describe("real-payment-store — Slice C: paying by @name", () => {
       expect(api.prepares()[0].body).toEqual({ recipient: ACCOUNT.safeAddress, amountBaseUnits: "1000000" });
       expect(store.getState()).toMatchObject({ status: "editing", recipientInput: ACCOUNT.safeAddress, error: "You can't pay yourself." });
     });
+  });
+});
+
+/**
+ * 3A-1 Stage 2A: payment-status polling safety. Automatic checks are bounded,
+ * growing, visibility-aware, deduplicated and cleaned up on unmount; the
+ * manual check is cooldown-limited. None of it ever touches the payment — it
+ * only decides WHEN a read happens.
+ */
+describe("real-payment-store — 3A-1 Stage 2A: bounded, deduplicated status polling", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  type Call = { url: string; at: number };
+  const ACCOUNT = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+
+  /** A fake server whose clock follows the fake local clock. `hold` parks every /status answer until release(). */
+  function setup(options: { secondsBeforeExpiry: number; statusStates?: string[]; hold?: boolean; cancelStatus?: number }) {
+    vi.mocked(signPreparedPayment).mockClear();
+    vi.useFakeTimers();
+    const offset = VALID_UNTIL - options.secondsBeforeExpiry - Math.floor(Date.now() / 1000);
+    const serverNow = () => Math.floor(Date.now() / 1000) + offset;
+    const calls: Call[] = [];
+    const held: Array<() => void> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls.push({ url, at: Date.now() });
+        if (url.includes("/latest")) {
+          return jsonResponse(200, { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() });
+        }
+        if (url.includes("/cancel")) return jsonResponse(options.cancelStatus ?? 409, { error: "wrong_state" });
+        if (url.includes("/status")) {
+          const n = calls.filter((c) => c.url.includes("/status")).length;
+          if (options.hold) await new Promise<void>((resolve) => held.push(resolve));
+          const state = options.statusStates?.[n - 1] ?? "awaiting_authorization";
+          const live = state === "awaiting_authorization";
+          return jsonResponse(200, {
+            attempt: { ...baseAttempt(), state, prepared: live ? PREPARED_FIELDS : null, failureReason: state === "failed" ? "This payment expired before it was included on-chain. No money moved." : null },
+            serverNowSeconds: serverNow(),
+          });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+    return {
+      calls,
+      statusCalls: () => calls.filter((c) => c.url.includes("/status")),
+      release: async () => {
+        held.splice(0).forEach((resolve) => resolve());
+        await vi.advanceTimersByTimeAsync(0);
+      },
+    };
+  }
+
+  const HOUR = 60 * 60 * 1000;
+
+  it("the interval policy: 75 s, doubling, capped at 10 minutes, for at most 8 follow-ups", () => {
+    expect(EXPIRY_FOLLOW_UP_MS).toBe(75_000);
+    expect(MAX_AUTOMATIC_FOLLOW_UPS).toBe(8);
+    expect(MAX_FOLLOW_UP_INTERVAL_MS).toBe(600_000);
+    expect(MANUAL_CHECK_COOLDOWN_MS).toBe(30_000);
+    expect(Array.from({ length: 8 }, (_, i) => followUpDelayMs(i) / 1000)).toEqual([75, 150, 300, 600, 600, 600, 600, 600]);
+    expect(followUpDelayMs(500)).toBe(600_000);
+  });
+
+  it("A. a submitted payment gets its one initial check — automatically, once, and no follow-up loop", async () => {
+    const server = setup({ secondsBeforeExpiry: 0, statusStates: ["submitted"] });
+    const store = createRealPaymentStore();
+    store.setState({ attempt: { ...baseAttempt(), state: "submitted", prepared: null }, status: "submitted" });
+
+    await store.getState().checkSubmittedStatus();
+    expect(server.statusCalls()).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(server.statusCalls()).toHaveLength(1);
+    expect(store.getState().status).toBe("submitted");
+  });
+
+  it("B. an already-expired pre-dispatch attempt (stranded or awaiting) is checked once on init, then followed up on the schedule", async () => {
+    for (const state of ["awaiting_authorization", "signed"]) {
+      const server = setup({ secondsBeforeExpiry: -100 });
+      const store = createRealPaymentStore();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          server.calls.push({ url, at: Date.now() });
+          const attempt = { ...baseAttempt(), state };
+          return jsonResponse(200, url.includes("/latest") ? { attempt, subOrganizationId: "s", authorizingCredentialId: "c", serverNowSeconds: VALID_UNTIL + 100 } : { attempt, serverNowSeconds: VALID_UNTIL + 100 });
+        }),
+      );
+      await store.getState().init();
+      expect(server.statusCalls(), state).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(EXPIRY_FOLLOW_UP_MS);
+      expect(server.statusCalls(), state).toHaveLength(2);
+      store.getState().detach();
+      vi.useRealTimers();
+    }
+  });
+
+  it("C. a failed cancel re-reads the real state exactly ONCE (no duplicate request behind it) and arms a follow-up", async () => {
+    const server = setup({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    store.setState({ attempt: baseAttempt(), status: "awaiting_authorization", clockOffsetSeconds: 0 });
+    // Server clock is past validUntil for this attempt.
+    store.setState({ clockOffsetSeconds: VALID_UNTIL + 100 - Math.floor(Date.now() / 1000) });
+
+    await store.getState().cancel();
+    expect(server.calls.filter((c) => c.url.includes("/cancel"))).toHaveLength(1);
+    expect(server.statusCalls()).toHaveLength(1);
+    expect(store.getState().status).toBe("awaiting_authorization");
+
+    await vi.advanceTimersByTimeAsync(EXPIRY_FOLLOW_UP_MS);
+    expect(server.statusCalls()).toHaveLength(2);
+  });
+
+  it("D/E/F/G. exactly 8 follow-ups after the initial check, at growing capped intervals, then silence — and the payment is untouched", async () => {
+    const server = setup({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+
+    const times = server.statusCalls().map((c) => c.at);
+    expect(times).toHaveLength(1 + MAX_AUTOMATIC_FOLLOW_UPS);
+    const gaps = times.slice(1).map((t, i) => (t - times[i]!) / 1000);
+    expect(gaps).toEqual([75, 150, 300, 600, 600, 600, 600, 600]);
+    expect(Math.max(...gaps) * 1000).toBeLessThanOrEqual(MAX_FOLLOW_UP_INTERVAL_MS);
+
+    await vi.advanceTimersByTimeAsync(48 * HOUR);
+    expect(server.statusCalls()).toHaveLength(1 + MAX_AUTOMATIC_FOLLOW_UPS);
+
+    // Silence is not an outcome: the payment is exactly as the server last reported it.
+    expect(store.getState().isFollowUpExhausted).toBe(true);
+    expect(store.getState().status).toBe("awaiting_authorization");
+    expect(store.getState().attempt?.state).toBe("awaiting_authorization");
+    expect(store.getState().error).toBeNull();
+    // T: only reads — never a prepare, submit or cancel.
+    expect(server.calls.every((c) => c.url.includes("/latest") || c.url.includes("/status"))).toBe(true);
+  });
+
+  it("G. after exhaustion the manual check still works, and does not restart the automatic sequence", async () => {
+    const server = setup({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    const before = server.statusCalls().length;
+
+    await store.getState().checkStatus();
+    expect(server.statusCalls()).toHaveLength(before + 1);
+    expect(store.getState().isFollowUpExhausted).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(48 * HOUR);
+    expect(server.statusCalls()).toHaveLength(before + 1);
+  });
+
+  it("G. a late callback (a re-schedule for the same attempt after exhaustion) cannot start a fresh sequence", async () => {
+    const server = setup({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    const before = server.statusCalls().length;
+
+    // A passkey prompt dismissed late re-schedules; a visibility flip re-evaluates.
+    useRealAccountStore.setState({ account: ACCOUNT });
+    await store.getState().resumeAuthorization();
+    expect(signPreparedPayment).toHaveBeenCalled(); // the re-schedule path really ran
+    store.getState().setPageVisible(false);
+    store.getState().setPageVisible(true);
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+
+    expect(server.statusCalls()).toHaveLength(before);
+    expect(store.getState().isFollowUpExhausted).toBe(true);
+  });
+
+  it("H. detach() (Pay form unmounted) cancels the pending follow-up — nothing fires afterwards", async () => {
+    const server = setup({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    expect(server.statusCalls()).toHaveLength(1);
+
+    store.getState().detach();
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+
+    expect(server.statusCalls()).toHaveLength(1);
+    // The durable payment is not "finalized" or reset by stopping the timer.
+    expect(store.getState().attempt?.id).toBe("attempt-1");
+    expect(store.getState().status).toBe("awaiting_authorization");
+  });
+
+  it("H. a stale callback after unmount (a dismissed passkey prompt finishing late) cannot arm or run a check", async () => {
+    const server = setup({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    store.getState().detach();
+    // detach() discards the restored attempt's context only for answers; the in-memory attempt stays, as a late caller would see it.
+    store.setState({ attempt: baseAttempt(), status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: VALID_UNTIL + 100 - Math.floor(Date.now() / 1000) });
+    useRealAccountStore.setState({ account: ACCOUNT });
+
+    await store.getState().resumeAuthorization();
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+
+    expect(signPreparedPayment).toHaveBeenCalled();
+    expect(server.statusCalls()).toHaveLength(1);
+  });
+
+  it("Q. a status answer that arrives after unmount is dropped and arms nothing", async () => {
+    const server = setup({ secondsBeforeExpiry: -100, hold: true });
+    const store = createRealPaymentStore();
+    const initializing = store.getState().init();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(server.statusCalls()).toHaveLength(1);
+
+    store.getState().detach();
+    await server.release();
+    await initializing;
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+
+    expect(server.statusCalls()).toHaveLength(1);
+  });
+
+  it("I/J/K. hidden: no automatic check starts; on return exactly one runs — no catch-up burst — and the schedule continues from where it was", async () => {
+    const server = setup({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    expect(server.statusCalls()).toHaveLength(1);
+
+    store.getState().setPageVisible(false);
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(server.statusCalls()).toHaveLength(1); // I
+
+    store.getState().setPageVisible(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(server.statusCalls()).toHaveLength(2); // J: one controlled check
+    await vi.advanceTimersByTimeAsync(EXPIRY_FOLLOW_UP_MS);
+    expect(server.statusCalls()).toHaveLength(2); // K: the next gap is the grown one (150 s), not a burst
+    await vi.advanceTimersByTimeAsync(EXPIRY_FOLLOW_UP_MS);
+    expect(server.statusCalls()).toHaveLength(3);
+  });
+
+  it("I. a check that was due while hidden never fires by itself, and an in-flight answer does not re-arm a timer while hidden", async () => {
+    const server = setup({ secondsBeforeExpiry: -100, hold: true });
+    const store = createRealPaymentStore();
+    const initializing = store.getState().init();
+    await vi.advanceTimersByTimeAsync(0);
+    store.getState().setPageVisible(false);
+    await server.release();
+    await initializing;
+
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(server.statusCalls()).toHaveLength(1);
+
+    store.getState().setPageVisible(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(server.statusCalls()).toHaveLength(2);
+  });
+
+  it("J. the post-submit check waits while hidden and runs once when the page is visible again", async () => {
+    const server = setup({ secondsBeforeExpiry: 0, statusStates: ["confirmed"] });
+    const store = createRealPaymentStore();
+    store.setState({ attempt: { ...baseAttempt(), state: "submitted", prepared: null }, status: "submitted" });
+
+    store.getState().setPageVisible(false);
+    await store.getState().checkSubmittedStatus();
+    expect(server.statusCalls()).toHaveLength(0);
+
+    store.getState().setPageVisible(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(server.statusCalls()).toHaveLength(1);
+    expect(store.getState().status).toBe("confirmed");
+    store.getState().setPageVisible(false);
+    store.getState().setPageVisible(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(server.statusCalls()).toHaveLength(1);
+  });
+
+  it("L. manual cooldown: repeated presses send one request; the control returns after 30 s", async () => {
+    const server = setup({ secondsBeforeExpiry: 0, statusStates: ["submitted", "submitted", "submitted"] });
+    const store = createRealPaymentStore();
+    store.setState({ attempt: { ...baseAttempt(), state: "submitted", prepared: null }, status: "submitted" });
+
+    await store.getState().checkStatus();
+    await store.getState().checkStatus();
+    await store.getState().checkStatus();
+    expect(server.statusCalls()).toHaveLength(1);
+    expect(store.getState().isManualCheckCoolingDown).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS - 1);
+    expect(store.getState().isManualCheckCoolingDown).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(store.getState().isManualCheckCoolingDown).toBe(false);
+
+    await store.getState().checkStatus();
+    expect(server.statusCalls()).toHaveLength(2);
+  });
+
+  it("L. the cooldown never leaves the control disabled forever, and an unresolved payment is never shown as failed", async () => {
+    setup({ secondsBeforeExpiry: 0, statusStates: ["unknown"] });
+    const store = createRealPaymentStore();
+    store.setState({ attempt: { ...baseAttempt(), state: "submitted", prepared: null }, status: "submitted" });
+    await store.getState().checkStatus();
+    await vi.advanceTimersByTimeAsync(10 * HOUR);
+    expect(store.getState().isManualCheckCoolingDown).toBe(false);
+    expect(store.getState().status).toBe("unknown"); // S: still non-terminal
+  });
+
+  it("M/N. automatic and manual checks that overlap share one request", async () => {
+    const server = setup({ secondsBeforeExpiry: 5, hold: true });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    await vi.advanceTimersByTimeAsync(6_000); // the validity timer fires: automatic request in flight (held)
+    expect(server.statusCalls()).toHaveLength(1);
+
+    const manual = store.getState().checkStatus();
+    const again = store.getState().checkSubmittedStatus(); // not "submitted": a no-op
+    await vi.advanceTimersByTimeAsync(0);
+    expect(server.statusCalls()).toHaveLength(1);
+
+    await server.release();
+    await Promise.all([manual, again]);
+    expect(server.statusCalls()).toHaveLength(1);
+  });
+
+  it("M. the post-submit check and a manual check pressed together share one request", async () => {
+    const server = setup({ secondsBeforeExpiry: 0, hold: true, statusStates: ["confirmed"] });
+    const store = createRealPaymentStore();
+    store.setState({ attempt: { ...baseAttempt(), state: "submitted", prepared: null }, status: "submitted" });
+
+    const automatic = store.getState().checkSubmittedStatus();
+    const manual = store.getState().checkStatus();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(server.statusCalls()).toHaveLength(1);
+    await server.release();
+    await Promise.all([automatic, manual]);
+    expect(server.statusCalls()).toHaveLength(1);
+    expect(store.getState().status).toBe("confirmed");
+  });
+
+  it("O. requests are never merged across attempts: attempt-2 gets its own request, and attempt-1's late answer is dropped", async () => {
+    const server = setup({ secondsBeforeExpiry: 0, hold: true });
+    const store = createRealPaymentStore();
+    store.setState({ attempt: baseAttempt(), status: "awaiting_authorization" });
+
+    const first = store.getState().checkStatus();
+    await vi.advanceTimersByTimeAsync(0);
+    store.setState({ attempt: { ...baseAttempt(), id: "attempt-2" }, status: "awaiting_authorization", isManualCheckCoolingDown: false });
+    const second = store.getState().checkStatus();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(server.statusCalls().map((c) => c.url)).toEqual(["/api/real/payments/attempt-1/status", "/api/real/payments/attempt-2/status"]);
+    await server.release();
+    await Promise.all([first, second]);
+    expect(store.getState().attempt?.id).toBe("attempt-2");
+  });
+
+  it("P. a new lifecycle (account switch → init) never joins the previous account's request and starts a fresh budget", async () => {
+    const server = setup({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(store.getState().isFollowUpExhausted).toBe(true);
+    const before = server.statusCalls().length;
+
+    await store.getState().init(); // another account / a fresh mount
+    expect(store.getState().isFollowUpExhausted).toBe(false);
+    expect(server.statusCalls()).toHaveLength(before + 1);
+    expect(store.getState().isManualCheckCoolingDown).toBe(false);
+  });
+
+  it("R. a terminal answer from a manual check ends the schedule immediately", async () => {
+    const server = setup({ secondsBeforeExpiry: -100, statusStates: ["awaiting_authorization", "failed"] });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    expect(server.statusCalls()).toHaveLength(1);
+
+    await store.getState().checkStatus();
+    expect(store.getState().status).toBe("failed");
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(server.statusCalls()).toHaveLength(2);
+  });
+
+  it("S. an unknown outcome stays non-terminal: no automatic polling is invented for it and nothing is finalized", async () => {
+    const server = setup({ secondsBeforeExpiry: 0, statusStates: ["unknown"] });
+    const store = createRealPaymentStore();
+    store.setState({ attempt: { ...baseAttempt(), state: "submitted", prepared: null }, status: "submitted" });
+
+    await store.getState().checkSubmittedStatus();
+    expect(store.getState().status).toBe("unknown");
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(server.statusCalls()).toHaveLength(1);
+    expect(store.getState().attempt?.failureReason).toBeNull();
+  });
+});
+
+/**
+ * Stage 2A.1: two corrections. (1) The follow-up sequence can run out while the
+ * payment still reads "waiting for your approval" — the manual check must stay
+ * available. (2) A status read that began before a local transition (submit, a
+ * refused cancel) must not be applied after it, and the read that follows the
+ * transition must be a fresh one, not a join of the older request.
+ */
+describe("real-payment-store — 3A-1 Stage 2A.1: recovery action and stale-read barrier", () => {
+  const ACCOUNT = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const HOUR = 60 * 60 * 1000;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  type StatusRequest = { url: string; respond: (state: string) => void; fail: () => void };
+
+  /**
+   * A fake server whose /status answers are DEFERRED: each request is parked in
+   * `statusRequests` until the test answers or fails it. `autoFail` rejects
+   * every /status immediately instead (a network that never works).
+   */
+  function server(options: { secondsBeforeExpiry?: number; autoFail?: boolean } = {}) {
+    vi.useFakeTimers();
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: "0xsig", activityId: "activity-1" } as never);
+    const offset = VALID_UNTIL - (options.secondsBeforeExpiry ?? 1000) - Math.floor(Date.now() / 1000);
+    const serverNow = () => Math.floor(Date.now() / 1000) + offset;
+    const log: { url: string; method: string; at: number }[] = [];
+    const statusRequests: StatusRequest[] = [];
+    let cancelStatus = 409;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        log.push({ url, method, at: Date.now() });
+        if (url.includes("/latest")) {
+          return jsonResponse(200, { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() });
+        }
+        if (url.includes("/submit")) return jsonResponse(200, { attempt: { ...baseAttempt(), state: "submitted", prepared: null } });
+        if (url.includes("/cancel")) return jsonResponse(cancelStatus, { error: "wrong_state" });
+        if (url.includes("/status")) {
+          if (options.autoFail) throw new TypeError("Failed to fetch");
+          return new Promise<Response>((resolve, reject) => {
+            statusRequests.push({
+              url,
+              respond: (state) =>
+                resolve(
+                  jsonResponse(200, {
+                    attempt: {
+                      ...baseAttempt(),
+                      id: url.split("/")[4]!,
+                      state,
+                      prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null,
+                      failureReason: state === "failed" ? "No money moved." : null,
+                    },
+                    serverNowSeconds: serverNow(),
+                  }),
+                ),
+              fail: () => reject(new TypeError("Failed to fetch")),
+            });
+          });
+        }
+        throw new Error(`unexpected fetch: ${method} ${url}`);
+      }),
+    );
+    const statusLog = () => log.filter((c) => c.url.includes("/status"));
+    return {
+      log,
+      statusRequests,
+      statusLog,
+      count: (fragment: string) => log.filter((c) => c.url.includes(fragment)).length,
+      setCancelStatus: (status: number) => {
+        cancelStatus = status;
+      },
+      settle: () => vi.advanceTimersByTimeAsync(0),
+    };
+  }
+
+  /** A pending, still-valid payment this session can approve. */
+  function awaiting(store: ReturnType<typeof createRealPaymentStore>) {
+    useRealAccountStore.setState({ account: ACCOUNT });
+    store.setState({
+      attempt: baseAttempt(),
+      status: "awaiting_authorization",
+      subOrganizationId: "sub-org-1",
+      authorizingCredentialId: "credential-1",
+      clockOffsetSeconds: 0,
+    });
+  }
+
+  // ---- LOW-1 -------------------------------------------------------------
+
+  it("LOW-1 A/B/C: nine failed checks from the validity boundary exhaust the schedule; the payment still reads as pending and the manual check stays", async () => {
+    const s = server({ secondsBeforeExpiry: 5, autoFail: true });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    expect(store.getState().isAttemptPastValidity).toBe(false); // computed before validUntil
+
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+
+    expect(s.statusLog()).toHaveLength(1 + MAX_AUTOMATIC_FOLLOW_UPS); // nine failed automatic checks
+    expect(store.getState().isFollowUpExhausted).toBe(true);
+    // The validity flag was stale in the audit's scenario (failed reads never refreshed it). It is refreshed when the schedule fires.
+    expect(store.getState().isAttemptPastValidity).toBe(true);
+    // Nothing was decided on the payment's behalf.
+    expect(store.getState().status).toBe("awaiting_authorization");
+    expect(store.getState().attempt?.state).toBe("awaiting_authorization");
+    expect(s.count("/submit") + s.count("/prepare") + s.count("/cancel")).toBe(0);
+
+    // Manual recovery: works, and works again after each cooldown, however many times it errors.
+    for (let i = 1; i <= 3; i++) {
+      const before = s.statusLog().length;
+      await store.getState().checkStatus();
+      expect(s.statusLog(), `manual #${i}`).toHaveLength(before + 1);
+      expect(store.getState().error).toBeTruthy();
+      expect(store.getState().isManualCheckCoolingDown).toBe(true); // D
+      await store.getState().checkStatus();
+      expect(s.statusLog(), `during cooldown #${i}`).toHaveLength(before + 1);
+      await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS);
+      expect(store.getState().isManualCheckCoolingDown).toBe(false);
+    }
+    // And the automatic sequence did not restart.
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(s.statusLog()).toHaveLength(1 + MAX_AUTOMATIC_FOLLOW_UPS + 3);
+    expect(store.getState().isFollowUpExhausted).toBe(true);
+  });
+
+  // ---- LOW-2 -------------------------------------------------------------
+
+  it("LOW-2 E/F/G/P: a read begun before the submit cannot revert the submitted payment, and the post-submit read is a fresh one", async () => {
+    const s = server();
+    const store = createRealPaymentStore();
+    awaiting(store);
+
+    // An ordinary read starts while the payment is awaiting approval.
+    const older = store.getState().checkStatus();
+    await s.settle();
+    expect(s.statusRequests).toHaveLength(1);
+
+    // The payment is then approved and submitted.
+    await store.getState().resumeAuthorization();
+    expect(store.getState().status).toBe("submitted");
+    expect(s.count("/submit")).toBe(1);
+
+    // The post-submit check (the form's effect) must not join the older request ...
+    const postSubmit = store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.statusRequests).toHaveLength(1);
+
+    // ... and when the older answer finally arrives (a stale "awaiting"), it is not applied.
+    s.statusRequests[0]!.respond("awaiting_authorization");
+    await s.settle();
+    await older;
+    expect(store.getState().status).toBe("submitted");
+    expect(store.getState().attempt?.state).toBe("submitted");
+
+    // Only then is the fresh read issued — and it is the one that decides.
+    expect(s.statusRequests).toHaveLength(2);
+    s.statusRequests[1]!.respond("confirmed");
+    await postSubmit;
+    expect(store.getState().status).toBe("confirmed");
+    expect(s.statusRequests).toHaveLength(2);
+    // P: exactly one submit, no prepare, no second dispatch.
+    expect(s.count("/submit")).toBe(1);
+    expect(s.count("/prepare")).toBe(0);
+  });
+
+  it("LOW-2 H/I: a refused cancel does not rely on a read that began before it — it waits, discards that answer, and reads fresh", async () => {
+    const s = server();
+    const store = createRealPaymentStore();
+    awaiting(store);
+
+    const older = store.getState().checkStatus();
+    await s.settle();
+    expect(s.statusRequests).toHaveLength(1);
+
+    const cancelling = store.getState().cancel();
+    await s.settle();
+    expect(s.count("/cancel")).toBe(1);
+    expect(s.statusRequests).toHaveLength(1); // no second concurrent request while the older one is open
+
+    s.statusRequests[0]!.respond("awaiting_authorization"); // predates whatever won the race
+    await s.settle();
+    await older;
+    expect(store.getState().status).toBe("awaiting_authorization");
+    expect(store.getState().error).toBeNull(); // the stale answer said nothing new
+
+    expect(s.statusRequests).toHaveLength(2);
+    s.statusRequests[1]!.respond("submitted");
+    await cancelling;
+    expect(store.getState().status).toBe("submitted");
+    expect(store.getState().attempt?.state).toBe("submitted");
+    expect(store.getState().error).toMatch(/could not be cancelled/i);
+    expect(s.count("/submit") + s.count("/prepare")).toBe(0);
+  });
+
+  it("J. ordinary overlap (automatic follow-up + manual press) still shares one request", async () => {
+    const s = server({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const initializing = store.getState().init();
+    await s.settle();
+    expect(s.statusRequests).toHaveLength(1); // the automatic check
+
+    const manual = store.getState().checkStatus();
+    await s.settle();
+    expect(s.statusRequests).toHaveLength(1); // joined, not duplicated
+
+    s.statusRequests[0]!.respond("awaiting_authorization");
+    await Promise.all([initializing, manual]);
+    expect(s.statusLog()).toHaveLength(1);
+    store.getState().detach();
+  });
+
+  it("K. no fresh read is issued once the lifecycle is detached while the older read is still open", async () => {
+    const s = server();
+    const store = createRealPaymentStore();
+    awaiting(store);
+
+    const older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization(); // submitted
+    const postSubmit = store.getState().checkSubmittedStatus();
+    await s.settle();
+
+    store.getState().detach();
+    s.statusRequests[0]!.respond("awaiting_authorization");
+    await s.settle();
+    await Promise.all([older, postSubmit]);
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+
+    expect(s.statusRequests).toHaveLength(1);
+  });
+
+  it("L. an attempt or account change while a fresh read is waiting invalidates it — nothing is requested for the old attempt", async () => {
+    // attempt change
+    let s = server();
+    let store = createRealPaymentStore();
+    awaiting(store);
+    let older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization();
+    let waiting = store.getState().checkSubmittedStatus();
+    await s.settle();
+    store.setState({ attempt: { ...baseAttempt(), id: "attempt-2", state: "submitted", prepared: null }, status: "submitted" });
+    s.statusRequests[0]!.respond("awaiting_authorization");
+    await s.settle();
+    await Promise.all([older, waiting]);
+    expect(s.statusRequests.map((r) => r.url)).toEqual(["/api/real/payments/attempt-1/status"]);
+    expect(store.getState().attempt?.id).toBe("attempt-2");
+    vi.useRealTimers();
+
+    // account switch (a new lifecycle)
+    s = server();
+    store = createRealPaymentStore();
+    awaiting(store);
+    older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization();
+    waiting = store.getState().checkSubmittedStatus();
+    await s.settle();
+    const reinit = store.getState().init(); // another account's page: new generation, own /latest
+    await s.settle();
+    s.statusRequests[0]!.respond("awaiting_authorization");
+    await s.settle();
+    await Promise.all([older, waiting, reinit]);
+    // The old lifecycle's waiter issued nothing; the new one's own expiry logic is not due yet (validUntil is far off).
+    expect(s.statusRequests).toHaveLength(1);
+    expect(store.getState().attempt?.id).toBe("attempt-1");
+    expect(store.getState().status).toBe("awaiting_authorization");
+    store.getState().detach();
+  });
+
+  it("M. a read that fails releases the slot: the waiting fresh read proceeds, and later triggers are not stuck on it", async () => {
+    const s = server();
+    const store = createRealPaymentStore();
+    awaiting(store);
+
+    const older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization();
+    const waiting = store.getState().checkSubmittedStatus();
+    await s.settle();
+
+    s.statusRequests[0]!.fail();
+    await s.settle();
+    await older;
+    expect(store.getState().error).toBeNull(); // a failed read from before the transition is not news
+    expect(s.statusRequests).toHaveLength(2);
+
+    s.statusRequests[1]!.fail();
+    await waiting;
+    expect(store.getState().status).toBe("submitted");
+    expect(store.getState().error).toMatch(/fetch/i);
+
+    // The slot is free again.
+    await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS);
+    const again = store.getState().checkStatus();
+    await s.settle();
+    expect(s.statusRequests).toHaveLength(3);
+    s.statusRequests[2]!.respond("confirmed");
+    await again;
+    expect(store.getState().status).toBe("confirmed");
+  });
+
+  it("N. a terminal payment stays terminal: no late non-terminal answer can move it", async () => {
+    const s = server();
+    const store = createRealPaymentStore();
+    awaiting(store);
+
+    const late = store.getState().checkStatus();
+    await s.settle();
+    store.setState({ status: "confirmed", attempt: { ...baseAttempt(), state: "confirmed", prepared: null } });
+    s.statusRequests[0]!.respond("awaiting_authorization");
+    await late;
+
+    expect(store.getState().status).toBe("confirmed");
+    expect(store.getState().attempt?.state).toBe("confirmed");
+  });
+
+  it("O. refused-cancel and submit transitions in the middle of a sequence never reset the follow-up allowance", async () => {
+    const s = server({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    useRealAccountStore.setState({ account: ACCOUNT });
+    const answerAll = async () => {
+      // Answer whatever is parked, as the (still non-terminal) server.
+      for (const request of s.statusRequests.splice(0)) request.respond("awaiting_authorization");
+      await s.settle();
+    };
+
+    const initializing = store.getState().init();
+    await s.settle();
+    await answerAll();
+    await initializing;
+    await vi.advanceTimersByTimeAsync(EXPIRY_FOLLOW_UP_MS);
+    await answerAll();
+    await vi.advanceTimersByTimeAsync(2 * EXPIRY_FOLLOW_UP_MS);
+    await answerAll();
+    expect(s.statusLog()).toHaveLength(3);
+
+    // A refused cancel mid-sequence: one fresh read, and it continues the SAME allowance.
+    const cancelling = store.getState().cancel();
+    await s.settle();
+    await answerAll();
+    await cancelling;
+    expect(s.statusLog()).toHaveLength(4);
+
+    for (let i = 0; i < 20; i++) {
+      await vi.advanceTimersByTimeAsync(MAX_FOLLOW_UP_INTERVAL_MS);
+      await answerAll();
+    }
+    expect(store.getState().isFollowUpExhausted).toBe(true);
+    // Nine automatic checks in all, plus the one the cancel fallback itself made — never a fresh nine.
+    expect(s.statusLog().length).toBeLessThanOrEqual(1 + MAX_AUTOMATIC_FOLLOW_UPS + 1);
+    const times = s.statusLog().map((c) => c.at);
+    const afterCancel = times.slice(4).map((t, i) => t - times[3 + i]!);
+    expect(Math.min(...afterCancel)).toBeGreaterThanOrEqual(MAX_FOLLOW_UP_INTERVAL_MS); // the interval kept growing; it did not restart at 75 s
+    expect(s.count("/submit") + s.count("/prepare")).toBe(0);
+    store.getState().detach();
+  });
+});
+
+/**
+ * Stage 2C-2: the client side of the server's "not now" (reconciliationDeferred),
+ * a bounded wait on every status read, current-epoch joins only, bounded
+ * fresh-waiters, and a cancel that cannot turn into a read storm. None of it
+ * touches payment execution: every request here is /latest, /status, or the
+ * one legitimate /submit / refused /cancel of the scenario.
+ */
+describe("real-payment-store — 3A-1 Stage 2C-2: deferral, deadlines, freshness", () => {
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const HOUR = 60 * 60 * 1000;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  type StatusRequest = { url: string; signal: AbortSignal | undefined; respond: (state: string, extra?: Record<string, unknown>) => void; fail: () => void };
+
+  /**
+   * A fake server with DEFERRED /status answers that deliberately IGNORE the
+   * AbortSignal (so only the client's own bounded wait can end a read).
+   */
+  function lab(options: { secondsBeforeExpiry?: number; latestId?: string; latestState?: string } = {}) {
+    vi.useFakeTimers();
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: "0xsig", activityId: "activity-1" } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+    const offset = VALID_UNTIL - (options.secondsBeforeExpiry ?? 1000) - Math.floor(Date.now() / 1000);
+    const serverNow = () => Math.floor(Date.now() / 1000) + offset;
+    const log: { url: string; method: string; at: number }[] = [];
+    const requests: StatusRequest[] = [];
+    let latestId = options.latestId ?? "attempt-1";
+    let cancelStatus = 409;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        log.push({ url, method, at: Date.now() });
+        if (url.includes("/latest")) {
+          const state = options.latestState ?? "awaiting_authorization";
+          return jsonResponse(200, {
+            attempt: { ...baseAttempt(), id: latestId, state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null },
+            subOrganizationId: "sub-org-1",
+            authorizingCredentialId: "credential-1",
+            serverNowSeconds: serverNow(),
+          });
+        }
+        if (url.includes("/submit")) return jsonResponse(200, { attempt: { ...baseAttempt(), state: "submitted", prepared: null } });
+        if (url.includes("/cancel")) return cancelStatus === 200 ? jsonResponse(200, { attempt: { ...baseAttempt(), state: "cancelled", prepared: null } }) : jsonResponse(cancelStatus, { error: "wrong_state" });
+        if (url.includes("/status")) {
+          return new Promise<Response>((resolve, reject) => {
+            requests.push({
+              url,
+              signal: init?.signal as AbortSignal | undefined,
+              respond: (state, extra = {}) =>
+                resolve(
+                  jsonResponse(200, {
+                    attempt: { ...baseAttempt(), id: url.split("/")[4]!, state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null, failureReason: state === "failed" ? "No money moved." : null },
+                    serverNowSeconds: serverNow(),
+                    reconciliationDeferred: false,
+                    ...extra,
+                  }),
+                ),
+              fail: () => reject(new TypeError("Failed to fetch")),
+            });
+          });
+        }
+        throw new Error(`unexpected fetch: ${method} ${url}`);
+      }),
+    );
+    const statusLog = () => log.filter((c) => c.url.includes("/status"));
+    return {
+      log,
+      requests,
+      statusLog,
+      count: (fragment: string) => log.filter((c) => c.url.includes(fragment)).length,
+      setLatestId: (id: string) => {
+        latestId = id;
+      },
+      setCancelStatus: (status: number) => {
+        cancelStatus = status;
+      },
+      settle: () => vi.advanceTimersByTimeAsync(0),
+    };
+  }
+
+  function awaiting(store: ReturnType<typeof createRealPaymentStore>, attempt = baseAttempt()) {
+    store.setState({ attempt, status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: 0 });
+  }
+
+  const submitted = (store: ReturnType<typeof createRealPaymentStore>) =>
+    store.setState({ attempt: { ...baseAttempt(), state: "submitted", prepared: null }, status: "submitted", clockOffsetSeconds: 0 });
+
+  const deferral = (seconds: unknown) => ({ reconciliationDeferred: true, retryAfterSeconds: seconds });
+
+  // ---- deferral ----------------------------------------------------------
+
+  it("A. an ordinary answer is settled: nothing deferred, no deadline", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submitted(store);
+    const check = store.getState().checkStatus();
+    await s.settle();
+    s.requests[0]!.respond("submitted");
+    await check;
+    expect(store.getState()).toMatchObject({ isStatusDeferred: false, statusRetryAfterSeconds: null, status: "submitted" });
+  });
+
+  it("B/C/D. a deferred answer keeps the stored attempt, invents no outcome, records the delay, and starts nothing", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submitted(store);
+    const check = store.getState().checkStatus();
+    await s.settle();
+    s.requests[0]!.respond("submitted", deferral(600));
+    await check;
+
+    expect(store.getState()).toMatchObject({ status: "submitted", isStatusDeferred: true, statusRetryAfterSeconds: 600, isManualCheckCoolingDown: true, error: null });
+    expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "submitted", failureReason: null, transactionHash: null });
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(s.statusLog()).toHaveLength(1);
+    expect(s.count("/submit") + s.count("/prepare")).toBe(0);
+  });
+
+  it("D. a deferred answer whose stored attempt is already terminal shows exactly that — the server's own stored state", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submitted(store);
+    const check = store.getState().checkStatus();
+    await s.settle();
+    s.requests[0]!.respond("confirmed", deferral(600));
+    await check;
+    expect(store.getState().status).toBe("confirmed");
+  });
+
+  it("E/F/G. a missing or unusable delay is never 'retry now': the attempt is not trusted, a generic message shows, a local deadline holds", async () => {
+    for (const bad of [undefined, null, 0, -1, 1.5, "600", Number.NaN, 86_401, 10 ** 12, true]) {
+      const s = lab();
+      const store = createRealPaymentStore();
+      submitted(store);
+      const before = store.getState().attempt;
+      const check = store.getState().checkStatus();
+      await s.settle();
+      // The malformed answer even claims a terminal state — it must not be applied.
+      s.requests[0]!.respond("failed", { reconciliationDeferred: true, retryAfterSeconds: bad });
+      await check;
+
+      expect(store.getState().attempt, String(bad)).toEqual(before);
+      expect(store.getState().status).toBe("submitted");
+      expect(store.getState().error).toMatch(/couldn.t check on this payment/i);
+      expect(store.getState()).toMatchObject({ isStatusDeferred: true, statusRetryAfterSeconds: null, isManualCheckCoolingDown: true });
+
+      await vi.advanceTimersByTimeAsync(STATUS_FALLBACK_DEADLINE_MS - 1);
+      await store.getState().checkStatus();
+      expect(s.statusLog()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.getState().isManualCheckCoolingDown).toBe(false);
+      vi.useRealTimers();
+    }
+  });
+
+  it("E. a non-boolean reconciliationDeferred is malformed too", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submitted(store);
+    const check = store.getState().checkStatus();
+    await s.settle();
+    s.requests[0]!.respond("failed", { reconciliationDeferred: "yes", retryAfterSeconds: 30 });
+    await check;
+    expect(store.getState().status).toBe("submitted");
+    expect(store.getState().error).toBeTruthy();
+  });
+
+  it("interpretStatusResult: settled / deferred / malformed, field by field", () => {
+    const attempt = baseAttempt();
+    const base = { attempt, serverNowSeconds: 1 };
+    expect(interpretStatusResult({ ...base })).toEqual({ kind: "settled" });
+    expect(interpretStatusResult({ ...base, reconciliationDeferred: false })).toEqual({ kind: "settled" });
+    expect(interpretStatusResult({ ...base, reconciliationDeferred: false, retryAfterSeconds: 9 })).toEqual({ kind: "settled" });
+    expect(interpretStatusResult({ ...base, reconciliationDeferred: true, retryAfterSeconds: 1 })).toEqual({ kind: "deferred", seconds: 1 });
+    expect(interpretStatusResult({ ...base, reconciliationDeferred: true, retryAfterSeconds: 86_400 })).toEqual({ kind: "deferred", seconds: 86_400 });
+    for (const bad of [0, -1, 0.5, 86_401, Number.POSITIVE_INFINITY, "5", null, undefined]) {
+      expect(interpretStatusResult({ ...base, reconciliationDeferred: true, retryAfterSeconds: bad }), String(bad)).toEqual({ kind: "malformed" });
+    }
+    expect(interpretStatusResult({ ...base, reconciliationDeferred: 1 })).toEqual({ kind: "malformed" });
+  });
+
+  it("H/I/J. a 24 h delay is honored exactly: nothing before the deadline, the control returns at it, then one manual check works", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submitted(store);
+    const check = store.getState().checkStatus();
+    await s.settle();
+    s.requests[0]!.respond("submitted", deferral(86_400));
+    await check;
+
+    await vi.advanceTimersByTimeAsync(86_400_000 - 1);
+    expect(store.getState().isManualCheckCoolingDown).toBe(true);
+    await store.getState().checkStatus();
+    await store.getState().checkSubmittedStatus();
+    expect(s.statusLog()).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(store.getState()).toMatchObject({ isManualCheckCoolingDown: false, isStatusDeferred: false });
+    const again = store.getState().checkStatus();
+    await s.settle();
+    expect(s.statusLog()).toHaveLength(2);
+    s.requests[1]!.respond("confirmed");
+    await again;
+    expect(store.getState().status).toBe("confirmed");
+  });
+
+  it("K/L/M. automatic follow-ups wait for the LATER of the exponential schedule and the server's deadline, and the eight-follow-up cap still holds", async () => {
+    const s = lab({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const answerAll = async (extra: Record<string, unknown>) => {
+      for (const request of s.requests.splice(0)) request.respond("awaiting_authorization", extra);
+      await s.settle();
+    };
+    const initializing = store.getState().init();
+    await s.settle();
+    await answerAll(deferral(1_200)); // the server says: not for 20 minutes
+    await initializing;
+
+    // 75 s would be the schedule's next step; the deadline (1200 s) is later, so that is when it fires.
+    await vi.advanceTimersByTimeAsync(1_199_000);
+    expect(s.statusLog()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(s.statusLog()).toHaveLength(2);
+
+    // Keep deferring with a short delay: the exponential schedule is the later one now, and the cap is unchanged.
+    for (let i = 0; i < 40; i++) {
+      await answerAll(deferral(5));
+      await vi.advanceTimersByTimeAsync(MAX_FOLLOW_UP_INTERVAL_MS);
+    }
+    expect(s.statusLog()).toHaveLength(1 + MAX_AUTOMATIC_FOLLOW_UPS);
+    expect(store.getState().isFollowUpExhausted).toBe(true);
+    expect(store.getState().status).toBe("awaiting_authorization");
+    expect(s.count("/submit") + s.count("/prepare") + s.count("/cancel")).toBe(0);
+    store.getState().detach();
+  });
+
+  it("N/O. a deferral that is still running survives the tab being hidden and shown: no request on return", async () => {
+    const s = lab({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const initializing = store.getState().init();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization", deferral(3_600));
+    await initializing;
+
+    store.getState().setPageVisible(false);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    store.getState().setPageVisible(true);
+    await s.settle();
+    expect(s.statusLog()).toHaveLength(1);
+    store.getState().detach();
+  });
+
+  it("P. unmount and remount for the SAME account and attempt: the deadline still holds and the control still waits", async () => {
+    const s = lab({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const first = store.getState().init();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization", deferral(1_800));
+    await first;
+    store.getState().detach();
+
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    const remount = store.getState().init(); // /latest is a database read and proceeds
+    await s.settle();
+    await remount;
+    expect(s.count("/latest")).toBe(2);
+    expect(s.statusLog()).toHaveLength(1); // ...but no provider-bound status read
+    expect(store.getState()).toMatchObject({ isStatusDeferred: true, isManualCheckCoolingDown: true });
+    await store.getState().checkStatus();
+    expect(s.statusLog()).toHaveLength(1);
+
+    // Past the deadline the established behaviour resumes: a manual check reads again.
+    await vi.advanceTimersByTimeAsync(25 * 60_000);
+    expect(store.getState().isManualCheckCoolingDown).toBe(false);
+    const manual = store.getState().checkStatus();
+    await s.settle();
+    expect(s.statusLog()).toHaveLength(2);
+    s.requests[1]!.respond("awaiting_authorization");
+    await manual;
+    store.getState().detach();
+  });
+
+  it("Q. another account is never held by this account's deadline", async () => {
+    const s = lab({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const first = store.getState().init();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization", deferral(3_600));
+    await first;
+    store.getState().detach();
+
+    useRealAccountStore.setState({ account: ACCOUNT_B });
+    const second = store.getState().init();
+    await s.settle();
+    expect(s.statusLog()).toHaveLength(2); // the same attempt id, but not the same account: read at once
+    expect(store.getState().isStatusDeferred).toBe(false);
+    s.requests[1]!.respond("awaiting_authorization");
+    await second;
+    store.getState().detach();
+  });
+
+  it("R. another attempt is never governed by this attempt's deadline", async () => {
+    const s = lab({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const first = store.getState().init();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization", deferral(3_600));
+    await first;
+    store.getState().detach();
+
+    s.setLatestId("attempt-2");
+    const second = store.getState().init();
+    await s.settle();
+    expect(s.statusLog().map((c) => c.url)).toEqual(["/api/real/payments/attempt-1/status", "/api/real/payments/attempt-2/status"]);
+    s.requests[1]!.respond("awaiting_authorization");
+    await second;
+    store.getState().detach();
+  });
+
+  it("S. reset() (logout / a new payment) drops the deadline", async () => {
+    const s = lab({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const first = store.getState().init();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization", deferral(3_600));
+    await first;
+    store.getState().reset();
+
+    const again = store.getState().init();
+    await s.settle();
+    expect(s.statusLog()).toHaveLength(2);
+    s.requests[1]!.respond("awaiting_authorization");
+    await again;
+    store.getState().detach();
+  });
+
+  it("T. a deferred answer that arrives after unmount applies nothing and records no deadline", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submitted(store);
+    const check = store.getState().checkStatus();
+    await s.settle();
+    store.getState().detach();
+    s.requests[0]!.respond("submitted", deferral(3_600));
+    await check;
+    expect(store.getState().isStatusDeferred).toBe(false);
+
+    // A later mount for the same attempt is not held by an answer that never applied.
+    const remount = store.getState().init();
+    await s.settle();
+    await remount;
+    expect(store.getState().isManualCheckCoolingDown).toBe(false);
+    const manual = store.getState().checkStatus();
+    await s.settle();
+    expect(s.statusLog()).toHaveLength(2);
+    s.requests[1]!.respond("awaiting_authorization");
+    await manual;
+    store.getState().detach();
+  });
+
+  // ---- request deadline --------------------------------------------------
+
+  it("U/V/W. a hanging status read is abandoned at 45 s even though fetch ignores the AbortSignal; nothing is fabricated; no timer lingers", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submitted(store);
+    const check = store.getState().checkStatus();
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS - 1);
+    expect(s.requests[0]!.signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await check;
+
+    expect(s.requests[0]!.signal?.aborted).toBe(true);
+    expect(store.getState().error).toMatch(/taking longer than usual/i);
+    expect(store.getState()).toMatchObject({ status: "submitted" });
+    expect(store.getState().attempt).toMatchObject({ state: "submitted", failureReason: null });
+    expect(s.count("/submit") + s.count("/prepare")).toBe(0);
+    await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(s.statusLog()).toHaveLength(1); // no automatic resend after a timeout
+  });
+
+  it("X/Y. a late success or a late rejection after the timeout is dropped, and nothing becomes an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      for (const late of ["success", "failure"] as const) {
+        const s = lab();
+        const store = createRealPaymentStore();
+        submitted(store);
+        const check = store.getState().checkStatus();
+        await s.settle();
+        await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+        await check;
+        const errorAfterTimeout = store.getState().error;
+
+        if (late === "success") s.requests[0]!.respond("confirmed");
+        else s.requests[0]!.fail();
+        // Real macrotask turns, so Node gets its chance to report an unhandled rejection.
+        vi.useRealTimers();
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+        expect(store.getState().status, late).toBe("submitted");
+        expect(store.getState().error).toBe(errorAfterTimeout);
+        vi.useRealTimers();
+      }
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("Z. a fresh waiter behind a read that times out is released at the deadline and proceeds with exactly one new read", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization(); // submitted: the epoch moves on
+    const waiter = store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+    await older;
+    expect(s.requests).toHaveLength(2); // released by the older read's deadline, not by anyone answering it
+    s.requests[1]!.respond("confirmed");
+    await waiter;
+    expect(store.getState().status).toBe("confirmed");
+    expect(s.count("/submit")).toBe(1);
+  });
+
+  it("no deadline timer survives detach(): the read is aborted and the timers are gone", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submitted(store);
+    const check = store.getState().checkStatus();
+    await s.settle();
+    store.getState().detach();
+    await check;
+    expect(s.requests[0]!.signal?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // ---- freshness ---------------------------------------------------------
+
+  it("AA. an ordinary caller never joins an older-epoch read — it waits, then reads once under the current epoch", async () => {
+    const s = lab({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const initializing = store.getState().init(); // an automatic read, in flight
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+    await store.getState().resumeAuthorization(); // submitted: the epoch moves
+    expect(store.getState().status).toBe("submitted");
+
+    const manual = store.getState().checkStatus(); // would have joined (and then lost its answer to) the old read
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+
+    s.requests[0]!.respond("awaiting_authorization"); // the stale answer: discarded
+    await s.settle();
+    expect(store.getState().status).toBe("submitted");
+    expect(s.requests).toHaveLength(2);
+    s.requests[1]!.respond("confirmed");
+    await Promise.all([initializing, manual]);
+    expect(store.getState().status).toBe("confirmed");
+  });
+
+  it("AB. two waiters behind one older read share ONE current-epoch read — never two", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization();
+    const first = store.getState().checkSubmittedStatus();
+    const second = store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+
+    s.requests[0]!.respond("awaiting_authorization");
+    await s.settle();
+    expect(s.requests).toHaveLength(2);
+    s.requests[1]!.respond("confirmed");
+    await Promise.all([older, first, second]);
+    expect(s.requests).toHaveLength(2);
+    expect(store.getState().status).toBe("confirmed");
+  });
+
+  it("AC. an older read that FAILS releases its waiters, which proceed with one new read", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization();
+    const a = store.getState().checkSubmittedStatus();
+    const b = store.getState().checkSubmittedStatus();
+    await s.settle();
+
+    s.requests[0]!.fail();
+    await s.settle();
+    expect(s.requests).toHaveLength(2);
+    s.requests[1]!.respond("confirmed");
+    await Promise.all([older, a, b]);
+    expect(store.getState().status).toBe("confirmed");
+  });
+
+  it("AD. an older read that TIMES OUT releases its waiters the same way", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization();
+    const a = store.getState().checkSubmittedStatus();
+    const b = store.getState().checkSubmittedStatus();
+    await s.settle();
+
+    await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+    expect(s.requests).toHaveLength(2);
+    s.requests[1]!.respond("confirmed");
+    await Promise.all([older, a, b]);
+    expect(store.getState().status).toBe("confirmed");
+  });
+
+  it("AE. another transition while a waiter is resuming: bounded — a stale read is discarded, the next one decides, and it never cascades", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization(); // epoch moves; payment submitted
+    const waiter = store.getState().checkSubmittedStatus();
+    await s.settle();
+
+    s.requests[0]!.respond("awaiting_authorization");
+    await s.settle();
+    expect(s.requests).toHaveLength(2); // the waiter's read, under the current epoch
+
+    // Before it answers, a cancel is refused: the epoch moves again.
+    const cancelling = store.getState().cancel();
+    await s.settle();
+    expect(s.requests).toHaveLength(2); // the cancel's read waits behind it; no concurrent third request
+    s.requests[1]!.respond("submitted"); // now stale: discarded
+    await s.settle();
+    expect(s.requests).toHaveLength(3); // the cancel's own read waited for it, then read once
+    s.requests[2]!.respond("confirmed");
+    await Promise.all([older, waiter, cancelling]);
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+
+    expect(store.getState().status).toBe("confirmed");
+    expect(s.requests).toHaveLength(3);
+    expect(s.count("/submit")).toBe(1);
+  });
+
+  it("AF. terminal answers stay monotonic against a later deferred or settled non-terminal answer", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submitted(store);
+    const first = store.getState().checkStatus();
+    await s.settle();
+    s.requests[0]!.respond("confirmed");
+    await first;
+    expect(store.getState().status).toBe("confirmed");
+
+    await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS);
+    const second = store.getState().checkStatus();
+    await s.settle();
+    s.requests[1]!.respond("submitted", deferral(600));
+    await second;
+    expect(store.getState().status).toBe("confirmed");
+    expect(store.getState().attempt?.state).toBe("confirmed");
+  });
+
+  // ---- cancellation ------------------------------------------------------
+
+  it("AG. a refused cancel still gets its first reconciliation read — and keeps the refusal visible", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const cancelling = store.getState().cancel();
+    await s.settle();
+    expect(s.count("/cancel")).toBe(1);
+    expect(s.requests).toHaveLength(1);
+    s.requests[0]!.respond("submitted");
+    await cancelling;
+    expect(store.getState()).toMatchObject({ status: "submitted" });
+    expect(store.getState().error).toMatch(/could not be cancelled/i);
+  });
+
+  it("AH. repeated refused cancels are locally bounded: one read per cooldown window, however fast Cancel is pressed", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const first = store.getState().cancel();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization");
+    await first;
+
+    for (let i = 0; i < 5; i++) await store.getState().cancel();
+    expect(s.count("/cancel")).toBe(6);
+    expect(s.statusLog()).toHaveLength(1);
+    expect(store.getState().error).toMatch(/could not be cancelled/i);
+    expect(store.getState().status).toBe("awaiting_authorization"); // never "cancelled", never failed
+
+    await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS);
+    const later = store.getState().cancel();
+    await s.settle();
+    expect(s.statusLog()).toHaveLength(2);
+    s.requests[1]!.respond("awaiting_authorization");
+    await later;
+  });
+
+  it("AI. a deferred answer to the cancel's read is applied honestly, records the deadline, and a second refusal does not read inside it", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const first = store.getState().cancel();
+    await s.settle();
+    s.requests[0]!.respond("submitted", deferral(1_200));
+    await first;
+    expect(store.getState()).toMatchObject({ status: "submitted", isStatusDeferred: true, statusRetryAfterSeconds: 1_200 });
+    expect(store.getState().error).toMatch(/could not be cancelled/i);
+
+    // Even after the 30 s cancel window, the server's 1200 s deadline still governs.
+    await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS + 1);
+    store.setState({ status: "awaiting_authorization", attempt: baseAttempt() });
+    await store.getState().cancel();
+    expect(s.statusLog()).toHaveLength(1);
+    expect(store.getState().status).toBe("awaiting_authorization");
+    expect(s.count("/submit") + s.count("/prepare")).toBe(0);
+  });
+});
+
+/**
+ * Stage 2C.3: the post-submit check is for a submission THIS client made or
+ * restored — not for a submitted answer a status read just delivered — and a
+ * refused cancel's local read window belongs to one account and one attempt.
+ */
+describe("real-payment-store — 3A-1 Stage 2C.3: redundant submitted read, cancel-read scope", () => {
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const HOUR = 60 * 60 * 1000;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  type Req = { url: string; respond: (state: string, extra?: Record<string, unknown>) => void };
+
+  function lab(options: { secondsBeforeExpiry?: number; latestState?: string; latestId?: string } = {}) {
+    vi.useFakeTimers();
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: "0xsig", activityId: "activity-1" } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+    const offset = VALID_UNTIL - (options.secondsBeforeExpiry ?? 1000) - Math.floor(Date.now() / 1000);
+    const serverNow = () => Math.floor(Date.now() / 1000) + offset;
+    const log: { url: string; method: string }[] = [];
+    const requests: Req[] = [];
+    let cancelStatus = 409;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        log.push({ url, method });
+        if (url.includes("/latest")) {
+          const state = options.latestState ?? "awaiting_authorization";
+          return jsonResponse(200, {
+            attempt: { ...baseAttempt(), id: options.latestId ?? "attempt-1", state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null },
+            subOrganizationId: "sub-org-1",
+            authorizingCredentialId: "credential-1",
+            serverNowSeconds: serverNow(),
+          });
+        }
+        if (url.includes("/submit")) return jsonResponse(200, { attempt: { ...baseAttempt(), state: "submitted", prepared: null } });
+        if (url.includes("/cancel")) {
+          return cancelStatus === 200 ? jsonResponse(200, { attempt: { ...baseAttempt(), state: "cancelled", prepared: null } }) : jsonResponse(cancelStatus, { error: "wrong_state" });
+        }
+        if (url.includes("/status")) {
+          return new Promise<Response>((resolve) => {
+            requests.push({
+              url,
+              respond: (state, extra = {}) =>
+                resolve(
+                  jsonResponse(200, {
+                    attempt: { ...baseAttempt(), id: url.split("/")[4]!, state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null },
+                    serverNowSeconds: serverNow(),
+                    reconciliationDeferred: false,
+                    ...extra,
+                  }),
+                ),
+            });
+          });
+        }
+        throw new Error(`unexpected fetch: ${method} ${url}`);
+      }),
+    );
+    return {
+      log,
+      requests,
+      statusCount: () => log.filter((c) => c.url.includes("/status")).length,
+      count: (fragment: string) => log.filter((c) => c.url.includes(fragment)).length,
+      setCancelStatus: (status: number) => {
+        cancelStatus = status;
+      },
+      settle: () => vi.advanceTimersByTimeAsync(0),
+    };
+  }
+
+  function awaiting(store: ReturnType<typeof createRealPaymentStore>, id = "attempt-1") {
+    store.setState({ attempt: { ...baseAttempt(), id }, status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: 0 });
+  }
+
+  // ---- LOW-2 -------------------------------------------------------------
+
+  it("A. a LOCAL submit still gets its one post-submit read", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    await store.getState().resumeAuthorization();
+    expect(store.getState().status).toBe("submitted");
+
+    const check = store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+    s.requests[0]!.respond("confirmed");
+    await check;
+    expect(store.getState().status).toBe("confirmed");
+    expect(s.count("/submit")).toBe(1);
+  });
+
+  it("B. a status read that RETURNS submitted does not trigger a second, immediate read", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const manual = store.getState().checkStatus();
+    await s.settle();
+    s.requests[0]!.respond("submitted");
+    await manual;
+    expect(store.getState().status).toBe("submitted");
+
+    // What the form's status-change effect does the moment status becomes "submitted".
+    await store.getState().checkSubmittedStatus();
+    await store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.statusCount()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(24 * HOUR); // and no polling loop was started
+    expect(s.statusCount()).toBe(1);
+  });
+
+  it("B. the same holds when an AUTOMATIC read (expired pre-dispatch attempt) returns submitted, and when the cancel fallback does", async () => {
+    const expired = lab({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const initializing = store.getState().init();
+    await expired.settle();
+    expired.requests[0]!.respond("submitted");
+    await initializing;
+    expect(store.getState().status).toBe("submitted");
+    await store.getState().checkSubmittedStatus();
+    await expired.settle();
+    expect(expired.statusCount()).toBe(1);
+    store.getState().detach();
+    vi.useRealTimers();
+
+    const refused = lab();
+    const second = createRealPaymentStore();
+    awaiting(second);
+    const cancelling = second.getState().cancel();
+    await refused.settle();
+    refused.requests[0]!.respond("submitted");
+    await cancelling;
+    expect(second.getState().status).toBe("submitted");
+    await second.getState().checkSubmittedStatus();
+    await refused.settle();
+    expect(refused.statusCount()).toBe(1);
+  });
+
+  it("C. a submitted attempt RESTORED by init() (no read has delivered it) still gets its check", async () => {
+    const s = lab({ latestState: "submitted" });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    expect(store.getState().status).toBe("submitted");
+    expect(s.statusCount()).toBe(0);
+
+    const check = store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+    s.requests[0]!.respond("submitted");
+    await check;
+    store.getState().detach();
+  });
+
+  it("D. once a submitted attempt has been checked in this lifecycle it is not checked again by the post-submit path — and a new lifecycle starts clean", async () => {
+    const s = lab({ latestState: "submitted" });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    const first = store.getState().checkSubmittedStatus();
+    await s.settle();
+    s.requests[0]!.respond("submitted");
+    await first;
+
+    await store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.statusCount()).toBe(1);
+
+    // A remount is a new lifecycle: the restored attempt gets its check again.
+    store.getState().detach();
+    await store.getState().init();
+    const again = store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.statusCount()).toBe(2);
+    s.requests[1]!.respond("submitted");
+    await again;
+    store.getState().detach();
+  });
+
+  it("a LATER local transition makes the marker stale: a submit after an earlier 'submitted' read is checked again", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const manual = store.getState().checkStatus();
+    await s.settle();
+    s.requests[0]!.respond("submitted");
+    await manual;
+    await store.getState().checkSubmittedStatus();
+    expect(s.statusCount()).toBe(1);
+
+    awaiting(store); // the attempt is back to awaiting approval locally and is submitted again
+    await store.getState().resumeAuthorization();
+    expect(store.getState().status).toBe("submitted");
+    const check = store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.statusCount()).toBe(2);
+    s.requests[1]!.respond("confirmed");
+    await check;
+  });
+
+  it("an active server retry deadline is still respected: a restored submitted attempt is not read inside it", async () => {
+    const s = lab({ latestState: "submitted" });
+    const store = createRealPaymentStore();
+    await store.getState().init();
+    const first = store.getState().checkSubmittedStatus();
+    await s.settle();
+    s.requests[0]!.respond("submitted", { reconciliationDeferred: true, retryAfterSeconds: 1_800 });
+    await first;
+    store.getState().detach();
+
+    await store.getState().init(); // remount: restored submitted, deadline still running
+    await store.getState().checkSubmittedStatus();
+    await s.settle();
+    expect(s.statusCount()).toBe(1);
+    store.getState().detach();
+  });
+
+  // ---- cancel-read scope -------------------------------------------------
+
+  it("repeated refused cancels on ONE attempt stay locally bounded", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const first = store.getState().cancel();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization");
+    await first;
+    for (let i = 0; i < 4; i++) await store.getState().cancel();
+    expect(s.count("/cancel")).toBe(5);
+    expect(s.statusCount()).toBe(1);
+  });
+
+  it("a DIFFERENT attempt does not inherit the previous attempt's cancel-read window", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, "attempt-1");
+    const first = store.getState().cancel();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization");
+    await first;
+
+    awaiting(store, "attempt-2"); // what prepare leaves behind
+    const second = store.getState().cancel();
+    await s.settle();
+    expect(s.requests.map((r) => r.url)).toEqual(["/api/real/payments/attempt-1/status", "/api/real/payments/attempt-2/status"]);
+    s.requests[1]!.respond("awaiting_authorization");
+    await second;
+  });
+
+  it("the reachable path: a refused cancel, then a successful cancel, then a new attempt's refused cancel — the new one gets its read", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, "attempt-1");
+    const refused = store.getState().cancel();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization");
+    await refused;
+
+    s.setCancelStatus(200);
+    await store.getState().cancel();
+    expect(store.getState().attempt).toBeNull();
+
+    s.setCancelStatus(409);
+    awaiting(store, "attempt-2");
+    const next = store.getState().cancel();
+    await s.settle();
+    expect(s.statusCount()).toBe(2);
+    s.requests[1]!.respond("awaiting_authorization");
+    await next;
+  });
+
+  it("another ACCOUNT does not share the window, even for the same attempt id", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const first = store.getState().cancel();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization");
+    await first;
+
+    useRealAccountStore.setState({ account: ACCOUNT_B });
+    awaiting(store);
+    const second = store.getState().cancel();
+    await s.settle();
+    expect(s.statusCount()).toBe(2);
+    s.requests[1]!.respond("awaiting_authorization");
+    await second;
+  });
+
+  it("a server-imposed deadline stays authoritative over the local window, for its own attempt only", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, "attempt-1");
+    const first = store.getState().cancel();
+    await s.settle();
+    s.requests[0]!.respond("submitted", { reconciliationDeferred: true, retryAfterSeconds: 3_600 });
+    await first;
+
+    await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS + 1); // the local window is over; the server's is not
+    awaiting(store, "attempt-1");
+    await store.getState().cancel();
+    expect(s.statusCount()).toBe(1);
+    expect(store.getState().status).toBe("awaiting_authorization"); // refusal reported; nothing invented
+
+    awaiting(store, "attempt-2"); // another attempt is not governed by it
+    const other = store.getState().cancel();
+    await s.settle();
+    expect(s.statusCount()).toBe(2);
+    s.requests[1]!.respond("awaiting_authorization");
+    await other;
+    expect(s.count("/submit") + s.count("/prepare")).toBe(0);
+  });
+});
+
+/**
+ * 3A-1 closeout: a server delay can never SHORTEN the manual cooldown (L-1),
+ * a repeated refused cancel can never discard the read its first refusal
+ * started (L-2), and the remaining client gaps the audits named.
+ */
+describe("real-payment-store — 3A-1 closeout: cooldown floor, cancel-read continuity, edge cases", () => {
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const HOUR = 60 * 60 * 1000;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  type Req = { url: string; respond: (state: string, extra?: Record<string, unknown>) => void; fail: () => void };
+
+  /** `statusDelayMs`: every /status answers itself after that long (registered AFTER the client's own deadline timer). */
+  function lab(options: { secondsBeforeExpiry?: number; latestId?: string; latestState?: string; statusDelayMs?: number; statusState?: string } = {}) {
+    vi.useFakeTimers();
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: "0xsig", activityId: "activity-1" } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+    const offset = VALID_UNTIL - (options.secondsBeforeExpiry ?? 1000) - Math.floor(Date.now() / 1000);
+    const serverNow = () => Math.floor(Date.now() / 1000) + offset;
+    const log: { url: string; method: string }[] = [];
+    const requests: Req[] = [];
+    let latestId = options.latestId ?? "attempt-1";
+    const body = (url: string, state: string, extra: Record<string, unknown> = {}) =>
+      jsonResponse(200, {
+        attempt: { ...baseAttempt(), id: url.split("/")[4]!, state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null },
+        serverNowSeconds: serverNow(),
+        reconciliationDeferred: false,
+        ...extra,
+      });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        log.push({ url, method });
+        if (url.includes("/latest")) {
+          const state = options.latestState ?? "awaiting_authorization";
+          return jsonResponse(200, {
+            attempt: { ...baseAttempt(), id: latestId, state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null },
+            subOrganizationId: "sub-org-1",
+            authorizingCredentialId: "credential-1",
+            serverNowSeconds: serverNow(),
+          });
+        }
+        if (url.includes("/submit")) return jsonResponse(200, { attempt: { ...baseAttempt(), state: "submitted", prepared: null } });
+        if (url.includes("/cancel")) return jsonResponse(409, { error: "wrong_state" });
+        if (url.includes("/status")) {
+          if (options.statusDelayMs !== undefined) {
+            return new Promise<Response>((resolve) => setTimeout(() => resolve(body(url, options.statusState ?? "awaiting_authorization")), options.statusDelayMs));
+          }
+          return new Promise<Response>((resolve, reject) => {
+            requests.push({ url, respond: (state, extra) => resolve(body(url, state, extra)), fail: () => reject(new TypeError("Failed to fetch")) });
+          });
+        }
+        throw new Error(`unexpected fetch: ${method} ${url}`);
+      }),
+    );
+    return {
+      log,
+      requests,
+      statusCount: () => log.filter((c) => c.url.includes("/status")).length,
+      count: (fragment: string) => log.filter((c) => c.url.includes(fragment)).length,
+      setLatestId: (id: string) => {
+        latestId = id;
+      },
+      settle: () => vi.advanceTimersByTimeAsync(0),
+    };
+  }
+
+  function awaiting(store: ReturnType<typeof createRealPaymentStore>, id = "attempt-1") {
+    store.setState({ attempt: { ...baseAttempt(), id }, status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: 0 });
+  }
+
+  const submittedState = (store: ReturnType<typeof createRealPaymentStore>) =>
+    store.setState({ attempt: { ...baseAttempt(), state: "submitted", prepared: null }, status: "submitted", clockOffsetSeconds: 0 });
+
+  const deferral = (seconds: number) => ({ reconciliationDeferred: true, retryAfterSeconds: seconds });
+
+  // ---- L-1: the cooldown is a floor ----------------------------------------
+
+  it("L-1: a 2 s server delay cannot shorten the 30 s manual cooldown — exact boundary, repeated presses, nothing sent early", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    submittedState(store);
+    const check = store.getState().checkStatus(); // starts the ordinary 30 s cooldown
+    await s.settle();
+    s.requests[0]!.respond("submitted", deferral(2));
+    await check;
+    expect(store.getState()).toMatchObject({ isManualCheckCoolingDown: true, isStatusDeferred: true, statusRetryAfterSeconds: 2 });
+
+    await vi.advanceTimersByTimeAsync(2_000); // the server's own delay has passed
+    expect(store.getState().isManualCheckCoolingDown).toBe(true);
+    for (let i = 0; i < 5; i++) await store.getState().checkStatus();
+    await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS - 2_000 - 1);
+    expect(store.getState().isManualCheckCoolingDown).toBe(true);
+    for (let i = 0; i < 5; i++) await store.getState().checkStatus();
+    expect(s.statusCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(1); // one cooldown timer — no recurring timer
+
+    await vi.advanceTimersByTimeAsync(1); // t = 30 000 ms exactly
+    expect(store.getState()).toMatchObject({ isManualCheckCoolingDown: false, isStatusDeferred: false });
+    expect(vi.getTimerCount()).toBe(0);
+    const again = store.getState().checkStatus();
+    await s.settle();
+    expect(s.statusCount()).toBe(2);
+    s.requests[1]!.respond("confirmed");
+    await again;
+    expect(store.getState().status).toBe("confirmed");
+    expect(s.count("/submit") + s.count("/prepare")).toBe(0);
+  });
+
+  it("L-1: a 600 s server delay is never cut to 30 s; a 30 s-or-shorter one leaves the ordinary cooldown untouched", async () => {
+    for (const [seconds, ms] of [[600, 600_000], [30, 30_000], [29, 30_000], [1, 30_000]] as const) {
+      const s = lab();
+      const store = createRealPaymentStore();
+      submittedState(store);
+      const check = store.getState().checkStatus();
+      await s.settle();
+      s.requests[0]!.respond("submitted", deferral(seconds));
+      await check;
+
+      await vi.advanceTimersByTimeAsync(ms - 1);
+      expect(store.getState().isManualCheckCoolingDown, `${seconds}s @ ${ms - 1}`).toBe(true);
+      await store.getState().checkStatus();
+      expect(s.statusCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.getState().isManualCheckCoolingDown, `${seconds}s @ ${ms}`).toBe(false);
+      store.getState().detach();
+      expect(vi.getTimerCount()).toBe(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it("L-1: another account or attempt is not held by it — init() is a new lifecycle with no inherited cooldown", async () => {
+    const s = lab({ secondsBeforeExpiry: -100 });
+    const store = createRealPaymentStore();
+    const first = store.getState().init();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization", deferral(2));
+    await first;
+    store.getState().detach();
+
+    useRealAccountStore.setState({ account: ACCOUNT_B });
+    const second = store.getState().init();
+    await s.settle();
+    expect(store.getState().isManualCheckCoolingDown).toBe(false);
+    expect(s.statusCount()).toBe(2);
+    s.requests[1]!.respond("awaiting_authorization");
+    await second;
+    store.getState().detach();
+
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+    s.setLatestId("attempt-2");
+    const third = store.getState().init();
+    await s.settle();
+    expect(s.requests[2]!.url).toBe("/api/real/payments/attempt-2/status");
+    s.requests[2]!.respond("awaiting_authorization");
+    await third;
+    store.getState().detach();
+  });
+
+  // ---- L-2: a repeated refused cancel keeps the useful read ----------------
+
+  it("L-2: a second refusal inside the window does not discard the first refusal's read — its answer updates the payment", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const first = store.getState().cancel(); // refused -> one reconciliation read, in flight
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+
+    await store.getState().cancel(); // refused again, inside the 30 s window
+    await store.getState().cancel();
+    expect(s.requests).toHaveLength(1);
+    expect(s.count("/cancel")).toBe(3);
+
+    s.requests[0]!.respond("submitted");
+    await first;
+    expect(store.getState()).toMatchObject({ status: "submitted" });
+    expect(store.getState().attempt?.state).toBe("submitted");
+    expect(store.getState().error).toMatch(/could not be cancelled/i);
+    expect(s.statusCount()).toBe(1); // no second provider-bound read
+    expect(s.count("/submit") + s.count("/prepare")).toBe(0);
+  });
+
+  it("L-2: a genuine state transition still invalidates that read — the stale 'awaiting' answer is dropped", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const refused = store.getState().cancel();
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+
+    await store.getState().resumeAuthorization(); // the payment is submitted: the epoch moves
+    expect(store.getState().status).toBe("submitted");
+    s.requests[0]!.respond("awaiting_authorization");
+    await s.settle();
+    await refused;
+    expect(store.getState().status).toBe("submitted");
+    expect(store.getState().attempt?.state).toBe("submitted");
+    expect(s.count("/submit")).toBe(1);
+  });
+
+  it("L-2: the first refusal after a window ends (or for another attempt) still invalidates and reads afresh", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store, "attempt-1");
+    const first = store.getState().cancel();
+    await s.settle();
+    s.requests[0]!.respond("awaiting_authorization");
+    await first;
+
+    await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS);
+    const later = store.getState().cancel();
+    await s.settle();
+    expect(s.statusCount()).toBe(2);
+    s.requests[1]!.respond("awaiting_authorization");
+    await later;
+
+    awaiting(store, "attempt-2");
+    const other = store.getState().cancel();
+    await s.settle();
+    expect(s.statusCount()).toBe(3);
+    s.requests[2]!.respond("awaiting_authorization");
+    await other;
+  });
+
+  // ---- remaining client gaps -----------------------------------------------
+
+  it("four or more waiters behind one older read share ONE current-epoch read", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization();
+    const waiters = [1, 2, 3, 4, 5].map(() => store.getState().checkSubmittedStatus());
+    await s.settle();
+    expect(s.requests).toHaveLength(1);
+
+    s.requests[0]!.respond("awaiting_authorization");
+    await s.settle();
+    expect(s.requests).toHaveLength(2);
+    s.requests[1]!.respond("confirmed");
+    await Promise.all([older, ...waiters]);
+    expect(s.requests).toHaveLength(2);
+    expect(store.getState().status).toBe("confirmed");
+    expect(s.count("/submit")).toBe(1);
+  });
+
+  it("the 45 s tie: the client's deadline is registered first, so at exactly 45 000 ms the read is abandoned and its answer dropped; at 44 999 ms the answer wins", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const tie = lab({ statusDelayMs: STATUS_REQUEST_DEADLINE_MS, statusState: "confirmed" });
+      const store = createRealPaymentStore();
+      submittedState(store);
+      const check = store.getState().checkStatus();
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await check;
+      expect(store.getState().status).toBe("submitted"); // not confirmed: the late answer was dropped
+      expect(store.getState().error).toMatch(/taking longer than usual/i);
+      expect(tie.count("/submit") + tie.count("/prepare")).toBe(0);
+      vi.useRealTimers();
+
+      const beat = lab({ statusDelayMs: STATUS_REQUEST_DEADLINE_MS - 1, statusState: "confirmed" });
+      const second = createRealPaymentStore();
+      submittedState(second);
+      const win = second.getState().checkStatus();
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await win;
+      expect(second.getState().status).toBe("confirmed");
+      expect(second.getState().error).toBeNull();
+      expect(beat.statusCount()).toBe(1);
+
+      vi.useRealTimers();
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("a stale old-epoch 'submitted' answer is discarded and does NOT stand in for the post-submit read after a local submit", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const older = store.getState().checkStatus(); // begun before the submit
+    await s.settle();
+    await store.getState().resumeAuthorization(); // local submit: epoch moves
+    s.requests[0]!.respond("submitted"); // the old read says "submitted" too — but it predates the submit
+    await s.settle();
+    await older;
+
+    const check = store.getState().checkSubmittedStatus(); // must still read
+    await s.settle();
+    expect(s.requests).toHaveLength(2);
+    s.requests[1]!.respond("confirmed");
+    await check;
+    expect(store.getState().status).toBe("confirmed");
+    expect(s.count("/submit")).toBe(1);
+  });
+
+  it("account isolation under waiting: a switch while waiters are queued drops them all — no read for the old account", async () => {
+    const s = lab();
+    const store = createRealPaymentStore();
+    awaiting(store);
+    const older = store.getState().checkStatus();
+    await s.settle();
+    await store.getState().resumeAuthorization();
+    const waiters = [1, 2, 3].map(() => store.getState().checkSubmittedStatus());
+    await s.settle();
+
+    useRealAccountStore.setState({ account: ACCOUNT_B });
+    s.requests[0]!.respond("awaiting_authorization");
+    await s.settle();
+    await Promise.all([older, ...waiters]);
+    expect(s.requests).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(24 * HOUR);
+    expect(s.requests).toHaveLength(1);
   });
 });

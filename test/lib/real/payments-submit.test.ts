@@ -10,6 +10,7 @@ import type { RealServerConfig } from "@/lib/real/server/config";
 import { SAFE_OP_VALIDITY_SECONDS } from "@/lib/real/payments/validity";
 import { createFakeEntryPoint } from "./fixtures/entry-point-fake";
 import { FakeTurnkey } from "./fixtures/turnkey-fake";
+import { openBudget } from "./fixtures/chain-read-budget";
 
 const SECRET = "test-session-secret";
 
@@ -450,7 +451,7 @@ describe("resolveSubmitPayment", () => {
       receipt: { transactionHash: "0xabc", status: "success" },
     });
 
-    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId });
+    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: createFakeEntryPoint({}).reader, attemptId });
 
     expect(outcome.outcome).toBe("ok");
     if (outcome.outcome !== "ok") return;
@@ -482,7 +483,7 @@ describe("resolveSubmitPayment", () => {
     await paymentStore.transition({ id: attemptId, from: "signed", to: "submitting" });
     fetchUserOperationReceiptMock.mockResolvedValueOnce(null);
 
-    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId });
+    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: createFakeEntryPoint({}).reader, attemptId });
 
     expect(outcome.outcome).toBe("ok");
     if (outcome.outcome !== "ok") return;
@@ -1221,7 +1222,7 @@ describe("Slice S1 — payment credential attribution", () => {
       sendOk(ctx);
       const original = ctx.paymentStore.beginDispatch.bind(ctx.paymentStore);
       vi.spyOn(ctx.paymentStore, "beginDispatch").mockImplementation(async (args) => {
-        const status = await resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId: ctx.attemptId });
+        const status = await resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: createFakeEntryPoint({}).reader, attemptId: ctx.attemptId });
         expect(status.outcome === "ok" && status.attempt.state).toBe("signed");
         return original(args);
       });

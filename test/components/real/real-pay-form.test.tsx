@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import { useRealBalanceStore } from "@/lib/stores/real-balance-store";
 import { useRealPaymentStore } from "@/lib/stores/real-payment-store";
@@ -931,5 +932,423 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     expect(prepares).toHaveLength(1);
     expect(lookups).toHaveLength(1);
     expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 3A-1 Stage 2A: the page's side of status-polling safety — it reports
+ * visibility, cleans up on unmount, and offers a cooldown-limited manual
+ * check. The timer arithmetic itself is covered in real-payment-store.test.ts.
+ */
+describe("RealPayForm — 3A-1 Stage 2A: status polling safety", () => {
+  const VALID_UNTIL = 1_900_000_600;
+
+  function setVisibility(state: "visible" | "hidden") {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(document, "visibilityState");
+  });
+
+  /** A restored `submitted` attempt (or an expired awaiting one) and a /status that never resolves it. */
+  function stubServer(kind: "submitted" | "expired") {
+    const statusCalls: string[] = [];
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return kind === "submitted"
+          ? jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 })
+          : jsonResponse(200, {
+              attempt: attemptFixture({ prepared: { ...PREPARED_FIELDS, validUntil: VALID_UNTIL } }),
+              subOrganizationId: "sub-org-1",
+              authorizingCredentialId: "credential-1",
+              serverNowSeconds: VALID_UNTIL + 100,
+            });
+      }
+      if (url.includes("/status") && method === "GET") {
+        statusCalls.push(url);
+        return kind === "submitted"
+          ? jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), serverNowSeconds: 1_900_000_000 })
+          : jsonResponse(200, { attempt: attemptFixture({ prepared: { ...PREPARED_FIELDS, validUntil: VALID_UNTIL } }), serverNowSeconds: VALID_UNTIL + 100 });
+      }
+      return null;
+    });
+    return statusCalls;
+  }
+
+  it("a hidden page starts no automatic status check; becoming visible runs exactly one", async () => {
+    setVisibility("hidden");
+    const statusCalls = stubServer("submitted");
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(statusCalls).toHaveLength(0);
+
+    await act(async () => setVisibility("visible"));
+    await waitFor(() => expect(statusCalls).toHaveLength(1));
+    await act(async () => {
+      setVisibility("hidden");
+      setVisibility("visible");
+    });
+    expect(statusCalls).toHaveLength(1);
+  });
+
+  it("unmounting the form stops its automatic work: no status request starts afterwards, and nothing is cancelled", async () => {
+    setVisibility("visible");
+    const statusCalls = stubServer("submitted");
+
+    const { unmount } = render(<RealPayForm />);
+    await waitFor(() => expect(statusCalls).toHaveLength(1));
+    unmount();
+
+    await useRealPaymentStore.getState().checkStatus(); // a stale caller after unmount
+    await useRealPaymentStore.getState().checkSubmittedStatus();
+    await act(async () => setVisibility("hidden"));
+    await act(async () => setVisibility("visible"));
+
+    expect(statusCalls).toHaveLength(1);
+    // The payment itself was not touched: still the submitted attempt, never reset or finalized.
+    expect(useRealPaymentStore.getState().attempt?.state).toBe("submitted");
+    expect(useRealPaymentStore.getState().status).toBe("submitted");
+  });
+
+  it("Check status: one press sends one request, then the control is disabled ('Checked just now') and extra presses send nothing", async () => {
+    setVisibility("visible");
+    const statusCalls = stubServer("submitted");
+
+    render(<RealPayForm />);
+    const button = await screen.findByRole("button", { name: "Check status" });
+    await waitFor(() => expect(statusCalls).toHaveLength(1)); // the automatic post-submit check
+
+    fireEvent.click(button);
+    await waitFor(() => expect(statusCalls).toHaveLength(2));
+    const cooling = await screen.findByRole("button", { name: "Checked just now" });
+    expect(cooling).toBeDisabled();
+    fireEvent.click(cooling);
+    fireEvent.click(cooling);
+    expect(statusCalls).toHaveLength(2);
+    // Still an unresolved payment — not shown as failed or finished.
+    expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument();
+  });
+
+  it("when the automatic follow-ups run out, the page says it is still waiting and keeps a manual Check status — never a failure", async () => {
+    setVisibility("visible");
+    const statusCalls = stubServer("expired");
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByText(/approval window expired/)).toBeInTheDocument());
+    await waitFor(() => expect(statusCalls).toHaveLength(1));
+    // While follow-ups are still scheduled there is no extra control.
+    expect(screen.queryByRole("button", { name: "Check status" })).not.toBeInTheDocument();
+
+    act(() => useRealPaymentStore.setState({ isFollowUpExhausted: true }));
+
+    expect(screen.getByText(/still waiting for an update/)).toBeInTheDocument();
+    expect(screen.queryByText(/failed|no money moved|nothing moved/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel payment" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+    await waitFor(() => expect(statusCalls).toHaveLength(2));
+    expect(screen.getByRole("button", { name: "Checked just now" })).toBeDisabled();
+    // No protocol vocabulary in the copy.
+    expect(document.body.textContent).not.toMatch(/UserOperation|bundler|RPC|Pimlico|bucket|budget/i);
+  });
+  it("LOW-1: when follow-ups run out while the validity flag is still stale-false, the pending payment keeps its Check status — on both the approval and the cancel-only screens", async () => {
+    setVisibility("visible");
+    for (const state of ["awaiting_authorization", "signed"]) {
+      const statusCalls: string[] = [];
+      routeFetch((url, method) => {
+        if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+          return jsonResponse(200, {
+            attempt: attemptFixture({ state, prepared: { ...PREPARED_FIELDS, validUntil: VALID_UNTIL } }),
+            subOrganizationId: "sub-org-1",
+            authorizingCredentialId: "credential-1",
+            serverNowSeconds: VALID_UNTIL - 1_000, // far from expiry: the flag is false
+          });
+        }
+        if (url.includes("/status") && method === "GET") {
+          statusCalls.push(url);
+          return jsonResponse(500, { error: "Could not check payment status." });
+        }
+        return null;
+      });
+
+      const { unmount } = render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId(state === "signed" ? "real-pay-stranded" : "real-pay-resume")).toBeInTheDocument());
+      expect(screen.queryByRole("button", { name: "Check status" }), state).not.toBeInTheDocument();
+
+      act(() => useRealPaymentStore.setState({ isFollowUpExhausted: true, isAttemptPastValidity: false }));
+
+      const button = screen.getByRole("button", { name: "Check status" });
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeInTheDocument();
+      expect(screen.queryByText(/failed|no money moved/i)).not.toBeInTheDocument();
+      fireEvent.click(button);
+      await waitFor(() => expect(statusCalls).toHaveLength(1));
+      // The refusal is reported; the payment is neither finished nor failed, and the control comes back after its cooldown.
+      await waitFor(() => expect(screen.getByRole("button", { name: "Checked just now" })).toBeDisabled());
+      expect(useRealPaymentStore.getState().status).toBe(state === "signed" ? "stranded" : "awaiting_authorization");
+      fireEvent.click(screen.getByRole("button", { name: "Checked just now" }));
+      expect(statusCalls).toHaveLength(1);
+      unmount();
+    }
+  });
+});
+
+/**
+ * 3A-1 Stage 2C-2: what the Pay screen says when the server declines a status
+ * check, and what its balance line says when there is no balance to show.
+ */
+describe("RealPayForm — 3A-1 Stage 2C-2: deferral and balance line", () => {
+  function setVisibilityVisible() {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+  }
+
+  beforeEach(() => {
+    setVisibilityVisible();
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null, retryAfterSeconds: null, isCoolingDown: false });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(document, "visibilityState");
+  });
+
+  async function renderEditing() {
+    routeFetch((url, method) => (url.endsWith("/api/real/payments/latest") && method === "GET" ? jsonResponse(200, { attempt: null }) : null));
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+  }
+
+  it("AJ-AN. with no balance the amount line says why — loading, refresh restriction, failure, signed out — and never shows a number or $0.00", async () => {
+    await renderEditing();
+    const cases: Array<[Partial<ReturnType<typeof useRealBalanceStore.getState>>, RegExp]> = [
+      [{ status: "idle" }, /Checking your balance/],
+      [{ status: "loading" }, /Checking your balance/],
+      [{ status: "rate_limited", retryAfterSeconds: 600, isCoolingDown: true }, /Balance unavailable right now/],
+      [{ status: "error", error: "Could not read your balance." }, /Couldn.t check your balance/],
+      [{ status: "unauthenticated" }, /Sign in to see your balance/],
+    ];
+    for (const [state, expected] of cases) {
+      act(() => useRealBalanceStore.setState({ balance: null, error: null, ...state }));
+      expect(screen.getByText(expected), JSON.stringify(state)).toBeInTheDocument();
+      expect(screen.queryByText(/\$0\.00|0\.00 available/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/available$/)).not.toBeInTheDocument();
+    }
+    // The restriction wording is plain: no counters, windows, or provider words.
+    act(() => useRealBalanceStore.setState({ balance: null, status: "rate_limited" }));
+    expect(screen.getByText("Balance unavailable right now").textContent).not.toMatch(/rate|limit|429|budget|RPC|chain/i);
+  });
+
+  it("a real balance still reads '$20.00 available' — the line only changes when there is none", async () => {
+    await renderEditing();
+    expect(screen.getByText("$20.00 available")).toBeInTheDocument();
+  });
+
+  it("a deferred status answer says the check is paused — not failed, not finished — and keeps the control for later", async () => {
+    let statusCalls = 0;
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 });
+      }
+      if (url.includes("/status") && method === "GET") {
+        statusCalls += 1;
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), serverNowSeconds: 1_900_000_000, reconciliationDeferred: true, retryAfterSeconds: 600 });
+      }
+      return null;
+    });
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByText(/can.t check for an update right now/)).toBeInTheDocument());
+    expect(statusCalls).toBe(1);
+
+    expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument();
+    expect(screen.queryByText(/failed|no money moved|could not be sent|cancel/i)).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/UserOperation|bundler|RPC|Pimlico|bucket|budget|429|rate_limited/i);
+    // The server's pause is not "just now": the label says when, not what happened.
+    const button = screen.getByRole("button", { name: "Check available later" });
+    expect(button).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Checked just now" })).not.toBeInTheDocument();
+    fireEvent.click(button);
+    expect(statusCalls).toBe(1);
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "submitted", isStatusDeferred: true, statusRetryAfterSeconds: 600 });
+  });
+
+  it("an unusable deferral shows the generic message and leaves the last reliable payment on screen", async () => {
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 });
+      }
+      if (url.includes("/status") && method === "GET") {
+        return jsonResponse(200, { attempt: attemptFixture({ state: "failed", failureReason: "No money moved.", prepared: null }), serverNowSeconds: 1_900_000_000, reconciliationDeferred: true });
+      }
+      return null;
+    });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByText(/couldn.t check on this payment just now/i)).toBeInTheDocument());
+    expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-failed")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No money moved/)).not.toBeInTheDocument();
+  });
+  // ---- Stage 2C.3 ---------------------------------------------------------
+
+  /** A restored submitted attempt whose /status answers with the given extra fields. */
+  function stubSubmitted(extra: Record<string, unknown>, counter: { calls: number }) {
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 });
+      }
+      if (url.includes("/status") && method === "GET") {
+        counter.calls += 1;
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), serverNowSeconds: 1_900_000_000, reconciliationDeferred: false, ...extra });
+      }
+      return null;
+    });
+  }
+
+  it("LOW-1: an ordinary cooldown still reads 'Checked just now' — and a server pause of 600 s or 24 h reads 'Check available later'", async () => {
+    // Ordinary: a settled answer, then the manual press's own 30 s cooldown.
+    const ordinary = { calls: 0 };
+    stubSubmitted({}, ordinary);
+    const first = render(<RealPayForm />);
+    await waitFor(() => expect(ordinary.calls).toBe(1));
+    fireEvent.click(await screen.findByRole("button", { name: "Check status" }));
+    expect(await screen.findByRole("button", { name: "Checked just now" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Check available later" })).not.toBeInTheDocument();
+    first.unmount();
+
+    for (const seconds of [600, 86_400]) {
+      useRealPaymentStore.getState().reset();
+      useRealPaymentStore.setState({ status: "idle" });
+      const deferred = { calls: 0 };
+      stubSubmitted({ reconciliationDeferred: true, retryAfterSeconds: seconds }, deferred);
+      const view = render(<RealPayForm />);
+      const button = await screen.findByRole("button", { name: "Check available later" });
+      expect(button, String(seconds)).toBeDisabled();
+      expect(screen.queryByRole("button", { name: "Checked just now" })).not.toBeInTheDocument();
+      fireEvent.click(button);
+      expect(deferred.calls).toBe(1);
+      view.unmount();
+    }
+  });
+
+  it("LOW-1: at the deadline the control returns as 'Check status', enabled — never before, and nothing is requested meanwhile", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const counter = { calls: 0 };
+      stubSubmitted({ reconciliationDeferred: true, retryAfterSeconds: 600 }, counter);
+      const flush = () =>
+        act(async () => {
+          for (let i = 0; i < 20; i++) await Promise.resolve();
+        });
+      render(<RealPayForm />);
+      await flush();
+      expect(counter.calls).toBe(1);
+      expect(screen.getByRole("button", { name: "Check available later" })).toBeDisabled();
+
+      await act(async () => {
+        vi.advanceTimersByTime(599_999);
+      });
+      expect(screen.getByRole("button", { name: "Check available later" })).toBeDisabled();
+      expect(counter.calls).toBe(1);
+
+      await act(async () => {
+        vi.advanceTimersByTime(1);
+      });
+      const ready = screen.getByRole("button", { name: "Check status" });
+      expect(ready).toBeEnabled();
+      expect(counter.calls).toBe(1); // nothing fires by itself
+
+      fireEvent.click(ready);
+      await flush();
+      expect(counter.calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("LOW-2: when the first status read itself delivers 'submitted', the status-change effect does not send a second read", async () => {
+    const validUntil = 1_900_000_600;
+    let statusCalls = 0;
+    routeFetch((url, method) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") {
+        return jsonResponse(200, {
+          attempt: attemptFixture({ prepared: { ...PREPARED_FIELDS, validUntil } }),
+          subOrganizationId: "sub-org-1",
+          authorizingCredentialId: "credential-1",
+          serverNowSeconds: validUntil + 100, // already expired: the form reconciles on mount
+        });
+      }
+      if (url.includes("/status") && method === "GET") {
+        statusCalls += 1;
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), serverNowSeconds: validUntil + 100, reconciliationDeferred: false });
+      }
+      return null;
+    });
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+
+    expect(statusCalls).toBe(1);
+    expect(useRealPaymentStore.getState().status).toBe("submitted");
+  });
+
+  it("LOW-2: a restored submitted attempt (no read delivered it) still gets exactly one check on mount", async () => {
+    const counter = { calls: 0 };
+    stubSubmitted({}, counter);
+    render(<RealPayForm />);
+    await waitFor(() => expect(counter.calls).toBe(1));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(counter.calls).toBe(1);
+  });
+  // ---- closeout -----------------------------------------------------------
+
+  it("closeout: React Strict Mode's double mount (mount, cleanup, mount) leaves one working lifecycle — one status read, no leaked work", async () => {
+    const counter = { calls: 0 };
+    stubSubmitted({}, counter);
+    const fetchMock = vi.mocked(globalThis.fetch);
+
+    const view = render(
+      <StrictMode>
+        <RealPayForm />
+      </StrictMode>,
+    );
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    await waitFor(() => expect(counter.calls).toBeGreaterThanOrEqual(1));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+
+    // The first (discarded) lifecycle's work was abandoned; the surviving one read once.
+    expect(counter.calls).toBe(1);
+    expect(useRealPaymentStore.getState().status).toBe("submitted");
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).includes("/submit") || String(url).includes("/prepare") || (init as RequestInit | undefined)?.method === "POST")).toHaveLength(0);
+
+    // The page still works: the control is live, and unmounting cleans up.
+    fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+    await waitFor(() => expect(counter.calls).toBe(2));
+    view.unmount();
+    await useRealPaymentStore.getState().checkStatus();
+    expect(counter.calls).toBe(2);
   });
 });

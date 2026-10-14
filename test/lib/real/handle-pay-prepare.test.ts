@@ -9,6 +9,7 @@ import { REAL_SESSION_COOKIE_NAME, createSessionPayload, serializeSession } from
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { rpcBlock } from "./fixtures/chain-block";
 import { denyingRateLimiter, failingRateLimiter, freshRateLimiter, recordingRateLimiter } from "./fixtures/rate-limit";
+import { openBudget } from "./fixtures/chain-read-budget";
 
 /**
  * Handle Pay Slice B through prepare: the wire contract (exactly one
@@ -384,7 +385,7 @@ describe("Slice D — recipientIdentity on every payer-facing read surface", () 
     const latest = await resolveLatestPayment({ ...session(w), now: () => NOW_MS });
     expect(latest).toMatchObject({ outcome: "ok", attempt: { id: prepared.id, recipient: MAYA_SAFE.toLowerCase(), recipientIdentity: MAYA } });
 
-    const status = await resolvePaymentStatus({ ...session(w), pimlicoApiKey: "pim_test_key", publicClient: publicClient() as never, attemptId: prepared.id, now: () => NOW_MS });
+    const status = await resolvePaymentStatus({ ...session(w), pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: publicClient() as never, attemptId: prepared.id, now: () => NOW_MS });
     expect(status).toMatchObject({ outcome: "ok", attempt: { id: prepared.id, state: "awaiting_authorization", recipientIdentity: MAYA } });
 
     const history = await resolvePaymentHistory({ ...session(w), limitInput: null });
@@ -440,7 +441,7 @@ describe("Slice D — recipientIdentity on every payer-facing read surface", () 
 
     // ...and no payer-facing read follows it.
     const latest = await resolveLatestPayment({ ...session(w), now: () => NOW_MS });
-    const status = await resolvePaymentStatus({ ...session(w), pimlicoApiKey: "pim_test_key", publicClient: publicClient() as never, attemptId: prepared.id, now: () => NOW_MS });
+    const status = await resolvePaymentStatus({ ...session(w), pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: publicClient() as never, attemptId: prepared.id, now: () => NOW_MS });
     const history = await resolvePaymentHistory({ ...session(w), limitInput: null });
     expect(latest).toMatchObject({ outcome: "ok", attempt: { recipientIdentity: MAYA } });
     expect(status).toMatchObject({ outcome: "ok", attempt: { recipientIdentity: MAYA } });
@@ -463,7 +464,7 @@ describe("Slice D — recipientIdentity on every payer-facing read surface", () 
     expect(outcome.attempt).toMatchObject({ recipient: MAYA_SAFE.toLowerCase(), recipientIdentity: null });
 
     const latest = await resolveLatestPayment({ ...session(w), now: () => NOW_MS });
-    const status = await resolvePaymentStatus({ ...session(w), pimlicoApiKey: "pim_test_key", publicClient: publicClient() as never, attemptId: outcome.attempt.id, now: () => NOW_MS });
+    const status = await resolvePaymentStatus({ ...session(w), pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: publicClient() as never, attemptId: outcome.attempt.id, now: () => NOW_MS });
     const history = await resolvePaymentHistory({ ...session(w), limitInput: null });
     const cancelled = await resolveCancelPayment({ ...session(w), attemptId: outcome.attempt.id });
     expect(latest).toMatchObject({ outcome: "ok", attempt: { recipientIdentity: null } });
@@ -477,7 +478,7 @@ describe("Slice D — recipientIdentity on every payer-facing read surface", () 
     const w = await world();
     const prepared = await preparedHandleAttempt(w);
 
-    expect(await resolvePaymentStatus({ ...session(w, 2), pimlicoApiKey: "pim_test_key", publicClient: publicClient() as never, attemptId: prepared.id, now: () => NOW_MS })).toEqual({ outcome: "not_found" });
+    expect(await resolvePaymentStatus({ ...session(w, 2), pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: publicClient() as never, attemptId: prepared.id, now: () => NOW_MS })).toEqual({ outcome: "not_found" });
     expect(await resolveCancelPayment({ ...session(w, 2), attemptId: prepared.id })).toEqual({ outcome: "not_found" });
     expect(await resolveLatestPayment({ ...session(w, 2), now: () => NOW_MS })).toEqual({ outcome: "none" });
     expect(await resolvePaymentHistory({ ...session(w, 2), limitInput: null })).toEqual({ outcome: "ok", entries: [] });

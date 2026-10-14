@@ -17,7 +17,8 @@ import { fetchUserOperationReceipt, prepareCashTransferUserOperation, sendPrepar
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "../constants";
 import { DuplicateSignActivityError, toPublicRecipientIdentity, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type PublicRecipientIdentity } from "./payment-attempts";
 import { isWellFormedActivityId, verifyPaymentAuthorization } from "./payment-authorization";
-import { ADDRESS_PREPARE_POLICIES, HANDLE_PREPARE_POLICIES, type RateLimiter } from "./rate-limit";
+import { ADDRESS_PREPARE_POLICIES, HANDLE_PREPARE_POLICIES, type ProviderBudgetLimiter, type RateLimiter } from "./rate-limit";
+import { consumeChainReadBudget } from "./chain-read-budget";
 import type { RealServerConfig } from "./config";
 import type { PrepareRecipientSelector } from "./handle-recipient";
 
@@ -648,7 +649,15 @@ export type PaymentStatusOutcome =
    * compute an advisory local-clock offset for its own pre-signing UX gate;
    * the server remains independently authoritative at /submit regardless.
    */
-  | { outcome: "ok"; attempt: PublicPaymentAttempt; serverNowSeconds: number };
+  | { outcome: "ok"; attempt: PublicPaymentAttempt; serverNowSeconds: number; reconciliationDeferred: false }
+  /**
+   * 3A-1 Stage 2B: the account's chain-read budget was spent, so the provider
+   * read this request would have made was NOT made. `attempt` is the stored
+   * attempt exactly as it is — nothing was transitioned, and nothing is
+   * implied about the payment. `retryAfterSeconds` is a validated whole
+   * number of seconds.
+   */
+  | { outcome: "ok"; attempt: PublicPaymentAttempt; serverNowSeconds: number; reconciliationDeferred: true; retryAfterSeconds: number };
 
 const RECONCILABLE_STATES: readonly PaymentAttemptState[] = ["submitting", "submitted", "unknown"];
 
@@ -686,6 +695,12 @@ export async function resolvePaymentStatus(input: {
   pimlicoApiKey: string;
   /** Read-only EntryPoint access for bundler-independent reconciliation (chain/entry-point.ts). */
   publicClient: EntryPointReader;
+  /**
+   * Required (3A-1 Stage 2B): the per-account chain-read budget, charged once
+   * per request immediately before the first provider call — and not at all
+   * on a branch that makes none.
+   */
+  providerBudgetLimiter: ProviderBudgetLimiter;
   attemptId: string;
   /** Unix ms. Only a pre-filter for pre-dispatch rows (skip chain reads before validUntil) — never the proof. */
   now?: () => number;
@@ -702,21 +717,39 @@ export async function resolvePaymentStatus(input: {
   if (!attempt || attempt.appUserId !== authenticated.account.appUserId) return { outcome: "not_found" };
 
   const nowSeconds = Math.floor((input.now ?? Date.now)() / 1000);
+  const stored = (): PaymentStatusOutcome => ({ outcome: "ok", attempt: toPublicAttempt(attempt), serverNowSeconds: nowSeconds, reconciliationDeferred: false });
+
+  // The ONE charge of this request, made immediately before the first
+  // provider call and covering every provider read after it (the bundler
+  // receipt AND the EntryPoint fallback). A limiter failure throws out of here
+  // — the route's generic 500, no provider call. A denial returns the stored
+  // attempt untouched: no transition, no read, nothing implied about the payment.
+  async function chargeChainRead(): Promise<PaymentStatusOutcome | null> {
+    const budget = await consumeChainReadBudget(input.providerBudgetLimiter, authenticated!.account.appUserId);
+    if (budget.allowed) return null;
+    return { outcome: "ok", attempt: toPublicAttempt(attempt!), serverNowSeconds: nowSeconds, reconciliationDeferred: true, retryAfterSeconds: budget.retryAfterSeconds };
+  }
 
   if (PRE_DISPATCH_EXPIRABLE_STATES.includes(attempt.state)) {
-    if (attempt.validUntil === null || nowSeconds <= attempt.validUntil) return { outcome: "ok", attempt: toPublicAttempt(attempt), serverNowSeconds: nowSeconds };
+    if (attempt.validUntil === null || nowSeconds <= attempt.validUntil) return stored();
+    // A legacy / incomplete row can't be proven against the EntryPoint at all:
+    // reconcileAgainstEntryPoint would return before any read, so it is free.
+    if (!entryPointProofTarget(attempt)) return stored();
+    const denied = await chargeChainRead();
+    if (denied) return denied;
     const resolution = await reconcileAgainstEntryPoint(input.publicClient, attempt);
-    if (!resolution) return { outcome: "ok", attempt: toPublicAttempt(attempt), serverNowSeconds: nowSeconds };
+    if (!resolution) return stored();
     // CAS from the row's own state: a concurrent submit (awaiting -> signed
     // -> submitting) or cancel that got there first simply wins, and submit's
     // own expiry check refuses to dispatch past validUntil anyway.
     const updated = await input.paymentStore.transition({ id: attempt.id, from: attempt.state, to: resolution.to, patch: resolution.patch });
-    return { outcome: "ok", attempt: toPublicAttempt(updated ?? attempt), serverNowSeconds: nowSeconds };
+    return { outcome: "ok", attempt: toPublicAttempt(updated ?? attempt), serverNowSeconds: nowSeconds, reconciliationDeferred: false };
   }
 
-  if (!RECONCILABLE_STATES.includes(attempt.state) || !attempt.expectedUserOperationHash) {
-    return { outcome: "ok", attempt: toPublicAttempt(attempt), serverNowSeconds: nowSeconds };
-  }
+  if (!RECONCILABLE_STATES.includes(attempt.state) || !attempt.expectedUserOperationHash) return stored();
+
+  const denied = await chargeChainRead();
+  if (denied) return denied;
 
   const receipt = await fetchUserOperationReceipt({
     pimlicoApiKey: input.pimlicoApiKey,
@@ -739,12 +772,21 @@ export async function resolvePaymentStatus(input: {
   } else if (classification.outcome === "failed") {
     resolution = { to: "failed", patch: { transactionHash: classification.transactionHash, failureReason: SAFE_REVERTED } };
   } else {
+    // Same request, same charge: the EntryPoint fallback is not charged again.
     resolution = await reconcileAgainstEntryPoint(input.publicClient, attempt);
   }
 
-  if (!resolution) return { outcome: "ok", attempt: toPublicAttempt(attempt), serverNowSeconds: nowSeconds };
+  if (!resolution) return stored();
   const updated = await input.paymentStore.transition({ id: attempt.id, from: attempt.state, to: resolution.to, patch: resolution.patch });
-  return { outcome: "ok", attempt: toPublicAttempt(updated ?? attempt), serverNowSeconds: nowSeconds };
+  return { outcome: "ok", attempt: toPublicAttempt(updated ?? attempt), serverNowSeconds: nowSeconds, reconciliationDeferred: false };
+}
+
+/** The stored evidence an EntryPoint proof needs. Null means reconcileAgainstEntryPoint makes no provider read at all. */
+function entryPointProofTarget(attempt: PaymentAttempt): { sender: Address; validUntil: number } | null {
+  if (attempt.validUntil === null || attempt.prepareBlockNumber === null || attempt.nonce === null || !attempt.expectedUserOperationHash) return null;
+  const sender = validateAddressCasePreserving(attempt.safeAddress);
+  if (!sender) return null;
+  return { sender: sender as Address, validUntil: attempt.validUntil };
 }
 
 /**
@@ -757,16 +799,17 @@ export async function resolvePaymentStatus(input: {
  * rows without a window, and any read error, stay exactly as they are.
  */
 async function reconcileAgainstEntryPoint(client: EntryPointReader, attempt: PaymentAttempt): Promise<{ to: PaymentAttemptState; patch: PaymentAttemptPatch } | null> {
-  if (attempt.validUntil === null || attempt.prepareBlockNumber === null || attempt.nonce === null || !attempt.expectedUserOperationHash) return null;
-  const sender = validateAddressCasePreserving(attempt.safeAddress);
-  if (!sender) return null;
+  // Whether this makes ANY provider read is exactly whether this target exists —
+  // resolvePaymentStatus charges the chain-read budget on the same test.
+  const target = entryPointProofTarget(attempt);
+  if (!target) return null;
   try {
     const state = await readUserOperationChainState(client, {
-      sender: sender as Address,
-      nonce: BigInt(attempt.nonce),
+      sender: target.sender,
+      nonce: BigInt(attempt.nonce!),
       userOperationHash: attempt.expectedUserOperationHash as Hash,
-      prepareBlockNumber: BigInt(attempt.prepareBlockNumber),
-      validUntil: attempt.validUntil,
+      prepareBlockNumber: BigInt(attempt.prepareBlockNumber!),
+      validUntil: target.validUntil,
     });
     if (state.kind === "included") {
       // Same explicit-clear reasoning as resolvePaymentStatus's bundler-receipt branch above.

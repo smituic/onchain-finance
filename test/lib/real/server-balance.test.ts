@@ -5,6 +5,7 @@ import { resolveAuthenticatedCashBalance } from "@/lib/real/server/balance";
 import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import { REAL_CASH_TOKEN } from "@/lib/real/constants";
+import { openBudget } from "./fixtures/chain-read-budget";
 
 const SECRET = "test-session-secret";
 const OWNER_ADDRESS = "0xf6C3fe6De636F0D8f421D5485d1a64Ff3628CfaF";
@@ -71,7 +72,7 @@ describe("resolveAuthenticatedCashBalance", () => {
     const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const publicClient = buildPublicClient(BigInt(20_000_000));
 
-    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
+    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient, providerBudgetLimiter: openBudget() });
 
     expect(result).toEqual({ outcome: "ready", balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" } });
   });
@@ -85,7 +86,7 @@ describe("resolveAuthenticatedCashBalance", () => {
     // pass — this call only compiles because that's true. The transport
     // mock's own assertions (SAFE_ADDRESS used, OWNER_ADDRESS never used)
     // are the real proof; this test names the property explicitly.
-    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
+    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient, providerBudgetLimiter: openBudget() });
     expect(result.outcome).toBe("ready");
   });
 
@@ -94,7 +95,7 @@ describe("resolveAuthenticatedCashBalance", () => {
     const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), SECRET);
     const publicClient = buildPublicClient(BigInt(0));
 
-    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
+    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient, providerBudgetLimiter: openBudget() });
     expect(result).toEqual({ outcome: "ready", balance: { token: "USDC", decimals: 6, balanceBaseUnits: "0" } });
   });
 
@@ -109,14 +110,14 @@ describe("resolveAuthenticatedCashBalance", () => {
       }),
     });
 
-    const result = await resolveAuthenticatedCashBalance({ cookieValue: undefined, sessionSecret: SECRET, registry, publicClient });
+    const result = await resolveAuthenticatedCashBalance({ cookieValue: undefined, sessionSecret: SECRET, registry, publicClient, providerBudgetLimiter: openBudget() });
     expect(result).toEqual({ outcome: "unauthenticated" });
   });
 
   it("rejects a tampered/invalid session cookie the same as no cookie", async () => {
     const registry = await seedAccount();
     const publicClient = buildPublicClient(BigInt(0));
-    const result = await resolveAuthenticatedCashBalance({ cookieValue: "garbage", sessionSecret: SECRET, registry, publicClient });
+    const result = await resolveAuthenticatedCashBalance({ cookieValue: "garbage", sessionSecret: SECRET, registry, publicClient, providerBudgetLimiter: openBudget() });
     expect(result).toEqual({ outcome: "unauthenticated" });
   });
 
@@ -133,7 +134,7 @@ describe("resolveAuthenticatedCashBalance", () => {
       }),
     });
 
-    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
+    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient, providerBudgetLimiter: openBudget() });
     expect(result.outcome).toBe("read_failed");
   });
 
@@ -151,7 +152,7 @@ describe("resolveAuthenticatedCashBalance", () => {
       }),
     });
 
-    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
+    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient, providerBudgetLimiter: openBudget() });
     expect(result.outcome).toBe("read_failed");
     if (result.outcome !== "read_failed") return;
     for (const forbidden of ["SECRET_ALCHEMY_KEY", "alchemy.com", "viem@"]) {
@@ -172,7 +173,7 @@ describe("resolveAuthenticatedCashBalance", () => {
       }),
     });
 
-    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient });
+    const result = await resolveAuthenticatedCashBalance({ cookieValue, sessionSecret: SECRET, registry, publicClient, providerBudgetLimiter: openBudget() });
     expect(result.outcome).toBe("read_failed");
   });
 });

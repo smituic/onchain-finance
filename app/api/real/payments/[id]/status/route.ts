@@ -3,7 +3,7 @@ import type { NextRequest } from "next/server";
 import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, requireRealServerConfig } from "@/lib/real/server/http";
 import { resolvePaymentStatus } from "@/lib/real/server/payments";
 import { createRealPublicClient } from "@/lib/real/chain/client";
-import { getPaymentAttemptStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
+import { getPaymentAttemptStore, getProviderBudgetLimiter, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
 
 /**
@@ -31,12 +31,22 @@ export async function GET(_request: NextRequest, ctx: RouteContext<"/api/real/pa
       paymentStore: getPaymentAttemptStore(),
       pimlicoApiKey: config.pimlicoApiKey,
       publicClient: createRealPublicClient(config.rpcUrl),
+      providerBudgetLimiter: getProviderBudgetLimiter(),
       attemptId: id,
     });
 
     if (outcome.outcome === "unauthenticated") return jsonError("Not authenticated.", 401);
     if (outcome.outcome === "not_found") return jsonError("Payment not found.", 404);
-    return Response.json({ attempt: outcome.attempt, serverNowSeconds: outcome.serverNowSeconds });
+    if (outcome.reconciliationDeferred) {
+      // The account's chain-read budget is spent: the stored attempt, unchanged,
+      // plus when to ask again. Still a 200 — the attempt is readable and no
+      // outcome is implied. The attempt object itself carries no such metadata.
+      return Response.json(
+        { attempt: outcome.attempt, serverNowSeconds: outcome.serverNowSeconds, reconciliationDeferred: true, retryAfterSeconds: outcome.retryAfterSeconds },
+        { headers: { "Retry-After": String(outcome.retryAfterSeconds) } },
+      );
+    }
+    return Response.json({ attempt: outcome.attempt, serverNowSeconds: outcome.serverNowSeconds, reconciliationDeferred: false });
   } catch {
     return jsonInternalError();
   }

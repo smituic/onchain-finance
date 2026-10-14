@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { classifyReceipt } from "@/lib/real/payments/reconcile";
 import { SAFE_OP_VALIDITY_SECONDS } from "@/lib/real/payments/validity";
 import { createFakeEntryPoint } from "./fixtures/entry-point-fake";
+import { openBudget } from "./fixtures/chain-read-budget";
 
 const EXPECTED_HASH = "0x1111111111111111111111111111111111111111111111111111111111111111" as const;
 const SENDER = "0x2222222222222222222222222222222222222222" as const;
@@ -127,7 +128,7 @@ describe("resolvePaymentStatus", () => {
     const { registry, paymentStore, attemptId, cookieValue } = await seedSubmittedAttempt();
     fetchUserOperationReceiptMock.mockResolvedValueOnce(receipt());
 
-    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId });
+    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: createFakeEntryPoint({}).reader, attemptId });
 
     expect(outcome.outcome).toBe("ok");
     if (outcome.outcome !== "ok") return;
@@ -140,7 +141,7 @@ describe("resolvePaymentStatus", () => {
     const { registry, paymentStore, attemptId, cookieValue } = await seedSubmittedAttempt();
     fetchUserOperationReceiptMock.mockResolvedValueOnce(null);
 
-    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId });
+    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: createFakeEntryPoint({}).reader, attemptId });
 
     expect(outcome.outcome).toBe("ok");
     if (outcome.outcome !== "ok") return;
@@ -152,7 +153,7 @@ describe("resolvePaymentStatus", () => {
     const { registry, paymentStore, attemptId, cookieValue } = await seedSubmittedAttempt();
     fetchUserOperationReceiptMock.mockResolvedValueOnce(receipt({ userOpHash: "0x9999999999999999999999999999999999999999999999999999999999999999" }));
 
-    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId });
+    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: createFakeEntryPoint({}).reader, attemptId });
 
     expect(outcome.outcome).toBe("ok");
     if (outcome.outcome !== "ok") return;
@@ -170,6 +171,7 @@ describe("resolvePaymentStatus", () => {
       registry,
       paymentStore,
       pimlicoApiKey: "pim_test_key",
+      providerBudgetLimiter: openBudget(),
       publicClient: createFakeEntryPoint({}).reader,
       attemptId,
       now: () => fixedNowMs,
@@ -186,7 +188,7 @@ describe("resolvePaymentStatus", () => {
     await paymentStore.transition({ id: attemptId, from: "unknown", to: "unknown", patch: { failureReason: "No definitive result was received after the operation was signed and dispatched." } });
     fetchUserOperationReceiptMock.mockResolvedValueOnce(receipt());
 
-    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", publicClient: createFakeEntryPoint({}).reader, attemptId });
+    const outcome = await resolvePaymentStatus({ cookieValue, sessionSecret: SECRET, registry, paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: createFakeEntryPoint({}).reader, attemptId });
 
     expect(outcome.outcome).toBe("ok");
     if (outcome.outcome !== "ok") return;
@@ -310,7 +312,7 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
 
   describe("resolvePaymentStatus with no bundler receipt", () => {
     const status = (ctx: Awaited<ReturnType<typeof seedSubmittedAttempt>>, publicClient: ReturnType<typeof createFakeEntryPoint>["reader"]) =>
-      resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", publicClient, attemptId: ctx.attemptId });
+      resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient, attemptId: ctx.attemptId });
 
     it("a lost bundler (no receipt) but an on-chain event => confirmed with the event's tx hash", async () => {
       fetchUserOperationReceiptMock.mockReset().mockResolvedValue(null);
@@ -367,7 +369,7 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
 
     describe("never-dispatched (awaiting_authorization / signed) rows", () => {
       const statusAt = (ctx: Awaited<ReturnType<typeof seedSubmittedAttempt>>, publicClient: ReturnType<typeof createFakeEntryPoint>["reader"], nowSeconds: number) =>
-        resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", publicClient, attemptId: ctx.attemptId, now: () => nowSeconds * 1000 });
+        resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient, attemptId: ctx.attemptId, now: () => nowSeconds * 1000 });
 
       it("before validUntil: unchanged, and the chain isn't even read", async () => {
         const ctx = await seedSubmittedAttempt({ state: "awaiting_authorization", window });
@@ -498,7 +500,7 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
           for (const reader of [createFakeEntryPoint({ ...evidence, chainId: 8453 }).reader, createFakeEntryPoint({ ...evidence, failChainId: true }).reader]) {
             fetchUserOperationReceiptMock.mockReset().mockResolvedValue(null);
             const ctx = await seedSubmittedAttempt({ state, window });
-            const outcome = await resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", publicClient: reader, attemptId: ctx.attemptId });
+            const outcome = await resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: reader, attemptId: ctx.attemptId });
             expect(outcome.outcome === "ok" && outcome.attempt).toMatchObject({ state, transactionHash: null, failureReason: null });
             expect(await ctx.paymentStore.findById(ctx.attemptId)).toMatchObject({ state, transactionHash: null, failureReason: null });
             const next = await ctx.paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SENDER, recipient: "0x4444444444444444444444444444444444444444", amountBaseUnits: "1", chainId: 84532, tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", authorizingCredentialId: "credential-1" });
@@ -513,7 +515,7 @@ describe("EntryPoint nonce reconciliation (bundler-independent)", () => {
         for (const evidence of [includedLooking, expiredLooking]) {
           for (const reader of [createFakeEntryPoint({ ...evidence, chainId: 11155111 }).reader, createFakeEntryPoint({ ...evidence, failChainId: true }).reader]) {
             const ctx = await seedSubmittedAttempt({ state, window });
-            const outcome = await resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", publicClient: reader, attemptId: ctx.attemptId, now: () => (VALID_UNTIL + 3_000) * 1000 });
+            const outcome = await resolvePaymentStatus({ cookieValue: ctx.cookieValue, sessionSecret: SECRET, registry: ctx.registry, paymentStore: ctx.paymentStore, pimlicoApiKey: "pim_test_key", providerBudgetLimiter: openBudget(), publicClient: reader, attemptId: ctx.attemptId, now: () => (VALID_UNTIL + 3_000) * 1000 });
             expect(outcome.outcome === "ok" && outcome.attempt).toMatchObject({ state, transactionHash: null, failureReason: null });
             expect((await ctx.paymentStore.findById(ctx.attemptId))?.state).toBe(state);
           }

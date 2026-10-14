@@ -33,7 +33,7 @@ let revocationStore: PasskeyRevocationStore | null = null;
 let handleStore: AccountHandleStore | null = null;
 // Slice E: selected with the other stores — Neon whenever a database is configured, in-memory only for local development. Production without a database throws below, so it can never silently run on process-local counters.
 let rateLimiter: RateLimiter | null = null;
-// Slice 3A-0: selected exactly like the rate limiter — Neon whenever a database is configured, in-memory only for local development, never in production. Nothing consults it yet.
+// Slice 3A-0: selected exactly like the rate limiter — Neon whenever a database is configured, in-memory only for local development, never in production. Consulted only by the two chain-read routes (account balance, payment status) through chain-read-budget.ts; fails closed without its table.
 let providerBudgetLimiter: ProviderBudgetLimiter | null = null;
 
 function ensureStoresInitialized(): void {
@@ -116,7 +116,13 @@ export function getRateLimiter(): RateLimiter {
   return rateLimiter!;
 }
 
-/** Slice 3A-0: the per-account provider-budget limiter (rate-limit.ts). Foundation only — no route calls this yet, and no numeric limit is approved. */
+/**
+ * The per-account provider-budget limiter (rate-limit.ts; Slice 3A-0 foundation).
+ * Its consumers are the account-balance and payment-status routes (Slice 3A-1),
+ * which hand it to their resolvers; no other route may. Production limits are
+ * not approved, and the table it charges must be applied to the real database
+ * before any code that calls this is deployed — it fails closed without it.
+ */
 export function getProviderBudgetLimiter(): ProviderBudgetLimiter {
   ensureStoresInitialized();
   return providerBudgetLimiter!;

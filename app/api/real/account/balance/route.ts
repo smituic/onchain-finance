@@ -1,7 +1,8 @@
 import { cookies } from "next/headers";
-import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, requireRealServerConfig } from "@/lib/real/server/http";
+import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, rateLimitedResponse, requireRealServerConfig } from "@/lib/real/server/http";
+import { CHAIN_READ_RATE_LIMITED_MESSAGE } from "@/lib/real/server/chain-read-budget";
 import { resolveAuthenticatedCashBalance } from "@/lib/real/server/balance";
-import { getRealAccountRegistry } from "@/lib/real/server/runtime";
+import { getProviderBudgetLimiter, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
 import { createRealPublicClient } from "@/lib/real/chain/client";
 
@@ -20,10 +21,12 @@ export async function GET() {
       sessionSecret: config.sessionSecret,
       registry: getRealAccountRegistry(),
       publicClient: createRealPublicClient(config.rpcUrl),
+      providerBudgetLimiter: getProviderBudgetLimiter(),
     });
 
     if (outcome.outcome === "unauthenticated") return jsonError("Not authenticated.", 401);
     if (outcome.outcome === "account_not_ready") return jsonError("Your account isn't fully set up yet.", 409);
+    if (outcome.outcome === "rate_limited") return rateLimitedResponse(CHAIN_READ_RATE_LIMITED_MESSAGE, outcome.retryAfterSeconds);
     if (outcome.outcome === "read_failed") return jsonError(outcome.reason, 502);
 
     return Response.json(outcome.balance);

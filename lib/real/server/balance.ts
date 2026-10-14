@@ -3,6 +3,8 @@ import { validateAddressCasePreserving } from "../identifiers";
 import { readCashBalance, type CashBalance } from "../chain/balance";
 import type { RealPublicClient } from "../chain/client";
 import { readAuthenticatedRealAccount } from "./auth";
+import { consumeChainReadBudget } from "./chain-read-budget";
+import type { ProviderBudgetLimiter } from "./rate-limit";
 import type { RealAccountRegistry } from "./registry";
 
 /** Fixed, safe message — never the raw upstream RPC error (see the catch below). */
@@ -13,6 +15,8 @@ export type BalanceOutcome =
   | { outcome: "unauthenticated" }
   /** Structurally shouldn't happen — a session is only ever issued for a fully-finalized (active) account (see onboarding.ts) — but the balance holder is checked explicitly rather than handed an unvalidated value regardless. */
   | { outcome: "account_not_ready" }
+  /** The account's chain-read budget is spent: no RPC was made and no balance is claimed. The delay is a validated whole number of seconds. */
+  | { outcome: "rate_limited"; retryAfterSeconds: number }
   | { outcome: "read_failed"; reason: string };
 
 /**
@@ -27,6 +31,8 @@ export async function resolveAuthenticatedCashBalance(input: {
   sessionSecret: string;
   registry: RealAccountRegistry;
   publicClient: RealPublicClient;
+  /** Required: a caller cannot reach the RPC read without a budget decision. */
+  providerBudgetLimiter: ProviderBudgetLimiter;
 }): Promise<BalanceOutcome> {
   const authenticated = await readAuthenticatedRealAccount({
     cookieValue: input.cookieValue,
@@ -37,6 +43,13 @@ export async function resolveAuthenticatedCashBalance(input: {
 
   const safeAddress = validateAddressCasePreserving(authenticated.account.safeAddress);
   if (!safeAddress) return { outcome: "account_not_ready" };
+
+  // Authenticated, account resolved, Safe validated — and only now charged,
+  // immediately before the one provider-bound read. Deliberately OUTSIDE the
+  // try below: a limiter failure is a server error (the route's generic 500),
+  // never a "read_failed" and never an allow.
+  const budget = await consumeChainReadBudget(input.providerBudgetLimiter, authenticated.account.appUserId);
+  if (!budget.allowed) return { outcome: "rate_limited", retryAfterSeconds: budget.retryAfterSeconds };
 
   try {
     const balance = await readCashBalance({ publicClient: input.publicClient, safeAddress: safeAddress as Address });

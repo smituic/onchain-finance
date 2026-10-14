@@ -7,6 +7,20 @@ import { useRealBalanceStore } from "@/lib/stores/real-balance-store";
 import { CASH_LABEL, formatCashBaseUnits } from "@/lib/real/display/cash";
 
 /**
+ * How long a server-given wait is, in plain words. Always rounded UP and never
+ * softer than the truth: a daily limit reads as hours, not "a moment".
+ */
+export function describeWait(seconds: number): string {
+  if (seconds < 60) return "in less than a minute";
+  if (seconds < 3_600) {
+    const minutes = Math.ceil(seconds / 60);
+    return minutes === 1 ? "in about a minute" : `in about ${minutes} minutes`;
+  }
+  const hours = Math.ceil(seconds / 3_600);
+  return hours === 1 ? "in about an hour" : `in about ${hours} hours`;
+}
+
+/**
  * The real (Base Sepolia) Cash balance for the signed-in account — read-only,
  * no signing, no Turnkey/Pimlico involvement. Renders nothing when there's
  * no account yet (AccountSetup already owns that state); "account not ready"
@@ -18,6 +32,8 @@ export function CashBalance() {
   const balance = useRealBalanceStore((s) => s.balance);
   const status = useRealBalanceStore((s) => s.status);
   const error = useRealBalanceStore((s) => s.error);
+  const retryAfterSeconds = useRealBalanceStore((s) => s.retryAfterSeconds);
+  const isCoolingDown = useRealBalanceStore((s) => s.isCoolingDown);
   const fetchBalance = useRealBalanceStore((s) => s.fetchBalance);
   const reset = useRealBalanceStore((s) => s.reset);
 
@@ -53,10 +69,22 @@ export function CashBalance() {
         </div>
       ) : status === "unauthenticated" ? (
         <p className="text-sm text-muted-foreground">Sign in to see your balance.</p>
+      ) : status === "rate_limited" ? (
+        // The server's own refusal — not a failed read and never a zero. The
+        // wait shown is the server's, in honest units; with none, no promise.
+        <div className="flex items-center gap-3" data-testid="real-cash-balance-limited">
+          <p className="text-sm text-muted-foreground">
+            Your balance can&apos;t be refreshed right now.{" "}
+            {isCoolingDown ? (retryAfterSeconds !== null ? `Try again ${describeWait(retryAfterSeconds)}.` : "Try again in a little while.") : "You can try again."}
+          </p>
+          <Button variant="outline" size="sm" disabled={isCoolingDown} onClick={() => void fetchBalance()}>
+            Try again
+          </Button>
+        </div>
       ) : (
         <div className="flex items-center gap-3">
           <p className="text-sm text-destructive">Couldn&apos;t load your balance{error ? `: ${error}` : "."}</p>
-          <Button variant="outline" size="sm" onClick={() => void fetchBalance()}>
+          <Button variant="outline" size="sm" disabled={isCoolingDown} onClick={() => void fetchBalance()}>
             Retry
           </Button>
         </div>

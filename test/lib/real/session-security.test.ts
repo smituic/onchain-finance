@@ -11,6 +11,7 @@ import { createInMemoryPasskeyRevocationStore } from "@/lib/real/server/passkey-
 import { REAL_SESSION_COOKIE_NAME, createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
 import { freshRateLimiter } from "./fixtures/rate-limit";
+import { openBudget } from "./fixtures/chain-read-budget";
 
 /**
  * S4 (F2/F6-D and the auth-route matrix), against the ACTUAL route.ts code:
@@ -97,6 +98,7 @@ function mockRuntime(stores: Stores, registryOverride?: Partial<RealAccountRegis
     getPasskeyRevocationStore: () => stores.revocations,
     getAccountHandleStore: () => stores.handles,
     getRateLimiter: () => freshRateLimiter(),
+    getProviderBudgetLimiter: () => openBudget(),
   }));
 }
 

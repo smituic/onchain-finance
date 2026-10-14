@@ -118,6 +118,29 @@ export type RealPaymentStore = {
   error: string | null;
   /** True only while a WebAuthn ceremony is actually in flight — distinct from status "awaiting_authorization", which is also the state a reload-restored, not-yet-resumed attempt sits in without ever having triggered a prompt. The UI uses this to tell "the passkey sheet is open right now" apart from "tap Continue to open it". */
   isAuthorizing: boolean;
+  /**
+   * 3A-1 Stage 2A: true while the manual "Check status" action is cooling
+   * down (MANUAL_CHECK_COOLDOWN_MS after a press). Flipped by a store timer —
+   * never derived from Date.now() in a component render.
+   */
+  isManualCheckCoolingDown: boolean;
+  /**
+   * 3A-1 Stage 2A: true once the bounded automatic follow-up sequence for the
+   * current attempt has run out. It says only that the page stopped asking by
+   * itself — never that the payment failed or was cancelled. The manual
+   * "Check status" action remains.
+   */
+  isFollowUpExhausted: boolean;
+  /**
+   * 3A-1 Stage 2C-2: the server answered the last status read with "not now"
+   * (reconciliationDeferred) — the stored attempt was returned untouched and no
+   * provider was asked. It says nothing about the payment: not confirmed, not
+   * failed, not cancelled. Cleared by a settled answer, a new lifecycle, or
+   * when the retry deadline passes.
+   */
+  isStatusDeferred: boolean;
+  /** The server's validated delay for that deferral, in whole seconds; null when none (or an unusable one — a local fallback deadline is then in force). */
+  statusRetryAfterSeconds: number | null;
   /** Reload/restore: never signs, never submits, never resends — see server/payments.ts's resolveLatestPayment. */
   init: () => Promise<void>;
   setRecipientInput: (value: string) => void;
@@ -133,7 +156,14 @@ export type RealPaymentStore = {
   resumeAuthorization: () => Promise<void>;
   /** Abandons an awaiting_authorization attempt so it stops occupying the account's one-active-attempt slot. */
   cancel: () => Promise<void>;
+  /** The manual "Check status" action: cooldown-limited, and joins any status request already in flight for the attempt. */
   checkStatus: () => Promise<void>;
+  /** The one automatic check after a payment becomes (or is restored as) submitted. Waits while the page is hidden; at most once per attempt. */
+  checkSubmittedStatus: () => Promise<void>;
+  /** Fed by the Pay form from `document.visibilityState`. While hidden, no automatic check starts and the follow-up timer is suspended. */
+  setPageVisible: (visible: boolean) => void;
+  /** Called when the Pay form unmounts: cancels timers and discards late responses. Server-side payment state is untouched, and nothing is cancelled or finalized. */
+  detach: () => void;
   reset: () => void;
 };
 
@@ -174,14 +204,36 @@ function parseLookupResponse(json: unknown, canonicalHandle: string): RecipientL
 
 const OTHER_PASSKEY_MESSAGE = "This payment was started with a different passkey. Cancel it and start a new payment.";
 const CANCEL_LOST_RACE_MESSAGE = "This payment could not be cancelled — it may already be on its way.";
+const STATUS_UNUSABLE_MESSAGE = "We couldn’t check on this payment just now. Try again in a little while.";
+const STATUS_TIMED_OUT_MESSAGE = "Checking is taking longer than usual. Try again in a little while.";
 const CANCEL_UNCONFIRMED_MESSAGE = "Could not confirm whether this payment was cancelled. Check its status before trying again.";
 
 /**
  * Part B: cadence of the follow-up /status check while an expired attempt is
  * still waiting for Base finality (~20 min behind validUntil). Deliberately
- * slow — one request per 75 s per open page, at most one timer outstanding.
+ * slow — at most one timer outstanding. 3A-1 Stage 2A: this is now the FIRST
+ * interval of a bounded, growing sequence (see followUpDelayMs).
  */
 export const EXPIRY_FOLLOW_UP_MS = 75_000;
+/** Stage 2A (provisional): automatic follow-up checks per attempt per mounted page lifecycle, after the one initial check. */
+export const MAX_AUTOMATIC_FOLLOW_UPS = 8;
+/** Stage 2A (provisional): ceiling for any single follow-up interval. */
+export const MAX_FOLLOW_UP_INTERVAL_MS = 10 * 60_000;
+/** Stage 2A (provisional): how long the manual "Check status" action stays unavailable after a press. */
+export const MANUAL_CHECK_COOLDOWN_MS = 30_000;
+/** Stage 2C-2: the client's own bound on one /status read. A timeout proves nothing about the server — it only ends OUR wait. */
+export const STATUS_REQUEST_DEADLINE_MS = 45_000;
+/** Stage 2C-2: the longest delay the chain-read policy can issue (its daily window); anything above is not a delay the server could have meant. */
+export const MAX_STATUS_RETRY_AFTER_SECONDS = 86_400;
+/** Stage 2C-2: applied when a deferral's delay is missing or unusable — never "retry now". */
+export const STATUS_FALLBACK_DEADLINE_MS = 60_000;
+/** Stage 2C-2: how many times one caller waits behind an older-epoch read before giving up (each wait is itself bounded by the request deadline). */
+const MAX_STALE_READ_WAITS = 2;
+
+/** Interval before follow-up number `index` (0-based): 75 s, then doubling, capped — 75, 150, 300, 600, 600 … seconds. */
+export function followUpDelayMs(index: number): number {
+  return Math.min(EXPIRY_FOLLOW_UP_MS * 2 ** index, MAX_FOLLOW_UP_INTERVAL_MS);
+}
 
 /** Part E: serverNowSeconds - local Date.now() — an advisory offset, never sent back to the server or used to extend validity. */
 function computeClockOffsetSeconds(serverNowSeconds: number): number {
@@ -244,10 +296,46 @@ function mapAttemptStateToStatus(state: RealPaymentAttemptState): RealPaymentSta
   }
 }
 
+type StatusResult = { attempt: RealPaymentAttempt; serverNowSeconds: number; reconciliationDeferred?: unknown; retryAfterSeconds?: unknown };
+/** One /status request: which attempt and generation asked, and the freshness epoch it began under. `abort` ends it (timer cleared, request aborted, promise rejected) — idempotent. */
+type StatusRead = { attemptId: string; generation: number; epoch: number; promise: Promise<StatusResult>; abort: () => void };
+
+/** Ends OUR wait only. The server may still be working: nothing here is evidence that no provider call happened. */
+class StatusTimeoutError extends Error {
+  constructor() {
+    super(STATUS_TIMED_OUT_MESSAGE);
+  }
+}
+
+class StatusAbortedError extends Error {}
+
+/**
+ * Reads the server's reconciliation verdict from a status answer, field by
+ * field. `settled`: an ordinary answer. `deferred`: the server declined to
+ * ask a provider and said when to come back (a whole number of seconds in
+ * 1…MAX_STATUS_RETRY_AFTER_SECONDS). `malformed`: anything else about those
+ * two fields — never treated as permission to retry.
+ */
+export function interpretStatusResult(result: StatusResult): { kind: "settled" } | { kind: "deferred"; seconds: number } | { kind: "malformed" } {
+  const { reconciliationDeferred, retryAfterSeconds } = result;
+  if (reconciliationDeferred === undefined || reconciliationDeferred === false) return { kind: "settled" };
+  if (reconciliationDeferred !== true) return { kind: "malformed" };
+  if (typeof retryAfterSeconds === "number" && Number.isSafeInteger(retryAfterSeconds) && retryAfterSeconds >= 1 && retryAfterSeconds <= MAX_STATUS_RETRY_AFTER_SECONDS) {
+    return { kind: "deferred", seconds: retryAfterSeconds };
+  }
+  return { kind: "malformed" };
+}
+
+/** Who a retry deadline belongs to: the signed-in account's canonical id, never a display address. */
+function currentSubject(): string | null {
+  return useRealAccountStore.getState().account?.appUserId ?? null;
+}
+
 async function authorizeAndSubmit(
   set: (partial: Partial<RealPaymentStore>) => void,
   get: () => RealPaymentStore,
   scheduleExpiryCheck: () => Promise<void>,
+  markTransition: () => void,
 ): Promise<void> {
   const { attempt, subOrganizationId, authorizingCredentialId, pendingSubmission, clockOffsetSeconds } = get();
   const account = useRealAccountStore.getState().account;
@@ -294,12 +382,15 @@ async function authorizeAndSubmit(
     }
   }
 
+  // Any status read already on its way predates the submit: its answer must not be applied after it.
+  markTransition();
   set({ status: "submitting", isAuthorizing: false, pendingSubmission: signed, error: null });
   try {
     const result = await api<{ attempt: RealPaymentAttempt }>("/api/real/payments/submit", {
       method: "POST",
       body: JSON.stringify({ attemptId: signed.attemptId, signature: signed.signature, activityId: signed.activityId }),
     });
+    markTransition();
     set({ status: mapAttemptStateToStatus(result.attempt.state), attempt: result.attempt, pendingSubmission: null, error: null });
     if (result.attempt.state === "confirmed") void useRealBalanceStore.getState().fetchBalance();
   } catch (error) {
@@ -317,6 +408,7 @@ async function authorizeAndSubmit(
     // The approval stays in memory: if a status check later shows the
     // attempt still awaiting, "Continue" re-sends it (the server's CAS keeps
     // that to at most one dispatch) rather than asking for a new signature.
+    markTransition();
     set({ status: "unknown", error: error instanceof Error ? error.message : "Lost connection while sending the payment." });
   }
 }
@@ -335,6 +427,59 @@ export function createRealPaymentStore() {
   // still current and the input still names the handle it asked about.
   let lookupSequence = 0;
   let inFlightLookup: { handle: string; sequence: number; promise: Promise<void> } | null = null;
+  // Stage 2A. The follow-up budget belongs to one attempt within one
+  // generation: init()/reset()/detach() clear it, a different attempt id
+  // replaces it, and a late callback for the same attempt never restarts it.
+  let followUp: { attemptId: string; armed: number; exhausted: boolean } | null = null;
+  // False while the Pay page's document is hidden. Nothing automatic starts then.
+  let pageVisible = true;
+  // True when an automatic check (follow-up/validity timer or the post-submit
+  // check) was due while hidden; becoming visible re-evaluates once.
+  let followUpSuspended = false;
+  let submittedCheckPendingFor: string | null = null;
+  // True from detach() (Pay form unmounted) until the next init(): no timer may be armed.
+  let detached = false;
+  // One outstanding /status request per attempt per generation; every trigger joins it.
+  let inFlightStatus: StatusRead | null = null;
+  // Freshness barrier. Bumped at every local payment transition (submit
+  // started/answered, prepare, a refused cancel). A read that began under an
+  // older epoch predates that transition: it is never applied, and a caller
+  // that needs current knowledge never joins it.
+  let statusEpoch = 0;
+  let cooldownTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  // Closeout L-1: the absolute end of the manual-check cooldown now in force
+  // (0 = none). A later wait is only ever LATER-or-equal: a server delay
+  // shorter than the 30 s cooldown never shortens it, and a longer one is
+  // never cut to 30 s.
+  let manualCooldownUntilMs = 0;
+  // Stage 2C-2: the server's "come back after" for ONE attempt of ONE account,
+  // as an absolute deadline. Deliberately outside clearFollowUpState: it
+  // survives navigation (init/detach) for that same account and attempt — a
+  // remount must not become a way around the server's answer — and is dropped
+  // by reset(), a different account or attempt, a settled answer, or a 401.
+  let statusDeadline: { subject: string | null; attemptId: string; untilMs: number; serverSeconds: number | null } | null = null;
+  // Stage 2C-2: after a refused cancel, at most one status read per cooldown
+  // window — however fast the user presses Cancel again.
+  // ...scoped to the account AND the attempt it was started for: another
+  // attempt (or account) never inherits it.
+  let cancelRead: { subject: string | null; attemptId: string; untilMs: number } | null = null;
+  // Stage 2C.3: the last status read that itself ESTABLISHED "submitted" for an
+  // attempt, and the epoch it applied under. The post-submit check exists for a
+  // submission this client just made (or restored); a read that already
+  // delivered the server's own "submitted" has done that check's job. Any
+  // later local transition moves the epoch, which makes the marker stale.
+  let submittedByRead: { attemptId: string; epoch: number } | null = null;
+
+  /** Milliseconds left on the retry deadline for this attempt and the signed-in account; 0 when none. A deadline that no longer applies is dropped on sight. */
+  function remainingDeadlineMs(attemptId: string): number {
+    if (!statusDeadline) return 0;
+    const remaining = statusDeadline.untilMs - Date.now();
+    if (statusDeadline.attemptId !== attemptId || statusDeadline.subject !== currentSubject() || remaining <= 0) {
+      statusDeadline = null;
+      return 0;
+    }
+    return remaining;
+  }
 
   function clearExpiryTimeout() {
     if (expiryTimeoutId !== null) {
@@ -343,21 +488,196 @@ export function createRealPaymentStore() {
     }
   }
 
+  function clearCooldownTimeout() {
+    if (cooldownTimeoutId !== null) {
+      clearTimeout(cooldownTimeoutId);
+      cooldownTimeoutId = null;
+    }
+  }
+
+  /** Drops every automatic-follow-up bookkeeping item — used when the lifecycle (generation) ends. */
+  function clearFollowUpState() {
+    clearExpiryTimeout();
+    clearCooldownTimeout();
+    manualCooldownUntilMs = 0;
+    followUp = null;
+    followUpSuspended = false;
+    submittedCheckPendingFor = null;
+    // Ends the read's own deadline timer and aborts it: nothing may outlive its lifecycle.
+    inFlightStatus?.abort();
+    inFlightStatus = null;
+    cancelRead = null;
+    submittedByRead = null;
+  }
+
   return create<RealPaymentStore>()((set, get) => {
     function isExpiryRelevant(state: Pick<RealPaymentStore, "status" | "attempt">): boolean {
       const validUntil = state.attempt?.prepared?.validUntil;
       return (state.status === "awaiting_authorization" || state.status === "stranded") && typeof validUntil === "number" && Number.isFinite(validUntil);
     }
 
+    function markTransition() {
+      statusEpoch++;
+    }
+
+    /** True when the server's own "submitted" for this attempt was delivered by a status read under the current epoch (no local transition since). */
+    function submittedEstablishedByRead(attemptId: string): boolean {
+      return submittedByRead !== null && submittedByRead.attemptId === attemptId && submittedByRead.epoch === statusEpoch;
+    }
+
+    /**
+     * One bounded /status request. The client waits at most
+     * STATUS_REQUEST_DEADLINE_MS: then the request is aborted (where fetch
+     * honors it) and — regardless of whether it does — the logical read is
+     * rejected, so no slot or waiter can hang on it. A late answer after that
+     * is dropped by the settled flag, and every path is handled, so nothing
+     * becomes an unhandled rejection. No automatic resend follows a timeout.
+     */
+    function startRead(attemptId: string): StatusRead {
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let finish: (settle: () => void) => void = () => {};
+      let rejectAs: (error: Error) => void = () => {};
+      const promise = new Promise<StatusResult>((resolve, reject) => {
+        let done = false;
+        finish = (settle) => {
+          if (done) return;
+          done = true;
+          if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          settle();
+        };
+        rejectAs = (error) =>
+          finish(() => {
+            controller.abort();
+            reject(error);
+          });
+        timer = setTimeout(() => rejectAs(new StatusTimeoutError()), STATUS_REQUEST_DEADLINE_MS);
+        api<StatusResult>(`/api/real/payments/${attemptId}/status`, { signal: controller.signal }).then(
+          (value) => finish(() => resolve(value)),
+          (error) => finish(() => reject(error)),
+        );
+      });
+      const entry: StatusRead = { attemptId, generation, epoch: statusEpoch, promise, abort: () => rejectAs(new StatusAbortedError()) };
+      const release = () => {
+        if (inFlightStatus === entry) inFlightStatus = null;
+      };
+      promise.then(release, release);
+      return entry;
+    }
+
+    /**
+     * The status read for `attemptId`. Every caller needs knowledge that is
+     * current as of NOW, so a read joins only one begun under the CURRENT
+     * epoch (ordinary same-epoch callers still share one request). A caller
+     * that finds an older-epoch read waits for it to settle — never two
+     * concurrent provider-bound requests for one attempt, and each wait is
+     * bounded by the request deadline — then re-checks everything (lifecycle,
+     * attempt, account, retry deadline) and either joins the current-epoch
+     * read another waiter already started or starts one. It gives up after
+     * MAX_STALE_READ_WAITS waits — a defensive bound: with a single in-flight
+     * slot, a waiter that resumes always finds either nothing or the read
+     * another waiter just started under the current epoch, so the bound is
+     * not reachable through the public actions; it exists so no future change
+     * can turn waiting into an unbounded loop. Returns null — requesting nothing — when the
+     * lifecycle ended, or the server's retry deadline for this attempt is
+     * still running.
+     */
+    async function requestStatus(attemptId: string): Promise<StatusRead | null> {
+      if (remainingDeadlineMs(attemptId) > 0) return null;
+      const myGeneration = generation;
+      const subject = currentSubject();
+      const stillMine = () => !detached && myGeneration === generation && get().attempt?.id === attemptId && currentSubject() === subject;
+
+      for (let waits = 0; ; waits++) {
+        const current = inFlightStatus as StatusRead | null;
+        if (!current || current.attemptId !== attemptId || current.generation !== generation) break;
+        if (current.epoch === statusEpoch) return current;
+        if (waits >= MAX_STALE_READ_WAITS) return null;
+        // The older read's own caller discards its answer (its epoch is stale); we only wait for it to finish.
+        try {
+          await current.promise;
+        } catch {
+          // A failed, timed-out or aborted older read releases the slot like any other.
+        }
+        if (!stillMine() || remainingDeadlineMs(attemptId) > 0) return null;
+      }
+      const entry = startRead(attemptId);
+      inFlightStatus = entry;
+      return entry;
+    }
+
+    /** Records the server's "come back after" for this attempt — or, for an unusable one, a local fallback. Both start the manual cooldown for the same span, so the control and the schedule agree. */
+    function noteDeferral(attemptId: string, serverSeconds: number | null) {
+      const ms = serverSeconds === null ? STATUS_FALLBACK_DEADLINE_MS : serverSeconds * 1000;
+      statusDeadline = { subject: currentSubject(), attemptId, untilMs: Date.now() + ms, serverSeconds };
+      set({ isStatusDeferred: true, statusRetryAfterSeconds: serverSeconds });
+      beginManualCooldown(ms);
+    }
+
+    function clearDeadline() {
+      statusDeadline = null;
+    }
+
+    /** Resets the follow-up budget when the attempt under watch is a different one. */
+    function followUpFor(attemptId: string) {
+      if (!followUp || followUp.attemptId !== attemptId) {
+        followUp = { attemptId, armed: 0, exhausted: false };
+        if (get().isFollowUpExhausted) set({ isFollowUpExhausted: false });
+      }
+      return followUp;
+    }
+
+    /**
+     * Starts (or restarts) the manual-check cooldown. Stage 2B can pass a
+     * longer server-supplied Retry-After here; nothing else about the manual
+     * check needs to change for that.
+     */
+    function beginManualCooldown(ms: number = MANUAL_CHECK_COOLDOWN_MS) {
+      // The LATER of what is already running and what is being asked for.
+      const now = Date.now();
+      const until = Math.max(now + Math.max(0, ms), manualCooldownUntilMs > now ? manualCooldownUntilMs : 0);
+      manualCooldownUntilMs = until;
+      clearCooldownTimeout();
+      set({ isManualCheckCoolingDown: true });
+      const myGeneration = generation;
+      cooldownTimeoutId = setTimeout(
+        () => {
+          cooldownTimeoutId = null;
+          manualCooldownUntilMs = 0;
+          if (myGeneration === generation) set({ isManualCheckCoolingDown: false, isStatusDeferred: false });
+        },
+        Math.min(Math.max(0, until - now), 2_147_483_647),
+      );
+    }
+
+    function endManualCooldown() {
+      clearCooldownTimeout();
+      manualCooldownUntilMs = 0;
+      if (get().isManualCheckCoolingDown) set({ isManualCheckCoolingDown: false });
+    }
+
+    /** Arms the single outstanding timer — unless the page is hidden or detached, in which case it is only remembered (suspended) and re-evaluated when the page is visible again. */
     function armExpiryTimer(delayMs: number) {
       clearExpiryTimeout();
+      if (detached) return;
+      if (!pageVisible) {
+        followUpSuspended = true;
+        return;
+      }
       const attemptId = get().attempt?.id;
       const myGeneration = generation;
       expiryTimeoutId = setTimeout(
         () => {
           expiryTimeoutId = null;
           const current = get();
-          if (myGeneration !== generation || current.attempt?.id !== attemptId || !isExpiryRelevant(current)) return;
+          if (detached || myGeneration !== generation || current.attempt?.id !== attemptId || !isExpiryRelevant(current)) return;
+          if (!pageVisible) {
+            followUpSuspended = true;
+            return;
+          }
           void runExpiryCheck();
         },
         // Clamped: a delay above 2^31-1 ms would overflow and fire immediately.
@@ -366,30 +686,122 @@ export function createRealPaymentStore() {
     }
 
     /**
-     * One /status reconciliation for an attempt believed past validUntil.
-     * Base finality usually lags validUntil by ~20 min, so the first answer
-     * is normally the same non-terminal attempt; in that case exactly one
-     * low-frequency follow-up (EXPIRY_FOLLOW_UP_MS) is armed. Stops as soon
-     * as the attempt is terminal/non-expiry-relevant, a different attempt, or
-     * a different generation.
+     * Arms the next follow-up for the attempt under watch, or — once
+     * MAX_AUTOMATIC_FOLLOW_UPS timers have been armed — stops the automatic
+     * sequence. Exhaustion changes no payment state; the manual check remains.
+     */
+    function armNextFollowUp(attemptId: string) {
+      const budget = followUpFor(attemptId);
+      if (budget.armed >= MAX_AUTOMATIC_FOLLOW_UPS) {
+        budget.exhausted = true;
+        clearExpiryTimeout();
+        if (!get().isFollowUpExhausted) set({ isFollowUpExhausted: true });
+        return;
+      }
+      // The later of the exponential schedule and the server's retry deadline.
+      armExpiryTimer(Math.max(followUpDelayMs(budget.armed++), remainingDeadlineMs(attemptId)));
+    }
+
+    /**
+     * The one status read every trigger shares (automatic follow-up, manual
+     * Check status, post-submit check). The response is applied only to the
+     * attempt and generation it was asked for. It is a read: nothing here
+     * submits, resends, cancels or finalizes anything.
+     */
+    async function performStatusCheck(): Promise<void> {
+      const attempt = get().attempt;
+      if (!attempt || detached) return;
+      // S2: captured before the await, verified after it — a response for
+      // a previous generation (reset / account switch / unmount), a previous
+      // attempt, or another signed-in account is discarded entirely, never
+      // applied over the current one.
+      const myGeneration = generation;
+      const subject = currentSubject();
+      const isCurrent = () => myGeneration === generation && get().attempt?.id === attempt.id && currentSubject() === subject;
+      let read: StatusRead | null = null;
+      try {
+        read = await requestStatus(attempt.id);
+        if (!read) return;
+        const result = await read.promise;
+        // A read that began before a local transition (submit, refused cancel) describes the payment as it WAS.
+        if (!isCurrent() || result.attempt.id !== attempt.id || read.epoch !== statusEpoch) return;
+        const verdict = interpretStatusResult(result);
+        if (verdict.kind === "malformed") {
+          // The attempt in this answer is not trusted either: keep the last reliable one, back off, say so plainly.
+          noteDeferral(attempt.id, null);
+          set({ error: STATUS_UNUSABLE_MESSAGE });
+          return;
+        }
+        const nextStatus = mapAttemptStateToStatus(result.attempt.state);
+        // Terminal is final: no answer may move a confirmed or failed payment to anything else.
+        const shown = get().status;
+        if ((shown === "confirmed" || shown === "failed") && nextStatus !== shown) return;
+        const offset = computeClockOffsetSeconds(result.serverNowSeconds);
+        set({
+          status: nextStatus,
+          attempt: result.attempt,
+          clockOffsetSeconds: offset,
+          // Recomputed here too (not only in scheduleOrRunExpiryCheck) so a
+          // standalone check (the manual "Check status" button, the
+          // post-submit one-shot check) never leaves a stale
+          // isAttemptPastValidity from before this response.
+          isAttemptPastValidity: isAttemptPastValidityNow(result.attempt, nextStatus, offset),
+          error: null,
+          ...(verdict.kind === "settled" ? { isStatusDeferred: false, statusRetryAfterSeconds: null } : {}),
+        });
+        if (verdict.kind === "deferred") noteDeferral(attempt.id, verdict.seconds);
+        else clearDeadline();
+        if (nextStatus === "submitted") submittedByRead = { attemptId: attempt.id, epoch: read.epoch };
+        // A terminal (or otherwise no-longer-expiring) answer ends the follow-up schedule now.
+        if (!isExpiryRelevant(get())) clearExpiryTimeout();
+        // The stored attempt is authoritative even in a deferred answer: if it says confirmed, the balance moved.
+        if (result.attempt.state === "confirmed") void useRealBalanceStore.getState().fetchBalance();
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401) {
+          if (isCurrent()) clearDeadline();
+        }
+        // A failure of a read that predates a transition says nothing about the payment as it is now.
+        if (isCurrent() && (!read || read.epoch === statusEpoch)) {
+          set({ error: error instanceof StatusTimeoutError ? STATUS_TIMED_OUT_MESSAGE : error instanceof Error ? error.message : "Could not check payment status." });
+        }
+      }
+    }
+
+    /**
+     * One automatic /status reconciliation for an attempt believed past
+     * validUntil. Base finality usually lags validUntil by ~20 min, so the
+     * first answer is normally the same non-terminal attempt; in that case the
+     * next follow-up is armed, at a growing interval, up to the bound. Stops as
+     * soon as the attempt is terminal/non-expiry-relevant, a different attempt,
+     * a different generation, or the page is detached.
      */
     async function runExpiryCheck(): Promise<void> {
       const attemptId = get().attempt?.id;
       const myGeneration = generation;
-      await get().checkStatus();
+      {
+        // The validity timer exists to fire exactly when validUntil passes, but
+        // the flag was last computed before that. A failing read would never
+        // refresh it, leaving "waiting for your approval" on an expired payment.
+        const { attempt, status, clockOffsetSeconds, isAttemptPastValidity } = get();
+        const pastNow = isAttemptPastValidityNow(attempt, status, clockOffsetSeconds);
+        if (pastNow !== isAttemptPastValidity) set({ isAttemptPastValidity: pastNow });
+      }
+      await performStatusCheck();
       const current = get();
-      if (myGeneration !== generation || current.attempt?.id !== attemptId || !isExpiryRelevant(current)) return;
-      armExpiryTimer(EXPIRY_FOLLOW_UP_MS);
+      if (detached || myGeneration !== generation || !attemptId || current.attempt?.id !== attemptId || !isExpiryRelevant(current)) return;
+      armNextFollowUp(attemptId);
     }
 
     /**
      * Part B (S2): if the current awaiting_authorization/stranded attempt is
-     * already past validUntil, reconcile now (and follow up slowly while it
-     * stays non-terminal); otherwise arm one timer for the instant validUntil
-     * passes. Never a rapid poll. Returns a promise so init() can await the
-     * immediate case — its first render then reflects the reconciled state.
+     * already past validUntil, reconcile now (and follow up slowly, boundedly,
+     * while it stays non-terminal); otherwise arm one timer for the instant
+     * validUntil passes. Never a rapid poll. Returns a promise so init() can
+     * await the immediate case — its first render then reflects the reconciled
+     * state. `justChecked`: the caller has just applied a fresh /status answer,
+     * so only the follow-up is armed — no second request right behind it.
      */
-    function scheduleOrRunExpiryCheck(): Promise<void> {
+    function scheduleOrRunExpiryCheck(options: { justChecked?: boolean } = {}): Promise<void> {
       clearExpiryTimeout();
       const { attempt, status, clockOffsetSeconds } = get();
       // Computed here (plain store logic), never read from Date.now() inside
@@ -397,7 +809,20 @@ export function createRealPaymentStore() {
       const pastValidity = isAttemptPastValidityNow(attempt, status, clockOffsetSeconds);
       set({ isAttemptPastValidity: pastValidity });
       if (!isExpiryRelevant({ attempt, status })) return Promise.resolve();
-      if (pastValidity) return runExpiryCheck();
+      const budget = followUpFor(attempt!.id);
+      // Exhausted: no automatic request of any kind until a manual check or a fresh lifecycle.
+      if (detached || budget.exhausted) return Promise.resolve();
+      if (!pageVisible) {
+        followUpSuspended = true;
+        return Promise.resolve();
+      }
+      if (pastValidity) {
+        if (options.justChecked) {
+          armNextFollowUp(attempt!.id);
+          return Promise.resolve();
+        }
+        return runExpiryCheck();
+      }
       const adjustedNowSeconds = Math.floor(Date.now() / 1000) + clockOffsetSeconds;
       // +1 s: the server treats an attempt as expired only strictly after validUntil.
       armExpiryTimer((attempt!.prepared!.validUntil - adjustedNowSeconds + 1) * 1000);
@@ -491,6 +916,10 @@ export function createRealPaymentStore() {
       authorizingCredentialId: null,
       pendingSubmission: null,
       isAuthorizing: false,
+      isManualCheckCoolingDown: false,
+      isFollowUpExhausted: false,
+      isStatusDeferred: false,
+      statusRetryAfterSeconds: null,
       clockOffsetSeconds: 0,
       isAttemptPastValidity: false,
       error: null,
@@ -498,14 +927,15 @@ export function createRealPaymentStore() {
       init: async () => {
         const myGeneration = ++generation;
         lookupSequence++;
-        clearExpiryTimeout();
+        clearFollowUpState();
+        detached = false;
         // Pre-2f hardening: clear any prior account's recipient/amount/
         // attempt/error as the FIRST synchronous action, before the fetch —
         // so "reset before init" holds regardless of which caller invokes
         // this (see components/real/real-pay-form.tsx's account-change
         // effect). Without this, a stale recipient/amount typed under one
         // account could survive into a different signed-in account.
-        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
+        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
         try {
           const response = await fetch("/api/real/payments/latest");
           if (response.status === 401) {
@@ -536,6 +966,12 @@ export function createRealPaymentStore() {
               clockOffsetSeconds: typeof json.serverNowSeconds === "number" ? computeClockOffsetSeconds(json.serverNowSeconds) : 0,
               error: notResumable ? OTHER_PASSKEY_MESSAGE : null,
             });
+            // A retry deadline the server gave for THIS attempt and account still applies after a remount.
+            const waiting = remainingDeadlineMs(json.attempt.id);
+            if (waiting > 0) {
+              set({ isStatusDeferred: true, statusRetryAfterSeconds: statusDeadline?.serverSeconds ?? null });
+              beginManualCooldown(waiting);
+            }
             await scheduleOrRunExpiryCheck();
           }
         } catch {
@@ -603,6 +1039,8 @@ export function createRealPaymentStore() {
             clockOffsetSeconds: computeClockOffsetSeconds(result.serverNowSeconds),
             error: null,
           });
+          markTransition();
+          endManualCooldown();
           await scheduleOrRunExpiryCheck();
         } catch (error) {
           // The server no longer finds the name (404) or refused the request
@@ -618,12 +1056,12 @@ export function createRealPaymentStore() {
           return;
         }
 
-        await authorizeAndSubmit(set, get, scheduleOrRunExpiryCheck);
+        await authorizeAndSubmit(set, get, scheduleOrRunExpiryCheck, markTransition);
       },
 
       resumeAuthorization: async () => {
         if (get().status !== "awaiting_authorization") return;
-        await authorizeAndSubmit(set, get, scheduleOrRunExpiryCheck);
+        await authorizeAndSubmit(set, get, scheduleOrRunExpiryCheck, markTransition);
       },
 
       cancel: async () => {
@@ -651,6 +1089,11 @@ export function createRealPaymentStore() {
 
         if (response.ok) {
           clearExpiryTimeout();
+          endManualCooldown();
+          clearDeadline();
+          cancelRead = null;
+          followUp = null;
+          submittedCheckPendingFor = null;
           lookupSequence++;
           set({
             status: "editing",
@@ -663,6 +1106,9 @@ export function createRealPaymentStore() {
             recipientInput: "",
             amountInput: "",
             isAttemptPastValidity: false,
+            isFollowUpExhausted: false,
+            isStatusDeferred: false,
+            statusRetryAfterSeconds: null,
             error: null,
           });
           return;
@@ -671,16 +1117,51 @@ export function createRealPaymentStore() {
         // Part D: a non-2xx (e.g. 409 — a concurrent submit already won the
         // race) means cancellation did NOT happen. Never show a false
         // "cancelled" state — re-fetch the real durable state instead.
+        // The refusal itself is news: a read that began before it may predate
+        // whatever won the race, so any such read is now stale — EXCEPT inside
+        // this attempt's own read window: the read begun for the first refusal
+        // is exactly the useful one, and invalidating it for a repeat press
+        // would lose its answer with no replacement allowed (closeout L-2).
+        // Genuine state transitions (submit, prepare) still bump the epoch.
+        const sameWindow = cancelRead !== null && cancelRead.attemptId === attempt.id && cancelRead.subject === currentSubject() && Date.now() < cancelRead.untilMs;
+        if (!sameWindow) markTransition();
+        // ...and only ONE reconciliation read per cooldown window, however fast
+        // Cancel is pressed again, and never inside the server's retry deadline.
+        // The refusal is still reported; the payment is left exactly as it is.
+        if (sameWindow || remainingDeadlineMs(attempt.id) > 0) {
+          set({ error: CANCEL_LOST_RACE_MESSAGE });
+          return;
+        }
+        cancelRead = { subject: currentSubject(), attemptId: attempt.id, untilMs: Date.now() + MANUAL_CHECK_COOLDOWN_MS };
         try {
-          const result = await api<{ attempt: RealPaymentAttempt; serverNowSeconds: number }>(`/api/real/payments/${attempt.id}/status`);
-          if (!isCurrent() || result.attempt.id !== attempt.id) return;
+          const read = await requestStatus(attempt.id);
+          if (!read) {
+            if (isCurrent()) set({ error: CANCEL_LOST_RACE_MESSAGE });
+            return;
+          }
+          const result = await read.promise;
+          if (!isCurrent() || result.attempt.id !== attempt.id || read.epoch !== statusEpoch) return;
+          const verdict = interpretStatusResult(result);
+          if (verdict.kind === "malformed") {
+            noteDeferral(attempt.id, null);
+            set({ error: CANCEL_UNCONFIRMED_MESSAGE });
+            return;
+          }
+          const shown = get().status;
+          const nextStatus = mapAttemptStateToStatus(result.attempt.state);
+          if ((shown === "confirmed" || shown === "failed") && nextStatus !== shown) return;
           set({
-            status: mapAttemptStateToStatus(result.attempt.state),
+            status: nextStatus,
             attempt: result.attempt,
             clockOffsetSeconds: computeClockOffsetSeconds(result.serverNowSeconds),
             error: CANCEL_LOST_RACE_MESSAGE,
+            ...(verdict.kind === "settled" ? { isStatusDeferred: false, statusRetryAfterSeconds: null } : {}),
           });
-          await scheduleOrRunExpiryCheck();
+          if (verdict.kind === "deferred") noteDeferral(attempt.id, verdict.seconds);
+          else clearDeadline();
+          if (nextStatus === "submitted") submittedByRead = { attemptId: attempt.id, epoch: read.epoch };
+          // This answer is fresh: only the follow-up is armed, not a second request behind it.
+          await scheduleOrRunExpiryCheck({ justChecked: true });
         } catch {
           // Couldn't confirm the real state either — preserve what we had
           // rather than guessing in either direction.
@@ -690,39 +1171,71 @@ export function createRealPaymentStore() {
 
       checkStatus: async () => {
         const attempt = get().attempt;
-        if (!attempt) return;
-        // S2: captured before the await, verified after it — a response for
-        // a previous generation (reset / account switch) or a previous
-        // attempt is discarded entirely, never applied over the current one.
-        const myGeneration = generation;
-        const isCurrent = () => myGeneration === generation && get().attempt?.id === attempt.id;
-        try {
-          const result = await api<{ attempt: RealPaymentAttempt; serverNowSeconds: number }>(`/api/real/payments/${attempt.id}/status`);
-          if (!isCurrent() || result.attempt.id !== attempt.id) return;
-          const nextStatus = mapAttemptStateToStatus(result.attempt.state);
-          const offset = computeClockOffsetSeconds(result.serverNowSeconds);
-          set({
-            status: nextStatus,
-            attempt: result.attempt,
-            clockOffsetSeconds: offset,
-            // Recomputed here too (not only in scheduleOrRunExpiryCheck) so a
-            // standalone checkStatus() call (the manual "Check status"
-            // button, the post-submit one-shot check) never leaves a stale
-            // isAttemptPastValidity from before this response.
-            isAttemptPastValidity: isAttemptPastValidityNow(result.attempt, nextStatus, offset),
-            error: null,
-          });
-          if (result.attempt.state === "confirmed") void useRealBalanceStore.getState().fetchBalance();
-        } catch (error) {
-          if (isCurrent()) set({ error: error instanceof Error ? error.message : "Could not check payment status." });
+        if (!attempt || get().isManualCheckCoolingDown) return;
+        // The server said when to come back: the control stays unavailable until then, and nothing is sent.
+        const waiting = remainingDeadlineMs(attempt.id);
+        if (waiting > 0) {
+          set({ isStatusDeferred: true, statusRetryAfterSeconds: statusDeadline?.serverSeconds ?? null });
+          beginManualCooldown(waiting);
+          return;
         }
+        beginManualCooldown();
+        await performStatusCheck();
+      },
+
+      checkSubmittedStatus: async () => {
+        const { attempt, status } = get();
+        if (!attempt || status !== "submitted" || detached) return;
+        // A status read that itself delivered "submitted" already did this check's job.
+        if (submittedEstablishedByRead(attempt.id)) return;
+        if (!pageVisible) {
+          submittedCheckPendingFor = attempt.id;
+          return;
+        }
+        submittedCheckPendingFor = null;
+        // Follows the submit: it must see the server's state AFTER it, never an older read that was already on its way.
+        await performStatusCheck();
+      },
+
+      setPageVisible: (visible) => {
+        const wasVisible = pageVisible;
+        pageVisible = visible;
+        if (!visible) {
+          // Suspend, don't lose: a timer that was outstanding is remembered and re-evaluated on return.
+          if (expiryTimeoutId !== null) {
+            clearExpiryTimeout();
+            followUpSuspended = true;
+          }
+          return;
+        }
+        if (wasVisible || detached) return;
+        // Back in view: re-evaluate once. Never a catch-up burst — at most one
+        // check, and an exhausted sequence stays exhausted.
+        const resumeFollowUp = followUpSuspended;
+        followUpSuspended = false;
+        const submittedPending = submittedCheckPendingFor !== null && submittedCheckPendingFor === get().attempt?.id;
+        submittedCheckPendingFor = null;
+        if (resumeFollowUp) void scheduleOrRunExpiryCheck();
+        if (submittedPending && get().status === "submitted" && !submittedEstablishedByRead(get().attempt!.id)) void performStatusCheck();
+      },
+
+      detach: () => {
+        // The Pay form is gone: no timer may outlive it and no in-flight answer
+        // may apply (or arm anything) afterwards. Server state is untouched.
+        detached = true;
+        generation++;
+        lookupSequence++;
+        clearFollowUpState();
+        set({ isManualCheckCoolingDown: false, isStatusDeferred: false });
       },
 
       reset: () => {
         generation++;
         lookupSequence++;
-        clearExpiryTimeout();
-        set({ status: "editing", recipientLookup: { status: "idle" }, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
+        clearFollowUpState();
+        // A new compose flow / sign-out: the previous attempt's deadline has nothing left to govern.
+        clearDeadline();
+        set({ isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, status: "editing", recipientLookup: { status: "idle" }, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
       },
     };
   });

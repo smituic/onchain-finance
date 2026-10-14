@@ -38,6 +38,10 @@ export function RealPayForm() {
   const attempt = useRealPaymentStore((s) => s.attempt);
   const isPastValidity = useRealPaymentStore((s) => s.isAttemptPastValidity);
   const isAuthorizing = useRealPaymentStore((s) => s.isAuthorizing);
+  const isCoolingDown = useRealPaymentStore((s) => s.isManualCheckCoolingDown);
+  const isFollowUpExhausted = useRealPaymentStore((s) => s.isFollowUpExhausted);
+  const isStatusDeferred = useRealPaymentStore((s) => s.isStatusDeferred);
+  const balanceStatus = useRealBalanceStore((s) => s.status);
   const error = useRealPaymentStore((s) => s.error);
   const init = useRealPaymentStore((s) => s.init);
   const setRecipientInput = useRealPaymentStore((s) => s.setRecipientInput);
@@ -49,11 +53,30 @@ export function RealPayForm() {
   const resumeAuthorization = useRealPaymentStore((s) => s.resumeAuthorization);
   const cancel = useRealPaymentStore((s) => s.cancel);
   const checkStatus = useRealPaymentStore((s) => s.checkStatus);
+  const checkSubmittedStatus = useRealPaymentStore((s) => s.checkSubmittedStatus);
+  const setPageVisible = useRealPaymentStore((s) => s.setPageVisible);
+  const detach = useRealPaymentStore((s) => s.detach);
   const reset = useRealPaymentStore((s) => s.reset);
 
   // Format and "that's you" feedback waits until the field is left (or Review
   // is pressed) — never while the name is still being typed.
   const [recipientTouched, setRecipientTouched] = useState(false);
+
+  // Declared before the init effect so the store knows whether the page is in
+  // view before init's first reconciliation decides whether it may run.
+  useEffect(() => {
+    // Stage 2A: automatic status checks run only while this page is on screen,
+    // and nothing outlives it. Hidden tab: the follow-up timer is suspended and
+    // resumes with at most one check; unmount: timers are cancelled and late
+    // answers dropped. Neither touches the payment itself.
+    const onVisibilityChange = () => setPageVisible(document.visibilityState !== "hidden");
+    onVisibilityChange();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      detach();
+    };
+  }, [setPageVisible, detach]);
 
   useEffect(() => {
     // Pre-2f hardening: the else branch matters — without it, logging out
@@ -74,7 +97,7 @@ export function RealPayForm() {
     // A freshly-submitted operation is usually confirmed within a few
     // seconds on testnet — one best-effort check, not a polling loop. The
     // user (or a later mount) can always tap "Check status" again.
-    if (status === "submitted") void checkStatus();
+    if (status === "submitted") void checkSubmittedStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
@@ -84,6 +107,8 @@ export function RealPayForm() {
     return <div aria-busy="true" aria-label="Loading" className="h-24 animate-pulse rounded-xl bg-muted/60" data-testid="real-pay-form-loading" />;
   }
 
+  // A deferral only matters while its wait is running; the store flips both flags together.
+  const showDeferred = isStatusDeferred && isCoolingDown;
   const amountBaseUnits = parseCashInputToBaseUnits(amountInput);
   const recipient = resolveRecipientView(recipientInput, recipientLookup, account.handle ?? null);
   // Slice D: once a payment is prepared, who it is to comes from the attempt
@@ -156,7 +181,7 @@ export function RealPayForm() {
           <div className="flex items-center justify-between">
             <Label htmlFor="real-pay-amount">Amount</Label>
             <span className="text-xs text-muted-foreground">
-              {balance ? `${formatAmount(balance.balanceBaseUnits)} available` : "Checking your balance…"}
+              {balance ? `${formatAmount(balance.balanceBaseUnits)} available` : balanceUnavailableLabel(balanceStatus)}
             </span>
           </div>
           <Input
@@ -264,9 +289,14 @@ export function RealPayForm() {
           ) : (
             <p className="text-xs font-medium text-destructive">Only continue if you started this payment.</p>
           )}
+          {isFollowUpExhausted ? (
+            <p className="text-xs text-muted-foreground">{STILL_WAITING_MESSAGE}</p>
+          ) : null}
+          {showDeferred ? <p className="text-xs text-muted-foreground">{isFollowUpExhausted ? STATUS_DEFERRED_MESSAGE : STATUS_DEFERRED_AUTOMATIC_MESSAGE}</p> : null}
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
         <div className="flex flex-col gap-2">
+          {isFollowUpExhausted ? <CheckStatusButton onClick={() => void checkStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} /> : null}
           {isPastValidity ? null : (
             <Button size="lg" className="h-12 w-full" onClick={() => void resumeAuthorization()}>
               Continue
@@ -288,8 +318,11 @@ export function RealPayForm() {
           <p className="text-sm text-muted-foreground">
             {isPastValidity ? "We’re waiting for final confirmation before showing the final result. This can take a while." : "It was never sent. You can safely cancel it and try again."}
           </p>
+          {isFollowUpExhausted ? <p className="text-xs text-muted-foreground">{STILL_WAITING_MESSAGE}</p> : null}
+          {showDeferred ? <p className="text-xs text-muted-foreground">{isFollowUpExhausted ? STATUS_DEFERRED_MESSAGE : STATUS_DEFERRED_AUTOMATIC_MESSAGE}</p> : null}
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
+        {isFollowUpExhausted ? <CheckStatusButton onClick={() => void checkStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} /> : null}
         <Button variant="outline" className="h-11 w-full" onClick={() => void cancel()}>
           Cancel payment
         </Button>
@@ -302,9 +335,11 @@ export function RealPayForm() {
       <div className="flex flex-col items-center gap-2 rounded-xl bg-muted/60 px-4 py-6 text-center" role="status" data-testid="real-pay-sending">
         <p className="text-sm font-medium">Sending…</p>
         {paidTo?.kind === "handle" ? <p className="break-words text-xs text-muted-foreground">To {paidTo.label}</p> : null}
+        {showDeferred ? <p className="text-xs text-muted-foreground">{STATUS_DEFERRED_MESSAGE}</p> : null}
+        {error ? <p className="text-xs text-destructive">{error}</p> : null}
         {status === "submitted" ? (
-          <Button variant="outline" size="sm" onClick={() => void checkStatus()}>
-            Check status
+          <Button variant="outline" size="sm" disabled={isCoolingDown} onClick={() => void checkStatus()}>
+            {isCoolingDown ? (showDeferred ? CHECK_LATER_LABEL : CHECKED_JUST_NOW_LABEL) : "Check status"}
           </Button>
         ) : null}
       </div>
@@ -353,15 +388,39 @@ export function RealPayForm() {
             disabled until this one resolves.
           </p>
         </div>
+        {showDeferred ? <p className="text-sm text-muted-foreground">{STATUS_DEFERRED_MESSAGE}</p> : null}
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        <Button variant="outline" className="h-11 w-full" onClick={() => void checkStatus()}>
-          Check status
-        </Button>
+        <CheckStatusButton onClick={() => void checkStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} />
       </div>
     );
   }
 
   return null;
+}
+
+const STILL_WAITING_MESSAGE = "This is taking longer than usual. Your payment is still waiting for an update.";
+const CHECKED_JUST_NOW_LABEL = "Checked just now";
+// While the SERVER has asked us to wait (possibly hours): not "just now", and no claim about the payment.
+const CHECK_LATER_LABEL = "Check available later";
+// The server declined to look right now (not a verdict on the payment). Plain words only.
+const STATUS_DEFERRED_MESSAGE = "We can’t check for an update right now. You can check again later.";
+const STATUS_DEFERRED_AUTOMATIC_MESSAGE = "We can’t check for an update right now. We’ll look again later.";
+
+/** What the amount line says while there is no balance to show — never a number, never zero. */
+function balanceUnavailableLabel(status: "idle" | "loading" | "ready" | "unauthenticated" | "rate_limited" | "error"): string {
+  if (status === "rate_limited") return "Balance unavailable right now";
+  if (status === "error") return "Couldn’t check your balance";
+  if (status === "unauthenticated") return "Sign in to see your balance";
+  return "Checking your balance…";
+}
+
+/** The manual "Check status" action. Briefly unavailable after a press so repeated taps can't pile up requests. */
+function CheckStatusButton({ onClick, isCoolingDown, isDeferred }: { onClick: () => void; isCoolingDown: boolean; isDeferred: boolean }) {
+  return (
+    <Button variant="outline" className="h-11 w-full" disabled={isCoolingDown} onClick={onClick}>
+      {isCoolingDown ? (isDeferred ? CHECK_LATER_LABEL : CHECKED_JUST_NOW_LABEL) : "Check status"}
+    </Button>
+  );
 }
 
 /** Both operands are non-negative base-10 integer strings — safe as a BigInt subtraction purely for a display-only "remaining" figure (never used to authorize anything; the server independently re-checks the live balance at prepare time). */

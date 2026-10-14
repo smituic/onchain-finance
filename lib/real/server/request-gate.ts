@@ -5,7 +5,9 @@ import { isRealModeEnabled, readExpectedOrigins } from "./config";
  * proxy.ts before any route handler. Framework-agnostic (plain Request/
  * Response) so it stays inside lib/real's fence and is unit-testable.
  *
- * Safe methods (GET/HEAD/OPTIONS) pass untouched. For every other method:
+ * Safe methods (GET/HEAD/OPTIONS) pass untouched, EXCEPT the chain-read GETs
+ * in PROTECTED_READS below (3A-1 Stage 1), which get a cross-site check of
+ * their own (see checkProtectedRead). For every other method:
  *
  *  1. `Sec-Fetch-Site: cross-site` is refused outright.
  *  2. An `Origin` header, when present, must EXACTLY equal one of the
@@ -39,6 +41,20 @@ const BODYLESS_ROUTES: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "DELETE", path: /^\/api\/real\/session$/ },
 ];
 
+/**
+ * Safe-method reads that spend provider work (chain RPC / bundler) on behalf
+ * of the signed-in user, and that the per-account chain-read budget charges
+ * (Slice 3A-1: the balance and payment-status resolvers consume it, after this
+ * gate has run). A cross-site page must not be able to make a victim's browser
+ * drive that spend, so these demand proof the request came from our own origin. Matched
+ * exactly: payments/latest, payments/history and every other GET are NOT
+ * listed, and so are unchanged.
+ */
+const PROTECTED_READS: ReadonlyArray<RegExp> = [
+  /^\/api\/real\/account\/balance$/,
+  /^\/api\/real\/payments\/[^/]+\/status$/,
+];
+
 function refuse(status: number): Response {
   return Response.json({ error: status === 415 ? "Unsupported request." : "Request not allowed." }, { status });
 }
@@ -52,13 +68,80 @@ function isBodylessRoute(method: string, pathname: string): boolean {
   return BODYLESS_ROUTES.some((route) => route.method === method && route.path.test(pathname));
 }
 
+/**
+ * Route handlers answer HEAD with the GET handler, so HEAD is guarded the same
+ * way. The path is matched raw and percent-decoded (with runs of "/"
+ * collapsed), so an encoded spelling can't slip past the pattern.
+ */
+function isProtectedRead(method: string, pathname: string): boolean {
+  if (method !== "GET" && method !== "HEAD") return false;
+  const candidates = [pathname];
+  try {
+    candidates.push(decodeURIComponent(pathname));
+  } catch {
+    // Not decodable: only the raw spelling is considered.
+  }
+  return candidates.some((candidate) => {
+    const collapsed = candidate.replace(/\/{2,}/g, "/").replace(/(?<=.)\/$/, "");
+    return PROTECTED_READS.some((pattern) => pattern.test(collapsed));
+  });
+}
+
+/** The exact-origin check on a Referer: its URL must parse and its origin must be configured verbatim. */
+function isTrustedReferer(referer: string, trusted: string[]): boolean {
+  try {
+    return trusted.includes(new URL(referer).origin);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cross-site protection for the protected reads. Each signal can only tighten
+ * the verdict; none can rescue a request another signal denied.
+ *
+ *  - `Sec-Fetch-Site`, when present, must be exactly `same-origin`. cross-site,
+ *    same-site (a sibling subdomain), none (typed/bookmarked/window.open from
+ *    nowhere), the empty string and any unknown or oddly-cased value are
+ *    refused. It is a forbidden header: page script cannot set it.
+ *  - `Origin`, when present, must exactly equal a configured Real origin.
+ *  - `Referer`, when present, must parse to a configured origin; when
+ *    `Sec-Fetch-Site` is absent (older browsers, non-browser callers) it is
+ *    REQUIRED, and its absence refuses the request.
+ *
+ * Trusted origins come only from readExpectedOrigins (NEXT_PUBLIC_REAL_ORIGIN);
+ * never from Host, X-Forwarded-Host or the request URL. No configured origin
+ * means nothing can be trusted, so a request without `Sec-Fetch-Site:
+ * same-origin` is refused.
+ */
+function checkProtectedRead(request: Request, env: Record<string, string | undefined>): Response | null {
+  const trusted = readExpectedOrigins(env);
+
+  const fetchSite = request.headers.get("sec-fetch-site");
+  if (fetchSite !== null && fetchSite.trim() !== "same-origin") return refuse(403);
+
+  const origin = request.headers.get("origin");
+  if (origin !== null && !trusted.includes(origin)) return refuse(403);
+
+  const referer = request.headers.get("referer");
+  if (referer !== null) {
+    if (!isTrustedReferer(referer, trusted)) return refuse(403);
+  } else if (fetchSite === null) {
+    return refuse(403);
+  }
+
+  return null;
+}
+
 /** Returns a refusal Response, or null when the request may proceed to its route handler. */
 export function checkRealApiRequest(request: Request, env: Record<string, string | undefined> = process.env): Response | null {
   // Disabled Real Mode: every route already answers 404 itself.
   if (!isRealModeEnabled(env)) return null;
 
   const method = request.method.toUpperCase();
-  if (SAFE_METHODS.has(method)) return null;
+  if (SAFE_METHODS.has(method)) {
+    return isProtectedRead(method, new URL(request.url).pathname) ? checkProtectedRead(request, env) : null;
+  }
 
   if (request.headers.get("sec-fetch-site")?.trim().toLowerCase() === "cross-site") return refuse(403);
 
