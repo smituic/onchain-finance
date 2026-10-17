@@ -2,6 +2,8 @@ import { credentialIdsEqual } from "../credential-id";
 import { isValidUuid } from "../identifiers";
 import type { RealAccountRecord, RealAccountRegistry } from "./registry";
 import type { RealServerConfig } from "./config";
+import type { ProviderBudgetLimiter } from "./rate-limit";
+import { consumeTurnkeyReconcileBudget, type TurnkeyReconcileBudgetDecision } from "./turnkey-reconcile-budget";
 import type { PasskeyRevocationAttempt, PasskeyRevocationStore } from "./passkey-revocation-attempts";
 import { listTurnkeyUserAuthenticators, readTurnkeyActivity, type TurnkeyUserAuthenticator } from "./turnkey-discovery";
 import {
@@ -133,6 +135,22 @@ export type ReconcileRevocationResult =
   | { outcome: "blocked"; reason: string }
   | { outcome: "rejected"; reason: string };
 
+/**
+ * An external reconcile the provider budget refused (3A-3). Always the plain
+ * pending state: no Turnkey read, activity-status write, or transition
+ * happened, so it implies nothing about the removal — the target stays
+ * 'revoking' until authoritative evidence permits the existing transition.
+ */
+export type DeferredRevocationReconcile = { outcome: "pending"; reason: string; reconciliationDeferred: true; retryAfterSeconds: number };
+
+/**
+ * Private. Whether a reconcile may read Turnkey. The external entrypoint
+ * charges the Turnkey reconcile budget; submit's internal reconcile is already
+ * admitted. Never exported, never an optional parameter of an exported function.
+ */
+type ReconcileAdmission = () => Promise<TurnkeyReconcileBudgetDecision>;
+const ALREADY_ADMITTED: ReconcileAdmission = async () => ({ allowed: true });
+
 export async function submitRevocation(input: {
   config: RealServerConfig;
   registry: RealAccountRegistry;
@@ -187,7 +205,9 @@ export async function submitRevocation(input: {
   if (forwarded.kind === "activity") {
     await input.revocations.recordActivity({ id: claimed.id, activityId: forwarded.activity.id, activityStatus: forwarded.activity.status });
   }
-  return reconcileRevocation(input);
+  // Already admitted: this submit passed its own WebAuthn authorization and durable dispatch claim,
+  // and is not charged the reconcile budget (3A-3). The private core is the only way to skip it.
+  return reconcileRevocationCore(input, ALREADY_ADMITTED);
 }
 
 function isPresent(authenticators: TurnkeyUserAuthenticator[], attempt: PasskeyRevocationAttempt): boolean {
@@ -246,8 +266,25 @@ export async function reconcileRevocation(input: {
   appUserId: string;
   credentialId: string;
   attemptId: string;
+  /** Required: an external reconcile that reads Turnkey is always charged (3A-3). Database-only paths consume nothing. */
+  providerBudgetLimiter: ProviderBudgetLimiter;
   deps?: TurnkeyDispatchDeps;
-}): Promise<ReconcileRevocationResult> {
+}): Promise<ReconcileRevocationResult | DeferredRevocationReconcile> {
+  return reconcileRevocationCore(input, () => consumeTurnkeyReconcileBudget(input.providerBudgetLimiter, input.appUserId));
+}
+
+async function reconcileRevocationCore(
+  input: {
+    config: RealServerConfig;
+    registry: RealAccountRegistry;
+    revocations: PasskeyRevocationStore;
+    appUserId: string;
+    credentialId: string;
+    attemptId: string;
+    deps?: TurnkeyDispatchDeps;
+  },
+  admit: ReconcileAdmission,
+): Promise<ReconcileRevocationResult | DeferredRevocationReconcile> {
   const deps = resolveDispatchDeps(input.deps);
   let attempt = await loadOwnedAttempt(input);
   if (!attempt) return { outcome: "rejected", reason: "Unknown removal." };
@@ -278,6 +315,12 @@ export async function reconcileRevocation(input: {
       return blockAttempt(input.revocations, attempt, "no_activity_receipt");
     }
   }
+
+  // An activity id is recorded: the rest reads Turnkey, so this is the ONE budget unit — charged
+  // before the first read. (The no-activity-id paths above made no provider call and cost nothing.)
+  // A denial reads nothing, writes nothing and forwards nothing: the target stays 'revoking'.
+  const admission = await admit();
+  if (!admission.allowed) return { outcome: "pending", reason: PENDING, reconciliationDeferred: true, retryAfterSeconds: admission.retryAfterSeconds };
 
   let activity: TurnkeyActivitySummary | null = null;
   for (let poll = 0; poll < deps.maxPolls; poll += 1) {

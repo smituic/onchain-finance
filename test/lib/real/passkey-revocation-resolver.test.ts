@@ -10,6 +10,10 @@ import type { TurnkeyReadOnlyLedger } from "@/lib/real/server/passkey-revocation
 import { TURNKEY_STAMP_FRESHNESS_WINDOW_MS } from "@/lib/real/server/turnkey-signed-request";
 import { createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
 import { FakeTurnkey, signRequest, toStdBase64 } from "./fixtures/turnkey-fake";
+import { createInMemoryProviderBudgetStore, createProviderBudgetLimiter } from "@/lib/real/server/rate-limit";
+
+/** A fresh in-memory provider budget per call: these tests exercise reconciliation, not throttling (see turnkey-reconcile-budget.test.ts). */
+const unthrottledBudget = () => createProviderBudgetLimiter(createInMemoryProviderBudgetStore());
 
 /**
  * S3 — operator resolution of BLOCKED passkey removals (R2a only).
@@ -198,7 +202,7 @@ function submit(w: World, target: FixtureAuthenticator, session: FixtureAuthenti
 }
 
 function reconcile(w: World, target: FixtureAuthenticator, attemptId: string) {
-  return revocation.reconcileRevocation({ config, registry: w.registry, revocations: w.revocations, appUserId: APP, credentialId: target.credentialIdBase64Url, attemptId, deps: w.deps });
+  return revocation.reconcileRevocation({ config, registry: w.registry, revocations: w.revocations, appUserId: APP, credentialId: target.credentialIdBase64Url, attemptId, providerBudgetLimiter: unthrottledBudget(), deps: w.deps });
 }
 
 /** LF1: the DELETE lands at Turnkey, every response is lost, the window closes => genuinely 'blocked/no_activity_receipt' with the target really gone. */

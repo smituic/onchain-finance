@@ -6,6 +6,10 @@ import { createInMemoryPasskeyRevocationStore, type PasskeyRevocationStore } fro
 import { TURNKEY_STAMP_FRESHNESS_WINDOW_MS } from "@/lib/real/server/turnkey-signed-request";
 import { buildAuthenticationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
 import { FakeTurnkey, signRequest, stampBody } from "./fixtures/turnkey-fake";
+import { createInMemoryProviderBudgetStore, createProviderBudgetLimiter } from "@/lib/real/server/rate-limit";
+
+/** A fresh in-memory provider budget per call: these tests exercise reconciliation, not throttling (see turnkey-reconcile-budget.test.ts). */
+const unthrottledBudget = () => createProviderBudgetLimiter(createInMemoryProviderBudgetStore());
 
 const turnkey: { fake: FakeTurnkey | null } = { fake: null };
 
@@ -107,7 +111,7 @@ function submit(w: World, target: FixtureAuthenticator, session: FixtureAuthenti
 }
 
 function reconcile(w: World, target: FixtureAuthenticator, attemptId: string) {
-  return revocation.reconcileRevocation({ config, registry: w.registry, revocations: w.revocations, appUserId: "app-user-1", credentialId: target.credentialIdBase64Url, attemptId, deps: w.deps });
+  return revocation.reconcileRevocation({ config, registry: w.registry, revocations: w.revocations, appUserId: "app-user-1", credentialId: target.credentialIdBase64Url, attemptId, providerBudgetLimiter: unthrottledBudget(), deps: w.deps });
 }
 
 const status = async (w: World, who: FixtureAuthenticator) => (await w.registry.findPasskeyByCredentialId(who.credentialIdBase64Url))?.status;

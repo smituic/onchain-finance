@@ -103,3 +103,48 @@ export const BACKUP_PASSKEY_EXPLANATION =
 export const EQUAL_AUTHORITY_NOTE = "Primary and backup passkeys have the same access to this account.";
 
 export const TOTAL_LOSS_NOTE = "If every passkey on this account is lost, the account can't currently be recovered.";
+
+// ---------------------------------------------------------------- 3A-3: checks that are temporarily unavailable
+//
+// Copy for a status check the server asked us to hold off on. It states what is still true (the stored state is
+// unchanged and unconfirmed), when a manual check is possible, and nothing more: no automatic retry, no success,
+// no failure, and no promise that nothing else will be needed.
+
+/** Rounds UP to a readable length, so the wait is never understated. Not a countdown. */
+export function formatWaitDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "a little while";
+  if (seconds <= 60) return "a minute";
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} minutes`;
+  const hours = Math.ceil(seconds / 3600);
+  return hours === 1 ? "an hour" : `${hours} hours`;
+}
+
+/** A backup setup whose authorization is sent but not yet confirmed, and whose check is on hold. */
+export function backupCheckWaitMessage(seconds: number): string {
+  return `We can't check your backup setup again just yet. It isn't confirmed. You can check again in about ${formatWaitDuration(seconds)}.`;
+}
+
+/** A setup under review whose re-check is on hold; the review reason is shown separately and unchanged. */
+export function reviewCheckWaitMessage(seconds: number): string {
+  return `We can't re-check this setup just yet. It still needs review. You can check again in about ${formatWaitDuration(seconds)}.`;
+}
+
+/** The final backup step: it isn't confirmed, so the passkey isn't set up yet, and trying again may ask for another approval. */
+export function signingCheckWaitMessage(seconds: number): string {
+  return `We can't confirm this last step just yet, so your backup passkey isn't set up yet. You can try again in about ${formatWaitDuration(seconds)}; you may be asked to approve with it again.`;
+}
+
+/** The truthful part of a removal message: the server's own text (it keeps the may-still-authorize warning), else the plain pending statement. */
+export function removalCheckWaitBase(reason: string | null | undefined): string {
+  return reason && reason.trim() ? reason.trim() : `Removal submitted, not yet confirmed. ${MAY_STILL_AUTHORIZE_NOTE}`;
+}
+
+/** A removal that is submitted but not confirmed: its truthful base plus when a manual check is possible. */
+export function removalCheckWaitMessage(reason: string | null | undefined, seconds: number): string {
+  return `${removalCheckWaitBase(reason)} We can't check again just yet. You can check again in about ${formatWaitDuration(seconds)}.`;
+}
+
+/** Shown beside a disabled "Check removal status" when the wait came from elsewhere. The row's own warning stays; this says nothing about the removal's outcome. */
+export function removalCheckPausedNote(seconds: number): string {
+  return `Checking is paused for a moment. You can check again in about ${formatWaitDuration(seconds)}.`;
+}

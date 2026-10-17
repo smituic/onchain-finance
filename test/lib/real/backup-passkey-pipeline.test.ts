@@ -9,6 +9,10 @@ import { createInMemoryBackupPasskeyEnrollmentStore, type BackupPasskeyEnrollmen
 import { TURNKEY_STAMP_FRESHNESS_WINDOW_MS } from "@/lib/real/server/turnkey-signed-request";
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
 import { FakeTurnkey, signRequest, stampBody } from "./fixtures/turnkey-fake";
+import { createInMemoryProviderBudgetStore, createProviderBudgetLimiter } from "@/lib/real/server/rate-limit";
+
+/** A fresh in-memory provider budget per call: these tests exercise reconciliation, not throttling (see turnkey-reconcile-budget.test.ts). */
+const unthrottledBudget = () => createProviderBudgetLimiter(createInMemoryProviderBudgetStore());
 
 const turnkey: { fake: FakeTurnkey | null } = { fake: null };
 
@@ -134,7 +138,7 @@ function submit(w: World, enrollmentId: string, signedRequest: unknown) {
 }
 
 function reconcile(w: World, enrollmentId: string) {
-  return pipeline.reconcileTurnkeyEnrollment({ config, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", enrollmentId, deps: w.deps });
+  return pipeline.reconcileTurnkeyEnrollment({ config, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", enrollmentId, providerBudgetLimiter: unthrottledBudget(), deps: w.deps });
 }
 
 async function proofA(w: World, enrollmentId: string, answerer: FixtureAuthenticator, userHandle?: string) {
@@ -162,7 +166,7 @@ async function proofB(w: World, enrollmentId: string, opts: { votePublicKey?: st
     result: { signRawPayloadResult: { r: signature.slice(2, 66), s: signature.slice(66, 130), v: Number.parseInt(signature.slice(130), 16) === 27 ? "00" : "01" } },
     votes: [{ selection: "VOTE_SELECTION_APPROVED", activityId: id, userId: "turnkey-user-1", publicKey: opts.votePublicKey ?? enrollment.turnkeyAuthenticatorPublicKey }],
   });
-  return pipeline.confirmSigningProof({ config, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", enrollmentId, activityId: id });
+  return pipeline.confirmSigningProof({ config, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", enrollmentId, activityId: id, providerBudgetLimiter: unthrottledBudget() });
 }
 
 async function driveToActive(w: World) {

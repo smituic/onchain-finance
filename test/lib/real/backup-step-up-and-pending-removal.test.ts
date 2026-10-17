@@ -10,6 +10,12 @@ import { createInMemoryPasskeyRevocationStore, type PasskeyRevocationStore } fro
 import { TURNKEY_STAMP_FRESHNESS_WINDOW_MS } from "@/lib/real/server/turnkey-signed-request";
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
 import { FakeTurnkey, signRequest } from "./fixtures/turnkey-fake";
+import { createInMemoryProviderBudgetStore, createProviderBudgetLimiter } from "@/lib/real/server/rate-limit";
+import { TURNKEY_RECONCILE_POLICIES } from "@/lib/real/server/turnkey-reconcile-budget";
+import { realBudget, scriptedBudget } from "./fixtures/chain-read-budget";
+
+/** A fresh in-memory provider budget per call: these tests exercise reconciliation, not throttling (see turnkey-reconcile-budget.test.ts). */
+const unthrottledBudget = () => createProviderBudgetLimiter(createInMemoryProviderBudgetStore());
 
 /**
  * 2g-H behavioral tests.
@@ -146,7 +152,7 @@ function submitCreate(w: World, enrollmentId: string, signedRequest: unknown, se
 }
 
 function reconcileCreate(w: World, enrollmentId: string) {
-  return pipeline.reconcileTurnkeyEnrollment({ config, registry: w.registry, enrollments: w.enrollments, appUserId: APP_USER, enrollmentId, deps: w.deps });
+  return pipeline.reconcileTurnkeyEnrollment({ config, registry: w.registry, enrollments: w.enrollments, appUserId: APP_USER, enrollmentId, providerBudgetLimiter: unthrottledBudget(), deps: w.deps });
 }
 
 /** Legitimate setup up to (but not through) the Turnkey create. */
@@ -205,7 +211,7 @@ async function seedProofB(w: World, enrollmentId: string) {
 }
 
 function confirmProofB(w: World, enrollmentId: string, activityId: string) {
-  return pipeline.confirmSigningProof({ config, registry: w.registry, enrollments: w.enrollments, appUserId: APP_USER, enrollmentId, activityId });
+  return pipeline.confirmSigningProof({ config, registry: w.registry, enrollments: w.enrollments, appUserId: APP_USER, enrollmentId, activityId, providerBudgetLimiter: unthrottledBudget() });
 }
 
 /** A full, legitimate enrollment to ACTIVE — gives the account a second active passkey. */
@@ -230,7 +236,7 @@ function submitRemoval(w: World, target: FixtureAuthenticator, session: FixtureA
 }
 
 function reconcileRemoval(w: World, target: FixtureAuthenticator, attemptId: string) {
-  return revocation.reconcileRevocation({ config, registry: w.registry, revocations: w.revocations, appUserId: APP_USER, credentialId: target.credentialIdBase64Url, attemptId, deps: w.deps });
+  return revocation.reconcileRevocation({ config, registry: w.registry, revocations: w.revocations, appUserId: APP_USER, credentialId: target.credentialIdBase64Url, attemptId, providerBudgetLimiter: unthrottledBudget(), deps: w.deps });
 }
 
 /** Dispatches a removal whose delete activity FAILS (nothing deleted at Turnkey) → attempt 'blocked', target 'revoking'. */
@@ -844,5 +850,520 @@ describe("2g-H — the one-open index migration is fail-safe (schema.sql structu
       .filter((line) => !line.trim().startsWith("--"))
       .join("\n");
     expect(statementsOutside).not.toMatch(/backup_passkey_enrollments_one_(open|active)_per_account/);
+  });
+});
+
+
+// ================================================================== 3A-3 Stage 1: Turnkey reconcile budgets
+
+describe("3A-3 — authenticated Turnkey reconcile budgets", () => {
+  const ALLOW = { allowed: true } as const;
+  const deny = (retryAfterSeconds: number) => ({ allowed: false, retryAfterSeconds }) as const;
+  const BOOM = new Error("limiter must not be consulted");
+
+  /** Records every Turnkey READ and every limiter charge, in order, into one event list. */
+  function instrument(w: World) {
+    const events: string[] = [];
+    const getUsers = w.fake.getUsers;
+    const getActivity = w.fake.getActivity;
+    w.fake.getUsers = (async (input: { organizationId: string }) => {
+      events.push("getUsers");
+      return getUsers(input);
+    }) as typeof w.fake.getUsers;
+    w.fake.getActivity = (async (input: { organizationId: string; activityId: string }) => {
+      events.push("getActivity");
+      return getActivity(input);
+    }) as typeof w.fake.getActivity;
+    const budget = (...steps: unknown[]) => {
+      const scripted = scriptedBudget(...steps);
+      return {
+        calls: scripted.calls,
+        limiter: {
+          async consume(input: Parameters<typeof scripted.limiter.consume>[0]) {
+            events.push("charge");
+            return scripted.limiter.consume(input);
+          },
+        },
+      };
+    };
+    const reads = () => events.filter((e) => e !== "charge").length;
+    return { events, budget, reads };
+  }
+
+  const reconcileCreateWith = (w: World, enrollmentId: string, providerBudgetLimiter: Parameters<typeof pipeline.reconcileTurnkeyEnrollment>[0]["providerBudgetLimiter"], appUserId = APP_USER) =>
+    pipeline.reconcileTurnkeyEnrollment({ config, registry: w.registry, enrollments: w.enrollments, appUserId, enrollmentId, providerBudgetLimiter, deps: w.deps });
+  const confirmWith = (w: World, enrollmentId: string, activityId: string, providerBudgetLimiter: Parameters<typeof pipeline.confirmSigningProof>[0]["providerBudgetLimiter"], registry = w.registry) =>
+    pipeline.confirmSigningProof({ config, registry, enrollments: w.enrollments, appUserId: APP_USER, enrollmentId, activityId, providerBudgetLimiter });
+  const reconcileRemovalWith = (w: World, target: FixtureAuthenticator, attemptId: string, providerBudgetLimiter: Parameters<typeof revocation.reconcileRevocation>[0]["providerBudgetLimiter"]) =>
+    revocation.reconcileRevocation({ config, registry: w.registry, revocations: w.revocations, appUserId: APP_USER, credentialId: target.credentialIdBase64Url, attemptId, providerBudgetLimiter, deps: w.deps });
+
+  /** The state submit leaves after a lost first response: exact request recorded, no activity id, replay not yet claimed. */
+  async function toUnansweredCreate(w: World) {
+    const { enrollmentId, backup } = await toRegistered(w);
+    const signed = await signedCreate(w, enrollmentId);
+    await w.enrollments.transition({
+      id: enrollmentId,
+      from: "credential_registered",
+      to: "turnkey_enrollment_in_flight",
+      patch: { externalOutcome: "unknown", turnkeyRequestEndpoint: "create_authenticators", turnkeyRequestBody: signed.body, turnkeyRequestBodySha256: "h", turnkeyRequestTimestampMs: Number(JSON.parse(signed.body).timestampMs), turnkeyRequestStamp: JSON.stringify(signed.stamp) },
+    });
+    return { enrollmentId, backup };
+  }
+
+  /** A create Turnkey accepted but has not completed: in flight WITH an activity id. */
+  async function toPendingCreate(w: World) {
+    const { enrollmentId, backup } = await toRegistered(w);
+    w.fake.nextMode = "pending_activity";
+    expect((await submitCreate(w, enrollmentId, await signedCreate(w, enrollmentId))).outcome).toBe("pending");
+    w.fake.nextMode = "ok";
+    expect((await w.enrollments.findById(enrollmentId))?.turnkeyActivityId).toBeTruthy();
+    return { enrollmentId, backup };
+  }
+
+  describe("backup reconcile", () => {
+    it("database-only exits cost nothing and never consult the limiter", async () => {
+      const never = scriptedBudget(BOOM).limiter;
+      const readsOf: Array<() => number> = [];
+      const fresh = async () => {
+        const w = await world();
+        return { w };
+      };
+
+      // unknown, malformed and foreign enrollment ids; and a create nothing was dispatched for
+      const { w } = await fresh();
+      const { enrollmentId } = await toRegistered(w);
+      const first = instrument(w);
+      readsOf.push(first.reads);
+      expect(await reconcileCreateWith(w, "11111111-1111-4111-8111-111111111111", never)).toMatchObject({ outcome: "rejected" });
+      expect(await reconcileCreateWith(w, "not-a-uuid", never)).toMatchObject({ outcome: "rejected" });
+      expect(await reconcileCreateWith(w, enrollmentId, never, "someone-else")).toMatchObject({ outcome: "rejected" });
+      expect(await reconcileCreateWith(w, enrollmentId, never)).toMatchObject({ outcome: "rejected" });
+
+      // confirmed
+      const { w: w2 } = await fresh();
+      const created = await toCreated(w2);
+      const second = instrument(w2);
+      readsOf.push(second.reads);
+      expect(await reconcileCreateWith(w2, created.enrollmentId, never)).toEqual({ outcome: "confirmed" });
+
+      // removed: a pending backup whose removal completed
+      const { w: w3 } = await fresh();
+      const pendingBackup = await toCreated(w3);
+      const removal = await signedRemoval(w3, pendingBackup.backup, w3.primary);
+      expect((await submitRemoval(w3, pendingBackup.backup, w3.primary, removal.attemptId, removal.signed)).outcome).toBe("revoked");
+      expect((await w3.enrollments.findById(pendingBackup.enrollmentId))?.state).toBe("removed");
+      const third = instrument(w3);
+      readsOf.push(third.reads);
+      expect(await reconcileCreateWith(w3, pendingBackup.enrollmentId, never)).toMatchObject({ outcome: "rejected" });
+
+      // missing account
+      const { w: w4 } = await fresh();
+      const inFlight = await toPendingCreate(w4);
+      const fourth = instrument(w4);
+      readsOf.push(fourth.reads);
+      expect(await reconcileCreateWith({ ...w4, registry: createInMemoryRealAccountRegistry() }, inFlight.enrollmentId, never)).toMatchObject({ outcome: "rejected" });
+
+      expect(readsOf.map((reads) => reads())).toEqual([0, 0, 0, 0]);
+    });
+
+    it("an in-flight create with an activity id costs exactly ONE unit, charged BEFORE the first Turnkey read", async () => {
+      const w = await world();
+      const { enrollmentId } = await toPendingCreate(w);
+      const { events, budget } = instrument(w);
+      const { limiter, calls } = budget(ALLOW);
+      expect((await reconcileCreateWith(w, enrollmentId, limiter)).outcome).toBe("pending");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toEqual({ subject: APP_USER, policies: TURNKEY_RECONCILE_POLICIES });
+      expect(events[0]).toBe("charge");
+      expect(events.filter((e) => e === "charge")).toHaveLength(1);
+      expect(events).toContain("getActivity");
+    });
+
+    it("a blocked review costs ONE unit before its read; a denial reads nothing and reports the stored reason, flagged as deferred", async () => {
+      const w = await world();
+      const { enrollmentId } = await toRegistered(w);
+      const signed = await signedCreate(w, enrollmentId);
+      w.fake.nextMode = "fail_activity";
+      expect((await submitCreate(w, enrollmentId, signed)).outcome).toBe("blocked");
+      w.fake.nextMode = "ok";
+      const stored = (await w.enrollments.findById(enrollmentId))!;
+      expect(stored.state).toBe("blocked");
+
+      const { events, budget, reads } = instrument(w);
+      const denied = budget(deny(37));
+      expect(await reconcileCreateWith(w, enrollmentId, denied.limiter)).toEqual({ outcome: "blocked", reason: stored.blockReason, reconciliationDeferred: true, retryAfterSeconds: 37 });
+      expect(denied.calls).toHaveLength(1);
+      expect(reads()).toBe(0);
+      expect(await w.enrollments.findById(enrollmentId)).toEqual(stored);
+
+      const allowed = budget(ALLOW);
+      const result = await reconcileCreateWith(w, enrollmentId, allowed.limiter);
+      expect(result.outcome).toBe("blocked");
+      expect(result).not.toHaveProperty("reconciliationDeferred");
+      expect(allowed.calls).toHaveLength(1);
+      expect(events.slice(-2)).toEqual(["charge", "getUsers"]);
+    });
+
+    it("a legacy 'definitive_failure' moves into review for free (database only); the read that follows is the one charged unit", async () => {
+      const w = await world();
+      const { enrollmentId } = await toRegistered(w);
+      await w.enrollments.transition({ id: enrollmentId, from: "credential_registered", to: "credential_registered", patch: { externalOutcome: "definitive_failure" } });
+      const { events, budget } = instrument(w);
+      const { limiter, calls } = budget(ALLOW);
+      expect((await reconcileCreateWith(w, enrollmentId, limiter)).outcome).toBe("blocked");
+      expect((await w.enrollments.findById(enrollmentId))?.state).toBe("blocked");
+      expect(calls).toHaveLength(1);
+      expect(events).toEqual(["charge", "getUsers"]);
+
+      // Denied: the transition (database only) still happens, nothing is read.
+      const w2 = await world();
+      const r2 = await toRegistered(w2);
+      await w2.enrollments.transition({ id: r2.enrollmentId, from: "credential_registered", to: "credential_registered", patch: { externalOutcome: "definitive_failure" } });
+      const second = instrument(w2);
+      expect(await reconcileCreateWith(w2, r2.enrollmentId, second.budget(deny(5)).limiter)).toMatchObject({ outcome: "blocked", reconciliationDeferred: true, retryAfterSeconds: 5 });
+      expect((await w2.enrollments.findById(r2.enrollmentId))?.state).toBe("blocked");
+      expect(second.reads()).toBe(0);
+    });
+
+    it("the charge comes BEFORE the replay claim: a denial claims nothing and forwards nothing, and a later allowed reconcile still gets the one replay", async () => {
+      const w = await world();
+      const { enrollmentId } = await toUnansweredCreate(w);
+      w.fake.nextMode = "pending_activity";
+      const { events, budget, reads } = instrument(w);
+
+      const denied = budget(deny(90));
+      expect(await reconcileCreateWith(w, enrollmentId, denied.limiter)).toMatchObject({ outcome: "pending", reconciliationDeferred: true, retryAfterSeconds: 90 });
+      expect(creates(w)).toHaveLength(0);
+      expect(reads()).toBe(0);
+      expect(await w.enrollments.findById(enrollmentId)).toMatchObject({ state: "turnkey_enrollment_in_flight", turnkeyRequestReplayed: false, turnkeyActivityId: null, turnkeyRequestStamp: expect.any(String) });
+
+      const allowed = budget(ALLOW);
+      await reconcileCreateWith(w, enrollmentId, allowed.limiter);
+      expect(creates(w)).toHaveLength(1);
+      expect(allowed.calls).toHaveLength(1);
+      expect(events.indexOf("charge")).toBeLessThan(events.indexOf("getUsers") === -1 ? Infinity : events.indexOf("getUsers"));
+      expect(await w.enrollments.findById(enrollmentId)).toMatchObject({ turnkeyRequestReplayed: true });
+    });
+
+    it("a stale stored stamp is dropped BEFORE the charge, so a throttled account does not keep it — and the denial then reads nothing", async () => {
+      const w = await world();
+      const { enrollmentId } = await toUnansweredCreate(w);
+      w.clock.now += TURNKEY_STAMP_FRESHNESS_WINDOW_MS + 1;
+      const { budget, reads } = instrument(w);
+      expect(await reconcileCreateWith(w, enrollmentId, budget(deny(12)).limiter)).toMatchObject({ outcome: "pending", reconciliationDeferred: true, retryAfterSeconds: 12 });
+      expect(await w.enrollments.findById(enrollmentId)).toMatchObject({ state: "turnkey_enrollment_in_flight", turnkeyRequestStamp: null, turnkeyRequestReplayed: false });
+      expect(creates(w)).toHaveLength(0);
+      expect(reads()).toBe(0);
+    });
+
+    describe("freshness is judged AFTER admission (3A-3 follow-up, LOW-1)", () => {
+      /** A limiter whose admission "takes time": it records the charge, moves the fake clock by `elapsedMs`, then answers. */
+      function slowAdmission(w: World, elapsedMs: number, decision: { allowed: true } | { allowed: false; retryAfterSeconds: number }) {
+        const calls: number[] = [];
+        const limiter = {
+          async consume() {
+            calls.push(w.clock.now);
+            w.clock.now += elapsedMs;
+            return decision;
+          },
+        };
+        return { limiter, calls };
+      }
+      /** An unanswered create whose signed request is exactly `ageMs` old on the fake clock. */
+      async function unansweredCreateAged(w: World, ageMs: number) {
+        const created = await toUnansweredCreate(w);
+        const timestamp = (await w.enrollments.findById(created.enrollmentId))!.turnkeyRequestTimestampMs!;
+        w.clock.now = timestamp + ageMs;
+        return { ...created, timestamp };
+      }
+
+      it("a request that expires WHILE admission runs claims nothing and forwards nothing — and recovery is unchanged", async () => {
+        const w = await world();
+        const { enrollmentId } = await unansweredCreateAged(w, TURNKEY_STAMP_FRESHNESS_WINDOW_MS); // fresh: exactly on the boundary
+        w.fake.nextMode = "pending_activity";
+        const { reads } = instrument(w);
+        const { limiter, calls } = slowAdmission(w, 1, ALLOW); // admission outlasts the window by 1 ms
+
+        const result = await reconcileCreateWith(w, enrollmentId, limiter);
+        expect(calls).toHaveLength(1); // exactly one charge
+        expect(result).toEqual({ outcome: "pending", reason: expect.any(String) }); // truthful: still unconfirmed, not a deferral
+        expect(result).not.toHaveProperty("reconciliationDeferred");
+        expect(creates(w)).toHaveLength(0); // no replay forwarded
+        const stored = (await w.enrollments.findById(enrollmentId))!;
+        expect(stored).toMatchObject({ state: "turnkey_enrollment_in_flight", turnkeyRequestReplayed: false, turnkeyActivityId: null, turnkeyActivityStatus: null });
+        expect(reads()).toBe(1); // only the read-only discovery that an expired request has always got
+
+        // Existing recovery behavior: the next reconcile (the request is now plainly stale) drops the stamp, still never replays.
+        expect((await reconcileCreateWith(w, enrollmentId, scriptedBudget(ALLOW).limiter)).outcome).toBe("pending");
+        expect(await w.enrollments.findById(enrollmentId)).toMatchObject({ turnkeyRequestStamp: null, turnkeyRequestReplayed: false, turnkeyActivityId: null });
+        expect(creates(w)).toHaveLength(0);
+      });
+
+      it("a request that is still fresh when admission ends keeps its one replay — including exactly on the boundary", async () => {
+        const w = await world();
+        const { enrollmentId } = await unansweredCreateAged(w, TURNKEY_STAMP_FRESHNESS_WINDOW_MS - 1);
+        w.fake.nextMode = "pending_activity";
+        const { limiter, calls } = slowAdmission(w, 1, ALLOW); // ends at age === window, which the predicate still accepts
+        await reconcileCreateWith(w, enrollmentId, limiter);
+        expect(calls).toHaveLength(1);
+        expect(creates(w)).toHaveLength(1);
+        expect(await w.enrollments.findById(enrollmentId)).toMatchObject({ turnkeyRequestReplayed: true, turnkeyActivityId: expect.any(String) });
+
+        // and never a second one
+        await reconcileCreateWith(w, enrollmentId, scriptedBudget(ALLOW).limiter);
+        expect(creates(w)).toHaveLength(1);
+      });
+
+      it("the boundary is the existing predicate: age === window replays, age === window + 1 does not (no admission delay)", async () => {
+        const fresh = await world();
+        const a = await unansweredCreateAged(fresh, TURNKEY_STAMP_FRESHNESS_WINDOW_MS);
+        fresh.fake.nextMode = "pending_activity";
+        await reconcileCreateWith(fresh, a.enrollmentId, slowAdmission(fresh, 0, ALLOW).limiter);
+        expect(creates(fresh)).toHaveLength(1);
+
+        const stale = await world();
+        const b = await unansweredCreateAged(stale, TURNKEY_STAMP_FRESHNESS_WINDOW_MS + 1);
+        stale.fake.nextMode = "pending_activity";
+        await reconcileCreateWith(stale, b.enrollmentId, slowAdmission(stale, 0, ALLOW).limiter);
+        expect(creates(stale)).toHaveLength(0);
+        expect(await stale.enrollments.findById(b.enrollmentId)).toMatchObject({ turnkeyRequestReplayed: false, turnkeyRequestStamp: null });
+      });
+
+      it("a denied admission — slow or not — cannot consume the replay claim, and a later allowed reconcile inside the window still gets it", async () => {
+        const w = await world();
+        const { enrollmentId } = await unansweredCreateAged(w, 1_000);
+        w.fake.nextMode = "pending_activity";
+        const { limiter, calls } = slowAdmission(w, 500, { allowed: false, retryAfterSeconds: 30 });
+        expect(await reconcileCreateWith(w, enrollmentId, limiter)).toMatchObject({ outcome: "pending", reconciliationDeferred: true, retryAfterSeconds: 30 });
+        expect(calls).toHaveLength(1);
+        expect(creates(w)).toHaveLength(0);
+        expect(await w.enrollments.findById(enrollmentId)).toMatchObject({ turnkeyRequestReplayed: false, turnkeyActivityId: null });
+
+        await reconcileCreateWith(w, enrollmentId, scriptedBudget(ALLOW).limiter);
+        expect(creates(w)).toHaveLength(1);
+        expect(await w.enrollments.findById(enrollmentId)).toMatchObject({ turnkeyRequestReplayed: true });
+      });
+    });
+
+    it("a limiter that throws or answers nonsense fails closed: it rejects, with no claim, forward, read or transition", async () => {
+      for (const bad of [new Error("connection terminated"), undefined, null, { allowed: "yes" }, { allowed: false }, { allowed: false, retryAfterSeconds: 0 }, { allowed: false, retryAfterSeconds: 86_401 }]) {
+        const w = await world();
+        const { enrollmentId } = await toUnansweredCreate(w);
+        const { budget, reads } = instrument(w);
+        await expect(reconcileCreateWith(w, enrollmentId, budget(bad).limiter), JSON.stringify(bad)).rejects.toThrow();
+        expect(creates(w)).toHaveLength(0);
+        expect(reads()).toBe(0);
+        expect(await w.enrollments.findById(enrollmentId)).toMatchObject({ turnkeyRequestReplayed: false, turnkeyActivityId: null });
+      }
+    });
+
+    it("concurrent reconciles are charged independently, and still forward at most ONE replay", async () => {
+      const w = await world();
+      const { enrollmentId } = await toUnansweredCreate(w);
+      w.fake.nextMode = "pending_activity";
+      const { calls, limiter } = scriptedBudget(ALLOW);
+      await Promise.all([1, 2, 3, 4].map(() => reconcileCreateWith(w, enrollmentId, limiter)));
+      expect(calls).toHaveLength(4);
+      expect(creates(w)).toHaveLength(1);
+    });
+
+    it("real accounting: the 21st reconcile in a window is deferred, another account is unaffected", async () => {
+      const w = await world();
+      const { enrollmentId } = await toPendingCreate(w);
+      const limiter = realBudget();
+      for (let i = 0; i < 20; i += 1) expect(await reconcileCreateWith(w, enrollmentId, limiter)).not.toHaveProperty("reconciliationDeferred");
+      const denied = await reconcileCreateWith(w, enrollmentId, limiter);
+      expect(denied).toMatchObject({ outcome: "pending", reconciliationDeferred: true });
+      expect((denied as { retryAfterSeconds: number }).retryAfterSeconds).toBeGreaterThanOrEqual(1);
+      expect((await limiter.consume({ subject: "someone-else", policies: TURNKEY_RECONCILE_POLICIES })).allowed).toBe(true);
+    });
+
+    it("submit's own reconcile is not charged: it has no limiter, still reads Turnkey, and still reaches the same outcome", async () => {
+      const w = await world();
+      const { enrollmentId } = await toRegistered(w);
+      const { events } = instrument(w);
+      expect((await submitCreate(w, enrollmentId, await signedCreate(w, enrollmentId))).outcome).toBe("confirmed");
+      expect(events).not.toContain("charge");
+      expect(events).toContain("getActivity");
+    });
+  });
+
+  describe("signing confirmation", () => {
+    it("costs nothing for unknown, wrong-state, malformed-id and missing-account requests", async () => {
+      const never = scriptedBudget(BOOM).limiter;
+
+      const w = await world();
+      const created = await toCreated(w); // authenticator created, not yet login-verified: wrong state
+      const first = instrument(w);
+      expect((await confirmWith(w, "11111111-1111-4111-8111-111111111111", "act-1", never)).outcome).toBe("rejected");
+      expect(await confirmWith(w, created.enrollmentId, "act-1", never)).toMatchObject({ outcome: "rejected" });
+      expect(first.reads()).toBe(0);
+
+      const w2 = await world();
+      const verified = await toLoginVerified(w2);
+      const prepared = await pipeline.prepareSigningProof({ config, registry: w2.registry, enrollments: w2.enrollments, appUserId: APP_USER, enrollmentId: verified.enrollmentId });
+      expect(prepared.outcome).toBe("ready");
+      const second = instrument(w2);
+      for (const bad of ["", "has space", "a/b", "x".repeat(129), "act;drop", "ünï"]) {
+        expect(await confirmWith(w2, verified.enrollmentId, bad, never), bad).toMatchObject({ outcome: "rejected" });
+      }
+      expect(await confirmWith(w2, verified.enrollmentId, "act-1", never, createInMemoryRealAccountRegistry())).toMatchObject({ outcome: "rejected" });
+      expect(second.reads()).toBe(0);
+      expect((await w2.enrollments.findById(verified.enrollmentId))?.state).toBe("login_verified");
+    });
+
+    it("an already-active enrollment answers 'active' for free", async () => {
+      const w = await world();
+      const { enrollmentId } = await addActiveBackup(w);
+      expect(await confirmWith(w, enrollmentId, "whatever", scriptedBudget(BOOM).limiter)).toEqual({ outcome: "active" });
+    });
+
+    it("a well-formed request costs exactly ONE unit, charged before readTurnkeyActivity", async () => {
+      const w = await world();
+      const { enrollmentId } = await toLoginVerified(w);
+      const activityId = await seedProofB(w, enrollmentId);
+      const { events, budget } = instrument(w);
+      const { limiter, calls } = budget(ALLOW);
+      expect((await confirmWith(w, enrollmentId, activityId, limiter)).outcome).toBe("active");
+      expect(calls).toEqual([{ subject: APP_USER, policies: TURNKEY_RECONCILE_POLICIES }]);
+      expect(events).toEqual(["charge", "getActivity"]);
+    });
+
+    it("a denial reads nothing, leaves the enrollment and its challenge untouched, and the same activity id works later", async () => {
+      const w = await world();
+      const { enrollmentId } = await toLoginVerified(w);
+      const activityId = await seedProofB(w, enrollmentId);
+      const before = (await w.enrollments.findById(enrollmentId))!;
+      const { budget, reads } = instrument(w);
+      expect(await confirmWith(w, enrollmentId, activityId, budget(deny(300)).limiter)).toEqual({ outcome: "rate_limited", retryAfterSeconds: 300 });
+      expect(reads()).toBe(0);
+      expect(await w.enrollments.findById(enrollmentId)).toEqual(before);
+      expect(before.state).toBe("login_verified");
+      expect((await confirmWith(w, enrollmentId, activityId, budget(ALLOW).limiter)).outcome).toBe("active");
+    });
+
+    it("a limiter failure rejects with no Turnkey read and no state change", async () => {
+      for (const bad of [new Error("down"), null, { allowed: false, retryAfterSeconds: 1.5 }, { allowed: false, retryAfterSeconds: -1 }]) {
+        const w = await world();
+        const { enrollmentId } = await toLoginVerified(w);
+        const activityId = await seedProofB(w, enrollmentId);
+        const { budget, reads } = instrument(w);
+        await expect(confirmWith(w, enrollmentId, activityId, budget(bad).limiter)).rejects.toThrow();
+        expect(reads()).toBe(0);
+        expect((await w.enrollments.findById(enrollmentId))?.state).toBe("login_verified");
+      }
+    });
+
+    it("the activity ids the real flow and the fixtures produce are accepted by the validator", async () => {
+      const { isWellFormedActivityId } = await import("@/lib/real/server/payment-authorization");
+      for (const id of ["01a12620-1c25-7329-86d4-f8a86a1d8d90", "sign-3fa85f64", "activity-1", "act_ABC-123"]) expect(isWellFormedActivityId(id), id).toBe(true);
+    });
+  });
+
+  describe("removal reconcile", () => {
+    async function inFlightRemoval(w: World, mode: "pending_activity" | "lose_response_before_apply") {
+      const added = await addActiveBackup(w);
+      const { attemptId, signed } = await signedRemoval(w, added.backup, w.primary);
+      w.fake.nextMode = mode;
+      expect((await submitRemoval(w, added.backup, w.primary, attemptId, signed)).outcome).toBe("pending");
+      w.fake.nextMode = "ok";
+      return { ...added, attemptId };
+    }
+
+    it("R0 holds under the budget: with NO activity id the reconcile is free and silent — fresh, then stale — whatever the limiter would say", async () => {
+      for (const limiterStep of [deny(60), BOOM]) {
+        const w = await world();
+        const { backup, attemptId } = await inFlightRemoval(w, "lose_response_before_apply");
+        expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "dispatch_in_flight", turnkeyActivityId: null });
+        const forwardedBefore = w.fake.forwarded.length;
+        const { budget, reads } = instrument(w);
+        const limited = budget(limiterStep);
+
+        expect(await reconcileRemovalWith(w, backup, attemptId, limited.limiter)).toMatchObject({ outcome: "pending" });
+        expect(await reconcileRemovalWith(w, backup, attemptId, limited.limiter)).not.toHaveProperty("reconciliationDeferred");
+        w.clock.now += TURNKEY_STAMP_FRESHNESS_WINDOW_MS + 1;
+        expect(await reconcileRemovalWith(w, backup, attemptId, limited.limiter)).toMatchObject({ outcome: "blocked" });
+        expect(await w.revocations.findById(attemptId)).toMatchObject({ state: "blocked", failureReason: "no_activity_receipt", turnkeyRequestStamp: null });
+
+        expect(limited.calls).toHaveLength(0);
+        expect(reads()).toBe(0);
+        expect(w.fake.forwarded).toHaveLength(forwardedBefore);
+        expect(deletes(w)).toHaveLength(1);
+      }
+    });
+
+    it("with an activity id it costs exactly ONE unit, charged before the first getActivity", async () => {
+      const w = await world();
+      const { backup, attemptId } = await inFlightRemoval(w, "pending_activity");
+      const { events, budget } = instrument(w);
+      const { limiter, calls } = budget(ALLOW);
+      expect((await reconcileRemovalWith(w, backup, attemptId, limiter)).outcome).toBe("pending");
+      expect(calls).toEqual([{ subject: APP_USER, policies: TURNKEY_RECONCILE_POLICIES }]);
+      expect(events[0]).toBe("charge");
+      expect(events.filter((e) => e === "charge")).toHaveLength(1);
+      expect(events).toContain("getActivity");
+    });
+
+    it("a denial is a truthful pending: no read, no write, no forward, the target stays revoking", async () => {
+      const w = await world();
+      const { backup, attemptId } = await inFlightRemoval(w, "pending_activity");
+      const before = (await w.revocations.findById(attemptId))!;
+      const forwardedBefore = w.fake.forwarded.length;
+      const { budget, reads } = instrument(w);
+      const result = await reconcileRemovalWith(w, backup, attemptId, budget(deny(120)).limiter);
+      expect(result).toEqual({
+        outcome: "pending",
+        reason: expect.stringContaining("This passkey may still be able to authorize this account until removal is confirmed."),
+        reconciliationDeferred: true,
+        retryAfterSeconds: 120,
+      });
+      expect(reads()).toBe(0);
+      expect(w.fake.forwarded).toHaveLength(forwardedBefore);
+      expect(await w.revocations.findById(attemptId)).toEqual(before);
+      expect((await passkey(w, backup))?.status).toBe("revoking");
+    });
+
+    it("a limiter failure rejects with no read and no change", async () => {
+      for (const bad of [new Error("down"), undefined, { allowed: 0 }, { allowed: false, retryAfterSeconds: Number.NaN }]) {
+        const w = await world();
+        const { backup, attemptId } = await inFlightRemoval(w, "pending_activity");
+        const before = (await w.revocations.findById(attemptId))!;
+        const { budget, reads } = instrument(w);
+        await expect(reconcileRemovalWith(w, backup, attemptId, budget(bad).limiter)).rejects.toThrow();
+        expect(reads()).toBe(0);
+        expect(await w.revocations.findById(attemptId)).toEqual(before);
+      }
+    });
+
+    it("a terminal attempt, an unknown id and another account's attempt cost nothing", async () => {
+      const w = await world();
+      const added = await addActiveBackup(w);
+      const { attemptId, signed } = await signedRemoval(w, added.backup, w.primary);
+      const never = scriptedBudget(BOOM).limiter;
+      expect((await reconcileRemovalWith(w, added.backup, attemptId, never)).outcome).toBe("authorization_needed"); // not yet dispatched
+      expect((await reconcileRemovalWith(w, added.backup, "11111111-1111-4111-8111-111111111111", never)).outcome).toBe("rejected");
+      expect((await submitRemoval(w, added.backup, w.primary, attemptId, signed)).outcome).toBe("revoked");
+      expect((await reconcileRemovalWith(w, added.backup, attemptId, never)).outcome).toBe("revoked");
+    });
+
+    it("concurrent reconciles with an activity id are each charged once", async () => {
+      const w = await world();
+      const { backup, attemptId } = await inFlightRemoval(w, "pending_activity");
+      const { calls, limiter } = scriptedBudget(ALLOW);
+      const results = await Promise.all([1, 2, 3, 4, 5].map(() => reconcileRemovalWith(w, backup, attemptId, limiter)));
+      expect(results.every((r) => r.outcome === "pending")).toBe(true);
+      expect(calls).toHaveLength(5);
+      expect(deletes(w)).toHaveLength(1);
+    });
+
+    it("submit's own reconcile is not charged and still reaches the confirmed removal", async () => {
+      const w = await world();
+      const added = await addActiveBackup(w);
+      const { attemptId, signed } = await signedRemoval(w, added.backup, w.primary);
+      const { events } = instrument(w);
+      expect((await submitRemoval(w, added.backup, w.primary, attemptId, signed)).outcome).toBe("revoked");
+      expect(events).not.toContain("charge");
+      expect(events).toContain("getActivity");
+    });
   });
 });

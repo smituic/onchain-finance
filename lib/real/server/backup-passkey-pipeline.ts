@@ -12,6 +12,9 @@ import { readAccountProfileBestEffort } from "./handle-claim";
 import { DuplicateCredentialError, type RealAccountRecord, type RealAccountRegistry, type RealPasskeyRecord } from "./registry";
 import { isAbandonable, type BackupPasskeyEnrollment, type BackupPasskeyEnrollmentState, type BackupPasskeyEnrollmentStore, type EnrollmentExternalOutcome } from "./backup-passkey-enrollment";
 import type { RealServerConfig } from "./config";
+import { isWellFormedActivityId } from "./payment-authorization";
+import type { ProviderBudgetLimiter } from "./rate-limit";
+import { consumeTurnkeyReconcileBudget, type TurnkeyReconcileBudgetDecision } from "./turnkey-reconcile-budget";
 import { buildLoginOptions, buildRegistrationOptions, verifyLogin, verifyRegistration } from "./webauthn";
 import { listTurnkeyUserAuthenticators, matchAuthenticatorByCredentialId, readTurnkeyActivity, turnkeyPublicKeysEqual } from "./turnkey-discovery";
 import {
@@ -482,6 +485,24 @@ export type ReconcileEnrollmentResult =
   | { outcome: "rejected"; reason: string };
 
 /**
+ * An external reconcile the provider budget refused (3A-3). It carries the
+ * enrollment's CURRENT stored state — pending while the create is in flight,
+ * blocked (with its stored reason) while in review — and nothing else: no
+ * Turnkey read, replay, or transition happened, so it implies no finality.
+ */
+export type DeferredEnrollmentReconcile = { outcome: "pending" | "blocked"; reason: string; reconciliationDeferred: true; retryAfterSeconds: number };
+
+/**
+ * Private. Whether a reconcile may do provider work. The external entrypoint
+ * charges the Turnkey reconcile budget; submit's internal reconcile is already
+ * admitted. Never exported, never an optional parameter of an exported function.
+ */
+type ReconcileAdmission = () => Promise<TurnkeyReconcileBudgetDecision>;
+const ALREADY_ADMITTED: ReconcileAdmission = async () => ({ allowed: true });
+
+const CREATE_SENT_NOT_CONFIRMED = "Your authorization was sent but hasn't been confirmed yet. Check again shortly.";
+
+/**
  * Receives the browser's child-stamped createAuthenticators request.
  * Validates body + URL + stamp authorship, then — in ONE CAS, BEFORE any
  * external call — moves 'credential_registered' -> 'turnkey_enrollment_in_flight'
@@ -543,7 +564,9 @@ export async function submitTurnkeyAuthorization(input: {
   const forwarded = await forwardSignedRequest({ config: input.config, endpoint: "create_authenticators", body: signed.body, stamp: signed.stamp, fetchImpl: input.deps?.fetchImpl });
   if (forwarded.kind === "activity") await recordCreateActivity(input.enrollments, claimed.id, forwarded.activity);
 
-  return reconcileTurnkeyEnrollment({ ...input, deps: input.deps });
+  // Already admitted: this submit passed its own WebAuthn authorization and durable claim, and
+  // is not charged the reconcile budget (3A-3). The private core is the only way to skip it.
+  return reconcileEnrollmentCore({ ...input, deps: input.deps }, ALREADY_ADMITTED);
 }
 
 async function recordCreateActivity(enrollments: BackupPasskeyEnrollmentStore, id: string, activity: TurnkeyActivitySummary): Promise<void> {
@@ -582,6 +605,12 @@ function createResultAuthenticatorId(activity: TurnkeyActivitySummary): string |
  *     result's id.
  *   - No activity id after the replay window: an exact credential match in
  *     getUsers confirms; a miss is NOT proof of failure and stays pending.
+ *
+ * 3A-3: every path that reaches Turnkey costs exactly ONE reconcile-budget
+ * unit, charged BEFORE the replay claim and every read; a denial claims,
+ * forwards, reads and transitions nothing and is reported as a deferral of the
+ * stored state. Database-only exits cost nothing. Submit's own reconcile runs
+ * on the private already-admitted core and is never charged.
  */
 export async function reconcileTurnkeyEnrollment(input: {
   config: RealServerConfig;
@@ -589,8 +618,24 @@ export async function reconcileTurnkeyEnrollment(input: {
   enrollments: BackupPasskeyEnrollmentStore;
   appUserId: string;
   enrollmentId: string;
+  /** Required: an external reconcile is always charged (3A-3). Only a provider-bound request consumes a unit. */
+  providerBudgetLimiter: ProviderBudgetLimiter;
   deps?: TurnkeyDispatchDeps;
-}): Promise<ReconcileEnrollmentResult> {
+}): Promise<ReconcileEnrollmentResult | DeferredEnrollmentReconcile> {
+  return reconcileEnrollmentCore(input, () => consumeTurnkeyReconcileBudget(input.providerBudgetLimiter, input.appUserId));
+}
+
+async function reconcileEnrollmentCore(
+  input: {
+    config: RealServerConfig;
+    registry: RealAccountRegistry;
+    enrollments: BackupPasskeyEnrollmentStore;
+    appUserId: string;
+    enrollmentId: string;
+    deps?: TurnkeyDispatchDeps;
+  },
+  admit: ReconcileAdmission,
+): Promise<ReconcileEnrollmentResult | DeferredEnrollmentReconcile> {
   const deps = resolveDispatchDeps(input.deps);
   let enrollment = await loadOwnedEnrollment(input);
   if (!enrollment) return { outcome: "rejected", reason: "Unknown setup." };
@@ -606,21 +651,45 @@ export async function reconcileTurnkeyEnrollment(input: {
   const account = await input.registry.findAccountByAppUserId(input.appUserId);
   if (!account) return { outcome: "rejected", reason: "No account found for this session." };
 
+  // Every path from here reads Turnkey, so each is exactly ONE budget unit — charged BEFORE the
+  // replay claim and before any read. First, the database-only cleanup of a stale stored stamp
+  // (an in-flight create with no activity id, once its window has closed): it needs no budget, and
+  // a throttled account must not keep a live body-bound bearer credential in the database.
+  const noActivityYet = enrollment.state !== "blocked" && !enrollment.turnkeyActivityId;
+  const fresh = noActivityYet && enrollment.turnkeyRequestTimestampMs !== null && isFreshTimestamp(enrollment.turnkeyRequestTimestampMs, deps.now());
+  if (noActivityYet && !fresh && enrollment.turnkeyRequestStamp) {
+    await input.enrollments.transition({ id: enrollment.id, from: "turnkey_enrollment_in_flight", to: "turnkey_enrollment_in_flight", patch: { turnkeyRequestStamp: null } });
+    enrollment = (await input.enrollments.findById(enrollment.id)) ?? enrollment;
+  }
+
+  const admission = await admit();
+  if (!admission.allowed) {
+    // Nothing was claimed, forwarded, read or transitioned. Report the stored state, never a guess.
+    if (enrollment.state === "turnkey_authenticator_created" || enrollment.state === "login_verified" || enrollment.state === "active") return { outcome: "confirmed" };
+    if (enrollment.state === "removal_in_progress" || enrollment.state === "removed") return { outcome: "rejected", reason: SETUP_REMOVED };
+    if (enrollment.state === "blocked") {
+      return { outcome: "blocked", reason: enrollment.blockReason ?? "This setup needs manual review.", reconciliationDeferred: true, retryAfterSeconds: admission.retryAfterSeconds };
+    }
+    return { outcome: "pending", reason: CREATE_SENT_NOT_CONFIRMED, reconciliationDeferred: true, retryAfterSeconds: admission.retryAfterSeconds };
+  }
+
   if (enrollment.state === "blocked") {
     // Review: read-only discovery only — never a replay, never a new create,
     // and a miss is never read as absence.
     const reason = enrollment.blockReason ?? "This setup needs manual review.";
-    const match = matchAuthenticatorByCredentialId(await listTurnkeyUserAuthenticators({ config: input.config, subOrganizationId: account.subOrganizationId, turnkeyUserId: account.turnkeyUserId }), enrollment.newCredentialId);
+    const match = matchAuthenticatorByCredentialId(await listTurnkeyUserAuthenticators({ config: input.config, subOrganizationId: account.subOrganizationId, turnkeyUserId: account.turnkeyUserId }), enrollment.newCredentialId!);
     if (match.outcome !== "found" || !match.authenticator.publicKey) return { outcome: "blocked", reason };
     const recovered = await input.enrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: match.authenticator.authenticatorId, turnkeyAuthenticatorPublicKey: match.authenticator.publicKey, turnkeyActivityStatus: null });
     if (recovered) return { outcome: "confirmed" };
-    const fresh = await input.enrollments.findById(enrollment.id);
-    return fresh && fresh.state !== "blocked" && fresh.state !== "turnkey_enrollment_in_flight" ? { outcome: "confirmed" } : { outcome: "blocked", reason };
+    const freshEnrollment = await input.enrollments.findById(enrollment.id);
+    return freshEnrollment && freshEnrollment.state !== "blocked" && freshEnrollment.state !== "turnkey_enrollment_in_flight" ? { outcome: "confirmed" } : { outcome: "blocked", reason };
   }
 
   if (!enrollment.turnkeyActivityId) {
-    const fresh = enrollment.turnkeyRequestTimestampMs !== null && isFreshTimestamp(enrollment.turnkeyRequestTimestampMs, deps.now());
-    if (fresh && enrollment.turnkeyRequestBody && enrollment.turnkeyRequestStamp) {
+    // Admission may have waited (a database lock, say), so the window is judged AGAIN here, at
+    // the moment of the decision — the pre-admission `fresh` above only gates the stamp cleanup.
+    const freshAtReplay = enrollment.turnkeyRequestTimestampMs !== null && isFreshTimestamp(enrollment.turnkeyRequestTimestampMs, deps.now());
+    if (freshAtReplay && enrollment.turnkeyRequestBody && enrollment.turnkeyRequestStamp) {
       // 2g-H: durably claim THE one replay before sending it — only the first
       // false -> true wins, so concurrent reconciles forward at most one replay.
       const claimedReplay = await input.enrollments.claimReplay({ id: enrollment.id });
@@ -629,8 +698,6 @@ export async function reconcileTurnkeyEnrollment(input: {
         const replayed = await forwardSignedRequest({ config: input.config, endpoint: "create_authenticators", body: enrollment.turnkeyRequestBody, stamp, fetchImpl: deps.fetchImpl });
         if (replayed.kind === "activity") await recordCreateActivity(input.enrollments, enrollment.id, replayed.activity);
       }
-    } else if (!fresh && enrollment.turnkeyRequestStamp) {
-      await input.enrollments.transition({ id: enrollment.id, from: "turnkey_enrollment_in_flight", to: "turnkey_enrollment_in_flight", patch: { turnkeyRequestStamp: null } });
     }
     enrollment = (await input.enrollments.findById(enrollment.id)) ?? enrollment;
   }
@@ -639,7 +706,7 @@ export async function reconcileTurnkeyEnrollment(input: {
   if (!enrollment.turnkeyActivityId) {
     const match = matchAuthenticatorByCredentialId(await listTurnkeyUserAuthenticators({ config: input.config, subOrganizationId: account.subOrganizationId, turnkeyUserId: account.turnkeyUserId }), newCredentialId);
     if (match.outcome === "ambiguous") return blockEnrollment(input.enrollments, enrollment.id, "More than one Turnkey authenticator matches this passkey; manual review is required.");
-    if (match.outcome !== "found") return { outcome: "pending", reason: "Your authorization was sent but hasn't been confirmed yet. Check again shortly." };
+    if (match.outcome !== "found") return { outcome: "pending", reason: CREATE_SENT_NOT_CONFIRMED };
     return confirmEnrollmentCreated(input.enrollments, enrollment.id, match.authenticator, null);
   }
 
@@ -821,7 +888,8 @@ export async function prepareSigningProof(input: {
   return { outcome: "ready", subOrganizationId: account.subOrganizationId, ownerAddress: account.ownerAddress, rpId: input.config.rpId, authorizingCredentialId: enrollment.newCredentialId, digest };
 }
 
-export type ConfirmSigningProofResult = { outcome: "active" } | { outcome: "rejected"; reason: string };
+/** "rate_limited": the provider budget refused this confirmation (3A-3) before any Turnkey read — nothing changed and the same activity id may be sent again later. */
+export type ConfirmSigningProofResult = { outcome: "active" } | { outcome: "rejected"; reason: string } | { outcome: "rate_limited"; retryAfterSeconds: number };
 
 /**
  * Proof B, attributed to the NEW authenticator specifically. Owner-address
@@ -843,6 +911,8 @@ export async function confirmSigningProof(input: {
   appUserId: string;
   enrollmentId: string;
   activityId: string;
+  /** Required: a provider-bound confirmation is always charged (3A-3), once, before the Turnkey read. */
+  providerBudgetLimiter: ProviderBudgetLimiter;
 }): Promise<ConfirmSigningProofResult> {
   const enrollment = await loadOwnedEnrollment(input);
   if (!enrollment) return { outcome: "rejected", reason: "Unknown setup." };
@@ -852,6 +922,14 @@ export async function confirmSigningProof(input: {
   }
   const account = await input.registry.findAccountByAppUserId(input.appUserId);
   if (!account) return { outcome: "rejected", reason: "No account found for this session." };
+
+  // A malformed id can never name a real activity: refuse it without spending budget or a provider read.
+  if (!isWellFormedActivityId(input.activityId)) return { outcome: "rejected", reason: "The authorization proof could not be verified." };
+
+  // From here the request reads Turnkey: exactly ONE budget unit, charged before the read. A denial
+  // leaves the stored challenge and enrollment untouched and makes no provider call.
+  const admission = await consumeTurnkeyReconcileBudget(input.providerBudgetLimiter, input.appUserId);
+  if (!admission.allowed) return { outcome: "rate_limited", retryAfterSeconds: admission.retryAfterSeconds };
 
   const activity = await readTurnkeyActivity({ config: input.config, subOrganizationId: account.subOrganizationId, activityId: input.activityId });
   if (!activity || activity.id !== input.activityId || activity.organizationId !== account.subOrganizationId || activity.type !== SIGN_ACTIVITY_TYPE) {

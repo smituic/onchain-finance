@@ -1,13 +1,19 @@
 import type { NextRequest } from "next/server";
 import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readJsonBody, requireRealServerConfig } from "@/lib/real/server/http";
 import { reconcileRevocation } from "@/lib/real/server/passkey-revocation";
-import { getPasskeyRevocationStore, getRealAccountRegistry } from "@/lib/real/server/runtime";
+import { getPasskeyRevocationStore, getProviderBudgetLimiter, getRealAccountRegistry } from "@/lib/real/server/runtime";
 import { readPasskeySession } from "@/app/api/real/account/passkeys/session";
 
 /**
  * Returns 200 with an explicit { outcome, reason } for every legitimate
  * state (revoked / pending / authorization_needed / cancelled / blocked) — the client
  * branches on `outcome`. Only a refused request ("rejected") is non-2xx.
+ *
+ * A reconcile the per-account Turnkey budget refused (3A-3) is ALSO a 200: the
+ * plain "pending" state plus `reconciliationDeferred: true` and
+ * `retryAfterSeconds`. Nothing was read or changed, so the target stays
+ * revoking and no finality is implied; an ordinary answer carries neither
+ * field. A limiter failure is the generic 500 with no Turnkey call.
  */
 export async function POST(request: NextRequest, ctx: RouteContext<"/api/real/account/passkeys/[credentialId]/revoke/reconcile">) {
   if (!isRealModeEnabled()) return disabledResponse();
@@ -28,6 +34,7 @@ export async function POST(request: NextRequest, ctx: RouteContext<"/api/real/ac
       appUserId: authenticated.account.appUserId,
       credentialId,
       attemptId: body.attemptId,
+      providerBudgetLimiter: getProviderBudgetLimiter(),
     });
     if (result.outcome === "rejected") return jsonError(result.reason, 400);
     return Response.json(result);

@@ -1,7 +1,9 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RealPasskeysManager } from "@/components/real/real-passkeys-manager";
-import { BACKUP_REMOVAL_PENDING_NOTE, MAY_STILL_AUTHORIZE_NOTE, SETUP_INCOMPLETE_NOTE, SETUP_NEEDS_REVIEW_NOTE } from "@/lib/real/display/passkey-status";
+import { useRealPasskeysStore } from "@/lib/stores/real-passkeys-store";
+import { act } from "@testing-library/react";
+import { BACKUP_REMOVAL_PENDING_NOTE, MAY_STILL_AUTHORIZE_NOTE, SETUP_INCOMPLETE_NOTE, SETUP_NEEDS_REVIEW_NOTE, removalCheckPausedNote, removalCheckWaitBase } from "@/lib/real/display/passkey-status";
 
 type Passkey = Record<string, unknown>;
 
@@ -323,5 +325,108 @@ describe("RealPasskeysManager — 2g-H authority lifecycle", () => {
     expect(retry.getByRole("button", { name: "Authorize removal" })).toBeTruthy();
     expect(retry.queryByRole("button", { name: "Try removal again" })).toBeNull();
     expect(retry.queryByText(/^Active/)).toBeNull();
+  });
+});
+
+
+describe("RealPasskeysManager — 3A-3 shared Turnkey-check wait", () => {
+  afterEach(() => useRealPasskeysStore.getState().reset());
+
+  const rows = () => [
+    passkey({}),
+    passkey({ credentialId: "cred-b", role: "backup", status: "revoking", isCurrentSession: false, removal: { attemptId: "r1", state: "dispatch_in_flight", ownedBySession: true } }),
+    passkey({ credentialId: "cred-c", role: "backup", isCurrentSession: false }),
+  ];
+
+  it("disables ONLY 'Check removal status' while the wait runs; Remove, Rename and the backup controls stay available; it re-enables when the wait clears", async () => {
+    stubServer(rows(), { id: "e1", state: "blocked", externalOutcome: "unknown", abandonable: false, blockReason: "needs review" });
+    render(<RealPasskeysManager />);
+    const check = await screen.findByRole("button", { name: "Check removal status" });
+    expect((check as HTMLButtonElement).disabled).toBe(false);
+
+    act(() => useRealPasskeysStore.setState({ isTurnkeyCheckWaiting: true, turnkeyCheckWaitSeconds: 120 }));
+    expect((screen.getByRole("button", { name: "Check removal status" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Remove" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getAllByRole("button", { name: "Rename" })[0] as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Check backup setup again" }) as HTMLButtonElement).disabled).toBe(false);
+    // The truthful state and its warning stay on screen.
+    expect(screen.getByText("Removal submitted — not yet confirmed")).toBeTruthy();
+    expect(screen.getByText(MAY_STILL_AUTHORIZE_NOTE)).toBeTruthy();
+
+    act(() => useRealPasskeysStore.setState({ isTurnkeyCheckWaiting: false, turnkeyCheckWaitSeconds: null }));
+    expect((screen.getByRole("button", { name: "Check removal status" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("a click on the disabled button sends nothing", async () => {
+    stubServer(rows(), null);
+    render(<RealPasskeysManager />);
+    const check = await screen.findByRole("button", { name: "Check removal status" });
+    act(() => useRealPasskeysStore.setState({ isTurnkeyCheckWaiting: true, turnkeyCheckWaitSeconds: 120 }));
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const before = fetchMock.mock.calls.length;
+    fireEvent.click(check);
+    expect(fetchMock.mock.calls.length).toBe(before);
+  });
+});
+
+
+describe("RealPasskeysManager — LOW-2: why the removal check is paused", () => {
+  afterEach(() => useRealPasskeysStore.getState().reset());
+
+  const rows = () => [
+    passkey({}),
+    passkey({ credentialId: "cred-b", role: "backup", status: "revoking", isCurrentSession: false, removal: { attemptId: "r1", state: "dispatch_in_flight", ownedBySession: true } }),
+    passkey({ credentialId: "cred-c", role: "backup", isCurrentSession: false }),
+  ];
+
+  it("a wait that started elsewhere explains the disabled check beside it, accessibly, keeps the warning, and leaves Remove alone — then the note ends with the wait", async () => {
+    stubServer(rows(), null);
+    render(<RealPasskeysManager />);
+    await screen.findByRole("button", { name: "Check removal status" });
+
+    act(() => useRealPasskeysStore.setState({ isTurnkeyCheckWaiting: true, turnkeyCheckWaitSeconds: 300 }));
+    const check = screen.getByRole("button", { name: "Check removal status" }) as HTMLButtonElement;
+    expect(check.disabled).toBe(true);
+    const note = screen.getByText(removalCheckPausedNote(300));
+    expect(note.textContent).toContain("5 minutes");
+    expect(check.getAttribute("aria-describedby")).toBe(note.id);
+    expect(note.id).toBeTruthy();
+    expect(screen.getByText(MAY_STILL_AUTHORIZE_NOTE)).toBeTruthy(); // the warning is still there
+    expect(document.body.textContent).not.toMatch(/turnkey|removed\b.*confirmed|has been removed/i);
+    expect((screen.getByRole("button", { name: "Remove" }) as HTMLButtonElement).disabled).toBe(false);
+
+    act(() => useRealPasskeysStore.setState({ isTurnkeyCheckWaiting: false, turnkeyCheckWaitSeconds: null }));
+    expect(screen.queryByText(removalCheckPausedNote(300))).toBeNull();
+    const after = screen.getByRole("button", { name: "Check removal status" }) as HTMLButtonElement;
+    expect(after.disabled).toBe(false);
+    expect(after.getAttribute("aria-describedby")).toBeNull();
+    expect(screen.getByText("Removal submitted — not yet confirmed")).toBeTruthy();
+  });
+
+  it("a long wait is stated honestly, as hours", async () => {
+    stubServer(rows(), null);
+    render(<RealPasskeysManager />);
+    await screen.findByRole("button", { name: "Check removal status" });
+    act(() => useRealPasskeysStore.setState({ isTurnkeyCheckWaiting: true, turnkeyCheckWaitSeconds: 86_400 }));
+    expect(screen.getByText(removalCheckPausedNote(86_400)).textContent).toContain("24 hours");
+  });
+
+  it("when the row's own message already carries the wait, the note is not repeated; once the wait ends the row keeps the truthful base", async () => {
+    stubServer(rows(), null);
+    render(<RealPasskeysManager />);
+    await screen.findByRole("button", { name: "Check removal status" });
+    const base = removalCheckWaitBase(undefined);
+    act(() =>
+      useRealPasskeysStore.setState({
+        isTurnkeyCheckWaiting: true,
+        turnkeyCheckWaitSeconds: 120,
+        removalMessage: { credentialId: "cred-b", text: `${base} We can't check again just yet. You can check again in about 2 minutes.`, waitBase: base },
+      }),
+    );
+    expect(screen.queryByText(removalCheckPausedNote(120))).toBeNull();
+    expect(screen.getByText(/We can't check again just yet/)).toBeTruthy();
+    act(() => useRealPasskeysStore.setState({ isTurnkeyCheckWaiting: false, turnkeyCheckWaitSeconds: null, removalMessage: { credentialId: "cred-b", text: base } }));
+    expect(screen.queryByText(/We can't check again just yet/)).toBeNull();
+    expect(screen.getByText(base)).toBeTruthy();
   });
 });

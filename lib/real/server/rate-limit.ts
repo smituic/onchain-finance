@@ -41,8 +41,9 @@
  * window. Its consumers are the two chain-read routes' resolvers (Slice
  * 3A-1, policy from server/chain-read-budget.ts) and the payment-submit
  * resolver (Slice 3A-2, policy from server/pay-submit-budget.ts) — development
- * values, not production limits. The turnkey_reconcile family has no consumer
- * yet.
+ * values, not production limits. The turnkey_reconcile family's consumers are
+ * the two backup-passkey reconcile/confirm reads and the passkey-removal
+ * reconcile (Slice 3A-3, policy from server/turnkey-reconcile-budget.ts).
  */
 export const RATE_LIMIT_BUCKETS = ["pay_prepare_day", "pay_prepare_short", "recipient_probe_day", "recipient_probe_short"] as const;
 export type RateLimitBucket = (typeof RATE_LIMIT_BUCKETS)[number];

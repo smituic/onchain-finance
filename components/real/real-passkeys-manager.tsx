@@ -15,6 +15,7 @@ import {
   TOTAL_LOSS_NOTE,
   mayStillAuthorize,
   passkeyDisplayState,
+  removalCheckPausedNote,
   passkeyRoleLabel,
   passkeyStateLabel,
 } from "@/lib/real/display/passkey-status";
@@ -41,6 +42,8 @@ export function RealPasskeysManager() {
   const removalBusyCredentialId = useRealPasskeysStore((s) => s.removalBusyCredentialId);
   const removalMessage = useRealPasskeysStore((s) => s.removalMessage);
   const removalError = useRealPasskeysStore((s) => s.removalError);
+  const isTurnkeyCheckWaiting = useRealPasskeysStore((s) => s.isTurnkeyCheckWaiting);
+  const turnkeyCheckWaitSeconds = useRealPasskeysStore((s) => s.turnkeyCheckWaitSeconds);
   const refresh = useRealPasskeysStore((s) => s.refresh);
   const continueBackupSetup = useRealPasskeysStore((s) => s.continueBackupSetup);
   const abandonBackupSetup = useRealPasskeysStore((s) => s.abandonBackupSetup);
@@ -99,6 +102,7 @@ export function RealPasskeysManager() {
           const rowBusy = removalBusyCredentialId === passkey.credentialId;
           const isEditing = editing?.credentialId === passkey.credentialId;
           const renaming = renameBusyCredentialId === passkey.credentialId;
+          const rowOwnsWaitCopy = removalMessage?.credentialId === passkey.credentialId && removalMessage.waitBase !== undefined;
           const awaitingMyAuthorization = passkey.removal?.state === "authorization_needed" && passkey.removal.ownedBySession;
           // An incomplete setup that already has wallet access is removable by
           // the (active) passkey this browser is signed in with.
@@ -193,9 +197,23 @@ export function RealPasskeysManager() {
                 </div>
               ) : null}
               {passkey.removal && state === "removal_submitted" ? (
-                <Button variant="outline" size="sm" disabled={busy} onClick={() => void checkRemoval(passkey.credentialId, passkey.removal!.attemptId)}>
-                  {rowBusy ? "Checking…" : "Check removal status"}
-                </Button>
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busy || isTurnkeyCheckWaiting}
+                    aria-describedby={isTurnkeyCheckWaiting && !rowOwnsWaitCopy ? `removal-check-paused-${passkey.credentialId}` : undefined}
+                    onClick={() => void checkRemoval(passkey.credentialId, passkey.removal!.attemptId)}
+                  >
+                    {rowBusy ? "Checking…" : "Check removal status"}
+                  </Button>
+                  {/* The shared wait may have started elsewhere (backup setup, signing); say why this is paused. Skipped when this row's own message already says it. */}
+                  {isTurnkeyCheckWaiting && !rowOwnsWaitCopy ? (
+                    <p id={`removal-check-paused-${passkey.credentialId}`} className="text-xs text-muted-foreground">
+                      {removalCheckPausedNote(turnkeyCheckWaitSeconds ?? 60)}
+                    </p>
+                  ) : null}
+                </>
               ) : null}
             </li>
           );
