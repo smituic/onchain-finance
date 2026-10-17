@@ -1,15 +1,25 @@
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { unstable_doesMiddlewareMatch, unstable_getResponseFromNextConfig } from "next/experimental/testing/server";
-import { checkRealApiRequest } from "@/lib/real/server/request-gate";
+import { REAL_API_MAX_BODY_BYTES, checkRealApiRequest } from "@/lib/real/server/request-gate";
 import { config as proxyConfig, proxy } from "@/proxy";
 import nextConfig from "@/next.config";
 
 const ORIGIN = "http://localhost:3000";
 const ENV = { NEXT_PUBLIC_REAL_MODE_ENABLED: "true", NEXT_PUBLIC_REAL_ORIGIN: `${ORIGIN}, https://real.example` };
 
-function request(path: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) {
-  return new Request(`${ORIGIN}${path}`, { method: init.method ?? "POST", headers: init.headers, body: init.body });
+/**
+ * A request as a browser would send it. A string body always travels with its
+ * Content-Length, so the helper adds it (3B-2 requires it on body routes) unless
+ * the test supplies one itself or sets `noLength` to model a request without it.
+ */
+function request(path: string, init: { method?: string; headers?: Record<string, string>; body?: string; noLength?: boolean } = {}) {
+  const headers: Record<string, string> = { ...init.headers };
+  const hasLength = Object.keys(headers).some((name) => name.toLowerCase() === "content-length");
+  if (init.body !== undefined && !init.noLength && !hasLength) headers["content-length"] = String(new TextEncoder().encode(init.body).byteLength);
+  return new Request(`${ORIGIN}${path}`, { method: init.method ?? "POST", headers, body: init.body });
 }
 
 const JSON_HEADERS = { "content-type": "application/json" };
@@ -427,7 +437,7 @@ describe("S4 proxy.ts wiring", () => {
     expect(refused?.status).toBe(403);
     const plain = proxy(new NextRequest(`${ORIGIN}${REGISTER_VERIFY}`, { method: "POST", headers: { "content-type": "text/plain", origin: ORIGIN }, body: "{}" }));
     expect(plain?.status).toBe(415);
-    expect(proxy(new NextRequest(`${ORIGIN}${LOGIN_VERIFY}`, { method: "POST", headers: { ...JSON_HEADERS, origin: ORIGIN }, body: "{}" }))).toBeUndefined();
+    expect(proxy(new NextRequest(`${ORIGIN}${LOGIN_VERIFY}`, { method: "POST", headers: { ...JSON_HEADERS, origin: ORIGIN, "content-length": "2" }, body: "{}" }))).toBeUndefined();
   });
 });
 
@@ -439,6 +449,291 @@ describe("S4 static security headers (F5) — next.config.ts as Next applies it"
       expect(response.headers.get("x-frame-options"), url).toBe("DENY");
       expect(response.headers.get("x-content-type-options"), url).toBe("nosniff");
       expect(response.headers.get("strict-transport-security"), url).toBeNull();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Milestone 3B-2: the declared-length gate (411 / 400 / 413) and the shared
+// 10 MiB ceiling.
+// ---------------------------------------------------------------------------
+
+const LIMIT = REAL_API_MAX_BODY_BYTES;
+const root = path.resolve(__dirname, "../../..");
+
+/** Every route file under app/api/real, as { file, url, methods } — the URL with `[x]` segments filled in. */
+function discoverRoutes() {
+  const found: { file: string; url: string; methods: string[] }[] = [];
+  const walk = (directory: string) => {
+    for (const entry of readdirSync(directory)) {
+      const full = path.join(directory, entry);
+      if (statSync(full).isDirectory()) walk(full);
+      else if (entry === "route.ts") {
+        const source = readFileSync(full, "utf8");
+        const methods = [...source.matchAll(/export async function (GET|HEAD|OPTIONS|POST|PUT|PATCH|DELETE)\(/g)].map((match) => match[1]!);
+        const relative = path.relative(root, full).split(path.sep).join("/");
+        const url = "/" + relative.replace(/^app\//, "").replace(/\/route\.ts$/, "").replace(/\[[^\]]+\]/g, "seg-1");
+        found.push({ file: relative, url, methods });
+      }
+    }
+  };
+  walk(path.join(root, "app/api/real"));
+  return found;
+}
+
+const UNSAFE = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const unsafeRoutes = discoverRoutes().flatMap((route) => route.methods.filter((method) => UNSAFE.has(method)).map((method) => ({ ...route, method })));
+/** The six route files that take no body (the gate's BODYLESS_ROUTES). */
+const BODYLESS_FILES = [
+  "app/api/real/account/register/options/route.ts",
+  "app/api/real/account/login/options/route.ts",
+  "app/api/real/account/passkeys/backup/step-up/options/route.ts",
+  "app/api/real/account/passkeys/[credentialId]/revoke/options/route.ts",
+  "app/api/real/payments/[id]/cancel/route.ts",
+  "app/api/real/session/route.ts",
+];
+const bodyRoutes = unsafeRoutes.filter((route) => !BODYLESS_FILES.includes(route.file));
+const bodylessRoutes = unsafeRoutes.filter((route) => BODYLESS_FILES.includes(route.file));
+
+const gateAt = (url: string, method: string, headers: Record<string, string>) => checkRealApiRequest(new Request(`${ORIGIN}${url}`, { method, headers }), ENV);
+const json = (extra: Record<string, string> = {}) => ({ ...JSON_HEADERS, origin: ORIGIN, ...extra });
+const LENGTH_REQUIRED = { error: "Unsupported request.", code: "length_required" };
+const TOO_LARGE = { error: "This request is too large.", code: "request_too_large" };
+const NOT_ALLOWED = { error: "Request not allowed." };
+
+describe("3B-2 classification — which routes the length rule covers", () => {
+  it("the repository has exactly 22 body-reading unsafe routes and 6 bodyless ones, and the gate's classification agrees with the files", () => {
+    expect(bodyRoutes).toHaveLength(22);
+    expect(bodylessRoutes).toHaveLength(6);
+    expect(unsafeRoutes).toHaveLength(28);
+    // Every route file the test treats as body-reading really calls a JSON body reader; none of the bodyless ones does.
+    for (const route of unsafeRoutes) {
+      const reads = /readJsonBody|readBoundedJsonBody/.test(readFileSync(path.join(root, route.file), "utf8"));
+      expect(reads, route.file).toBe(!BODYLESS_FILES.includes(route.file));
+    }
+  });
+
+  it.each(bodyRoutes)("A. $method $url (a body route) is subject to the length rule", (route) => {
+    const response = gateAt(route.url, route.method, json());
+    expect(response?.status).toBe(411);
+  });
+
+  it.each(bodylessRoutes)("B. $method $url (bodyless) stays exempt: no Content-Type and no Content-Length needed", (route) => {
+    expect(gateAt(route.url, route.method, { origin: ORIGIN })).toBeNull();
+    expect(gateAt(route.url, route.method, {})).toBeNull();
+    // ...but the Origin and Fetch Metadata checks still apply to them.
+    expect(gateAt(route.url, route.method, { origin: "https://evil.example" })?.status).toBe(403);
+  });
+
+  it("B. DELETE /api/real/session works with no Content-Length and with an explicit zero", () => {
+    expect(gateAt("/api/real/session", "DELETE", { origin: ORIGIN })).toBeNull();
+    expect(gateAt("/api/real/session", "DELETE", { origin: ORIGIN, "content-length": "0" })).toBeNull();
+  });
+
+  it("C. GET, HEAD and OPTIONS are untouched by the length rule, with or without a length", () => {
+    for (const method of ["GET", "HEAD", "OPTIONS"]) {
+      for (const url of ["/api/real/session", "/api/real/payments/prepare", "/api/real/account/profile"]) {
+        expect(gateAt(url, method, { origin: ORIGIN }), `${method} ${url}`).toBeNull();
+        expect(gateAt(url, method, { origin: ORIGIN, "content-length": String(LIMIT + 1) }), `${method} ${url} oversized`).toBeNull();
+        expect(gateAt(url, method, { origin: ORIGIN, "content-length": "garbage" }), `${method} ${url} garbage`).toBeNull();
+      }
+    }
+  });
+
+  it("a body route nobody has written yet is covered by default (any path not on the bodyless list)", () => {
+    expect(gateAt("/api/real/future/new-thing", "POST", json())?.status).toBe(411);
+    expect(gateAt("/api/real/future/new-thing", "PUT", json())?.status).toBe(411);
+    expect(gateAt("/api/real/future/new-thing", "DELETE", json())?.status).toBe(411);
+  });
+
+  it("with Real Mode disabled the gate still steps aside completely (routes answer 404 themselves)", () => {
+    expect(checkRealApiRequest(new Request(`${ORIGIN}/api/real/payments/prepare`, { method: "POST", headers: JSON_HEADERS }), {})).toBeNull();
+  });
+});
+
+describe("3B-2 Content-Length — missing, malformed, unsafe, too large, and at the limit", () => {
+  it("D/E. a missing Content-Length is HTTP 411 with the exact body, no Retry-After and nothing retryable", async () => {
+    const response = gateAt("/api/real/payments/prepare", "POST", json())!;
+    expect(response.status).toBe(411);
+    expect(await response.json()).toEqual(LENGTH_REQUIRED);
+    expect(response.headers.get("retry-after")).toBeNull();
+    expect(response.headers.get("content-type")).toContain("application/json");
+  });
+
+  it("D. a chunked request (Transfer-Encoding, no length) to a body route is refused the same way", () => {
+    expect(gateAt("/api/real/payments/submit", "POST", json({ "transfer-encoding": "chunked" }))?.status).toBe(411);
+    // A request that carries a length is judged by that length, not by how the client framed it.
+    expect(gateAt("/api/real/payments/submit", "POST", json({ "transfer-encoding": "chunked", "content-length": "10" }))).toBeNull();
+  });
+
+  it("F. a declared length of exactly 10,485,760 bytes passes the gate on every body route", () => {
+    expect(LIMIT).toBe(10_485_760);
+    for (const route of bodyRoutes) expect(gateAt(route.url, route.method, json({ "content-length": String(LIMIT) })), route.url).toBeNull();
+  });
+
+  it("F. Content-Length: 0 passes the gate; the route's own validation then rejects the empty body", () => {
+    for (const route of bodyRoutes) expect(gateAt(route.url, route.method, json({ "content-length": "0" })), route.url).toBeNull();
+  });
+
+  it("F. leading zeros are plain decimal digits: they are read as the number they spell", () => {
+    expect(gateAt("/api/real/payments/prepare", "POST", json({ "content-length": "0010485760" }))).toBeNull();
+    expect(gateAt("/api/real/payments/prepare", "POST", json({ "content-length": "0010485761" }))?.status).toBe(413);
+  });
+
+  it("G/H. one byte above the ceiling is HTTP 413 with the exact body on every body route, and nothing is echoed or retryable", async () => {
+    for (const route of bodyRoutes) {
+      const response = gateAt(route.url, route.method, json({ "content-length": String(LIMIT + 1) }))!;
+      expect(response.status, route.url).toBe(413);
+      expect(await response.json(), route.url).toEqual(TOO_LARGE);
+      expect(response.headers.get("retry-after"), route.url).toBeNull();
+    }
+    expect(gateAt("/api/real/payments/prepare", "POST", json({ "content-length": "9007199254740991" }))?.status).toBe(413);
+  });
+
+  it("I. anything but plain decimal digits is HTTP 400 in the gate's own convention", async () => {
+    for (const bad of ["abc", "-1", "+5", "1e3", "5.0", "0x10", "", "5,5", "5, 5", "1_000", "\u00b2"]) {
+      const response = gateAt("/api/real/payments/prepare", "POST", json({ "content-length": bad }));
+      expect(response?.status, JSON.stringify(bad)).toBe(400);
+      expect(await response?.json(), JSON.stringify(bad)).toEqual(NOT_ALLOWED);
+    }
+  });
+
+  it("J. a value that is not a safe integer is HTTP 400, even though it is all digits", () => {
+    for (const unsafe of ["9007199254740992", "9007199254740993", "99999999999999999999", "1".repeat(400)]) {
+      expect(gateAt("/api/real/payments/prepare", "POST", json({ "content-length": unsafe }))?.status, unsafe.slice(0, 24)).toBe(400);
+    }
+  });
+
+  it("K. a duplicated or combined Content-Length cannot slip through: two headers, even equal ones, are a list and are refused", () => {
+    const duplicated = new Headers({ ...json() });
+    duplicated.append("content-length", "5");
+    duplicated.append("content-length", "5");
+    expect(checkRealApiRequest(new Request(`${ORIGIN}/api/real/payments/prepare`, { method: "POST", headers: duplicated }), ENV)?.status).toBe(400);
+
+    const mixed = new Headers({ ...json() });
+    mixed.append("content-length", "5");
+    mixed.append("content-length", String(LIMIT + 1));
+    expect(checkRealApiRequest(new Request(`${ORIGIN}/api/real/payments/prepare`, { method: "POST", headers: mixed }), ENV)?.status).toBe(400);
+
+    for (const combined of ["5, 5", "5,5", `5, ${LIMIT + 1}`, `${LIMIT + 1}, 5`, "5 5"]) {
+      expect(gateAt("/api/real/payments/prepare", "POST", json({ "content-length": combined }))?.status, combined).toBe(400);
+    }
+  });
+
+  it("Q. no refusal from the new rule is retryable: no Retry-After header and no `retryable` field", async () => {
+    for (const headers of [json(), json({ "content-length": "x" }), json({ "content-length": String(LIMIT + 1) })]) {
+      const response = gateAt("/api/real/payments/prepare", "POST", headers)!;
+      expect(response.headers.get("retry-after")).toBeNull();
+      expect(Object.keys((await response.json()) as object)).not.toContain("retryable");
+    }
+  });
+});
+
+describe("3B-2 ordering — the existing checks run first", () => {
+  it("L. a foreign Origin or cross-site fetch is 403 whatever the length", () => {
+    for (const length of [undefined, "0", "bad", String(LIMIT + 1)]) {
+      const lengthHeader: Record<string, string> = length === undefined ? {} : { "content-length": length };
+      expect(gateAt("/api/real/payments/prepare", "POST", { ...JSON_HEADERS, origin: "https://evil.example", ...lengthHeader })?.status, String(length)).toBe(403);
+      expect(gateAt("/api/real/payments/prepare", "POST", { ...JSON_HEADERS, "sec-fetch-site": "cross-site", ...lengthHeader })?.status, String(length)).toBe(403);
+    }
+  });
+
+  it("L. a non-JSON Content-Type is 415 whatever the length", () => {
+    for (const length of [undefined, "0", "bad", String(LIMIT + 1)]) {
+      const lengthHeader: Record<string, string> = length === undefined ? {} : { "content-length": length };
+      expect(gateAt("/api/real/payments/prepare", "POST", { "content-type": "text/plain", origin: ORIGIN, ...lengthHeader })?.status, String(length)).toBe(415);
+      expect(gateAt("/api/real/payments/prepare", "POST", { origin: ORIGIN, ...lengthHeader })?.status, String(length)).toBe(415);
+    }
+  });
+
+  it("L. 403 beats 415 beats the length rule, in that order", () => {
+    expect(gateAt("/api/real/payments/prepare", "POST", { "content-type": "text/plain", origin: "https://evil.example" })?.status).toBe(403);
+    expect(gateAt("/api/real/payments/prepare", "POST", { "content-type": "text/plain", origin: ORIGIN, "content-length": String(LIMIT + 1) })?.status).toBe(415);
+  });
+});
+
+describe("3B-2 paths — encoded and unusual spellings cannot reach a body route as if it were bodyless", () => {
+  it("M. every spelling the URL parser resolves to a body route still needs a length", () => {
+    const spellings = [
+      "/api/real/payments/%70repare",
+      "/api/real/payments/prepare/",
+      "/api/real//payments//prepare",
+      "/api/real/payments/./prepare",
+      "/api/real/payments/x/../prepare",
+      "/api/real/payments/%2e%2e/payments/prepare",
+      "/api/real/payments/%2E%2E/payments/prepare",
+      "/api/real/account/login/%76erify",
+      "/api/real/account/passkeys/seg-1/revoke/%73ubmit",
+      "/API/REAL/PAYMENTS/PREPARE",
+      "/api/real/session/",
+      "/api/real/session%2F",
+      "/api/real/payments/seg-1/cancel/",
+      "/api/real/payments/seg-1/cancel/extra",
+      "/api/real/account/register/options/",
+      "/api/real/account/register/options/more",
+      "/api/real/account/login/options/..%2fverify",
+    ];
+    for (const spelling of spellings) {
+      const resolved = new URL(`${ORIGIN}${spelling}`).pathname;
+      const isExempt = unsafeRoutes.some((route) => BODYLESS_FILES.includes(route.file) && route.method === "POST" && route.url === resolved);
+      if (isExempt) continue; // resolves to a genuinely bodyless route: nothing to bypass
+      expect(gateAt(spelling, "POST", json())?.status, `${spelling} -> ${resolved}`).toBe(411);
+    }
+  });
+
+  it("M. dot-segments that resolve onto a body route are judged on the resolved path", () => {
+    expect(new URL(`${ORIGIN}/api/real/account/login/options/../verify`).pathname).toBe("/api/real/account/login/verify");
+    expect(gateAt("/api/real/account/login/options/../verify", "POST", json())?.status).toBe(411);
+    expect(new URL(`${ORIGIN}/api/real/payments/seg/../prepare`).pathname).toBe("/api/real/payments/prepare");
+    expect(gateAt("/api/real/payments/seg/../prepare", "POST", json())?.status).toBe(411);
+  });
+
+  it("M. an encoded slash inside the id segment of a bodyless route keeps it bodyless-and-exact (it is that route's own id)", () => {
+    expect(gateAt("/api/real/payments/a%2Fb/cancel", "POST", { origin: ORIGIN })).toBeNull();
+  });
+
+  it("M. the bodyless patterns are anchored: a longer or prefixed path is not exempt", () => {
+    for (const url of ["/api/real/x/api/real/session", "/api/real/session/extra", "/api/real/payments/seg-1/cancel/x", "/api/real/payments//cancel", "/api/real/payments/seg-1/seg-2/cancel"]) {
+      expect(gateAt(url, "DELETE", json())?.status, url).toBe(411);
+    }
+  });
+
+  it("M. an exempt method is exempt only on its own route: POST to the DELETE-only session route and DELETE on a POST route are not", () => {
+    expect(gateAt("/api/real/session", "POST", json())?.status).toBe(411);
+    expect(gateAt("/api/real/payments/seg-1/cancel", "DELETE", json())?.status).toBe(411);
+  });
+});
+
+describe("3B-2 shared ceiling and the framework's configuration", () => {
+  it("N. next.config.ts sets the proxy body-copy limit to the very constant the gate enforces (10 MiB)", () => {
+    expect(REAL_API_MAX_BODY_BYTES).toBe(10 * 1024 * 1024);
+    expect((nextConfig.experimental as { proxyClientMaxBodySize?: unknown }).proxyClientMaxBodySize).toBe(REAL_API_MAX_BODY_BYTES);
+  });
+
+  it("N. the framework limit is not lower than the gate limit (no accepted request can be truncated by the copy)", () => {
+    const framework = (nextConfig.experimental as { proxyClientMaxBodySize: number }).proxyClientMaxBodySize;
+    expect(framework).toBeGreaterThanOrEqual(REAL_API_MAX_BODY_BYTES);
+  });
+
+  it("O. a request the gate admits can still be refused by a route's smaller limit (the 4 KiB policy is untouched)", () => {
+    // The gate is a ceiling, not the control limit: 5 000 bytes passes here and is refused by the route (see request-body-limits.test.ts).
+    expect(gateAt("/api/real/account/profile", "PATCH", json({ "content-length": "5000" }))).toBeNull();
+    expect(gateAt("/api/real/payments/submit", "POST", json({ "content-length": String(LIMIT) }))).toBeNull();
+  });
+
+  it("P. the gate and next.config.ts stay inside Real Mode: neither imports Practice, stores, or components", () => {
+    for (const file of ["lib/real/server/request-gate.ts", "next.config.ts"]) {
+      const imports = [...readFileSync(path.join(root, file), "utf8").matchAll(/from "([^"]+)"/g)].map((match) => match[1]!);
+      for (const specifier of imports) expect(specifier, file).not.toMatch(/simulation|stores|components|app\//);
+    }
+  });
+
+  it("the gate imports only ./config and ./http, and neither imports next.config.ts back (no cycle)", () => {
+    const gateImports = [...readFileSync(path.join(root, "lib/real/server/request-gate.ts"), "utf8").matchAll(/from "([^"]+)"/g)].map((match) => match[1]);
+    expect(gateImports.sort()).toEqual(["./config", "./http"]);
+    for (const file of ["lib/real/server/http.ts", "lib/real/server/config.ts", "lib/real/server/session.ts"]) {
+      const imports = [...readFileSync(path.join(root, file), "utf8").matchAll(/from "([^"]+)"/g)].map((match) => match[1]!);
+      for (const specifier of imports) expect(specifier, file).not.toMatch(/next\.config|request-gate/);
     }
   });
 });

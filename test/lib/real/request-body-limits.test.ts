@@ -3,6 +3,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { CONTROL_BODY_MAX_BYTES } from "@/lib/real/server/http";
+import { REAL_API_MAX_BODY_BYTES, checkRealApiRequest } from "@/lib/real/server/request-gate";
 import { createInMemoryPaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
@@ -438,6 +439,48 @@ describe("other side effects stay behind the body check", () => {
     await invoke(route, jsonRequest(route, bodyOfBytes(route, CONTROL_BODY_MAX_BYTES + 1)));
     expect(state.events).toEqual([]);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3B-2: the request gate in front of the 3B-1 routes.
+// ---------------------------------------------------------------------------
+
+describe("3B-2 gate + route together — the 4 KiB route limit still applies to what the 10 MiB gate admits", () => {
+  const GATE_ENV = { NEXT_PUBLIC_REAL_MODE_ENABLED: "true", NEXT_PUBLIC_REAL_ORIGIN: "http://localhost:3000" };
+  const gate = (request: Request) => checkRealApiRequest(request, GATE_ENV);
+  const withHeaders = (route: RouteCase, body: string, extra: Record<string, string>) =>
+    new Request(`http://localhost${route.url}`, { method: route.method, headers: { "content-type": "application/json", origin: "http://localhost:3000", ...extra }, body });
+
+  it.each(ROUTES)("$url: a 5 000-byte body with an honest Content-Length passes the gate and is refused 413 by the route", async (route) => {
+    const body = bodyOfBytes(route, 5000);
+    const request = withHeaders(route, body, { "content-length": "5000" });
+    expect(gate(request)).toBeNull();
+    expect(await invoke(route, withHeaders(route, body, { "content-length": "5000" }))).toEqual({ status: 413, body: TOO_LARGE });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(route.sessionFirst ? nonSession(state.events) : state.events).toEqual([]);
+  });
+
+  it.each(ROUTES)("$url: a body declared at exactly 10 MiB passes the gate; the route refuses it at once from the declared length, without reading it", async (route) => {
+    const declared = { "content-length": String(REAL_API_MAX_BODY_BYTES) };
+    expect(gate(withHeaders(route, "{}", declared))).toBeNull();
+    expect(await invoke(route, withHeaders(route, "{}", declared))).toEqual({ status: 413, body: TOO_LARGE });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(ROUTES)("$url: a body declared one byte over 10 MiB never reaches the route — the gate answers 413 first", async (route) => {
+    const response = gate(withHeaders(route, "{}", { "content-length": String(REAL_API_MAX_BODY_BYTES + 1) }));
+    expect(response?.status).toBe(413);
+    expect(await response?.json()).toEqual(TOO_LARGE);
+  });
+
+  it("a short valid JSON prefix followed by padding cannot be admitted by declaring a small length: the framing, not the header, decides what is read", async () => {
+    // Without a length the gate refuses outright (411), so a 'prefix + padding' upload cannot even start.
+    const route = ROUTES[0]!;
+    const request = new Request(`http://localhost${route.url}`, { method: route.method, headers: { "content-type": "application/json", origin: "http://localhost:3000" }, body: `${JSON.stringify(route.valid)}${" ".repeat(64)}garbage` });
+    expect(gate(request)?.status).toBe(411);
+    // With a declared length over the ceiling it is 413 at the gate, and with one over the route's own limit it is 413 in the route.
+    expect(gate(withHeaders(route, JSON.stringify(route.valid), { "content-length": String(REAL_API_MAX_BODY_BYTES + 1) }))?.status).toBe(413);
   });
 });
 

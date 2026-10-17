@@ -458,7 +458,9 @@ describe("POST /api/real/account/handle/options + /claim", () => {
     const env = { NEXT_PUBLIC_REAL_MODE_ENABLED: "true", NEXT_PUBLIC_REAL_ORIGIN: ORIGIN };
     for (const [method, pathname] of [["POST", "/api/real/account/handle/options"], ["POST", "/api/real/account/handle/claim"], ["PATCH", "/api/real/account/profile"]] as const) {
       const url = `http://localhost:3000${pathname}`;
-      expect(checkRealApiRequest(new Request(url, { method, headers: { origin: ORIGIN, "content-type": "application/json" }, body: "{}" }), env)).toBeNull();
+      // A normal browser request declares its length (3B-2): the exact UTF-8 byte length of the serialized body.
+      const body = "{}";
+      expect(checkRealApiRequest(new Request(url, { method, headers: { origin: ORIGIN, "content-type": "application/json", "content-length": String(Buffer.byteLength(body, "utf8")) }, body }), env)).toBeNull();
       expect(checkRealApiRequest(new Request(url, { method, headers: { origin: ORIGIN } }), env)?.status).toBe(415);
       expect(checkRealApiRequest(new Request(url, { method, headers: { origin: ORIGIN, "content-type": "text/plain" }, body: "{}" }), env)?.status).toBe(415);
       expect(checkRealApiRequest(new Request(url, { method, headers: { origin: "https://evil.example", "content-type": "application/json" }, body: "{}" }), env)?.status).toBe(403);

@@ -1,4 +1,5 @@
 import { isRealModeEnabled, readExpectedOrigins } from "./config";
+import { requestTooLargeResponse } from "./http";
 
 /**
  * S4 request gate for every /api/real/** call, run centrally by the root
@@ -26,8 +27,32 @@ import { isRealModeEnabled, readExpectedOrigins } from "./config";
  *     reaching a route that parses a JSON body. A new route is JSON-only by
  *     default; a body-less route must be added here.
  *
+ *  5. (3B-2) A route that takes a body must DECLARE its length: `Content-Length`
+ *     is required (411), must be plain decimal digits that form a safe integer
+ *     (400), and may not exceed REAL_API_MAX_BODY_BYTES (413). This runs after
+ *     rules 1-4, so a 403 or 415 still wins. It exists because Next.js copies a
+ *     proxied request body only up to `experimental.proxyClientMaxBodySize`
+ *     and, past it, keeps just the prefix while the request continues "normally":
+ *     a route could otherwise see a truncated body that happens to parse. The
+ *     framework limit is set to the same constant in next.config.ts, so no
+ *     request that passes this gate can be truncated by the copy. A declared
+ *     length is not proof of the body that follows — the server's HTTP framing
+ *     enforces that — and a 411/413 here does not stop the framework from
+ *     draining the upload; it only keeps the request from any route.
+ *
  * No CSRF tokens: SameSite=Lax cookies plus this gate are the defense.
  */
+
+/**
+ * The ONE size ceiling for a body-carrying /api/real/** request: 10 MiB, the
+ * framework's own default proxy body-copy limit. next.config.ts sets
+ * `experimental.proxyClientMaxBodySize` to this same constant and the gate
+ * below refuses any larger declared length, so the two can never drift apart.
+ * Never lower the framework limit without lowering this, and never raise this
+ * above the framework limit. Route-specific limits (the 4 KiB control budget,
+ * 3B-1) are smaller and are enforced inside the routes.
+ */
+export const REAL_API_MAX_BODY_BYTES = 10_485_760;
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
@@ -57,6 +82,28 @@ const PROTECTED_READS: ReadonlyArray<RegExp> = [
 
 function refuse(status: number): Response {
   return Response.json({ error: status === 415 ? "Unsupported request." : "Request not allowed." }, { status });
+}
+
+/** 411: a body route was called without a Content-Length. Not retryable as-is, so no Retry-After and no `retryable`. */
+function refuseLengthRequired(): Response {
+  return Response.json({ error: "Unsupported request.", code: "length_required" }, { status: 411 });
+}
+
+/** A Content-Length field value is 1*DIGIT (RFC 9110); a list ("5, 5"), sign, space, fraction, or empty value is not. */
+const CONTENT_LENGTH_SYNTAX = /^[0-9]+$/;
+
+/**
+ * Rule 5. Returns the refusal for a body route's declared length, or null when
+ * the request may go on. Reads only the header; never the body.
+ */
+function checkDeclaredLength(request: Request): Response | null {
+  const declared = request.headers.get("content-length");
+  if (declared === null) return refuseLengthRequired();
+  if (!CONTENT_LENGTH_SYNTAX.test(declared)) return refuse(400);
+  const length = Number(declared);
+  if (!Number.isSafeInteger(length)) return refuse(400);
+  if (length > REAL_API_MAX_BODY_BYTES) return requestTooLargeResponse();
+  return null;
 }
 
 function isJsonContentType(value: string | null): boolean {
@@ -149,7 +196,8 @@ export function checkRealApiRequest(request: Request, env: Record<string, string
   if (origin !== null && !readExpectedOrigins(env).includes(origin)) return refuse(403);
 
   const { pathname } = new URL(request.url);
-  if (!isBodylessRoute(method, pathname) && !isJsonContentType(request.headers.get("content-type"))) return refuse(415);
+  if (isBodylessRoute(method, pathname)) return null;
+  if (!isJsonContentType(request.headers.get("content-type"))) return refuse(415);
 
-  return null;
+  return checkDeclaredLength(request);
 }

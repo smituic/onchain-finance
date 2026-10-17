@@ -236,7 +236,9 @@ describe("request gate — /api/real/recipients/lookup is JSON-only and same-ori
   const gate = (init: RequestInit) => checkRealApiRequest(new Request(`http://localhost${URL_PATH}`, { method: "POST", ...init }), { NEXT_PUBLIC_REAL_MODE_ENABLED: "true", NEXT_PUBLIC_REAL_ORIGIN: ORIGIN });
 
   it("accepts application/json from the configured origin", () => {
-    expect(gate({ headers: { "content-type": "application/json", origin: ORIGIN }, body: "{}" })).toBeNull();
+    // A normal browser request declares its length (3B-2): the exact UTF-8 byte length of the serialized body.
+    const body = "{}";
+    expect(gate({ headers: { "content-type": "application/json", origin: ORIGIN, "content-length": String(Buffer.byteLength(body, "utf8")) }, body })).toBeNull();
   });
 
   it("refuses non-JSON bodies (415), a missing content type (415), and cross-site / foreign origins (403)", () => {

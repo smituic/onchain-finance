@@ -270,7 +270,9 @@ describe("cross-site requests are refused by the request gate before any route â
     vi.stubEnv("NEXT_PUBLIC_REAL_ORIGIN", "http://localhost:3000");
     const origin = "http://localhost:3000";
     for (const endpoint of Object.values(ENDPOINTS)) {
-      const make = (headers: Record<string, string>) => new NextRequest(`${origin}${endpoint}`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: "{}" });
+      // A normal browser request declares its length (3B-2): the exact UTF-8 byte length of the serialized body.
+      const body = "{}";
+      const make = (headers: Record<string, string>) => new NextRequest(`${origin}${endpoint}`, { method: "POST", headers: { "content-type": "application/json", "content-length": String(Buffer.byteLength(body, "utf8")), ...headers }, body });
       expect(proxy(make({ "sec-fetch-site": "cross-site" }))?.status, endpoint).toBe(403);
       expect(proxy(make({ origin: "https://evil.example" }))?.status, endpoint).toBe(403);
       expect(proxy(make({ origin, "sec-fetch-site": "same-origin" })), endpoint).toBeUndefined();
