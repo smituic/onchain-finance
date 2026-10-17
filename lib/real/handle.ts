@@ -74,8 +74,26 @@ const RESERVED = new Set(RESERVED_HANDLES);
 
 export type HandleValidation = { ok: true; handle: string } | { ok: false; reason: string };
 
-const ASCII_WHITESPACE_EDGES = /^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g;
 const NON_ASCII = /[^\x00-\x7F]/;
+
+/** Space, tab, LF, VT, FF, CR — exactly the class `[ \t\n\r\f\v]`. */
+function isAsciiWhitespace(code: number): boolean {
+  return code === 0x20 || (code >= 0x09 && code <= 0x0d);
+}
+
+/**
+ * Strips leading and trailing ASCII whitespace in one linear pass. This
+ * replaces `/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g`, whose trailing alternative
+ * rescans the rest of a long whitespace run from every start offset — a
+ * quadratic stall on "a" + spaces + "a" before any authentication.
+ */
+function trimAsciiWhitespace(input: string): string {
+  let start = 0;
+  let end = input.length;
+  while (start < end && isAsciiWhitespace(input.charCodeAt(start))) start += 1;
+  while (end > start && isAsciiWhitespace(input.charCodeAt(end - 1))) end -= 1;
+  return start === 0 && end === input.length ? input : input.slice(start, end);
+}
 
 /**
  * Order matters and is fixed:
@@ -90,7 +108,7 @@ const NON_ASCII = /[^\x00-\x7F]/;
  */
 export function canonicalizeHandle(input: unknown): HandleValidation {
   if (typeof input !== "string") return { ok: false, reason: "Enter a name." };
-  const trimmed = input.replace(ASCII_WHITESPACE_EDGES, "");
+  const trimmed = trimAsciiWhitespace(input);
   const bare = trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
   if (bare.length === 0) return { ok: false, reason: "Enter a name." };
   if (NON_ASCII.test(bare)) return { ok: false, reason: "Use only letters a–z, numbers, and underscores." };
