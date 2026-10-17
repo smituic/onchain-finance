@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { PAYMENT_PREPARE_RATE_LIMITED_MESSAGE, disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, rateLimitedResponse, readJsonBody, requireRealServerConfig } from "@/lib/real/server/http";
+import { CONTROL_BODY_MAX_BYTES, PAYMENT_PREPARE_RATE_LIMITED_MESSAGE, disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, rateLimitedResponse, readBoundedJsonBody, requestTooLargeResponse, requireRealServerConfig } from "@/lib/real/server/http";
 import { parsePrepareRecipientSelector } from "@/lib/real/server/handle-recipient";
 import { resolvePreparePayment } from "@/lib/real/server/payments";
 import { getPaymentAttemptStore, getRateLimiter, getRealAccountRegistry } from "@/lib/real/server/runtime";
@@ -23,7 +23,10 @@ export async function POST(request: Request) {
   if (!isRealModeEnabled()) return disabledResponse();
   try {
     const config = requireRealServerConfig();
-    const rawBody = await readJsonBody(request);
+    const bounded = await readBoundedJsonBody(request, CONTROL_BODY_MAX_BYTES);
+    if (bounded.kind === "too_large") return requestTooLargeResponse();
+    // An unreadable body (invalid) takes the route's existing null path and its existing 400.
+    const rawBody = bounded.kind === "ok" ? bounded.value : null;
     if (rawBody === null) return jsonError("Invalid request body.", 400);
     // Exactly one of { recipient } (an address) or { recipientHandle }, parsed
     // once here. Only those two keys and amountBaseUnits are ever read from the

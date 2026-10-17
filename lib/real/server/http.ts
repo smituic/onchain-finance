@@ -75,4 +75,137 @@ export async function readJsonBody(request: Request): Promise<unknown | null> {
   }
 }
 
+/**
+ * Milestone 3B, Slice 3B-1: the byte budget for a CONTROL request — a small
+ * JSON body of ids, a short name, a handle, an address, an amount, a hex
+ * signature, or a Turnkey activity id. The largest legitimate control body is
+ * a few hundred bytes (a payment-submit signature is about 160 hex characters;
+ * a display name is at most 40 characters), so 4 KiB leaves wide headroom while
+ * keeping a hostile body from being buffered, decoded, or parsed. Requests that
+ * carry WebAuthn attestations or assertions are NOT control requests and do not
+ * use this limit.
+ */
+export const CONTROL_BODY_MAX_BYTES = 4096;
+
+export const REQUEST_TOO_LARGE_MESSAGE = "This request is too large.";
+
+/**
+ * HTTP 413 with a fixed body. Deliberately not `retryable` and without
+ * Retry-After: resending the same body can never succeed. It carries nothing
+ * from the request.
+ */
+export function requestTooLargeResponse(): Response {
+  return Response.json({ error: REQUEST_TOO_LARGE_MESSAGE, code: "request_too_large" }, { status: 413 });
+}
+
+export type BoundedJsonResult = { kind: "ok"; value: unknown } | { kind: "too_large" } | { kind: "invalid" };
+
+/** A Content-Length field value is 1*DIGIT (RFC 9110). A list ("5, 5"), sign, space, or empty value is not. */
+const CONTENT_LENGTH_SYNTAX = /^[0-9]+$/;
+
+/** Cancels without ever throwing or leaving a rejected promise behind. */
+function cancelQuietly(target: { cancel(reason?: unknown): Promise<void> } | null | undefined): void {
+  if (!target) return;
+  try {
+    target.cancel().catch(() => undefined);
+  } catch {
+    // A stream that cannot be cancelled (already locked or errored) has nothing left for us to release.
+  }
+}
+
+/**
+ * Reads a request body as JSON, counting the bytes actually received BEFORE
+ * anything is decoded or parsed, and never buffering more than `maxBytes`.
+ *
+ *  - `too_large`: more than `maxBytes` bytes were declared (Content-Length) or
+ *    actually arrived. The stream is cancelled; the chunk that crossed the line
+ *    is never kept.
+ *  - `invalid`: everything else that is not a JSON value — a malformed,
+ *    duplicated, or unsafe Content-Length; a declared length that does not match
+ *    the bytes received; a body that is empty, aborted, failed mid-read, not
+ *    valid UTF-8, or not valid JSON.
+ *  - `ok`: a complete, in-limit, valid UTF-8, valid JSON body. JSON `null` is a
+ *    valid `ok` value; the caller keeps its own validation of it.
+ *
+ * A missing Content-Length is allowed (chunked uploads have none); only the
+ * actual byte count then bounds the body. Decoding is strict UTF-8 (invalid
+ * sequences are an error, never replaced); one leading BOM is dropped exactly as
+ * `request.json()` would. No reviver, no normalization, no trimming.
+ *
+ * `maxBytes` must be given and must be a positive safe integer — there is no
+ * unlimited default, and this never falls back to `request.json()`. It does not
+ * and cannot stop an earlier layer (the framework's own body copy) from having
+ * already drained the upload; it bounds what THIS route buffers and parses.
+ * The body is never logged.
+ */
+export async function readBoundedJsonBody(request: Request, maxBytes: number): Promise<BoundedJsonResult> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new TypeError("readBoundedJsonBody needs a positive safe-integer maxBytes.");
+
+  const declaredHeader = request.headers.get("content-length");
+  let declaredLength: number | null = null;
+  if (declaredHeader !== null) {
+    if (!CONTENT_LENGTH_SYNTAX.test(declaredHeader)) {
+      cancelQuietly(request.body);
+      return { kind: "invalid" };
+    }
+    declaredLength = Number(declaredHeader);
+    if (!Number.isSafeInteger(declaredLength)) {
+      cancelQuietly(request.body);
+      return { kind: "invalid" };
+    }
+    if (declaredLength > maxBytes) {
+      cancelQuietly(request.body);
+      return { kind: "too_large" };
+    }
+  }
+
+  if (request.body === null) return { kind: "invalid" };
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    reader = request.body.getReader();
+  } catch {
+    // Already read or locked: there is nothing left to parse.
+    return { kind: "invalid" };
+  }
+
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!ArrayBuffer.isView(value)) {
+        cancelQuietly(reader);
+        return { kind: "invalid" };
+      }
+      // Count BEFORE keeping: the chunk that crosses the limit is never appended.
+      if (received + value.byteLength > maxBytes) {
+        cancelQuietly(reader);
+        return { kind: "too_large" };
+      }
+      received += value.byteLength;
+      chunks.push(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    }
+  } catch {
+    // An aborted or failed stream: a partial body is never parsed.
+    cancelQuietly(reader);
+    return { kind: "invalid" };
+  }
+
+  if (declaredLength !== null && received !== declaredLength) return { kind: "invalid" };
+
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return { kind: "ok", value: JSON.parse(text) as unknown };
+  } catch {
+    return { kind: "invalid" };
+  }
+}
+
 export { isRealModeEnabled };

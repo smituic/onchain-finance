@@ -1,5 +1,5 @@
 import { cookies } from "next/headers";
-import { disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readJsonBody, requireRealServerConfig, retryableRateLimitedResponse } from "@/lib/real/server/http";
+import { CONTROL_BODY_MAX_BYTES, disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readBoundedJsonBody, requestTooLargeResponse, requireRealServerConfig, retryableRateLimitedResponse } from "@/lib/real/server/http";
 import { PAY_SUBMIT_RATE_LIMITED_MESSAGE } from "@/lib/real/server/pay-submit-budget";
 import { resolveSubmitPayment } from "@/lib/real/server/payments";
 import { getPaymentAttemptStore, getProviderBudgetLimiter, getRealAccountRegistry } from "@/lib/real/server/runtime";
@@ -22,7 +22,10 @@ export async function POST(request: Request) {
   if (!isRealModeEnabled()) return disabledResponse();
   try {
     const config = requireRealServerConfig();
-    const rawBody = await readJsonBody(request);
+    const bounded = await readBoundedJsonBody(request, CONTROL_BODY_MAX_BYTES);
+    if (bounded.kind === "too_large") return requestTooLargeResponse();
+    // An unreadable body (invalid) takes the route's existing null path and its existing 400.
+    const rawBody = bounded.kind === "ok" ? bounded.value : null;
     if (rawBody === null) return jsonError("Invalid request body.", 400);
     const body = rawBody as { attemptId?: unknown; signature?: unknown; activityId?: unknown };
     const store = await cookies();
