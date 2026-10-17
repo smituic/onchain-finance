@@ -87,6 +87,26 @@ export async function readJsonBody(request: Request): Promise<unknown | null> {
  */
 export const CONTROL_BODY_MAX_BYTES = 4096;
 
+/**
+ * Milestone 3B, Slice 3B-3: the byte budget for a request that carries ONE
+ * WebAuthn assertion (login verify, handle claim, backup-passkey step-up and
+ * verify-login). A realistic assertion JSON is a few KiB at most (credential id,
+ * rawId, clientDataJSON, authenticatorData, a signature, optional userHandle and
+ * extension results, all base64url); 16 KiB leaves wide headroom. Registration
+ * attestations are a different shape and are NOT covered by this budget.
+ */
+export const WEBAUTHN_ASSERTION_BODY_MAX_BYTES = 16_384;
+
+/**
+ * 3B-3: the byte budget for the two routes that carry a browser-STAMPED Turnkey
+ * request envelope ({ attemptId | enrollmentId, signedRequest: { body, stamp,
+ * url } }). The parser still caps the signed body at 16 384 and the stamp at
+ * 8 192 UTF-16 units; this transport limit is larger to allow for JSON escaping
+ * of those strings in the outer envelope, and only refuses what the parser could
+ * never accept. It measures transport bytes, not string length.
+ */
+export const SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES = 65_536;
+
 export const REQUEST_TOO_LARGE_MESSAGE = "This request is too large.";
 
 /**
