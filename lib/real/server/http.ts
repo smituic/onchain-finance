@@ -62,20 +62,6 @@ export function retryableRateLimitedResponse(message: string, retryAfterSeconds:
 }
 
 /**
- * Parses a request body as JSON, returning null on any parse failure
- * instead of throwing — so a malformed body becomes a clean 400 at the
- * call site, never an uncaught exception that would otherwise fall through
- * to jsonInternalError()'s generic 500.
- */
-export async function readJsonBody(request: Request): Promise<unknown | null> {
-  try {
-    return await request.json();
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Milestone 3B, Slice 3B-1: the byte budget for a CONTROL request — a small
  * JSON body of ids, a short name, a handle, an address, an amount, a hex
  * signature, or a Turnkey activity id. The largest legitimate control body is
@@ -106,6 +92,18 @@ export const WEBAUTHN_ASSERTION_BODY_MAX_BYTES = 16_384;
  * never accept. It measures transport bytes, not string length.
  */
 export const SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES = 65_536;
+
+/**
+ * 3B-4: the byte budget for the two routes that carry ONE WebAuthn registration
+ * response (primary account registration and backup-passkey registration). A
+ * registration envelope is larger than an assertion because it carries an
+ * attestation object (and, for some formats, a certificate chain); this cap is
+ * a controlled-development policy chosen with generous headroom over the shapes
+ * modeled offline, NOT a measurement of every real authenticator. It is
+ * intentionally stricter than the 10 MiB gate in front of it, and it measures
+ * transport bytes, not string length.
+ */
+export const WEBAUTHN_REGISTRATION_BODY_MAX_BYTES = 65_536;
 
 export const REQUEST_TOO_LARGE_MESSAGE = "This request is too large.";
 

@@ -2,14 +2,14 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
-import { CONTROL_BODY_MAX_BYTES, SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES, WEBAUTHN_ASSERTION_BODY_MAX_BYTES, readBoundedJsonBody } from "@/lib/real/server/http";
+import { CONTROL_BODY_MAX_BYTES, SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES, WEBAUTHN_ASSERTION_BODY_MAX_BYTES, WEBAUTHN_REGISTRATION_BODY_MAX_BYTES, readBoundedJsonBody } from "@/lib/real/server/http";
 import { parseSignedTurnkeyRequest } from "@/lib/real/server/turnkey-signed-request";
 import { REAL_API_MAX_BODY_BYTES, checkRealApiRequest } from "@/lib/real/server/request-gate";
 import { createInMemoryPaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import { scriptedBudget } from "./fixtures/chain-read-budget";
-import { buildAuthenticationResponseJSON, createFixtureAuthenticator } from "./fixtures/webauthn";
+import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator } from "./fixtures/webauthn";
 
 /**
  * Milestone 3B, Slice 3B-1: the 14 control routes refuse a body over 4 KiB with
@@ -41,14 +41,15 @@ const state = vi.hoisted(() => ({
   overrides: {} as Record<string, unknown>,
   tripwires: {} as Record<string, unknown>,
   /** What the two signed-request services were called with (they are still the real functions; this only records the argument). */
-  captured: { revocation: [] as unknown[], authorization: [] as unknown[] },
+  captured: { revocation: [] as unknown[], authorization: [] as unknown[], registration: [] as unknown[], backupRegistration: [] as unknown[] },
+  emptyCaptured: () => ({ revocation: [] as unknown[], authorization: [] as unknown[], registration: [] as unknown[], backupRegistration: [] as unknown[] }),
 }));
 
 vi.mock("next/headers", () => ({
   cookies: async () => ({
     // The only cookie any of these routes reads is the session cookie.
     get: (name: string) => (state.cookie !== undefined ? { name, value: state.cookie } : undefined),
-    set: () => undefined,
+    set: () => void state.events.push("cookies.set"),
     delete: () => undefined,
   }),
 }));
@@ -73,6 +74,21 @@ vi.mock("@/lib/real/server/backup-passkey-pipeline", async (importOriginal) => {
       state.captured.authorization.push(input.signedRequest);
       return actual.submitTurnkeyAuthorization(input);
     }) as typeof actual.submitTurnkeyAuthorization,
+    completeBackupCredentialRegistration: ((input: Parameters<typeof actual.completeBackupCredentialRegistration>[0]) => {
+      state.captured.backupRegistration.push(input.response);
+      return actual.completeBackupCredentialRegistration(input);
+    }) as typeof actual.completeBackupCredentialRegistration,
+  };
+});
+
+vi.mock("@/lib/real/server/registration", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/real/server/registration")>();
+  return {
+    ...actual,
+    completeRegistration: ((input: Parameters<typeof actual.completeRegistration>[0]) => {
+      state.captured.registration.push(input.response);
+      return actual.completeRegistration(input);
+    }) as typeof actual.completeRegistration,
   };
 });
 
@@ -153,7 +169,7 @@ beforeEach(() => {
   fetchSpy.mockClear();
   state.cookie = validCookie;
   state.events = [];
-  state.captured = { revocation: [], authorization: [] };
+  state.captured = state.emptyCaptured();
   state.overrides = {};
   state.registry = recordingRegistry(realRegistry);
   state.tripwires = {
@@ -196,11 +212,13 @@ type RouteCase = {
   budgeted?: boolean;
   /** The body budget the route enforces, and the name of the shared constant it must use. */
   limit: number;
-  limitName: "CONTROL_BODY_MAX_BYTES" | "WEBAUTHN_ASSERTION_BODY_MAX_BYTES" | "SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES";
+  limitName: "CONTROL_BODY_MAX_BYTES" | "WEBAUTHN_ASSERTION_BODY_MAX_BYTES" | "SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES" | "WEBAUTHN_REGISTRATION_BODY_MAX_BYTES";
   /** A valid request makes no store call the harness can see beyond the session reads (login verify has no session). */
   anyEventCounts?: boolean;
   /** Which signed-request service the route passes `signedRequest` to. */
   signedService?: "revocation" | "authorization";
+  /** Which registration service receives the parsed `response` (3B-4). */
+  registrationService?: "registration" | "backupRegistration";
 };
 
 type ControlCase = Omit<RouteCase, "limit" | "limitName">;
@@ -256,10 +274,22 @@ const SIGNED_ROUTES: RouteCase[] = [
   { file: "app/api/real/account/passkeys/backup/authorize/submit/route.ts", method: "POST", url: "/api/real/account/passkeys/backup/authorize/submit", sessionFirst: true, valid: { enrollmentId: ENROLLMENT_ID, signedRequest: CREATE_SIGNED }, limit: SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES, limitName: SIGNED, signedService: "authorization" },
 ];
 
+// --- 3B-4: the two WebAuthn-registration routes (64 KiB). ---
+
+/** A REAL offline registration response (genuine P-256 key, CBOR attestation object, "none" format). */
+const REGISTRATION_RESPONSE = buildRegistrationResponseJSON({ authenticator: createFixtureAuthenticator(), challenge: "Y2hhbGxlbmdlLWZvci10ZXN0cw", origin: "http://localhost:3000", rpId: "localhost", transports: ["internal", "hybrid"] });
+const REGISTRATION = "WEBAUTHN_REGISTRATION_BODY_MAX_BYTES" as const;
+
+const REGISTRATION_ROUTES: RouteCase[] = [
+  { file: "app/api/real/account/register/verify/route.ts", method: "POST", url: "/api/real/account/register/verify", sessionFirst: false, anyEventCounts: true, valid: { response: REGISTRATION_RESPONSE }, limit: WEBAUTHN_REGISTRATION_BODY_MAX_BYTES, limitName: REGISTRATION, registrationService: "registration" },
+  { file: "app/api/real/account/passkeys/backup/register/route.ts", method: "POST", url: "/api/real/account/passkeys/backup/register", sessionFirst: true, valid: { response: REGISTRATION_RESPONSE }, limit: WEBAUTHN_REGISTRATION_BODY_MAX_BYTES, limitName: REGISTRATION, registrationService: "backupRegistration" },
+];
+
 const ROUTES: RouteCase[] = [
   ...CONTROL_ROUTES.map((route): RouteCase => ({ ...route, limit: CONTROL_BODY_MAX_BYTES, limitName: "CONTROL_BODY_MAX_BYTES" })),
   ...ASSERTION_ROUTES,
   ...SIGNED_ROUTES,
+  ...REGISTRATION_ROUTES,
 ];
 
 
@@ -287,6 +317,8 @@ const ROUTE_MODULES: Record<string, () => Promise<RouteModule>> = {
   "app/api/real/account/passkeys/backup/verify-login/confirm/route.ts": () => import("@/app/api/real/account/passkeys/backup/verify-login/confirm/route"),
   "app/api/real/account/passkeys/[credentialId]/revoke/submit/route.ts": () => import("@/app/api/real/account/passkeys/[credentialId]/revoke/submit/route"),
   "app/api/real/account/passkeys/backup/authorize/submit/route.ts": () => import("@/app/api/real/account/passkeys/backup/authorize/submit/route"),
+  "app/api/real/account/register/verify/route.ts": () => import("@/app/api/real/account/register/verify/route"),
+  "app/api/real/account/passkeys/backup/register/route.ts": () => import("@/app/api/real/account/passkeys/backup/register/route"),
 };
 
 const moduleFor = (file: string) => ROUTE_MODULES[file]!();
@@ -320,7 +352,7 @@ describe.each(ROUTES)("$method $url — oversized body is refused with 413 befor
   const assertNothingHappened = () => {
     expect(fetchSpy).not.toHaveBeenCalled(); // no Turnkey, Pimlico, or RPC
     expect(route.sessionFirst ? nonSession(state.events) : state.events).toEqual([]); // no limiter, challenge, claim, write, or transition
-    expect(state.captured).toEqual({ revocation: [], authorization: [] }); // the signed-request services were never called
+    expect(state.captured).toEqual(state.emptyCaptured()); // the signed-request services were never called
   };
 
   it("actual body over 4096 bytes (no Content-Length): 413 with the exact body", async () => {
@@ -397,11 +429,13 @@ describe("authentication placement is unchanged", () => {
   const prepare = ROUTES[0]!;
   const submit = ROUTES[1]!;
   const loginVerify = ROUTES.find((route) => route.url === "/api/real/account/login/verify")!;
+  const registerVerify = ROUTES.find((route) => route.url === "/api/real/account/register/verify")!;
+  const backupRegister = ROUTES.find((route) => route.url === "/api/real/account/passkeys/backup/register")!;
   const profile = ROUTES.find((route) => route.url === "/api/real/account/profile")!;
 
   it("prepare and submit judge size BEFORE the session: an unauthenticated oversized body is a 413 with the registry untouched", async () => {
     state.cookie = undefined;
-    for (const route of [prepare, submit, loginVerify]) {
+    for (const route of [prepare, submit, loginVerify, registerVerify]) {
       state.events = [];
       expect(await invoke(route, jsonRequest(route, bodyOfBytes(route, route.limit + 1)))).toEqual({ status: 413, body: TOO_LARGE });
       expect(state.events).toEqual([]);
@@ -410,7 +444,11 @@ describe("authentication placement is unchanged", () => {
 
   it("a session-first route still answers 401 to an unauthenticated caller, whatever the body size", async () => {
     state.cookie = undefined;
-    expect(await invoke(profile, jsonRequest(profile, bodyOfBytes(profile, profile.limit + 1)))).toEqual({ status: 401, body: { error: "Not authenticated." } });
+    for (const route of [profile, backupRegister]) {
+      expect(await invoke(route, jsonRequest(route, bodyOfBytes(route, route.limit + 1))), route.url).toEqual({ status: 401, body: { error: "Not authenticated." } });
+      expect(await invoke(route, jsonRequest(route, JSON.stringify(route.valid))), route.url).toEqual({ status: 401, body: { error: "Not authenticated." } });
+    }
+    expect(state.captured.backupRegistration).toEqual([]); // the unauthenticated body never reached the service
   });
 
   it("an unauthenticated small prepare/submit is still the route's own 401", async () => {
@@ -674,7 +712,7 @@ describe("3B-3 signed Turnkey envelopes — sizes, integrity, and no forwarding 
     // The route got to its service: it was handed the original signedRequest object.
     expect(capturedFor(route)).toHaveLength(1);
 
-    state.captured = { revocation: [], authorization: [] };
+    state.captured = state.emptyCaptured();
     state.events = [];
     const over = bodyOfBytes(route, SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES + 1);
     expect(encoder.encode(over).byteLength).toBe(65_537);
@@ -727,7 +765,7 @@ describe("3B-3 signed Turnkey envelopes — sizes, integrity, and no forwarding 
     expect(pretty).not.toBe(compact);
 
     for (const [name, text] of [["compact", compact], ["pretty-printed", pretty], ["escaped non-ASCII", escaped]] as const) {
-      state.captured = { revocation: [], authorization: [] };
+      state.captured = state.emptyCaptured();
       state.events = [];
       await invoke(route, jsonRequest(route, text));
       const captured = capturedFor(route);
@@ -784,6 +822,256 @@ describe("3B-3 handle claim, step-up options and verify-login confirm — a 413 
     expect(state.events.filter((event) => /^(challengeStore|handleStore|enrollmentStore|revocationStore|rateLimiter|providerBudget|paymentStore|registrationAttempts)\./.test(event))).toEqual([]);
     expect(nonSession(state.events)).toEqual([]);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3B-4: WebAuthn registration routes (64 KiB).
+// ---------------------------------------------------------------------------
+
+describe("3B-4 registration routes — exact boundaries, with proof the body was PARSED", () => {
+  const capturedFor = (route: RouteCase) => state.captured[route.registrationService!];
+
+  it.each(REGISTRATION_ROUTES)("$url: exactly 65 536 bytes is read and the resolver receives the original response; 65 537 is a 413 that reaches nothing", async (route) => {
+    const exact = bodyOfBytes(route, WEBAUTHN_REGISTRATION_BODY_MAX_BYTES);
+    expect(encoder.encode(exact).byteLength).toBe(65_536);
+    const accepted = await invoke(route, jsonRequest(route, exact, { "content-length": "65536" }));
+    expect(accepted.status).not.toBe(413);
+    // A 401 or an unrelated 500 would not prove anything: the resolver must have been handed the parsed `response`, field for field.
+    expect(capturedFor(route)).toEqual([REGISTRATION_RESPONSE]);
+
+    state.captured = state.emptyCaptured();
+    state.events = [];
+    const over = bodyOfBytes(route, WEBAUTHN_REGISTRATION_BODY_MAX_BYTES + 1);
+    expect(encoder.encode(over).byteLength).toBe(65_537);
+    expect(await invoke(route, jsonRequest(route, over, { "content-length": "65537" }))).toEqual({ status: 413, body: TOO_LARGE });
+    expect(capturedFor(route)).toEqual([]);
+    expect(route.sessionFirst ? nonSession(state.events) : state.events).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: a body with no `response` is the existing response-required 400, and the resolver is not called", async (route) => {
+    for (const body of ["{}", '{"response":null}', '{"response":false}', '{"other":1}']) {
+      const result = await invoke(route, jsonRequest(route, body));
+      expect(result, body).toEqual({ status: 400, body: { error: "A WebAuthn registration response is required." } });
+    }
+    expect(capturedFor(route)).toEqual([]);
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: JSON null, malformed JSON, invalid UTF-8 and an empty body are the existing 'Invalid request body.' 400", async (route) => {
+    const invalidUtf8 = new Uint8Array([...encoder.encode('{"response":"'), 0xff, ...encoder.encode('"}')]);
+    for (const body of ["null", "{not json", invalidUtf8, ""]) {
+      const result = await invoke(route, jsonRequest(route, body));
+      expect(result, String(body)).toEqual({ status: 400, body: { error: "Invalid request body." } });
+    }
+    expect(capturedFor(route)).toEqual([]);
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: a declared length that disagrees with the body is the existing 400; one over the limit is a 413 without reading the stream", async (route) => {
+    expect(await invoke(route, jsonRequest(route, JSON.stringify(route.valid), { "content-length": "5" }))).toEqual({ status: 400, body: { error: "Invalid request body." } });
+    expect(await invoke(route, jsonRequest(route, "{}", { "content-length": "65537" }))).toEqual({ status: 413, body: TOO_LARGE });
+    expect(capturedFor(route)).toEqual([]);
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: an oversized STREAMED body (no Content-Length) is a 413 and the stream is cancelled", async (route) => {
+    let pulls = 0;
+    let cancelled = false;
+    const chunk = encoder.encode("x".repeat(20_000));
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls <= 8) controller.enqueue(chunk);
+        else controller.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const request = new Request(`http://localhost${route.url}`, { method: route.method, headers: { "content-type": "application/json" }, body: stream, duplex: "half" } as RequestInit & { duplex: "half" });
+    expect(await invoke(route, request)).toEqual({ status: 413, body: TOO_LARGE });
+    await Promise.resolve();
+    expect(cancelled).toBe(true);
+    expect(pulls).toBeLessThan(8); // it stopped asking once the limit was crossed
+    expect(capturedFor(route)).toEqual([]);
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: UTF-8 multibyte bytes are counted as bytes (a body short in characters but over 64 KiB is refused)", async (route) => {
+    const euro = String.fromCharCode(0x20ac);
+    const body = JSON.stringify({ ...route.valid, _pad: euro.repeat(Math.floor(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES / 3) + 1) });
+    expect(body.length).toBeLessThan(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES);
+    expect(encoder.encode(body).byteLength).toBeGreaterThan(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES);
+    expect(await invoke(route, jsonRequest(route, body))).toEqual({ status: 413, body: TOO_LARGE });
+  });
+});
+
+describe("3B-4 registration fixtures — complete envelopes stay far below 64 KiB and arrive unchanged", () => {
+  const bytes = (value: unknown) => encoder.encode(JSON.stringify(value)).byteLength;
+  const b64 = (count: number) => "A".repeat(Math.ceil((count * 4) / 3));
+  /** A synthetic startRegistration()-shaped response built from per-field BYTE sizes (base64url length ~ 4/3 of that). */
+  const synthetic = (sizes: { credentialId: number; clientDataJSON: number; authenticatorData: number; publicKey: number; attestationObject: number; extensionResults?: number; transports?: string[]; publicKeyAlgorithm?: number }) => ({
+    id: b64(sizes.credentialId),
+    rawId: b64(sizes.credentialId),
+    response: {
+      clientDataJSON: b64(sizes.clientDataJSON),
+      attestationObject: b64(sizes.attestationObject),
+      authenticatorData: b64(sizes.authenticatorData),
+      transports: sizes.transports ?? ["internal"],
+      publicKeyAlgorithm: sizes.publicKeyAlgorithm ?? -7,
+      publicKey: b64(sizes.publicKey),
+    },
+    authenticatorAttachment: "platform",
+    clientExtensionResults: sizes.extensionResults ? { credProps: { rk: true }, largeBlob: { supported: true, blob: b64(sizes.extensionResults) } } : { credProps: { rk: true } },
+    type: "public-key",
+  });
+  // A certificate is typically 0.5-1.5 KiB; "synthetic chain" below stacks several, with the leaf, an intermediate and a root.
+  const CERT = 1500;
+  const SHAPES: Record<string, unknown> = {
+    "real offline ES256 fixture (format none)": REGISTRATION_RESPONSE,
+    "ES256 full startRegistration shape, 16-byte credential id": synthetic({ credentialId: 16, clientDataJSON: 150, authenticatorData: 200, publicKey: 91, attestationObject: 300 }),
+    "ES256 full startRegistration shape, 32-byte credential id": synthetic({ credentialId: 32, clientDataJSON: 150, authenticatorData: 200, publicKey: 91, attestationObject: 300 }),
+    "ES256 full startRegistration shape, 64-byte credential id": synthetic({ credentialId: 64, clientDataJSON: 150, authenticatorData: 230, publicKey: 91, attestationObject: 330 }),
+    "RS256-shaped (294-byte SubjectPublicKeyInfo, 2048-bit)": synthetic({ credentialId: 32, clientDataJSON: 150, authenticatorData: 420, publicKey: 294, attestationObject: 700, publicKeyAlgorithm: -257 }),
+    "RS256-shaped (550-byte public key, 4096-bit)": synthetic({ credentialId: 32, clientDataJSON: 150, authenticatorData: 700, publicKey: 550, attestationObject: 1100, publicKeyAlgorithm: -257 }),
+    "1023-byte credential id (the WebAuthn maximum)": synthetic({ credentialId: 1023, clientDataJSON: 150, authenticatorData: 1200, publicKey: 91, attestationObject: 1500 }),
+    "large authenticatorData": synthetic({ credentialId: 64, clientDataJSON: 150, authenticatorData: 4096, publicKey: 91, attestationObject: 4300 }),
+    "large publicKey": synthetic({ credentialId: 64, clientDataJSON: 150, authenticatorData: 600, publicKey: 2048, attestationObject: 900 }),
+    "packed attestation with a synthetic certificate chain (3 certs)": synthetic({ credentialId: 32, clientDataJSON: 150, authenticatorData: 250, publicKey: 91, attestationObject: 3 * CERT + 400 }),
+    "TPM-shaped attestation (certInfo + pubArea + AIK chain)": synthetic({ credentialId: 32, clientDataJSON: 150, authenticatorData: 300, publicKey: 294, attestationObject: 4 * CERT + 1200, publicKeyAlgorithm: -257 }),
+    "Android-key-shaped (certificate chain of 4 + extensions)": synthetic({ credentialId: 32, clientDataJSON: 150, authenticatorData: 250, publicKey: 91, attestationObject: 4 * CERT + 800, transports: ["internal", "hybrid"] }),
+    "Apple-shaped (anonymous attestation, 2-cert chain)": synthetic({ credentialId: 20, clientDataJSON: 150, authenticatorData: 250, publicKey: 91, attestationObject: 2 * CERT + 300 }),
+    "generous synthetic worst case (every field generous, 6-cert chain, 4 KiB extensions)": synthetic({ credentialId: 1023, clientDataJSON: 1024, authenticatorData: 8192, publicKey: 2048, attestationObject: 6 * CERT + 6000, extensionResults: 4096, transports: ["usb", "nfc", "ble", "internal", "hybrid", "smart-card"] }),
+  };
+
+  it("every shape, as the complete serialized request envelope, is measured in real UTF-8 bytes and sits below the 64 KiB limit", () => {
+    const sizes = Object.entries(SHAPES).map(([name, response]) => [name, bytes({ response })] as const);
+    for (const [name, size] of sizes) expect(size, name).toBeLessThan(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES);
+    // The extreme synthetic still leaves headroom, and the sizes are monotone in the way the shapes were built.
+    const worst = Math.max(...sizes.map(([, size]) => size));
+    expect(worst).toBeLessThan(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES * 0.75);
+    expect(sizes[0]![1]).toBeLessThan(worst);
+    // Measuring with the Buffer API gives the same figure as TextEncoder.
+    for (const [, response] of Object.entries(SHAPES)) expect(Buffer.byteLength(JSON.stringify({ response }), "utf8")).toBe(bytes({ response }));
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: every shape reaches the resolver with values IDENTICAL to what the legacy request.json() reader produced", async (route) => {
+    for (const [name, response] of Object.entries(SHAPES)) {
+      state.captured = state.emptyCaptured();
+      state.events = [];
+      const text = JSON.stringify({ response });
+      const legacy = (await new Request("http://localhost/x", { method: "POST", body: text }).json()) as { response: unknown };
+      const result = await invoke(route, jsonRequest(route, text));
+      expect(result.status, name).not.toBe(413);
+      expect(state.captured[route.registrationService!], name).toEqual([legacy.response]);
+    }
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: credential data is passed through byte-for-byte — no trim, no case-folding, no Unicode normalization, no re-serialization", async (route) => {
+    const eDecomposed = "e" + String.fromCharCode(0x0301);
+    const nbsp = String.fromCharCode(0x00a0);
+    const tricky = {
+      id: "AbC-_dEf0123456789AbC-_dEf0123456789AbC",
+      rawId: " AbC-_dEf0123456789AbC-_dEf0123456789AbC ",
+      response: {
+        clientDataJSON: "  eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIn0  ",
+        attestationObject: "o2NmbXRkbm9uZQ==\n",
+        authenticatorData: "MIXED-case_Base64Url",
+        publicKey: "0xAbCdEf0123456789",
+        transports: ["INTERNAL", "Hybrid", eDecomposed],
+      },
+      clientExtensionResults: { Key: { "": null, UPPER: 1.0, nested: [0, -0, 1e21] } },
+      type: "public-key",
+      extra: `The  Quick\tBrown${nbsp}Fox`,
+    };
+    const compact = JSON.stringify({ response: tricky });
+    const pretty = JSON.stringify({ response: tricky }, null, 3);
+    for (const text of [compact, pretty]) {
+      state.captured = state.emptyCaptured();
+      await invoke(route, jsonRequest(route, text));
+      const received = state.captured[route.registrationService!][0] as typeof tricky;
+      expect(received).toEqual(JSON.parse(text).response);
+      expect(received.rawId).toBe(" AbC-_dEf0123456789AbC-_dEf0123456789AbC ");
+      expect(received.response.clientDataJSON).toBe("  eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIn0  ");
+      expect(received.response.attestationObject).toBe("o2NmbXRkbm9uZQ==\n");
+      expect(received.response.publicKey).toBe("0xAbCdEf0123456789");
+      expect(received.response.transports).toEqual(["INTERNAL", "Hybrid", eDecomposed]);
+      expect(received.extra).toBe(`The  Quick\tBrown${nbsp}Fox`);
+    }
+  });
+
+  it("the real fixture is nowhere near the limit", () => {
+    expect(bytes({ response: REGISTRATION_RESPONSE })).toBeLessThan(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES / 20);
+  });
+});
+
+describe("3B-4 primary registration — a 413 reaches nothing durable and sets no cookie", () => {
+  const route = REGISTRATION_ROUTES[0]!;
+
+  it("an oversized registration makes zero challenge, attempt, registry, provisioning, database, cookie or provider operations", async () => {
+    const result = await invoke(route, jsonRequest(route, JSON.stringify({ response: { ...REGISTRATION_RESPONSE, padding: "x".repeat(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES) } })));
+    expect(result).toEqual({ status: 413, body: TOO_LARGE });
+    expect(state.events).toEqual([]); // no challengeStore.*, registrationAttempts.*, registry.*, or cookies.set
+    expect(state.captured.registration).toEqual([]); // completeRegistration (and so createVerified / provisioning) never ran
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("a valid request does reach the registration service (the same harness sees the operations a 413 must not)", async () => {
+    await invoke(route, jsonRequest(route, JSON.stringify(route.valid)));
+    expect(state.captured.registration).toEqual([REGISTRATION_RESPONSE]);
+    expect(state.events.length).toBeGreaterThan(0);
+  });
+});
+
+describe("3B-4 backup registration — a 413 reaches nothing durable and keeps the session read first", () => {
+  const route = REGISTRATION_ROUTES[1]!;
+
+  it("an authenticated oversized request: 413 with only the two session reads, no challenge, enrollment, credential registration or provider call", async () => {
+    const result = await invoke(route, jsonRequest(route, JSON.stringify({ response: { ...REGISTRATION_RESPONSE, padding: "x".repeat(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES) } })));
+    expect(result).toEqual({ status: 413, body: TOO_LARGE });
+    expect(state.events).toEqual(SESSION_READS); // exactly the two read-only session-registry reads, in order, and nothing else
+    expect(state.captured.backupRegistration).toEqual([]); // completeBackupCredentialRegistration never ran
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("a valid authenticated request does reach the backup registration service", async () => {
+    await invoke(route, jsonRequest(route, JSON.stringify(route.valid)));
+    expect(state.captured.backupRegistration).toEqual([REGISTRATION_RESPONSE]);
+  });
+});
+
+describe("3B-4 gate compatibility for the registration routes", () => {
+  const GATE_ENV = { NEXT_PUBLIC_REAL_MODE_ENABLED: "true", NEXT_PUBLIC_REAL_ORIGIN: "http://localhost:3000" };
+  const gate = (request: Request) => checkRealApiRequest(request, GATE_ENV);
+  const build = (route: RouteCase, body: string, extra: Record<string, string>) =>
+    new Request(`http://localhost${route.url}`, { method: route.method, headers: { "content-type": "application/json", origin: "http://localhost:3000", ...extra }, body });
+
+  it.each(REGISTRATION_ROUTES)("$url: a body under 64 KiB is admitted by the gate and handled by the route", async (route) => {
+    const body = JSON.stringify(route.valid);
+    const declared = { "content-length": String(Buffer.byteLength(body, "utf8")) };
+    expect(gate(build(route, body, declared))).toBeNull();
+    await invoke(route, build(route, body, declared));
+    expect(state.captured[route.registrationService!]).toEqual([REGISTRATION_RESPONSE]);
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: a body between 64 KiB and 10 MiB is admitted by the gate and refused 413 by the route", async (route) => {
+    const body = bodyOfBytes(route, 200_000);
+    const declared = { "content-length": "200000" };
+    expect(gate(build(route, body, declared))).toBeNull();
+    expect(await invoke(route, build(route, body, declared))).toEqual({ status: 413, body: TOO_LARGE });
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: declared 10 MiB passes the gate and is a route 413; 10 MiB + 1 is the gate's 413; no length at all is the gate's 411", async (route) => {
+    const atCeiling = { "content-length": String(REAL_API_MAX_BODY_BYTES) };
+    expect(gate(build(route, "{}", atCeiling))).toBeNull();
+    expect(await invoke(route, build(route, "{}", atCeiling))).toEqual({ status: 413, body: TOO_LARGE });
+    const over = gate(build(route, "{}", { "content-length": String(REAL_API_MAX_BODY_BYTES + 1) }));
+    expect(over?.status).toBe(413);
+    expect(await over?.json()).toEqual(TOO_LARGE);
+    expect(gate(build(route, "{}", {}))?.status).toBe(411);
+  });
+
+  it.each(REGISTRATION_ROUTES)("$url: the 403 and 415 checks still come first", (route) => {
+    expect(gate(build(route, "{}", { origin: "https://evil.example" }))?.status).toBe(403);
+    expect(gate(new Request(`http://localhost${route.url}`, { method: route.method, headers: { "content-type": "text/plain", origin: "http://localhost:3000", "content-length": "2" }, body: "{}" }))?.status).toBe(415);
   });
 });
 
@@ -851,16 +1139,11 @@ function routeFiles(directory: string): string[] {
 /** Strips comments so a guard never trips on prose that mentions a forbidden call. */
 const code = (source: string) => source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
-/** The two registration routes that still use the unbounded reader — 3B-4's work, not this slice's. */
-const TWO_REMAINING_BODY_ROUTES = [
-  "app/api/real/account/passkeys/backup/register/route.ts",
-  "app/api/real/account/register/verify/route.ts",
-];
 
-describe("source guards — the 20 bounded routes (14 control, 4 assertion, 2 signed)", () => {
-  it("the inventory is exactly 14 + 4 + 2 = 20 distinct routes, each with the right method and family constant", () => {
-    expect(ROUTES).toHaveLength(20);
-    expect(new Set(ROUTES.map((route) => route.file)).size).toBe(20);
+describe("source guards — the 22 bounded routes (14 control, 4 assertion, 2 signed, 2 registration)", () => {
+  it("the inventory is exactly 14 + 4 + 2 + 2 = 22 distinct routes, each with the right method and family constant", () => {
+    expect(ROUTES).toHaveLength(22);
+    expect(new Set(ROUTES.map((route) => route.file)).size).toBe(22);
     expect(ROUTES.filter((route) => route.limitName === "CONTROL_BODY_MAX_BYTES")).toHaveLength(14);
     expect(ROUTES.filter((route) => route.limitName === "WEBAUTHN_ASSERTION_BODY_MAX_BYTES").map((route) => route.url)).toEqual([
       "/api/real/account/login/verify",
@@ -873,9 +1156,13 @@ describe("source guards — the 20 bounded routes (14 control, 4 assertion, 2 si
       "/api/real/account/passkeys/backup/authorize/submit",
     ]);
     expect(ROUTES.filter((route) => route.method === "PATCH").map((route) => route.url)).toEqual(["/api/real/account/profile", "/api/real/account/passkeys/credential-1"]);
-    expect(ROUTES.filter((route) => route.method === "POST")).toHaveLength(18);
+    expect(ROUTES.filter((route) => route.limitName === "WEBAUTHN_REGISTRATION_BODY_MAX_BYTES").map((route) => route.url)).toEqual([
+      "/api/real/account/register/verify",
+      "/api/real/account/passkeys/backup/register",
+    ]);
+    expect(ROUTES.filter((route) => route.method === "POST")).toHaveLength(20);
     // The limit each route is tested with is the very constant it names.
-    const byName = { CONTROL_BODY_MAX_BYTES, WEBAUTHN_ASSERTION_BODY_MAX_BYTES, SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES };
+    const byName = { CONTROL_BODY_MAX_BYTES, WEBAUTHN_ASSERTION_BODY_MAX_BYTES, SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES, WEBAUTHN_REGISTRATION_BODY_MAX_BYTES };
     for (const route of ROUTES) expect(route.limit, route.file).toBe(byName[route.limitName]);
   });
 
@@ -884,7 +1171,7 @@ describe("source guards — the 20 bounded routes (14 control, 4 assertion, 2 si
     expect(source.match(/readBoundedJsonBody\(/g)).toHaveLength(1);
     expect(source).toContain(`readBoundedJsonBody(request, ${route.limitName})`);
     // It names exactly one policy constant — never another family's.
-    for (const other of ["CONTROL_BODY_MAX_BYTES", "WEBAUTHN_ASSERTION_BODY_MAX_BYTES", "SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES"]) {
+    for (const other of ["CONTROL_BODY_MAX_BYTES", "WEBAUTHN_ASSERTION_BODY_MAX_BYTES", "SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES", "WEBAUTHN_REGISTRATION_BODY_MAX_BYTES"]) {
       if (other !== route.limitName) expect(source, other).not.toContain(other);
     }
     expect(source).toMatch(/bounded\.kind === "too_large"\) return requestTooLargeResponse\(\)/);
@@ -893,7 +1180,7 @@ describe("source guards — the 20 bounded routes (14 control, 4 assertion, 2 si
     // No second, unbounded way to read the body, and no inline size number.
     expect(source).not.toContain("readJsonBody");
     expect(source).not.toMatch(/\.(json|text|arrayBuffer|blob|formData|bytes)\(\)/);
-    expect(source).not.toMatch(/request\.body\b/);
+    expect(source).not.toMatch(/request\.body\b|\breq\.(json|text|arrayBuffer|formData|blob|body)\b/);
     expect(source).not.toMatch(/\b4096\b|\b4 \* 1024\b|1024 \*|\b16384\b|\b16_384\b|\b65536\b|\b65_536\b|\b10485760\b|\b10_485_760\b|\b64 \* 1024\b|\b16 \* 1024\b/);
   });
 
@@ -909,33 +1196,35 @@ describe("source guards — the 20 bounded routes (14 control, 4 assertion, 2 si
   });
 });
 
-describe("source guards — the two registration routes NOT migrated by this slice", () => {
-  it("still read their bodies with readJsonBody (they are not yet protected by a route limit)", () => {
-    for (const file of TWO_REMAINING_BODY_ROUTES) {
+describe("source guards — no body-reading route uses the legacy unbounded reader", () => {
+  it("every body-reading route in app/api is one of the 22 bounded routes — all 22 accounted for, none counted twice, nothing new", () => {
+    const bodyReaders = routeFiles(path.join(root, "app/api"))
+      .map((file) => path.relative(root, file))
+      .filter((file) => /readBoundedJsonBody|\breadJsonBody\b|\brequest\.(json|text|arrayBuffer|formData|blob|body)\b|\breq\.(json|text|arrayBuffer|formData|blob|body)\b/.test(code(read(file))))
+      .sort();
+    expect(bodyReaders).toEqual(ROUTES.map((route) => route.file).sort());
+    expect(bodyReaders).toHaveLength(22);
+    expect(new Set(bodyReaders).size).toBe(22);
+    // All 22 use the bounded reader, exactly once; none uses anything else.
+    for (const file of bodyReaders) {
       const source = code(read(file));
-      expect(source, file).toContain("readJsonBody(request)");
-      expect(source, file).not.toContain("readBoundedJsonBody");
+      expect(source.match(/readBoundedJsonBody\(/g), file).toHaveLength(1);
+      expect(source, file).not.toMatch(/\breadJsonBody\b/);
     }
   });
 
-  it("every body-reading route in app/api is one of the 20 bounded routes or one of these 2 — 22 in all, none counted twice, nothing new", () => {
-    const bodyReaders = routeFiles(path.join(root, "app/api"))
-      .map((file) => path.relative(root, file))
-      .filter((file) => /readJsonBody|readBoundedJsonBody|\brequest\.(json|text|arrayBuffer|formData|blob|body)\b|\breq\.(json|text|arrayBuffer|formData|blob|body)\b/.test(code(read(file))))
-      .sort();
-    expect(bodyReaders).toEqual([...ROUTES.map((route) => route.file), ...TWO_REMAINING_BODY_ROUTES].sort());
-    expect(bodyReaders).toHaveLength(22);
-    expect(new Set(bodyReaders).size).toBe(22);
-    // Exactly 20 use the bounded reader; exactly 2 use the unbounded one; no route uses both.
-    const bounded = bodyReaders.filter((file) => code(read(file)).includes("readBoundedJsonBody("));
-    const unbounded = bodyReaders.filter((file) => /\breadJsonBody\(/.test(code(read(file))));
-    expect(bounded).toHaveLength(20);
-    expect(unbounded.sort()).toEqual([...TWO_REMAINING_BODY_ROUTES].sort());
-    expect(bounded.filter((file) => unbounded.includes(file))).toEqual([]);
-  });
-
-  it("readJsonBody itself still exists for them (it is not banned yet)", () => {
-    expect(code(read("lib/real/server/http.ts"))).toContain("export async function readJsonBody(");
+  it("readJsonBody has no production caller anywhere in app/ or lib/, and http.ts no longer defines it", () => {
+    const walk = (directory: string): string[] =>
+      readdirSync(directory).flatMap((entry) => {
+        const full = path.join(directory, entry);
+        if (statSync(full).isDirectory()) return walk(full);
+        return /\.(ts|tsx|mjs|js)$/.test(entry) ? [full] : [];
+      });
+    const callers = [...walk(path.join(root, "app")), ...walk(path.join(root, "lib")), ...walk(path.join(root, "components"))]
+      .filter((file) => /\breadJsonBody\b/.test(readFileSync(file, "utf8")))
+      .map((file) => path.relative(root, file));
+    expect(callers).toEqual([]);
+    expect(code(read("lib/real/server/http.ts"))).not.toMatch(/\breadJsonBody\b/);
   });
 });
 
@@ -947,16 +1236,20 @@ describe("source guards — the shared reader", () => {
     expect(http.match(/export const CONTROL_BODY_MAX_BYTES = 4096;/g)).toHaveLength(1);
     expect(http.match(/export const WEBAUTHN_ASSERTION_BODY_MAX_BYTES = 16_384;/g)).toHaveLength(1);
     expect(http.match(/export const SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES = 65_536;/g)).toHaveLength(1);
+    expect(http.match(/export const WEBAUTHN_REGISTRATION_BODY_MAX_BYTES = 65_536;/g)).toHaveLength(1);
     expect(CONTROL_BODY_MAX_BYTES).toBe(4096);
     // The constants live in http.ts: there is no separate limits module.
     const serverFiles = readdirSync(path.join(root, "lib/real/server"));
     expect(serverFiles.filter((name) => /body-?limit|request-?limit|size-?limit/i.test(name))).toEqual([]);
   });
 
-  it("the policy hierarchy is strictly increasing: control < WebAuthn assertion < signed Turnkey < the 10 MiB gate", () => {
+  it("the policy hierarchy: control < assertion < registration < the 10 MiB gate, and signed < the gate (signed and registration may be equal)", () => {
     expect(CONTROL_BODY_MAX_BYTES).toBeLessThan(WEBAUTHN_ASSERTION_BODY_MAX_BYTES);
+    expect(WEBAUTHN_ASSERTION_BODY_MAX_BYTES).toBeLessThan(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES);
+    expect(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES).toBeLessThan(REAL_API_MAX_BODY_BYTES);
     expect(WEBAUTHN_ASSERTION_BODY_MAX_BYTES).toBeLessThan(SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES);
     expect(SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES).toBeLessThan(REAL_API_MAX_BODY_BYTES);
+    expect(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES).toBe(65_536);
   });
 
   it("counts a chunk against the limit BEFORE keeping it, so the chunk that crosses the line is never retained", () => {
