@@ -576,7 +576,7 @@ describe("other side effects stay behind the body check", () => {
 const NEW_ROUTES = [...ASSERTION_ROUTES, ...SIGNED_ROUTES];
 
 describe("3B-3 family limits — each family uses its own budget, not the control one", () => {
-  it("the policy hierarchy is strictly increasing and every family sits under the 10 MiB gate", () => {
+  it("the policy hierarchy is strictly increasing and every family sits under the 256 KiB gate", () => {
     expect(CONTROL_BODY_MAX_BYTES).toBe(4096);
     expect(WEBAUTHN_ASSERTION_BODY_MAX_BYTES).toBe(16_384);
     expect(SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES).toBe(65_536);
@@ -1052,14 +1052,14 @@ describe("3B-4 gate compatibility for the registration routes", () => {
     expect(state.captured[route.registrationService!]).toEqual([REGISTRATION_RESPONSE]);
   });
 
-  it.each(REGISTRATION_ROUTES)("$url: a body between 64 KiB and 10 MiB is admitted by the gate and refused 413 by the route", async (route) => {
+  it.each(REGISTRATION_ROUTES)("$url: a body between 64 KiB and 256 KiB is admitted by the gate and refused 413 by the route", async (route) => {
     const body = bodyOfBytes(route, 200_000);
     const declared = { "content-length": "200000" };
     expect(gate(build(route, body, declared))).toBeNull();
     expect(await invoke(route, build(route, body, declared))).toEqual({ status: 413, body: TOO_LARGE });
   });
 
-  it.each(REGISTRATION_ROUTES)("$url: declared 10 MiB passes the gate and is a route 413; 10 MiB + 1 is the gate's 413; no length at all is the gate's 411", async (route) => {
+  it.each(REGISTRATION_ROUTES)("$url: declared 256 KiB passes the gate and is a route 413; 256 KiB + 1 is the gate's 413; no length at all is the gate's 411", async (route) => {
     const atCeiling = { "content-length": String(REAL_API_MAX_BODY_BYTES) };
     expect(gate(build(route, "{}", atCeiling))).toBeNull();
     expect(await invoke(route, build(route, "{}", atCeiling))).toEqual({ status: 413, body: TOO_LARGE });
@@ -1079,7 +1079,7 @@ describe("3B-4 gate compatibility for the registration routes", () => {
 // 3B-2: the request gate in front of the 3B-1 routes.
 // ---------------------------------------------------------------------------
 
-describe("3B-2 gate + route together — each route's own limit still applies to what the 10 MiB gate admits", () => {
+describe("3B-2 gate + route together — each route's own limit still applies to what the 256 KiB gate admits", () => {
   const GATE_ENV = { NEXT_PUBLIC_REAL_MODE_ENABLED: "true", NEXT_PUBLIC_REAL_ORIGIN: "http://localhost:3000" };
   const gate = (request: Request) => checkRealApiRequest(request, GATE_ENV);
   const withHeaders = (route: RouteCase, body: string, extra: Record<string, string>) =>
@@ -1094,17 +1094,44 @@ describe("3B-2 gate + route together — each route's own limit still applies to
     expect(route.sessionFirst ? nonSession(state.events) : state.events).toEqual([]);
   });
 
-  it.each(ROUTES)("$url: a body declared at exactly 10 MiB passes the gate; the route refuses it at once from the declared length, without reading it", async (route) => {
+  it.each(ROUTES)("$url: a body declared at exactly 256 KiB (262,144) passes the gate; the route refuses it at once from the declared length, without reading it", async (route) => {
     const declared = { "content-length": String(REAL_API_MAX_BODY_BYTES) };
     expect(gate(withHeaders(route, "{}", declared))).toBeNull();
     expect(await invoke(route, withHeaders(route, "{}", declared))).toEqual({ status: 413, body: TOO_LARGE });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it.each(ROUTES)("$url: a body declared one byte over 10 MiB never reaches the route — the gate answers 413 first", async (route) => {
+  it.each(ROUTES)("$url: a body declared one byte over 256 KiB (262,145) never reaches the route — the gate answers 413 first", async (route) => {
     const response = gate(withHeaders(route, "{}", { "content-length": String(REAL_API_MAX_BODY_BYTES + 1) }));
     expect(response?.status).toBe(413);
     expect(await response?.json()).toEqual(TOO_LARGE);
+    expect(response?.headers.get("retry-after")).toBeNull();
+    // The route was never invoked: no session read, challenge, claim, signing, provider call or write.
+    expect(state.events).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(ROUTES)("$url: a 200,000-byte body passes the 256 KiB gate and is refused 413 by the route's own smaller limit (when that limit is below 200,000)", async (route) => {
+    const body = bodyOfBytes(route, 200_000);
+    const declared = { "content-length": "200000" };
+    expect(gate(withHeaders(route, body, declared))).toBeNull();
+    expect(route.limit).toBeLessThan(200_000);
+    expect(await invoke(route, withHeaders(route, body, declared))).toEqual({ status: 413, body: TOO_LARGE });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(route.sessionFirst ? nonSession(state.events) : state.events).toEqual([]);
+  });
+
+  it.each(ROUTES)("$url: the gate boundary is exactly 262,144 (admitted) / 262,145 (refused) for this route", (route) => {
+    expect(REAL_API_MAX_BODY_BYTES).toBe(262_144);
+    expect(gate(withHeaders(route, "{}", { "content-length": "262144" }))).toBeNull();
+    expect(gate(withHeaders(route, "{}", { "content-length": "262145" }))?.status).toBe(413);
+  });
+
+  it.each(ROUTES)("$url: a body valid under the route's own limit is admitted by the gate and unchanged by the lower ceiling", async (route) => {
+    const body = JSON.stringify(route.valid);
+    const size = Buffer.byteLength(body, "utf8");
+    expect(size).toBeLessThanOrEqual(route.limit);
+    expect(gate(withHeaders(route, body, { "content-length": String(size) }))).toBeNull();
   });
 
   it.each(ROUTES)("$url: no Content-Length at all is refused 411 by the gate before the route; a directly invoked handler still counts the bytes", async (route) => {
@@ -1182,6 +1209,8 @@ describe("source guards — the 22 bounded routes (14 control, 4 assertion, 2 si
     expect(source).not.toMatch(/\.(json|text|arrayBuffer|blob|formData|bytes)\(\)/);
     expect(source).not.toMatch(/request\.body\b|\breq\.(json|text|arrayBuffer|formData|blob|body)\b/);
     expect(source).not.toMatch(/\b4096\b|\b4 \* 1024\b|1024 \*|\b16384\b|\b16_384\b|\b65536\b|\b65_536\b|\b10485760\b|\b10_485_760\b|\b64 \* 1024\b|\b16 \* 1024\b/);
+    // The global 256 KiB gate value, in any common spelling, must never be copied into a route.
+    expect(source).not.toMatch(/\b262144\b|\b262_144\b|\b256 \* 1024\b|\b1024 \* 256\b|\b0x40000\b|\b2 \*\* 18\b|\b262145\b|\b262_145\b/);
   });
 
   it("the 413 happens before the first thing after the body in every route (the response is returned at the read site)", () => {
@@ -1243,7 +1272,7 @@ describe("source guards — the shared reader", () => {
     expect(serverFiles.filter((name) => /body-?limit|request-?limit|size-?limit/i.test(name))).toEqual([]);
   });
 
-  it("the policy hierarchy: control < assertion < registration < the 10 MiB gate, and signed < the gate (signed and registration may be equal)", () => {
+  it("the policy hierarchy: control < assertion < registration < the 256 KiB gate, and signed < the gate (signed and registration may be equal)", () => {
     expect(CONTROL_BODY_MAX_BYTES).toBeLessThan(WEBAUTHN_ASSERTION_BODY_MAX_BYTES);
     expect(WEBAUTHN_ASSERTION_BODY_MAX_BYTES).toBeLessThan(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES);
     expect(WEBAUTHN_REGISTRATION_BODY_MAX_BYTES).toBeLessThan(REAL_API_MAX_BODY_BYTES);

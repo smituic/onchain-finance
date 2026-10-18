@@ -455,7 +455,8 @@ describe("S4 static security headers (F5) — next.config.ts as Next applies it"
 
 // ---------------------------------------------------------------------------
 // Milestone 3B-2: the declared-length gate (411 / 400 / 413) and the shared
-// 10 MiB ceiling.
+// ceiling. The ceiling was 10 MiB when 3B closed and is 256 KiB (262_144 bytes)
+// since the separate post-3B global body-ceiling change.
 // ---------------------------------------------------------------------------
 
 const LIMIT = REAL_API_MAX_BODY_BYTES;
@@ -566,9 +567,27 @@ describe("3B-2 Content-Length — missing, malformed, unsafe, too large, and at 
     expect(gateAt("/api/real/payments/submit", "POST", json({ "transfer-encoding": "chunked", "content-length": "10" }))).toBeNull();
   });
 
-  it("F. a declared length of exactly 10,485,760 bytes passes the gate on every body route", () => {
-    expect(LIMIT).toBe(10_485_760);
+  it("F. a declared length of exactly 262,144 bytes (256 KiB) passes the gate on every body route", () => {
+    expect(LIMIT).toBe(262_144);
     for (const route of bodyRoutes) expect(gateAt(route.url, route.method, json({ "content-length": String(LIMIT) })), route.url).toBeNull();
+  });
+
+  it("F. the boundary on every body route: 262,143 and 262,144 are admitted, 262,145 is the gate's 413", () => {
+    for (const route of bodyRoutes) {
+      expect(gateAt(route.url, route.method, json({ "content-length": "262143" })), `${route.url} 262143`).toBeNull();
+      expect(gateAt(route.url, route.method, json({ "content-length": "262144" })), `${route.url} 262144`).toBeNull();
+      expect(gateAt(route.url, route.method, json({ "content-length": "262145" }))?.status, `${route.url} 262145`).toBe(413);
+    }
+  });
+
+  it("F. the previous 10 MiB ceiling is gone: a declared 10 MiB (and 10 MiB + 1) is now the gate's 413 on every body route", async () => {
+    for (const route of bodyRoutes) {
+      for (const declared of ["10485760", "10485761"]) {
+        const response = gateAt(route.url, route.method, json({ "content-length": declared }))!;
+        expect(response.status, `${route.url} ${declared}`).toBe(413);
+        expect(await response.json(), `${route.url} ${declared}`).toEqual(TOO_LARGE);
+      }
+    }
   });
 
   it("F. Content-Length: 0 passes the gate; the route's own validation then rejects the empty body", () => {
@@ -576,8 +595,8 @@ describe("3B-2 Content-Length — missing, malformed, unsafe, too large, and at 
   });
 
   it("F. leading zeros are plain decimal digits: they are read as the number they spell", () => {
-    expect(gateAt("/api/real/payments/prepare", "POST", json({ "content-length": "0010485760" }))).toBeNull();
-    expect(gateAt("/api/real/payments/prepare", "POST", json({ "content-length": "0010485761" }))?.status).toBe(413);
+    expect(gateAt("/api/real/payments/prepare", "POST", json({ "content-length": "000262144" }))).toBeNull();
+    expect(gateAt("/api/real/payments/prepare", "POST", json({ "content-length": "000262145" }))?.status).toBe(413);
   });
 
   it("G/H. one byte above the ceiling is HTTP 413 with the exact body on every body route, and nothing is echoed or retryable", async () => {
@@ -705,14 +724,15 @@ describe("3B-2 paths — encoded and unusual spellings cannot reach a body route
 });
 
 describe("3B-2 shared ceiling and the framework's configuration", () => {
-  it("N. next.config.ts sets the proxy body-copy limit to the very constant the gate enforces (10 MiB)", () => {
-    expect(REAL_API_MAX_BODY_BYTES).toBe(10 * 1024 * 1024);
+  it("N. next.config.ts sets the proxy body-copy limit to the very constant the gate enforces (256 KiB)", () => {
+    expect(REAL_API_MAX_BODY_BYTES).toBe(256 * 1024);
+    expect(REAL_API_MAX_BODY_BYTES).toBe(262_144);
     expect((nextConfig.experimental as { proxyClientMaxBodySize?: unknown }).proxyClientMaxBodySize).toBe(REAL_API_MAX_BODY_BYTES);
   });
 
-  it("N. the framework limit is not lower than the gate limit (no accepted request can be truncated by the copy)", () => {
+  it("N. the framework limit equals the gate limit exactly (no accepted request can be truncated by the copy, and neither side can drift)", () => {
     const framework = (nextConfig.experimental as { proxyClientMaxBodySize: number }).proxyClientMaxBodySize;
-    expect(framework).toBeGreaterThanOrEqual(REAL_API_MAX_BODY_BYTES);
+    expect(framework).toBe(REAL_API_MAX_BODY_BYTES);
   });
 
   it("O. a request the gate admits can still be refused by a route's smaller limit (the 4 KiB policy is untouched)", () => {

@@ -100,7 +100,7 @@ export const SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES = 65_536;
  * attestation object (and, for some formats, a certificate chain); this cap is
  * a controlled-development policy chosen with generous headroom over the shapes
  * modeled offline, NOT a measurement of every real authenticator. It is
- * intentionally stricter than the 10 MiB gate in front of it, and it measures
+ * intentionally stricter than the 256 KiB gate in front of it, and it measures
  * transport bytes, not string length.
  */
 export const WEBAUTHN_REGISTRATION_BODY_MAX_BYTES = 65_536;

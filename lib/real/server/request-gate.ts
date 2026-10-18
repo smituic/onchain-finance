@@ -44,15 +44,17 @@ import { requestTooLargeResponse } from "./http";
  */
 
 /**
- * The ONE size ceiling for a body-carrying /api/real/** request: 10 MiB, the
- * framework's own default proxy body-copy limit. next.config.ts sets
+ * The ONE size ceiling for a body-carrying /api/real/** request: 256 KiB
+ * (262 144 bytes), a controlled-development policy set after Milestone 3B
+ * (which closed with the framework's 10 MiB default). next.config.ts sets
  * `experimental.proxyClientMaxBodySize` to this same constant and the gate
  * below refuses any larger declared length, so the two can never drift apart.
  * Never lower the framework limit without lowering this, and never raise this
- * above the framework limit. Route-specific limits (the 4 KiB control budget,
- * 3B-1) are smaller and are enforced inside the routes.
+ * above the framework limit. Route-specific limits (4 KiB control, 16 KiB
+ * assertion, 64 KiB signed Turnkey and registration) are smaller and are
+ * enforced inside the routes.
  */
-export const REAL_API_MAX_BODY_BYTES = 10_485_760;
+export const REAL_API_MAX_BODY_BYTES = 262_144;
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 

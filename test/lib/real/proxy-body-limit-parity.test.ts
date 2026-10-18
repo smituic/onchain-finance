@@ -48,13 +48,19 @@ describe("proxy body-copy limit parity (loaded by Next.js's own config loader)",
     }
   });
 
-  it("the explicit value equals the framework's own default, so the copy limit was not lowered or raised", () => {
+  it("the approved 256 KiB policy is pinned, and is deliberately below the framework's own 10 MiB default", () => {
+    expect(REAL_API_MAX_BODY_BYTES).toBe(262_144);
+    expect(REAL_API_MAX_BODY_BYTES).toBe(256 * 1024);
+    // The installed framework default (10 MiB) is what the explicit setting overrides; it is not the policy.
     expect(loaded.defaultLimit).toBe(10_485_760);
-    expect(REAL_API_MAX_BODY_BYTES).toBe(loaded.defaultLimit);
+    expect(REAL_API_MAX_BODY_BYTES).toBeLessThan(loaded.defaultLimit);
   });
 
-  it("the framework limit is not below the gate ceiling", () => {
-    for (const result of Object.values(loaded.phases)) expect(result.limit).toBeGreaterThanOrEqual(REAL_API_MAX_BODY_BYTES);
+  it("the framework limit EQUALS the gate ceiling in every phase (strict equality, not an inequality)", () => {
+    for (const [phase, result] of Object.entries(loaded.phases)) {
+      expect(result.limit, phase).toBe(REAL_API_MAX_BODY_BYTES);
+      expect(result.limit, phase).toBe(262_144);
+    }
   });
 });
 
@@ -68,6 +74,8 @@ describe("next.config.ts takes the limit from the gate's constant", () => {
 
   it("contains no independently maintained size literal", () => {
     expect(source).not.toMatch(/10485760|10_485_760|10 \* 1024|1024 \* 1024|"10mb"|'10mb'|"10 MB"/i);
+    // The approved 256 KiB value, in every common spelling, must come from the shared constant only.
+    expect(source).not.toMatch(/\b262144\b|\b262_144\b|\b256 \* 1024\b|\b256\s*\*\s*1_?024\b|\b0x40000\b|\b1024 \* 256\b|\b2 \*\* 18\b|"256 ?k(i?b)?"|'256 ?k(i?b)?'/i);
     expect(source.match(/proxyClientMaxBodySize/g)).toHaveLength(1);
   });
 

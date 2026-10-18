@@ -2,8 +2,8 @@ import type { NextConfig } from "next";
 import { REAL_API_MAX_BODY_BYTES } from "./lib/real/server/request-gate";
 
 const nextConfig: NextConfig = {
-  // 3B-2: make the proxy body-copy ceiling explicit (it equals the framework's
-  // 10 MB default) and tie it to the request gate's declared-length ceiling.
+  // 3B-2: make the proxy body-copy ceiling explicit (256 KiB, below the
+  // framework's 10 MB default) and tie it to the request gate's declared-length ceiling.
   // Past this limit Next.js silently keeps only a prefix of the body, so the
   // gate (lib/real/server/request-gate.ts) refuses any larger declared length
   // before a route can see it. One constant, two uses: do not set a literal here.
