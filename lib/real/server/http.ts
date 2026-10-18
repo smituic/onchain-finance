@@ -62,6 +62,23 @@ export function retryableRateLimitedResponse(message: string, retryAfterSeconds:
 }
 
 /**
+ * Milestone 3C-1: the ONE shape of a global registration-admission refusal —
+ * 503 (the shared pool is used up; nothing is wrong with this caller), a plain
+ * message, `code: "registration_unavailable"`, and an advisory whole-second
+ * Retry-After. Nothing else: no count, limit, window, or key. It is sent before
+ * any challenge exists, so no passkey has been created or is being asked for.
+ * The delay is validated upstream; a value that is not a whole number of seconds
+ * from 1 to 86 400 is a bug, so it throws (the route's generic 500) rather than
+ * inventing a Retry-After. A storage failure must NEVER be sent through here.
+ */
+export const REGISTRATION_UNAVAILABLE_MESSAGE = "We can't open new accounts right now. Please try again later.";
+
+export function registrationUnavailableResponse(retryAfterSeconds: number): Response {
+  if (!Number.isSafeInteger(retryAfterSeconds) || retryAfterSeconds < 1 || retryAfterSeconds > 86_400) throw new Error("Registration-unavailable response needs a whole-second delay from 1 to 86400.");
+  return Response.json({ error: REGISTRATION_UNAVAILABLE_MESSAGE, code: "registration_unavailable" }, { status: 503, headers: { "Retry-After": String(retryAfterSeconds) } });
+}
+
+/**
  * Milestone 3B, Slice 3B-1: the byte budget for a CONTROL request — a small
  * JSON body of ids, a short name, a handle, an address, an amount, a hex
  * signature, or a Turnkey activity id. The largest legitimate control body is

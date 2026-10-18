@@ -26,6 +26,7 @@ const SUITES: Array<[string, string]> = [
   [`${R}rate-limit.smoke.test.ts`, "REAL_SMOKE_RATE_LIMIT"],
   [`${R}provisioning-limits.smoke.test.ts`, "REAL_SMOKE_PROVISIONING_LIMITS"],
   [`${R}provider-budget.smoke.test.ts`, "REAL_SMOKE_PROVIDER_BUDGET"],
+  [`${R}registration-admission.smoke.test.ts`, "REAL_SMOKE_REGISTRATION_ADMISSION"],
 ];
 /** The five suites finding L1 was about (they used to skip when their gate was set without a branch URL), and every disposable-branch suite added since. */
 const L1_SUITES = SUITES.slice(4);

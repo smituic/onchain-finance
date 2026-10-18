@@ -12,6 +12,7 @@ import { REAL_SESSION_COOKIE_NAME, createSessionPayload, serializeSession } from
 import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
 import { freshRateLimiter } from "./fixtures/rate-limit";
 import { openBudget } from "./fixtures/chain-read-budget";
+import { createInMemoryRegistrationAdmissionStore, createRegistrationAdmission } from "@/lib/real/server/registration-admission";
 
 /**
  * S4 (F2/F6-D and the auth-route matrix), against the ACTUAL route.ts code:
@@ -99,6 +100,7 @@ function mockRuntime(stores: Stores, registryOverride?: Partial<RealAccountRegis
     getAccountHandleStore: () => stores.handles,
     getRateLimiter: () => freshRateLimiter(),
     getProviderBudgetLimiter: () => openBudget(),
+    getRegistrationAdmission: () => createRegistrationAdmission(createInMemoryRegistrationAdmissionStore()),
   }));
 }
 

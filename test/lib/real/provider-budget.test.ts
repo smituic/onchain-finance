@@ -544,7 +544,9 @@ describe("schema.sql (static — no PostgreSQL has run any of this here)", () =>
     expect(schema.split(BEGIN)).toHaveLength(2);
     expect(schema.split(END)).toHaveLength(2);
     expect(schema).toContain(`${SLICE_E_END}\n\n${BEGIN}\n`);
-    expect(schema).toContain(`${END}\n\n-- BEGIN Provisioning Evidence Capture\n`);
+    // 3C-1: the Registration Admission block now sits between this one and the provisioning-evidence block (which still comes later and stays last).
+    expect(schema).toContain(`${END}\n\n-- BEGIN Registration Admission\n`);
+    expect(schema.indexOf("-- BEGIN Provisioning Evidence Capture")).toBeGreaterThan(schema.indexOf(END));
     expect(schema.trimEnd().endsWith("-- END Provisioning Evidence Capture")).toBe(true);
     expect(code.trim().startsWith("DO $$")).toBe(true);
     expect(code.trim().endsWith("END $$;")).toBe(true);

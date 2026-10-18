@@ -1928,6 +1928,256 @@ BEGIN
 END $$;
 -- END Provider Budgets
 
+-- BEGIN Registration Admission
+-- Milestone 3C-1 (global registration admission). Hand-applied, idempotent,
+-- FAIL-CLOSED.
+--
+-- NOT APPLIED ANYWHERE. This migration has not been executed against any
+-- database — not the real application database, not a disposable Neon branch,
+-- not a scratch schema. It has never been parsed or run by PostgreSQL. Writing
+-- this text does not authorize applying it: applying it is a separate operator
+-- checkpoint that needs its own explicit authorization, and the application
+-- code that consults it (POST /api/real/account/register/options) must not be
+-- deployed against a database that lacks it — the admission statements FAIL
+-- CLOSED without the table or its seed row (the route answers its generic 500
+-- and mints no challenge).
+--
+-- What would be executed is the single statement that follows these comments
+-- (its text starts at the line that begins with the keyword that opens a
+-- procedural block and ends at its closing END line): SHA-256
+-- b269ebcc0953efce79c7504ec451237eca3dc1bc4d67996d7179b5eba26ac91f, 13101 characters.
+-- Once a disposable-Neon smoke has run it, that statement becomes
+-- evidence-bearing like the blocks above and must not change without
+-- re-running the smoke. Later edits to the comments ABOVE it change the
+-- BEGIN..END text but not that statement; extraction takes the first
+-- occurrence of the statement's opening token, so these comments must never
+-- spell it out. It is derived from the Handle Pay Rate Limits statement above
+-- (the same six catalog proofs) with a different table, a five-column
+-- definition, and a final seed step.
+--
+-- ONE ROW, ONE SCOPE: a GLOBAL counter for POST /api/real/account/register/options.
+--   scope               the only value allowed is 'register_options'
+--   short_window_start  the database's now() at the first ADMITTED request of
+--                       the hourly window (3600 s); the seed is 1970-01-01
+--   short_hits          requests admitted in that window (0 only in the seed)
+--   day_window_start    the same for the daily window (86400 s)
+--   day_hits            requests admitted in that window
+-- The window lengths and limits (30 per hour, 100 per day) are NOT stored here:
+-- they are frozen code constants (registration-admission.ts) passed as
+-- parameters, so a policy change never needs a migration. The 0..100000 CHECKs
+-- are a sanity / overflow bound, not the policy. The two counters are
+-- independent (windows roll separately), so there is deliberately no CHECK
+-- relating them.
+--
+-- PRIVACY — the row holds nothing about any request or caller: no IP address,
+-- account, session, header, or body. Deliberately no foreign key, no secondary
+-- index, no trigger, and no default.
+--
+-- THE SEED: the statement inserts the one row (scope 'register_options', both
+-- window starts 1970-01-01 00:00:00+00, both counts 0) with ON CONFLICT (scope)
+-- DO NOTHING, ONLY after every structural proof has passed, then proves exactly
+-- one row with that scope exists. An epoch start reads as an elapsed window, so
+-- the first admitted request anchors both windows. An ordinary rerun therefore
+-- PRESERVES live counters. The application never creates or repairs this row:
+-- if it is deleted every registration start fails closed (generic 500) until
+-- an operator re-runs this statement, which re-inserts the seed — a DELIBERATE
+-- operator act that RESETS registration capacity to a full allowance, so it
+-- must be done knowingly and recorded.
+--
+-- ROLLBACK (never run automatically): this block creates only this table, so
+-- `DROP TABLE real_registration_admission` removes everything it adds. The
+-- registration-admission application code must be rolled back first — without
+-- the table it fails closed and no registration can start.
+--
+-- FAIL-CLOSED, same convention as the blocks above: `IF NOT EXISTS` only trusts
+-- a NAME, so the statement proves from the catalog that the relation under that
+-- name IS the intended one — pinned search_path and a single target-schema
+-- constant; an ordinary permanent non-partition table with no inheritance, row
+-- security, policy, user trigger, or rule and only built-in types and
+-- collations; exactly the reference's columns; exactly the reference's
+-- validated constraints and no foreign key in either direction; only the
+-- primary key's index; no outside dependency — and RAISEs, rolling the whole
+-- block back (the table creation and the seed together), if it is not. Nothing
+-- is ever dropped, rebuilt, or repaired.
+DO $$
+DECLARE
+  -- Declared types are resolved BEFORE the search_path pin below, so each is schema-qualified.
+  target_schema CONSTANT pg_catalog.text := 'public';
+  table_name CONSTANT pg_catalog.text := 'real_registration_admission';
+  reference_name CONSTANT pg_catalog.text := 'real_registration_admission_reference';
+  seed_scope CONSTANT pg_catalog.text := 'register_options';
+  seed_epoch CONSTANT pg_catalog.text := '1970-01-01 00:00:00+00';
+  -- Every column and constraint, each constraint explicitly named.
+  definition CONSTANT pg_catalog.text := $definition$
+    scope               TEXT COLLATE "C" NOT NULL,
+    short_window_start  TIMESTAMPTZ NOT NULL,
+    short_hits          INTEGER NOT NULL,
+    day_window_start    TIMESTAMPTZ NOT NULL,
+    day_hits            INTEGER NOT NULL,
+    CONSTRAINT real_registration_admission_pkey PRIMARY KEY (scope),
+    CONSTRAINT real_registration_admission_scope_check CHECK (scope = 'register_options'),
+    CONSTRAINT real_registration_admission_short_hits_check CHECK (short_hits >= 0 AND short_hits <= 100000),
+    CONSTRAINT real_registration_admission_day_hits_check CHECK (day_hits >= 0 AND day_hits <= 100000)
+  $definition$;
+  ns pg_catalog.oid;
+  tbl pg_catalog.oid;
+  ref pg_catalog.oid;
+  t record;
+  r record;
+  k record;
+  bad pg_catalog.text;
+  seed_total pg_catalog.int8;
+  seed_match pg_catalog.int8;
+BEGIN
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+
+  SELECT n.oid INTO ns FROM pg_catalog.pg_namespace n WHERE n.nspname = target_schema;
+  IF ns IS NULL THEN
+    RAISE EXCEPTION 'Registration admission migration refused: schema % does not exist.', target_schema;
+  END IF;
+
+  -- Create what is missing (IF NOT EXISTS trusts the name — everything below does not).
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I.%I (%s)', target_schema, table_name, definition);
+
+  -- 2. The relation under that name.
+  SELECT c.oid, c.relkind, c.relpersistence, c.relispartition, c.relrowsecurity, c.relforcerowsecurity
+    INTO t FROM pg_catalog.pg_class c WHERE c.relnamespace = ns AND c.relname = table_name;
+  IF t.oid IS NULL OR t.relkind IS DISTINCT FROM 'r' OR t.relpersistence IS DISTINCT FROM 'p' OR t.relispartition IS NOT FALSE THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% is not an ordinary, permanent, non-partition table. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  tbl := t.oid;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = tbl OR i.inhparent = tbl) THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% takes part in table inheritance (as a child or a parent). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF t.relrowsecurity IS NOT FALSE OR t.relforcerowsecurity IS NOT FALSE OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol WHERE pol.polrelid = tbl) THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% has row-level security enabled or forced, or a policy. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_trigger g WHERE g.tgrelid = tbl AND NOT g.tgisinternal)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite w WHERE w.ev_class = tbl)
+  THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% has a user trigger or a rule. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  SELECT pg_catalog.string_agg(a.attname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
+    WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
+      AND (ty.typnamespace IS DISTINCT FROM (SELECT n2.oid FROM pg_catalog.pg_namespace n2 WHERE n2.nspname = 'pg_catalog')
+        OR ty.typtype IS DISTINCT FROM 'b' OR ty.oid >= 16384 OR a.attcollation >= 16384);
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% column(s) % use a type or collation that is not a built-in base type/collation. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- The reference: the same definition, deparsed by this server, in this transaction.
+  EXECUTE format('DROP TABLE IF EXISTS pg_temp.%I', reference_name);
+  EXECUTE format('CREATE TEMPORARY TABLE %I (%s) ON COMMIT DROP', reference_name, definition);
+  SELECT c.oid INTO ref FROM pg_catalog.pg_class c WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relname = reference_name;
+
+  -- 3. Columns: exactly the reference's — no more, no fewer, each identical.
+  IF (SELECT pg_catalog.count(*) FROM pg_catalog.pg_attribute a WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped)
+    IS DISTINCT FROM (SELECT pg_catalog.count(*) FROM pg_catalog.pg_attribute a WHERE a.attrelid = ref AND a.attnum > 0 AND NOT a.attisdropped)
+  THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% does not have exactly the intended columns (scope, short_window_start, short_hits, day_window_start, day_hits). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  SELECT pg_catalog.string_agg(rc.attname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_attribute rc
+    LEFT JOIN pg_catalog.pg_attrdef rd ON rd.adrelid = rc.attrelid AND rd.adnum = rc.attnum
+    WHERE rc.attrelid = ref AND rc.attnum > 0 AND NOT rc.attisdropped
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute tc
+        LEFT JOIN pg_catalog.pg_attrdef td ON td.adrelid = tc.attrelid AND td.adnum = tc.attnum
+        WHERE tc.attrelid = tbl AND tc.attname = rc.attname AND NOT tc.attisdropped AND tc.attnum > 0
+          AND tc.atttypid = rc.atttypid AND tc.atttypmod = rc.atttypmod AND tc.attcollation = rc.attcollation
+          AND tc.attnotnull = rc.attnotnull AND tc.attidentity = rc.attidentity AND tc.attgenerated = rc.attgenerated
+          AND pg_catalog.pg_get_expr(td.adbin, td.adrelid) IS NOT DISTINCT FROM pg_catalog.pg_get_expr(rd.adbin, rd.adrelid));
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% column(s) % differ from the intended definition. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- 4. Constraints: exactly the reference's CHECK and PRIMARY KEY constraints —
+  --    so no foreign key, no extra CHECK, and nothing else references this
+  --    table. (PostgreSQL 18 also records each NOT NULL as a constraint row;
+  --    those are proven by the column comparison above, on every version.)
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl AND NOT c.convalidated) THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% has a constraint that is not validated.', target_schema, table_name;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl AND c.contype NOT IN ('c', 'p', 'n'))
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.confrelid = tbl)
+  THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% has, or is the target of, a foreign key (or another unintended kind of constraint). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  IF (SELECT pg_catalog.count(*) FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl AND c.contype IN ('c', 'p'))
+    IS DISTINCT FROM (SELECT pg_catalog.count(*) FROM pg_catalog.pg_constraint c WHERE c.conrelid = ref AND c.contype IN ('c', 'p'))
+  THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% does not have exactly the intended constraints. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name;
+  END IF;
+  FOR r IN
+    SELECT c.conname, c.contype, c.condeferrable, c.condeferred, c.connoinherit,
+           pg_catalog.pg_get_constraintdef(c.oid) AS def,
+           (SELECT pg_catalog.array_agg(a.attname ORDER BY u.ord) FROM pg_catalog.unnest(c.conkey) WITH ORDINALITY u(attnum, ord)
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum) AS key_names,
+           c.conindid
+      FROM pg_catalog.pg_constraint c WHERE c.conrelid = ref AND c.contype IN ('c', 'p')
+  LOOP
+    SELECT c.oid, c.conindid INTO k
+      FROM pg_catalog.pg_constraint c
+      WHERE c.conrelid = tbl AND c.conname = r.conname AND c.contype = r.contype AND c.convalidated
+        AND c.condeferrable = r.condeferrable AND c.condeferred = r.condeferred AND c.connoinherit = r.connoinherit
+        AND pg_catalog.pg_get_constraintdef(c.oid) = r.def
+        AND (SELECT pg_catalog.array_agg(a.attname ORDER BY u.ord) FROM pg_catalog.unnest(c.conkey) WITH ORDINALITY u(attnum, ord)
+              JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum) IS NOT DISTINCT FROM r.key_names;
+    IF k.oid IS NULL THEN
+      RAISE EXCEPTION 'Registration admission migration refused: constraint % on %.% is missing or not the intended definition. Nothing was changed; review and resolve by hand (never auto-dropped).', r.conname, target_schema, table_name;
+    END IF;
+    -- 5. The primary key's backing index, structurally.
+    IF r.contype = 'p' AND NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_index ti, pg_catalog.pg_index ri, pg_catalog.pg_class tic, pg_catalog.pg_class ric
+      WHERE ti.indexrelid = k.conindid AND ri.indexrelid = r.conindid AND tic.oid = ti.indexrelid AND ric.oid = ri.indexrelid
+        AND ti.indrelid = tbl AND tic.relam = ric.relam
+        AND ti.indisunique AND ti.indisunique = ri.indisunique AND ti.indisprimary AND ti.indisprimary = ri.indisprimary
+        AND ti.indisvalid AND ti.indisready AND ti.indimmediate AND NOT ti.indisexclusion
+        AND ti.indnullsnotdistinct = ri.indnullsnotdistinct
+        AND ti.indnatts = ri.indnatts AND ti.indnkeyatts = ri.indnkeyatts
+        AND ti.indexprs IS NULL AND ti.indpred IS NULL AND ri.indexprs IS NULL AND ri.indpred IS NULL
+        AND ti.indclass::pg_catalog.text = ri.indclass::pg_catalog.text
+        AND ti.indcollation::pg_catalog.text = ri.indcollation::pg_catalog.text
+        AND ti.indoption::pg_catalog.text = ri.indoption::pg_catalog.text)
+    THEN
+      RAISE EXCEPTION 'Registration admission migration refused: the index behind % on %.% is not the intended one.', r.conname, target_schema, table_name;
+    END IF;
+  END LOOP;
+
+  -- 5 (continued). No index on the table but the primary key's.
+  SELECT pg_catalog.string_agg(c.relname::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+    WHERE i.indrelid = tbl
+      AND i.indexrelid NOT IN (SELECT c2.conindid FROM pg_catalog.pg_constraint c2 WHERE c2.conrelid = tbl AND c2.contype = 'p');
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% has unexpected index(es) %. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- 6. Dependencies: only on this table.
+  SELECT pg_catalog.string_agg(DISTINCT d.classid::pg_catalog.regclass::pg_catalog.text || ':' || d.objid::pg_catalog.text, ', ') INTO bad
+    FROM pg_catalog.pg_depend d
+    WHERE ((d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid IN (SELECT c.oid FROM pg_catalog.pg_constraint c WHERE c.conrelid = tbl))
+        OR (d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid IN (SELECT ad.oid FROM pg_catalog.pg_attrdef ad WHERE ad.adrelid = tbl)))
+      AND NOT (d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = tbl);
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% has a constraint or default depending on an object other than its own columns (%). Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, bad;
+  END IF;
+
+  -- 7. The seed — only now that the table is proven. A live row is never touched.
+  EXECUTE format(
+    'INSERT INTO %I.%I (scope, short_window_start, short_hits, day_window_start, day_hits) VALUES (%L, %L::pg_catalog.timestamptz, 0, %L::pg_catalog.timestamptz, 0) ON CONFLICT (scope) DO NOTHING',
+    target_schema, table_name, seed_scope, seed_epoch, seed_epoch);
+  EXECUTE format('SELECT pg_catalog.count(*), pg_catalog.count(*) FILTER (WHERE scope = %L) FROM %I.%I', seed_scope, target_schema, table_name)
+    INTO seed_total, seed_match;
+  IF seed_total IS DISTINCT FROM 1 OR seed_match IS DISTINCT FROM 1 THEN
+    RAISE EXCEPTION 'Registration admission migration refused: %.% does not hold exactly the one % row. Nothing was changed; review and resolve by hand (never auto-dropped).', target_schema, table_name, seed_scope;
+  END IF;
+
+  EXECUTE format('DROP TABLE pg_temp.%I', reference_name);
+END $$;
+-- END Registration Admission
+
 -- BEGIN Provisioning Evidence Capture
 -- Hand-applied, idempotent, FAIL-CLOSED. Already applied (and its idempotent
 -- rerun proven) on a disposable Neon branch and on the REAL Neon database's

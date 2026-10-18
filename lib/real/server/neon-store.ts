@@ -17,6 +17,7 @@ import {
 } from "./registration-attempts";
 import type { AccountHandleRecord, AccountHandleStore } from "./account-handles";
 import type { ProviderBudgetStore, RateLimitBucketState, RateLimitStore } from "./rate-limit";
+import { classifyRegistrationDenial, interpretAdmittedRows, validateRegistrationAdmissionPolicy, type RegistrationAdmissionStore } from "./registration-admission";
 import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveHandlePaymentResult, type ReserveResult } from "./payment-attempts";
 
 /**
@@ -1757,6 +1758,79 @@ export function createNeonProviderBudgetStore(sql: NeonQueryFunction<false, fals
   };
 }
 
+/**
+ * Milestone 3C-1 — the durable global registration-admission counters
+ * (real_registration_admission), consumed only through the runtime's
+ * registration-admission limiter by POST /api/real/account/register/options.
+ *
+ * TWO STATEMENTS, each its own autocommit request — NEVER a sql.transaction()
+ * batch, never a read-then-write, never a CTE fallback:
+ *
+ *  E1  one conditional UPDATE ... RETURNING. The WHERE clause admits only if each
+ *      window has elapsed or is under its limit, and the SET clause charges BOTH
+ *      windows (resetting an elapsed one to the database's now()). Exactly one
+ *      returned row is an admission; it is the ONLY way to be admitted. Under
+ *      READ COMMITTED a concurrent UPDATE waits on the row's tuple lock and then
+ *      re-checks the WHERE clause and recomputes the SET values against the
+ *      newest committed version, so counters cannot be lost or oversubscribed.
+ *      The WHERE clause reads only this row's own columns (a sub-select on the
+ *      table would use the old snapshot and not be re-checked).
+ *  E2  only when E1 returned zero rows: a separate read-only SELECT with a fresh
+ *      snapshot, used ONLY to classify the refusal (exhausted / missing row /
+ *      malformed) and to time Retry-After. It never grants admission. Zero rows
+ *      from E1 is NOT "missing" — it can be an exhausted window or a lost race.
+ *
+ * A refusal changes no counter and no window and writes no new row version. A
+ * refused UPDATE that raced a writer may take a transient tuple lock and write a
+ * lock WAL record, and every refusal still costs one or two queries.
+ *
+ * Every policy value is validated BEFORE the first statement (a zero or
+ * negative window would make a window instantly elapsed). The values travel as
+ * parameters, the scope is a literal in the SQL, and nothing about the request
+ * (no IP, header, session, account, or body) is read or sent. Nothing ever
+ * lowers a counter: an admission is never refunded, whatever happens next.
+ *
+ * FAIL CLOSED: a missing table, a database error, a missing singleton row, or a
+ * malformed answer throws; the route answers its generic 500 and mints no
+ * challenge. The row is never re-created here. The sql tag is called without a
+ * transaction; the default isolation level (READ COMMITTED) is assumed and
+ * has not been asserted live.
+ */
+export function createNeonRegistrationAdmissionStore(sql: NeonQueryFunction<false, false>): RegistrationAdmissionStore {
+  return {
+    async admit(rawPolicy) {
+      const policy = validateRegistrationAdmissionPolicy(rawPolicy);
+      const { short, day } = policy;
+      const admitted = (await sql`
+        UPDATE real_registration_admission AS a
+        SET
+          short_window_start = CASE WHEN a.short_window_start + make_interval(secs => ${short.windowSeconds}::int) <= now() THEN now() ELSE a.short_window_start END,
+          short_hits = CASE WHEN a.short_window_start + make_interval(secs => ${short.windowSeconds}::int) <= now() THEN 1 ELSE a.short_hits + 1 END,
+          day_window_start = CASE WHEN a.day_window_start + make_interval(secs => ${day.windowSeconds}::int) <= now() THEN now() ELSE a.day_window_start END,
+          day_hits = CASE WHEN a.day_window_start + make_interval(secs => ${day.windowSeconds}::int) <= now() THEN 1 ELSE a.day_hits + 1 END
+        WHERE a.scope = 'register_options'
+          AND (a.short_window_start + make_interval(secs => ${short.windowSeconds}::int) <= now() OR a.short_hits < ${short.limit}::int)
+          AND (a.day_window_start + make_interval(secs => ${day.windowSeconds}::int) <= now() OR a.day_hits < ${day.limit}::int)
+        RETURNING a.short_hits, a.day_hits
+      `) as Row[];
+      if (admitted.length > 0) return interpretAdmittedRows(policy, admitted);
+
+      const state = (await sql`
+        SELECT
+          a.short_hits,
+          a.day_hits,
+          CASE WHEN a.short_window_start + make_interval(secs => ${short.windowSeconds}::int) <= now() THEN NULL
+            ELSE LEAST(GREATEST(ceil(extract(epoch FROM (a.short_window_start + make_interval(secs => ${short.windowSeconds}::int) - now()))), 1), 1000000)::int END AS short_wait,
+          CASE WHEN a.day_window_start + make_interval(secs => ${day.windowSeconds}::int) <= now() THEN NULL
+            ELSE LEAST(GREATEST(ceil(extract(epoch FROM (a.day_window_start + make_interval(secs => ${day.windowSeconds}::int) - now()))), 1), 1000000)::int END AS day_wait
+        FROM real_registration_admission a
+        WHERE a.scope = 'register_options'
+      `) as Row[];
+      return classifyRegistrationDenial(policy, state);
+    },
+  };
+}
+
 export type NeonDurableStores = {
   challengeStore: ChallengeStore;
   registry: RealAccountRegistry;
@@ -1767,6 +1841,7 @@ export type NeonDurableStores = {
   handles: AccountHandleStore;
   rateLimits: RateLimitStore;
   providerBudgets: ProviderBudgetStore;
+  registrationAdmission: RegistrationAdmissionStore;
 };
 
 /**
@@ -1791,7 +1866,7 @@ export function createNeonSqlClient(databaseUrl: string): NeonQueryFunction<fals
   return neon(databaseUrl, { isolationLevel: NEON_TRANSACTION_ISOLATION_LEVEL });
 }
 
-/** One connection (Neon's HTTP query function is stateless/per-request-safe), nine adapters. */
+/** One connection (Neon's HTTP query function is stateless/per-request-safe), ten adapters. */
 export function createNeonDurableStores(databaseUrl: string): NeonDurableStores {
   const sql = createNeonSqlClient(databaseUrl);
   return {
@@ -1804,5 +1879,6 @@ export function createNeonDurableStores(databaseUrl: string): NeonDurableStores 
     handles: createNeonAccountHandleStore(sql),
     rateLimits: createNeonRateLimitStore(sql),
     providerBudgets: createNeonProviderBudgetStore(sql),
+    registrationAdmission: createNeonRegistrationAdmissionStore(sql),
   };
 }

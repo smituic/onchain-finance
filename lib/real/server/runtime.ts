@@ -6,6 +6,7 @@ import { createInMemoryBackupPasskeyEnrollmentStore, type BackupPasskeyEnrollmen
 import { createInMemoryPasskeyRevocationStore, type PasskeyRevocationStore } from "./passkey-revocation-attempts";
 import { createInMemoryAccountHandleStore, type AccountHandleStore } from "./account-handles";
 import { createInMemoryProviderBudgetStore, createInMemoryRateLimitStore, createProviderBudgetLimiter, createRateLimiter, type ProviderBudgetLimiter, type RateLimiter } from "./rate-limit";
+import { createInMemoryRegistrationAdmissionStore, createRegistrationAdmission, type RegistrationAdmission } from "./registration-admission";
 import { createNeonDurableStores } from "./neon-store";
 
 /**
@@ -35,9 +36,11 @@ let handleStore: AccountHandleStore | null = null;
 let rateLimiter: RateLimiter | null = null;
 // Slice 3A-0: selected exactly like the rate limiter — Neon whenever a database is configured, in-memory only for local development, never in production. Consulted only by the two chain-read routes (account balance, payment status) and the payment-submit route, each through its own policy module; fails closed without its table.
 let providerBudgetLimiter: ProviderBudgetLimiter | null = null;
+// Milestone 3C-1: the GLOBAL registration-admission limiter, consulted only by POST /api/real/account/register/options. Selected exactly like the limiters above: Neon whenever a database is configured, in-memory only for local development and never in production (the throw below). It fails closed without its table.
+let registrationAdmission: RegistrationAdmission | null = null;
 
 function ensureStoresInitialized(): void {
-  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore && handleStore && rateLimiter && providerBudgetLimiter) return;
+  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore && handleStore && rateLimiter && providerBudgetLimiter && registrationAdmission) return;
 
   const databaseUrl = process.env.DATABASE_URL?.trim();
   if (databaseUrl) {
@@ -51,6 +54,7 @@ function ensureStoresInitialized(): void {
     handleStore = durable.handles;
     rateLimiter = createRateLimiter(durable.rateLimits);
     providerBudgetLimiter = createProviderBudgetLimiter(durable.providerBudgets);
+    registrationAdmission = createRegistrationAdmission(durable.registrationAdmission);
     return;
   }
 
@@ -73,6 +77,7 @@ function ensureStoresInitialized(): void {
   handleStore = createInMemoryAccountHandleStore(registry);
   rateLimiter = createRateLimiter(createInMemoryRateLimitStore());
   providerBudgetLimiter = createProviderBudgetLimiter(createInMemoryProviderBudgetStore());
+  registrationAdmission = createRegistrationAdmission(createInMemoryRegistrationAdmissionStore());
 }
 
 export function getRealAccountRegistry(): RealAccountRegistry {
@@ -127,4 +132,17 @@ export function getRateLimiter(): RateLimiter {
 export function getProviderBudgetLimiter(): ProviderBudgetLimiter {
   ensureStoresInitialized();
   return providerBudgetLimiter!;
+}
+
+/**
+ * The global registration-admission limiter (registration-admission.ts;
+ * Milestone 3C-1). Its only consumer is the register/options route. It is a
+ * controlled-development limit, not production abuse protection, and the
+ * real_registration_admission table must be applied and seeded on the real
+ * database before any code that calls this is deployed — it fails closed
+ * without it.
+ */
+export function getRegistrationAdmission(): RegistrationAdmission {
+  ensureStoresInitialized();
+  return registrationAdmission!;
 }
