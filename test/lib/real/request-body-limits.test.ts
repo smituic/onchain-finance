@@ -10,6 +10,7 @@ import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import { scriptedBudget } from "./fixtures/chain-read-budget";
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator } from "./fixtures/webauthn";
+import { issueLoginChallenge } from "@/lib/real/server/login-challenge";
 
 /**
  * Milestone 3B, Slice 3B-1: the 14 control routes refuse a body over 4 KiB with
@@ -95,7 +96,7 @@ vi.mock("@/lib/real/server/registration", async (importOriginal) => {
 vi.mock("@/lib/real/server/runtime", () => {
   const pick = (name: string) => () => (name in state.overrides ? state.overrides[name] : name === "getRealAccountRegistry" ? state.registry : state.tripwires[name]);
   return Object.fromEntries(
-    ["getRealAccountRegistry", "getRegistrationAttemptStore", "getPaymentAttemptStore", "getRateLimiter", "getProviderBudgetLimiter", "getAccountHandleStore", "getChallengeStore", "getBackupPasskeyEnrollmentStore", "getPasskeyRevocationStore"].map((name) => [name, pick(name)]),
+    ["getRealAccountRegistry", "getRegistrationAttemptStore", "getPaymentAttemptStore", "getRateLimiter", "getProviderBudgetLimiter", "getAccountHandleStore", "getChallengeStore", "getLoginChallengeUses", "getBackupPasskeyEnrollmentStore", "getPasskeyRevocationStore"].map((name) => [name, pick(name)]),
   );
 });
 
@@ -245,6 +246,12 @@ const CONTROL_ROUTES: ControlCase[] = [
 const fixtureAuthenticator = createFixtureAuthenticator();
 /** A REAL ES256 assertion produced by the offline fixture authenticator. */
 const ES256_ASSERTION = buildAuthenticationResponseJSON({ authenticator: fixtureAuthenticator, challenge: "Y2hhbGxlbmdlLWZvci10ZXN0cw", origin: "http://localhost:3000", rpId: "localhost", userHandle: "dXNlci1oYW5kbGUtMQ" });
+/**
+ * Milestone 3C-2: login verify checks the challenge as a SIGNED token before it touches any store, so the "ordinary valid request
+ * reaches its resolver" case needs a challenge the server could have issued (this file's secret and RP ID). It is minted at load time
+ * and lives five minutes; the other WebAuthn routes keep the fixed challenge above, because they are still database-backed.
+ */
+const LOGIN_ASSERTION = buildAuthenticationResponseJSON({ authenticator: fixtureAuthenticator, challenge: issueLoginChallenge({ sessionSecret: SECRET, rpId: "localhost" }).challenge, origin: "http://localhost:3000", rpId: "localhost", userHandle: "dXNlci1oYW5kbGUtMQ" });
 
 /** Representative signed envelopes: the shapes the browser's Turnkey stamper sends (sizes are realistic, values are fake). */
 const stampValue = (credentialIdChars = 43) => JSON.stringify({ authenticatorData: "A".repeat(50), clientDataJson: "B".repeat(280), credentialId: "C".repeat(credentialIdChars), signature: "D".repeat(96) });
@@ -263,7 +270,7 @@ const WEBAUTHN = "WEBAUTHN_ASSERTION_BODY_MAX_BYTES" as const;
 const SIGNED = "SIGNED_TURNKEY_REQUEST_BODY_MAX_BYTES" as const;
 
 const ASSERTION_ROUTES: RouteCase[] = [
-  { file: "app/api/real/account/login/verify/route.ts", method: "POST", url: "/api/real/account/login/verify", sessionFirst: false, anyEventCounts: true, valid: { response: ES256_ASSERTION }, limit: WEBAUTHN_ASSERTION_BODY_MAX_BYTES, limitName: WEBAUTHN },
+  { file: "app/api/real/account/login/verify/route.ts", method: "POST", url: "/api/real/account/login/verify", sessionFirst: false, anyEventCounts: true, valid: { response: LOGIN_ASSERTION }, limit: WEBAUTHN_ASSERTION_BODY_MAX_BYTES, limitName: WEBAUTHN },
   { file: "app/api/real/account/handle/claim/route.ts", method: "POST", url: "/api/real/account/handle/claim", sessionFirst: true, valid: { handle: "smit", response: ES256_ASSERTION }, limit: WEBAUTHN_ASSERTION_BODY_MAX_BYTES, limitName: WEBAUTHN },
   { file: "app/api/real/account/passkeys/backup/options/route.ts", method: "POST", url: "/api/real/account/passkeys/backup/options", sessionFirst: true, valid: { stepUp: ES256_ASSERTION }, limit: WEBAUTHN_ASSERTION_BODY_MAX_BYTES, limitName: WEBAUTHN },
   { file: "app/api/real/account/passkeys/backup/verify-login/confirm/route.ts", method: "POST", url: "/api/real/account/passkeys/backup/verify-login/confirm", sessionFirst: true, valid: { response: ES256_ASSERTION }, limit: WEBAUTHN_ASSERTION_BODY_MAX_BYTES, limitName: WEBAUTHN },

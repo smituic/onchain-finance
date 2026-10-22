@@ -105,6 +105,26 @@ export type ScratchObjectKind = "table" | "view" | "function";
 export type ScratchObject = { kind: ScratchObjectKind; name: string };
 const OBJECT_KINDS: readonly string[] = ["table", "view", "function"];
 
+/** The hardest cap any run may ask for. The shared default (MAX_RUN_SCRATCH_SCHEMAS) is unchanged; a larger value must be requested explicitly, per run. */
+export const MAX_CONFIGURABLE_SCRATCH_SCHEMAS = 60;
+export type RunOwnershipOptions = { maxScratchSchemas?: number };
+
+/**
+ * The scratch-schema capacity for ONE registry. No options (or an empty object): the shared default, 40 — every existing
+ * caller. A caller that needs more passes `{ maxScratchSchemas }`: a positive safe integer from 1 to 60 inclusive, rejected —
+ * never clamped — otherwise. An unknown option, or the key present with a non-number, is refused as well.
+ */
+export function resolveScratchSchemaCapacity(options?: unknown): number {
+  if (options === undefined) return MAX_RUN_SCRATCH_SCHEMAS;
+  if (typeof options !== "object" || options === null || Array.isArray(options)) throw new Error("provider budget smoke: the ownership options must be an object");
+  const keys = Object.keys(options);
+  if (keys.some((key) => key !== "maxScratchSchemas")) throw new Error("provider budget smoke: unknown ownership option");
+  if (!keys.includes("maxScratchSchemas")) return MAX_RUN_SCRATCH_SCHEMAS;
+  const value: unknown = (options as { maxScratchSchemas?: unknown }).maxScratchSchemas;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > MAX_CONFIGURABLE_SCRATCH_SCHEMAS) throw new Error(`provider budget smoke: maxScratchSchemas must be a whole number from 1 to ${MAX_CONFIGURABLE_SCRATCH_SCHEMAS}`);
+  return value;
+}
+
 /**
  * One run's fixtures, by exact name. A subject or a scratch schema is owned
  * only if THIS registry minted it, and a scratch object only if it was
@@ -118,8 +138,9 @@ const OBJECT_KINDS: readonly string[] = ["table", "view", "function"];
  * before the table that uses it, a referenced table before the one that
  * references it): cleanup drops them in reverse, with RESTRICT.
  */
-export function createRunOwnership(runId: string) {
+export function createRunOwnership(runId: string, options?: RunOwnershipOptions) {
   if (!RUN_ID.test(runId)) throw new Error("provider budget smoke: the run id must be 8 lowercase hex characters");
+  const maxScratchSchemas = resolveScratchSchemaCapacity(options);
   const subjects: string[] = [];
   const schemas = new Map<string, ScratchObject[]>();
   let objects = 0;
@@ -158,7 +179,7 @@ export function createRunOwnership(runId: string) {
     registerScratchSchema(suffix: string): string {
       assertOpen();
       if (typeof suffix !== "string" || !SCHEMA_SUFFIX.test(suffix)) throw new Error("provider budget smoke: a schema suffix must be 1 to 12 lowercase letters and digits");
-      if (schemas.size >= MAX_RUN_SCRATCH_SCHEMAS) throw new Error("provider budget smoke: this run reached its scratch-schema limit; refusing to register more");
+      if (schemas.size >= maxScratchSchemas) throw new Error("provider budget smoke: this run reached its scratch-schema limit; refusing to register more");
       const schema = assertPlainIdentifier(`pb_smoke_${runId}_${suffix}`);
       if (schemas.has(schema)) throw new Error("provider budget smoke: a schema suffix was used twice");
       schemas.set(schema, []);
@@ -183,6 +204,8 @@ export function createRunOwnership(runId: string) {
     assertOwnedObject,
     ownedSubjects: (): string[] => [...subjects],
     ownedSchemas: (): string[] => [...schemas.keys()],
+    /** The most scratch schemas THIS registry will ever accept (the shared default, or the bounded value its creator asked for). */
+    scratchSchemaCapacity: (): number => maxScratchSchemas,
     objectsOf(schema: string): ScratchObject[] {
       assertOwnedSchema(schema);
       return schemas.get(schema)!.map((object) => ({ ...object }));

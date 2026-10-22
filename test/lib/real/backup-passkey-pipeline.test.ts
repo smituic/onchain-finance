@@ -10,6 +10,7 @@ import { TURNKEY_STAMP_FRESHNESS_WINDOW_MS } from "@/lib/real/server/turnkey-sig
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
 import { FakeTurnkey, signRequest, stampBody } from "./fixtures/turnkey-fake";
 import { createInMemoryProviderBudgetStore, createProviderBudgetLimiter } from "@/lib/real/server/rate-limit";
+import { createInMemoryLoginChallengeUseStore } from "@/lib/real/server/login-challenge-uses";
 
 /** A fresh in-memory provider budget per call: these tests exercise reconciliation, not throttling (see turnkey-reconcile-budget.test.ts). */
 const unthrottledBudget = () => createProviderBudgetLimiter(createInMemoryProviderBudgetStore());
@@ -215,10 +216,10 @@ describe("backup enrollment — local registration", () => {
     expect(passkey).toMatchObject({ status: "pending", role: "backup", appUserId: "app-user-1", displayName: null });
     expect((await w.enrollments.findById(enrollmentId))?.state).toBe("credential_registered");
 
-    const loginChallenges = createInMemoryChallengeStore();
-    const { optionsJSON } = await beginLogin({ config, challengeStore: loginChallenges });
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator: backup, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: passkey!.userHandle });
-    expect((await completeLogin({ config, challengeStore: loginChallenges, registry: w.registry, attempts: createInMemoryRegistrationAttemptStore(), response })).outcome).toBe("rejected");
+    expect((await completeLogin({ config, loginChallengeUses, registry: w.registry, attempts: createInMemoryRegistrationAttemptStore(), response })).outcome).toBe("rejected");
   });
 
   it("pending-insert/attach race: two credentials racing onto one enrollment — exactly one attaches, the loser leaves NO orphan pending passkey", async () => {
@@ -639,11 +640,11 @@ describe("backup enrollment — end-to-end invariants", () => {
     const { backup } = await driveToActive(w);
     expect(await w.registry.findAccountByAppUserId("app-user-1")).toEqual(before);
 
-    const challengeStore = createInMemoryChallengeStore();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
+    const { optionsJSON } = await beginLogin({ config });
     const passkey = (await w.registry.findPasskeyByCredentialId(backup.credentialIdBase64Url))!;
     const response = buildAuthenticationResponseJSON({ authenticator: backup, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: passkey.userHandle });
-    const login = await completeLogin({ config, challengeStore, registry: w.registry, attempts: createInMemoryRegistrationAttemptStore(), response });
+    const login = await completeLogin({ config, loginChallengeUses, registry: w.registry, attempts: createInMemoryRegistrationAttemptStore(), response });
     expect(login.outcome).toBe("verified");
     if (login.outcome !== "verified") return;
     expect(login.account).toEqual(before);

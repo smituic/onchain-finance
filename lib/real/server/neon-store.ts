@@ -17,6 +17,7 @@ import {
 } from "./registration-attempts";
 import type { AccountHandleRecord, AccountHandleStore } from "./account-handles";
 import type { ProviderBudgetStore, RateLimitBucketState, RateLimitStore } from "./rate-limit";
+import { assertExpiresAtIso, assertNonceHex, classifyLoginChallengeUseRows, type LoginChallengeUseStore } from "./login-challenge-uses";
 import { classifyRegistrationDenial, interpretAdmittedRows, validateRegistrationAdmissionPolicy, type RegistrationAdmissionStore } from "./registration-admission";
 import { DuplicateSignActivityError, type PaymentAttempt, type PaymentAttemptPatch, type PaymentAttemptState, type PaymentAttemptStore, type ReserveHandlePaymentResult, type ReserveResult } from "./payment-attempts";
 
@@ -1759,6 +1760,62 @@ export function createNeonProviderBudgetStore(sql: NeonQueryFunction<false, fals
 }
 
 /**
+ * Milestone 3C-2 — the durable used-marker for stateless login challenges
+ * (real_login_challenge_uses). Consumed only by completeLogin, AFTER a login
+ * assertion has been cryptographically verified.
+ *
+ * ONE autocommit statement — never a sql.transaction() batch, never separate
+ * purge and insert statements. The CTE purges AT MOST 64 markers that expired
+ * more than an HOUR ago (oldest first, FOR UPDATE SKIP LOCKED, so concurrent
+ * purges never wait on or fight each other); the insert then records the nonce
+ * only if the challenge is still in the future by the DATABASE's wall clock (and
+ * not implausibly far ahead), does nothing on a conflict (a nonce is used at most
+ * once; the marker is never updated), and RETURNING checks expiry AGAIN after the
+ * insert, so a marker inserted just as the challenge expired is never an
+ * admission. The one-hour retention margin plus that second clock check are what
+ * keep cleanup from re-enabling a consumed challenge (see login-challenge-uses.ts).
+ * The earlier candidate that purged `expires_at < now()` was rejected: a stalled
+ * replay holding a stale transaction-start now() could insert after another
+ * session purged the expired marker.
+ *
+ * Values are bound parameters: the nonce as 32 lowercase hex characters (decoded
+ * in SQL to exactly 16 bytes, which the table's CHECK also enforces) and the
+ * expiration as an explicit-UTC ISO timestamp — both validated before any SQL.
+ * No IP, credential, user, or token body is sent or stored. FAIL CLOSED: a
+ * missing table, a missing unique index (ON CONFLICT would error), or any
+ * database error throws, and the caller issues no session. An uncertain write is
+ * never retried.
+ */
+export function createNeonLoginChallengeUseStore(sql: NeonQueryFunction<false, false>): LoginChallengeUseStore {
+  return {
+    async consume(input) {
+      const nonceHex = assertNonceHex(input.nonceHex);
+      const expIso = assertExpiresAtIso(input.expiresAtIso);
+      const rows = (await sql`
+        WITH purged AS (
+          DELETE FROM real_login_challenge_uses d
+          WHERE d.nonce IN (
+            SELECT p.nonce
+            FROM real_login_challenge_uses p
+            WHERE p.expires_at < now() - interval '1 hour'
+            ORDER BY p.expires_at
+            LIMIT 64
+            FOR UPDATE SKIP LOCKED
+          )
+        )
+        INSERT INTO real_login_challenge_uses AS u (nonce, expires_at, used_at)
+        SELECT decode(${nonceHex}::text, 'hex'), ${expIso}::timestamptz, clock_timestamp()
+        WHERE ${expIso}::timestamptz > clock_timestamp()
+          AND ${expIso}::timestamptz <= clock_timestamp() + interval '10 minutes'
+        ON CONFLICT (nonce) DO NOTHING
+        RETURNING (u.expires_at > clock_timestamp()) AS live
+      `) as Row[];
+      return classifyLoginChallengeUseRows(rows);
+    },
+  };
+}
+
+/**
  * Milestone 3C-1 — the durable global registration-admission counters
  * (real_registration_admission), consumed only through the runtime's
  * registration-admission limiter by POST /api/real/account/register/options.
@@ -1842,6 +1899,7 @@ export type NeonDurableStores = {
   rateLimits: RateLimitStore;
   providerBudgets: ProviderBudgetStore;
   registrationAdmission: RegistrationAdmissionStore;
+  loginChallengeUses: LoginChallengeUseStore;
 };
 
 /**
@@ -1866,7 +1924,7 @@ export function createNeonSqlClient(databaseUrl: string): NeonQueryFunction<fals
   return neon(databaseUrl, { isolationLevel: NEON_TRANSACTION_ISOLATION_LEVEL });
 }
 
-/** One connection (Neon's HTTP query function is stateless/per-request-safe), ten adapters. */
+/** One connection (Neon's HTTP query function is stateless/per-request-safe), eleven adapters. */
 export function createNeonDurableStores(databaseUrl: string): NeonDurableStores {
   const sql = createNeonSqlClient(databaseUrl);
   return {
@@ -1880,5 +1938,6 @@ export function createNeonDurableStores(databaseUrl: string): NeonDurableStores 
     rateLimits: createNeonRateLimitStore(sql),
     providerBudgets: createNeonProviderBudgetStore(sql),
     registrationAdmission: createNeonRegistrationAdmissionStore(sql),
+    loginChallengeUses: createNeonLoginChallengeUseStore(sql),
   };
 }

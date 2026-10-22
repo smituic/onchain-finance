@@ -10,6 +10,7 @@ import { readAuthenticatedRealAccount } from "@/lib/real/server/auth";
 import { bytesToBase64Url } from "@/lib/real/bytes";
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
 import { FakeParentTurnkey } from "./fixtures/turnkey-parent-fake";
+import { createInMemoryLoginChallengeUseStore } from "@/lib/real/server/login-challenge-uses";
 
 const getWalletAccountsMock = vi.fn();
 const getSubOrgIdsMock = vi.fn();
@@ -100,10 +101,10 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
   it("a valid assertion from a registered, discoverable passkey restores the session — never touches Turnkey", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
 
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({
       authenticator,
       challenge: optionsJSON.challenge,
@@ -112,7 +113,7 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
       userHandle: USER_HANDLE,
     });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
 
     expect(result.outcome).toBe("verified");
     if (result.outcome !== "verified") return;
@@ -126,8 +127,7 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
   });
 
   it("uses no allowCredentials — the discoverable-credential flow that makes fresh-device restore possible", async () => {
-    const challengeStore = createInMemoryChallengeStore();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     expect(optionsJSON.allowCredentials === undefined || optionsJSON.allowCredentials.length === 0).toBe(true);
   });
 
@@ -135,54 +135,52 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
     const registeredAuthenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(registeredAuthenticator);
     const unknownAuthenticator = createFixtureAuthenticator();
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
 
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator: unknownAuthenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("rejected");
   });
 
   it("rejects an unknown/never-issued challenge", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: "never-issued", origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("rejected");
   });
 
   it("rejects an expired challenge", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
-    // Immediately expire it by consuming and re-recording with a negative TTL.
-    await challengeStore.consume({ challenge: optionsJSON.challenge, purpose: "login" });
-    await challengeStore.create({ challenge: optionsJSON.challenge, purpose: "login", ttlMs: -1 });
+    // Issued six minutes ago: its signed five-minute lifetime has ended (no database row exists to expire — the expiry is in the signed token).
+    const { optionsJSON } = await beginLogin({ config, nowMs: Date.now() - 6 * 60 * 1000 });
 
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("rejected");
   });
 
   it("rejects a replayed challenge — the second completeLogin for the same challenge is rejected", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
 
-    const first = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const first = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(first.outcome).toBe("verified");
 
-    const second = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const second = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(second.outcome).toBe("rejected");
   });
 
@@ -190,33 +188,33 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
     const registered = createFixtureAuthenticator();
     const impostor = createFixtureAuthenticator({ credentialId: registered.credentialId });
     const registry = await seedRegistry(registered);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator: impostor, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("rejected");
   });
 
   it("rejects a wrong-origin assertion", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: "http://evil.example", rpId: config.rpId, userHandle: USER_HANDLE });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("rejected");
   });
 
   it("rejects a userHandle mismatch even though the credentialId and signature are both valid", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator, USER_HANDLE);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({
       authenticator,
       challenge: optionsJSON.challenge,
@@ -225,19 +223,19 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
       userHandle: "a-different-user-handle",
     });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("rejected");
   });
 
   it("rejects when userHandle is missing entirely from the assertion", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("rejected");
   });
 
@@ -245,25 +243,25 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
     await registry.transitionPasskeyStatus({ credentialId: authenticator.credentialIdBase64Url, from: "active", to: "revoked" });
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("rejected");
   });
 
   it("zero-counter authenticators are accepted repeatedly (matches @simplewebauthn/server semantics, not an invented stricter rule)", async () => {
     const authenticator = createFixtureAuthenticator({ counter: 0 });
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const { optionsJSON } = await beginLogin({ config, challengeStore });
+      const { optionsJSON } = await beginLogin({ config });
       const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
-      const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+      const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
       expect(result.outcome).toBe("verified");
     }
 
@@ -273,9 +271,9 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
   it("persists an advanced counter after a successful login", async () => {
     const authenticator = createFixtureAuthenticator({ counter: 5 });
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({
       authenticator,
       challenge: optionsJSON.challenge,
@@ -285,7 +283,7 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
       counterOverride: 6,
     });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("verified");
     expect((await registry.findPasskeyByCredentialId(authenticator.credentialIdBase64Url))?.counter).toBe(6);
   });
@@ -293,9 +291,9 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
   it("a counter regression is rejected when the stored counter is nonzero — payment-time signing advancing the counter between app logins is still a valid gap forward, never backward", async () => {
     const authenticator = createFixtureAuthenticator({ counter: 5 });
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({
       authenticator,
       challenge: optionsJSON.challenge,
@@ -305,29 +303,29 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
       counterOverride: 3,
     });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
     expect(result.outcome).toBe("rejected");
   });
 
   it("rotates: two successful logins issue two different session cookies", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
 
-    const { optionsJSON: first } = await beginLogin({ config, challengeStore });
+    const { optionsJSON: first } = await beginLogin({ config });
     const firstResult = await completeLogin({
       config,
-      challengeStore,
+      loginChallengeUses,
       registry,
       attempts,
       response: buildAuthenticationResponseJSON({ authenticator, challenge: first.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE }),
     });
 
-    const { optionsJSON: second } = await beginLogin({ config, challengeStore });
+    const { optionsJSON: second } = await beginLogin({ config });
     const secondResult = await completeLogin({
       config,
-      challengeStore,
+      loginChallengeUses,
       registry,
       attempts,
       response: buildAuthenticationResponseJSON({ authenticator, challenge: second.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE }),
@@ -341,24 +339,24 @@ describe("login (fresh-device restore) flow: beginLogin -> completeLogin", () =>
 });
 
 describe("S4: login and the account session epoch", () => {
-  async function loginOnce(authenticator: FixtureAuthenticator, registry: RealAccountRegistry, challengeStore = createInMemoryChallengeStore()) {
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+  async function loginOnce(authenticator: FixtureAuthenticator, registry: RealAccountRegistry, loginChallengeUses = createInMemoryLoginChallengeUseStore()) {
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
-    return completeLogin({ config, challengeStore, registry, attempts: newAttempts(), response });
+    return completeLogin({ config, loginChallengeUses, registry, attempts: newAttempts(), response });
   }
   const authed = (registry: RealAccountRegistry, cookieValue: string) => readAuthenticatedRealAccount({ cookieValue, sessionSecret: config.sessionSecret, registry });
 
   it("concurrent completion of the SAME assertion: exactly one session is issued (single-use challenge consumption)", async () => {
     const authenticator = createFixtureAuthenticator();
     const registry = await seedRegistry(authenticator);
-    const challengeStore = createInMemoryChallengeStore();
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
 
     const results = await Promise.all([
-      completeLogin({ config, challengeStore, registry, attempts: newAttempts(), response }),
-      completeLogin({ config, challengeStore, registry, attempts: newAttempts(), response }),
-      completeLogin({ config, challengeStore, registry, attempts: newAttempts(), response }),
+      completeLogin({ config, loginChallengeUses, registry, attempts: newAttempts(), response }),
+      completeLogin({ config, loginChallengeUses, registry, attempts: newAttempts(), response }),
+      completeLogin({ config, loginChallengeUses, registry, attempts: newAttempts(), response }),
     ]);
     expect(results.filter((r) => r.outcome === "verified")).toHaveLength(1);
     expect(results.filter((r) => r.outcome === "rejected")).toHaveLength(2);
@@ -416,7 +414,8 @@ describe("S5 L2 (Option 3): an uncertain Turnkey create is never adopted — log
   async function stuckAttempt() {
     turnkey.submitMode = "network_error_before_apply";
     const registry = createInMemoryRealAccountRegistry();
-    const challengeStore = createInMemoryChallengeStore();
+    const challengeStore = createInMemoryChallengeStore(); // registration still uses the database-backed ChallengeStore
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
     const authenticator = createFixtureAuthenticator();
     const { optionsJSON } = await beginRegistration({ config, challengeStore });
@@ -424,12 +423,14 @@ describe("S5 L2 (Option 3): an uncertain Turnkey create is never adopted — log
     expect(registered).toEqual({ outcome: "pending", reason: PROVISIONING_NEEDS_REVIEW_REASON });
     const attempt = (await attempts.findByCredentialId(authenticator.credentialIdBase64Url))!;
     expect(attempt).toMatchObject({ state: "provisioning_in_flight", externalOutcome: "unknown" });
-    const login = async () => {
-      const { optionsJSON: loginOptions } = await beginLogin({ config, challengeStore });
-      const response = buildAuthenticationResponseJSON({ authenticator, challenge: loginOptions.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: attempt.userHandle });
-      return completeLogin({ config, challengeStore, registry, attempts, response, publicClient: buildPublicClient(), provisioningDeps: turnkey.deps() });
+    const freshResponse = async () => {
+      const { optionsJSON: loginOptions } = await beginLogin({ config });
+      return buildAuthenticationResponseJSON({ authenticator, challenge: loginOptions.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: attempt.userHandle });
     };
-    return { registry, attempts, authenticator, attempt, login };
+    const loginWith = (response: Awaited<ReturnType<typeof freshResponse>>) =>
+      completeLogin({ config, loginChallengeUses, registry, attempts, response, publicClient: buildPublicClient(), provisioningDeps: turnkey.deps() });
+    const login = async () => loginWith(await freshResponse());
+    return { registry, attempts, authenticator, attempt, login, loginWith, freshResponse, loginChallengeUses };
   }
 
   /** Nothing about the attempt (beyond login's own counter persistence) or the registry changed. */
@@ -468,6 +469,30 @@ describe("S5 L2 (Option 3): an uncertain Turnkey create is never adopted — log
     await expectUntouched(w);
   });
 
+  it("3C-2: a REPLAYED assertion enters the provisioning pipeline exactly once — the second use is rejected at the used marker, before the counter and the pipeline", async () => {
+    const w = await stuckAttempt();
+    const response = await w.freshResponse();
+    const first = await w.loginWith(response);
+    expect(first).toEqual({ outcome: "pending", reason: PROVISIONING_NEEDS_REVIEW_REASON });
+    const counterAfterFirst = (await w.attempts.findByCredentialId(w.authenticator.credentialIdBase64Url))!.counter;
+    const requestsAfterFirst = turnkey.requests.length;
+    expect(w.loginChallengeUses.snapshot()).toHaveLength(1); // exactly one used marker, written after the assertion verified
+    const second = await w.loginWith(response);
+    expect(second).toEqual({ outcome: "rejected", reason: "Unknown, expired, or already-used login challenge." });
+    expect((await w.attempts.findByCredentialId(w.authenticator.credentialIdBase64Url))!.counter).toBe(counterAfterFirst); // no second counter write
+    expect(turnkey.requests.length).toBe(requestsAfterFirst); // no second pipeline entry (and no Turnkey request of any kind)
+    expect(w.loginChallengeUses.snapshot()).toHaveLength(1);
+  });
+
+  it("3C-2: three parallel uses of ONE assertion on a pending registration reach the pipeline once", async () => {
+    const w = await stuckAttempt();
+    const response = await w.freshResponse();
+    const results = await Promise.all([w.loginWith(response), w.loginWith(response), w.loginWith(response)]);
+    expect(results.filter((r) => r.outcome === "pending")).toHaveLength(1);
+    expect(results.filter((r) => r.outcome === "rejected")).toHaveLength(2);
+    expect(turnkey.createRequests).toHaveLength(1);
+  });
+
   it("repeated logins never dispatch another create, never read Turnkey, and never move the attempt", async () => {
     const w = await stuckAttempt();
     for (let i = 0; i < 3; i += 1) expect((await w.login()).outcome).toBe("pending");
@@ -486,7 +511,8 @@ describe("S5 L2 (Option 3): an uncertain Turnkey create is never adopted — log
       account: { appUserId: "other-user", subOrganizationId: "sub-org-1", turnkeyUserId: "other-turnkey-user", walletId: "other-wallet", walletAccountId: "other-wallet-account", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222", accountConfigVersion: 1 },
       passkey: { credentialId: "other-credential", appUserId: "other-user", credentialPublicKey: "other-cose", userHandle: "other-handle", counter: 0, transports: ["internal"], credentialDeviceType: "singleDevice", credentialBackedUp: false },
     });
-    const challengeStore = createInMemoryChallengeStore();
+    const challengeStore = createInMemoryChallengeStore(); // registration still uses the database-backed ChallengeStore
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = newAttempts();
     const authenticator = createFixtureAuthenticator();
     const { optionsJSON } = await beginRegistration({ config, challengeStore });
@@ -495,9 +521,9 @@ describe("S5 L2 (Option 3): an uncertain Turnkey create is never adopted — log
     const attempt = (await attempts.findByCredentialId(authenticator.credentialIdBase64Url))!;
     const requestsBefore = turnkey.requests.length;
 
-    const { optionsJSON: loginOptions } = await beginLogin({ config, challengeStore });
+    const { optionsJSON: loginOptions } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: loginOptions.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: attempt.userHandle });
-    expect(await completeLogin({ config, challengeStore, registry, attempts, response, publicClient: buildPublicClient(), provisioningDeps: turnkey.deps() })).toEqual({ outcome: "blocked", reason: REGISTRATION_IDENTITY_CONFLICT_REASON });
+    expect(await completeLogin({ config, loginChallengeUses, registry, attempts, response, publicClient: buildPublicClient(), provisioningDeps: turnkey.deps() })).toEqual({ outcome: "blocked", reason: REGISTRATION_IDENTITY_CONFLICT_REASON });
     expect(turnkey.requests).toHaveLength(requestsBefore);
     expect(turnkeyReads() - (requestsBefore - turnkey.createRequests.length)).toBe(0); // nothing beyond the registration's own reads
     expect(turnkey.createRequests).toHaveLength(1);

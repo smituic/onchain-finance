@@ -249,7 +249,7 @@ describe("runtime selection", () => {
     expect(neonBranch).not.toContain("createInMemoryRegistrationAdmissionStore");
     expect(runtime.slice(runtime.indexOf("DATABASE_URL is required in production"))).toContain("registrationAdmission = createRegistrationAdmission(createInMemoryRegistrationAdmissionStore());");
     expect(runtime.match(/createInMemoryRegistrationAdmissionStore\(\)/g)).toHaveLength(1);
-    expect(runtime).toContain("&& registrationAdmission) return;");
+    expect(runtime).toContain("&& registrationAdmission && loginChallengeUses) return;"); // 3C-2 added the login used-marker store after it
   });
 });
 
@@ -353,7 +353,9 @@ describe("schema.sql — the Registration Admission block (static; nothing here 
     expect(schema.split(BEGIN)).toHaveLength(2);
     expect(schema.split(END)).toHaveLength(2);
     expect(schema).toContain(`-- END Provider Budgets\n\n${BEGIN}\n`);
-    expect(schema).toContain(`${END}\n\n-- BEGIN Provisioning Evidence Capture\n`);
+    // 3C-2: the Login Challenge Uses block now sits between this one and the provisioning-evidence block (which still comes later and stays last).
+    expect(schema).toContain(`${END}\n\n-- BEGIN Login Challenge Uses\n`);
+    expect(schema.indexOf("-- BEGIN Provisioning Evidence Capture")).toBeGreaterThan(schema.indexOf(END));
     expect(schema.trimEnd().endsWith("-- END Provisioning Evidence Capture")).toBe(true);
     expect(code.trim().startsWith("DO $$")).toBe(true);
     expect(code.trim().endsWith("END $$;")).toBe(true);

@@ -12,6 +12,7 @@ import { checkRealApiRequest } from "@/lib/real/server/request-gate";
 import { REAL_SESSION_COOKIE_NAME, createSessionPayload, parseSession, serializeSession } from "@/lib/real/server/session";
 import { buildAuthenticationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
 import { denyingRateLimiter, failingRateLimiter, freshRateLimiter, recordingRateLimiter } from "./fixtures/rate-limit";
+import { createInMemoryLoginChallengeUseStore } from "@/lib/real/server/login-challenge-uses";
 
 /**
  * Account Handles through the ACTUAL route.ts code — only next/headers'
@@ -67,6 +68,7 @@ async function load(stores: Stores, cookie: string | undefined, overrides: Recor
   vi.resetModules();
   stubEnv();
   const rateLimiter = freshRateLimiter(); // one per load, like one process (override getRateLimiter to observe or deny)
+  const loginChallengeUses = createInMemoryLoginChallengeUseStore(); // Milestone 3C-2: the used-marker store login/verify records into
   const set: Array<{ name: string; value: string }> = [];
   const deleted: string[] = [];
   vi.doMock("next/headers", () => ({
@@ -85,6 +87,7 @@ async function load(stores: Stores, cookie: string | undefined, overrides: Recor
     getPasskeyRevocationStore: () => stores.revocations,
     getAccountHandleStore: () => stores.handles,
     getRateLimiter: () => rateLimiter,
+    getLoginChallengeUses: () => loginChallengeUses,
     ...overrides,
   }));
   const post = (url: string, body: unknown) => new Request(`http://localhost${url}`, { method: "POST", headers: { "content-type": "application/json" }, body: typeof body === "string" ? body : JSON.stringify(body) });

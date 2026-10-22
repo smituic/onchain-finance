@@ -245,7 +245,7 @@ describe("completeHandleClaim — verify and claim", () => {
 
   it("WRONG PURPOSE: a login or backup step-up challenge can never claim a handle, and a handle_claim challenge is burned by the attempt", async () => {
     const w = await world();
-    const login = await beginLogin({ config, challengeStore: w.challengeStore });
+    const login = await beginLogin({ config });
     expect((await complete(w, w.a, "smit", assertion(w.a, login.optionsJSON.challenge))).outcome).toBe("rejected");
     const stepUp = await prepareBackupStepUp({ config, challengeStore: w.challengeStore, registry: w.registry, appUserId: "app-user-1", sessionCredentialId: w.a.authenticator.credentialIdBase64Url });
     if (stepUp.outcome !== "ready") throw new Error("setup");
@@ -377,14 +377,14 @@ describe("completeHandleClaim — verify and claim", () => {
       ["app-user-1"],
     ]) {
       const w = await world();
-      const login = await beginLogin({ config, challengeStore: createInMemoryChallengeStore() });
+      const login = await beginLogin({ config });
       await w.challengeStore.create({ challenge: login.optionsJSON.challenge, purpose: "handle_claim", ttlMs: 60_000, context });
       expect((await complete(w, w.a, "smit", assertion(w.a, login.optionsJSON.challenge))).outcome).toBe("rejected");
       await nothingClaimed(w);
     }
     for (const handle of ["Smit", "admin", "sm", "_smit", 7]) {
       const w = await world();
-      const login = await beginLogin({ config, challengeStore: createInMemoryChallengeStore() });
+      const login = await beginLogin({ config });
       await w.challengeStore.create({ challenge: login.optionsJSON.challenge, purpose: "handle_claim", ttlMs: 60_000, context: { appUserId: "app-user-1", credentialId: w.a.authenticator.credentialIdBase64Url, handle } });
       expect((await complete(w, w.a, handle, assertion(w.a, login.optionsJSON.challenge))).outcome, String(handle)).toBe("rejected");
       await nothingClaimed(w);
@@ -474,7 +474,7 @@ describe("display name service", () => {
 
   it("an EMPTY-handle context naming the real session credential is still refused, even with an empty body handle", async () => {
     const w = await world();
-    const login = await beginLogin({ config, challengeStore: createInMemoryChallengeStore() });
+    const login = await beginLogin({ config });
     await w.challengeStore.create({ challenge: login.optionsJSON.challenge, purpose: "handle_claim", ttlMs: 60_000, context: { appUserId: "app-user-1", credentialId: w.a.authenticator.credentialIdBase64Url, handle: "" } });
     expect((await complete(w, w.a, "", assertion(w.a, login.optionsJSON.challenge))).outcome).toBe("rejected");
     await nothingClaimed(w);

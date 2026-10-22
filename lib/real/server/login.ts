@@ -2,15 +2,14 @@ import { decodeClientDataJSON } from "@simplewebauthn/server/helpers";
 import type { AuthenticationResponseJSON } from "@simplewebauthn/server";
 import { base64UrlToBytes } from "../bytes";
 import type { SafeAccountPublicClient } from "../account/safe";
-import type { ChallengeStore } from "./challenge-store";
 import type { RealAccountRegistry } from "./registry";
 import type { RegistrationAttemptStore } from "./registration-attempts";
 import type { RealServerConfig } from "./config";
 import { buildLoginOptions, verifyLogin } from "./webauthn";
+import { issueLoginChallenge, parseLoginChallenge } from "./login-challenge";
+import { consumeLoginChallenge, type LoginChallengeUseStore } from "./login-challenge-uses";
 import { createSessionPayload, serializeSession } from "./session";
 import { runProvisioningPipeline, type OnboardingOutcome, type ProvisioningDeps } from "./onboarding";
-
-const LOGIN_CHALLENGE_TTL_MS = 1000 * 60 * 5;
 
 /**
  * Pre-2f hardening: never forward @simplewebauthn/server's own error.message
@@ -20,19 +19,25 @@ const LOGIN_CHALLENGE_TTL_MS = 1000 * 60 * 5;
  * convention was broken. Mirrors server/payments.ts's SAFE_* constants.
  */
 const SAFE_LOGIN_VERIFICATION_FAILED = "Login could not be verified.";
+/** The one rejection wording for a challenge that is unknown, forged, malformed, expired, or already used (unchanged from the database-backed design). */
+const UNKNOWN_LOGIN_CHALLENGE = "Unknown, expired, or already-used login challenge.";
 
-export async function beginLogin(input: {
-  config: RealServerConfig;
-  challengeStore: ChallengeStore;
-}): Promise<{ optionsJSON: Awaited<ReturnType<typeof buildLoginOptions>> }> {
+/**
+ * Milestone 3C-2: a STATELESS login challenge. This performs ZERO database
+ * requests and ZERO writes — it mints a signed, expiring token (login-challenge.ts)
+ * and hands its exact bytes to option generation. Replay protection lives in
+ * completeLogin, after a successful verification. There is no global quota and no
+ * source-IP logic here; anonymous callers can no longer cause durable writes.
+ */
+export async function beginLogin(input: { config: RealServerConfig; nowMs?: number }): Promise<{ optionsJSON: Awaited<ReturnType<typeof buildLoginOptions>> }> {
+  const issued = issueLoginChallenge({ sessionSecret: input.config.sessionSecret, rpId: input.config.rpId, nowMs: input.nowMs });
   // No allowCredentials: the discoverable-credential flow lets the platform
   // authenticator present whichever synced passkeys it has for this RP ID —
   // this is what makes fresh-device restore possible without us needing to
   // already know which credential the browser has.
-  const optionsJSON = await buildLoginOptions({ config: input.config });
-  // Record exactly the challenge the library minted (see registration.ts's
-  // identical reasoning and webauthn.ts's buildLoginOptions).
-  await input.challengeStore.create({ challenge: optionsJSON.challenge, purpose: "login", ttlMs: LOGIN_CHALLENGE_TTL_MS });
+  const optionsJSON = await buildLoginOptions({ config: input.config, challenge: issued.tokenBytes });
+  // The library must have encoded exactly our bytes; anything else would make every login fail (or worse, verify a different value).
+  if (optionsJSON.challenge !== issued.challenge) throw new Error("Login options refused: the library did not encode the challenge bytes exactly.");
   return { optionsJSON };
 }
 
@@ -51,7 +56,10 @@ export type CompleteLoginResult = OnboardingOutcome;
  */
 export async function completeLogin(input: {
   config: RealServerConfig;
-  challengeStore: ChallengeStore;
+  /** Milestone 3C-2: where a VERIFIED login challenge is recorded as used (login-challenge-uses.ts). Never webauthn_challenges. */
+  loginChallengeUses: LoginChallengeUseStore;
+  /** Application clock for the advisory expiry precheck; production leaves it unset. */
+  nowMs?: number;
   registry: RealAccountRegistry;
   attempts: RegistrationAttemptStore;
   response: AuthenticationResponseJSON;
@@ -65,8 +73,14 @@ export async function completeLogin(input: {
     return { outcome: "rejected", reason: "Malformed login response." };
   }
 
-  const stored = await input.challengeStore.consume({ challenge: clientData.challenge, purpose: "login" });
-  if (!stored) return { outcome: "rejected", reason: "Unknown, expired, or already-used login challenge." };
+  // Milestone 3C-2 ordering. The challenge is first checked as a SIGNED, UNEXPIRED, login-purpose token for this
+  // RP ID — with no database access, so a forged or malformed one costs nothing. It is NOT yet consumed: a used
+  // marker is written only after the assertion has been cryptographically verified and every acceptance check
+  // below has passed, so an invalid assertion can never create a marker. A challenge that is not one of ours
+  // (including any old database-backed login challenge) is refused here.
+  const token = parseLoginChallenge(clientData.challenge, { sessionSecret: input.config.sessionSecret, rpId: input.config.rpId, nowMs: input.nowMs });
+  if (!token.ok) return { outcome: "rejected", reason: UNKNOWN_LOGIN_CHALLENGE };
+  const expectedChallenge = clientData.challenge;
 
   const passkey = await input.registry.findPasskeyByCredentialId(input.response.id);
   if (passkey) {
@@ -82,7 +96,7 @@ export async function completeLogin(input: {
       verified = await verifyLogin({
         config: input.config,
         response: input.response,
-        expectedChallenge: stored.challenge,
+        expectedChallenge,
         credential: {
           id: passkey.credentialId,
           publicKey: base64UrlToBytes(passkey.credentialPublicKey),
@@ -101,6 +115,10 @@ export async function completeLogin(input: {
     }
     if (!verified.verified) return { outcome: "rejected", reason: SAFE_LOGIN_VERIFICATION_FAILED };
     if (!verified.authenticationInfo.userVerified) return { outcome: "rejected", reason: "User verification was not performed." };
+
+    // Single use, enforced by the database, BEFORE the counter update, the account lookup, and the session. A throw
+    // (database error, malformed answer) propagates: no session, no retry of an uncertain write.
+    if (!(await consumeLoginChallenge(input.loginChallengeUses, token))) return { outcome: "rejected", reason: UNKNOWN_LOGIN_CHALLENGE };
 
     await input.registry.updateAuthenticatorCounter({ credentialId: passkey.credentialId, counter: verified.authenticationInfo.newCounter });
 
@@ -131,7 +149,7 @@ export async function completeLogin(input: {
     verified = await verifyLogin({
       config: input.config,
       response: input.response,
-      expectedChallenge: stored.challenge,
+      expectedChallenge,
       credential: {
         id: attempt.credentialId,
         publicKey: base64UrlToBytes(attempt.credentialPublicKey),
@@ -146,6 +164,10 @@ export async function completeLogin(input: {
   }
   if (!verified.verified) return { outcome: "rejected", reason: SAFE_LOGIN_VERIFICATION_FAILED };
   if (!verified.authenticationInfo.userVerified) return { outcome: "rejected", reason: "User verification was not performed." };
+
+  // Single use, enforced by the database, BEFORE the counter update and BEFORE the provisioning pipeline: a replay of
+  // one challenge can never enter provisioning twice. A throw propagates (no pipeline entry, no retry).
+  if (!(await consumeLoginChallenge(input.loginChallengeUses, token))) return { outcome: "rejected", reason: UNKNOWN_LOGIN_CHALLENGE };
 
   // Possession proven independently of Turnkey. Persist the counter
   // durably even though the account isn't active yet, then resume the

@@ -5,6 +5,7 @@ import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { createInMemoryRegistrationAttemptStore } from "@/lib/real/server/registration-attempts";
 import { bytesToBase64Url } from "@/lib/real/bytes";
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator } from "./fixtures/webauthn";
+import { createInMemoryLoginChallengeUseStore } from "@/lib/real/server/login-challenge-uses";
 
 /**
  * Pre-2f hardening: login.ts and registration.ts used to forward
@@ -74,13 +75,13 @@ describe("WebAuthn verification failures never leak the underlying library error
         credentialBackedUp: false,
       },
     });
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = createInMemoryRegistrationAttemptStore();
 
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
 
     expect(result.outcome).toBe("rejected");
     if (result.outcome !== "rejected") return;
@@ -93,7 +94,7 @@ describe("WebAuthn verification failures never leak the underlying library error
 
     const authenticator = createFixtureAuthenticator();
     const registry = createInMemoryRealAccountRegistry();
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = createInMemoryRegistrationAttemptStore();
     // No active passkey exists for this credential — only a pending,
     // independently-verified registration attempt — so completeLogin takes
@@ -112,10 +113,10 @@ describe("WebAuthn verification failures never leak the underlying library error
       rawAttestationObject: "x",
     });
 
-    const { optionsJSON } = await beginLogin({ config, challengeStore });
+    const { optionsJSON } = await beginLogin({ config });
     const response = buildAuthenticationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: USER_HANDLE });
 
-    const result = await completeLogin({ config, challengeStore, registry, attempts, response });
+    const result = await completeLogin({ config, loginChallengeUses, registry, attempts, response });
 
     expect(result.outcome).toBe("rejected");
     if (result.outcome !== "rejected") return;

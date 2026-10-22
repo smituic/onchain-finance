@@ -7,6 +7,7 @@ import { TURNKEY_STAMP_FRESHNESS_WINDOW_MS } from "@/lib/real/server/turnkey-sig
 import { buildAuthenticationResponseJSON, createFixtureAuthenticator, type FixtureAuthenticator } from "./fixtures/webauthn";
 import { FakeTurnkey, signRequest, stampBody } from "./fixtures/turnkey-fake";
 import { createInMemoryProviderBudgetStore, createProviderBudgetLimiter } from "@/lib/real/server/rate-limit";
+import { createInMemoryLoginChallengeUseStore } from "@/lib/real/server/login-challenge-uses";
 
 /** A fresh in-memory provider budget per call: these tests exercise reconciliation, not throttling (see turnkey-reconcile-budget.test.ts). */
 const unthrottledBudget = () => createProviderBudgetLimiter(createInMemoryProviderBudgetStore());
@@ -30,7 +31,6 @@ const revocation = await import("@/lib/real/server/passkey-revocation");
 const { readAuthenticatedRealAccount } = await import("@/lib/real/server/auth");
 const { createSessionPayload, serializeSession } = await import("@/lib/real/server/session");
 const { beginLogin, completeLogin } = await import("@/lib/real/server/login");
-const { createInMemoryChallengeStore } = await import("@/lib/real/server/challenge-store");
 const { createInMemoryRegistrationAttemptStore } = await import("@/lib/real/server/registration-attempts");
 
 const ORIGIN = "http://localhost:3000";
@@ -276,12 +276,12 @@ describe("revocation — confirmation standard (completed delete activity AND co
     expect(await readAuthenticatedRealAccount({ cookieValue: oldSession, sessionSecret: config.sessionSecret, registry: w.registry })).toBeNull();
     expect(await readAuthenticatedRealAccount({ cookieValue: survivorSession, sessionSecret: config.sessionSecret, registry: w.registry })).not.toBeNull();
 
-    const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const attempts = createInMemoryRegistrationAttemptStore();
     const login = async (who: FixtureAuthenticator, handle: string) => {
-      const { optionsJSON } = await beginLogin({ config, challengeStore });
+      const { optionsJSON } = await beginLogin({ config });
       const response = buildAuthenticationResponseJSON({ authenticator: who, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId, userHandle: handle });
-      return (await completeLogin({ config, challengeStore, registry: w.registry, attempts, response })).outcome;
+      return (await completeLogin({ config, loginChallengeUses, registry: w.registry, attempts, response })).outcome;
     };
     expect(await login(w.b, "handle-b")).toBe("rejected");
     expect(await login(w.a, "handle-a")).toBe("verified");

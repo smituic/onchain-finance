@@ -870,6 +870,7 @@ const DISPOSABLE_SMOKES: Array<[string, string[]]> = [
   [`${R}provisioning-limits.smoke.test.ts`, ["REAL_SMOKE_PROVISIONING_LIMITS"]],
   [`${R}provider-budget.smoke.test.ts`, ["REAL_SMOKE_PROVIDER_BUDGET"]],
   [`${R}registration-admission.smoke.test.ts`, ["REAL_SMOKE_REGISTRATION_ADMISSION"]],
+  [`${R}login-challenge-uses.smoke.test.ts`, ["REAL_SMOKE_LOGIN_CHALLENGE_USES"]],
 ];
 /** Every live suite family: its file, and the smoke gates it may run with. */
 const FAMILIES: Array<[string, string[]]> = [
@@ -1040,5 +1041,57 @@ describe("smoke gates never collide (static + behavior)", () => {
   it("the allowed-gate lists in the files are exactly the families above", () => {
     expect(codeOf(ADAPTER_SMOKE)).toContain('const ALLOWED_GATES = [GATE, "REAL_SMOKE_PROVISIONING_DISPATCH", "REAL_SMOKE_L2_INDEXES"] as const;');
     for (const [file, gates] of DISPOSABLE_SMOKES) expect(codeOf(file), file).toContain(gates.length === 2 ? "const ALLOWED_GATES = [GATE, PUBLIC_GATE] as const;" : "const ALLOWED_GATES = [GATE] as const;");
+  });
+});
+
+describe("the 3C-2 login-challenge-uses smoke family (registered above)", () => {
+  const FILE = `${R}login-challenge-uses.smoke.test.ts`;
+  const GATE_3C2 = "REAL_SMOKE_LOGIN_CHALLENGE_USES";
+  const check = (e: Env, allowed: string[] = [GATE_3C2]) => checkConfirmedDisposableTarget({ env: e, envLocalText: realLine(), otherEnvFiles: {}, gate: GATE_3C2, allowedGates: allowed });
+  const base = { [GATE_3C2]: "1", [BRANCH_URL_ENV]: branch, [EXPECTED_ENDPOINT_ENV]: BRANCH_ID };
+
+  it("is a registered family whose primary gate is unique, and is in the lists the shared collision tests iterate", () => {
+    expect(DISPOSABLE_SMOKES.map(([file]) => file)).toContain(FILE);
+    expect(FAMILIES.map(([file]) => file)).toContain(FILE);
+    expect(new Set(FAMILIES.map(([, gates]) => gates[0])).size).toBe(FAMILIES.length);
+    expect(read(FILE)).toContain(GATE_3C2);
+  });
+
+  it("its own gate with a confirmed branch passes the shared check; with no gate, an unrelated smoke gate, a legacy gate, or any admin gate it refuses", () => {
+    expect(check(base)).toEqual({ ok: true });
+    expectRefused(check({ [BRANCH_URL_ENV]: branch, [EXPECTED_ENDPOINT_ENV]: BRANCH_ID }), /REAL_SMOKE_LOGIN_CHALLENGE_USES is not set/);
+    for (const [, gates] of FAMILIES) if (gates[0] !== GATE_3C2) expectRefused(check({ ...base, [gates[0]!]: "1" }), /an unrelated smoke gate is set/);
+    expectRefused(check({ ...base, REAL_SMOKE_L2_INDEXES: "1" }), /an unrelated smoke gate is set/);
+    expectRefused(check({ ...base, REAL_ADMIN_BACKFILL_TURNKEY_AUTHENTICATOR_IDS: "1" }), /an admin gate is set/);
+    expectRefused(check({ ...base, REAL_ADMIN_POLL_COMMIT: "1" }), /an admin gate is set/);
+    expectRefused(check({ ...base, DATABASE_URL: branch }), /DATABASE_URL/);
+  });
+
+  it("no OTHER family arms when this gate is set beside its own, and the direct-URL race suite refuses beside it", () => {
+    for (const [file, gates] of FAMILIES) {
+      if (file === FILE || file === RACE_SMOKE) continue;
+      const own = Object.fromEntries(gates.map((gate) => [gate, "1"]));
+      const other = checkConfirmedDisposableTarget({ env: { ...own, [GATE_3C2]: "1", [BRANCH_URL_ENV]: branch, [EXPECTED_ENDPOINT_ENV]: BRANCH_ID }, envLocalText: realLine(), otherEnvFiles: {}, gate: gates[0]!, allowedGates: gates });
+      expectRefused(other, /an unrelated smoke gate is set/);
+    }
+    expectRefused(checkConfirmedDirectTarget(directInput(directEnv({ [GATE_3C2]: "1" }))), /an unrelated smoke gate is set/);
+  });
+
+  it("its run id and confirmation variables are NOT smoke gates (they cannot trip, or be tripped by, another suite's gate check)", () => {
+    const code = codeOf(FILE) + codeOf(`${R}fixtures/login-challenge-uses-smoke.ts`);
+    expect(code).toContain('"LOGIN_CHALLENGE_SMOKE_RUN_ID"');
+    expect(code).toContain('"LOGIN_CHALLENGE_SMOKE_CONFIRM"');
+    expect(code).not.toMatch(/REAL_SMOKE_LOGIN_CHALLENGE_USES_(RUN|CONFIRM)/);
+    expectRefused(check({ ...base, LOGIN_CHALLENGE_SMOKE_RUN_ID: "1a2b3c4d", LOGIN_CHALLENGE_SMOKE_CONFIRM: "x:y", REAL_SMOKE_PROVIDER_BUDGET: "1" }), /an unrelated smoke gate is set/);
+    expect(check({ ...base, LOGIN_CHALLENGE_SMOKE_RUN_ID: "1a2b3c4d", LOGIN_CHALLENGE_SMOKE_CONFIRM: "x:y" })).toEqual({ ok: true });
+  });
+
+  it("its file keeps the shared static conventions and reads no other suite's gate, and only the one live describe is skipped by its gate", () => {
+    const code = codeOf(FILE);
+    expect(code).toContain('const GATE = "REAL_SMOKE_LOGIN_CHALLENGE_USES";');
+    expect(code).toContain("const ALLOWED_GATES = [GATE] as const;");
+    expect(code).toContain('const enabled = process.env[GATE] === "1";');
+    expect(code.match(/^describe\.skipIf\(/gm)).toHaveLength(1);
+    for (const [otherFile, otherGates] of FAMILIES) if (otherFile !== FILE) expect(code).not.toContain(`process.env.${otherGates[0]}`);
   });
 });

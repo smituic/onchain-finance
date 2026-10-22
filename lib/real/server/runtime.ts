@@ -7,6 +7,7 @@ import { createInMemoryPasskeyRevocationStore, type PasskeyRevocationStore } fro
 import { createInMemoryAccountHandleStore, type AccountHandleStore } from "./account-handles";
 import { createInMemoryProviderBudgetStore, createInMemoryRateLimitStore, createProviderBudgetLimiter, createRateLimiter, type ProviderBudgetLimiter, type RateLimiter } from "./rate-limit";
 import { createInMemoryRegistrationAdmissionStore, createRegistrationAdmission, type RegistrationAdmission } from "./registration-admission";
+import { createInMemoryLoginChallengeUseStore, type LoginChallengeUseStore } from "./login-challenge-uses";
 import { createNeonDurableStores } from "./neon-store";
 
 /**
@@ -38,9 +39,11 @@ let rateLimiter: RateLimiter | null = null;
 let providerBudgetLimiter: ProviderBudgetLimiter | null = null;
 // Milestone 3C-1: the GLOBAL registration-admission limiter, consulted only by POST /api/real/account/register/options. Selected exactly like the limiters above: Neon whenever a database is configured, in-memory only for local development and never in production (the throw below). It fails closed without its table.
 let registrationAdmission: RegistrationAdmission | null = null;
+// Milestone 3C-2: where VERIFIED stateless login challenges are recorded as used. Neon whenever a database is configured, in-memory only for local development and never in production (the throw below). Fails closed without its table.
+let loginChallengeUses: LoginChallengeUseStore | null = null;
 
 function ensureStoresInitialized(): void {
-  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore && handleStore && rateLimiter && providerBudgetLimiter && registrationAdmission) return;
+  if (registry && challengeStore && attemptStore && paymentAttemptStore && backupEnrollmentStore && revocationStore && handleStore && rateLimiter && providerBudgetLimiter && registrationAdmission && loginChallengeUses) return;
 
   const databaseUrl = process.env.DATABASE_URL?.trim();
   if (databaseUrl) {
@@ -55,6 +58,7 @@ function ensureStoresInitialized(): void {
     rateLimiter = createRateLimiter(durable.rateLimits);
     providerBudgetLimiter = createProviderBudgetLimiter(durable.providerBudgets);
     registrationAdmission = createRegistrationAdmission(durable.registrationAdmission);
+    loginChallengeUses = durable.loginChallengeUses;
     return;
   }
 
@@ -78,6 +82,7 @@ function ensureStoresInitialized(): void {
   rateLimiter = createRateLimiter(createInMemoryRateLimitStore());
   providerBudgetLimiter = createProviderBudgetLimiter(createInMemoryProviderBudgetStore());
   registrationAdmission = createRegistrationAdmission(createInMemoryRegistrationAdmissionStore());
+  loginChallengeUses = createInMemoryLoginChallengeUseStore();
 }
 
 export function getRealAccountRegistry(): RealAccountRegistry {
@@ -145,4 +150,15 @@ export function getProviderBudgetLimiter(): ProviderBudgetLimiter {
 export function getRegistrationAdmission(): RegistrationAdmission {
   ensureStoresInitialized();
   return registrationAdmission!;
+}
+
+/**
+ * The used-marker store for stateless login challenges (login-challenge-uses.ts;
+ * Milestone 3C-2). Its only consumer is the login/verify route. The
+ * real_login_challenge_uses table must be applied on the real database BEFORE the
+ * new login code is deployed — without it every login answers the generic 500.
+ */
+export function getLoginChallengeUses(): LoginChallengeUseStore {
+  ensureStoresInitialized();
+  return loginChallengeUses!;
 }

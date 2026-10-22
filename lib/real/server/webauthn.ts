@@ -79,12 +79,22 @@ export async function buildLoginOptions(input: {
    * whichever synced passkey it has (fresh-device restore depends on that).
    */
   allowCredentialIds?: string[];
+  /**
+   * Milestone 3C-2 ONLY (the ordinary stateless login challenge, login-challenge.ts):
+   * the exact token BYTES. They must be a Uint8Array, never the base64url STRING —
+   * the library UTF-8-encodes a string challenge, which would silently change the
+   * value (see the note below). With bytes, optionsJSON.challenge is exactly
+   * canonicalBase64url(bytes). Every other caller leaves this unset.
+   */
+  challenge?: Uint8Array<ArrayBuffer>;
 }): Promise<PublicKeyCredentialRequestOptionsJSON> {
-  // Same reasoning as buildRegistrationOptions: no explicit `challenge`, let
-  // the library mint its own random bytes; capture optionsJSON.challenge.
+  // Same reasoning as buildRegistrationOptions: unless the caller supplies the
+  // 3C-2 token BYTES, no explicit `challenge` — let the library mint its own
+  // random bytes and capture optionsJSON.challenge.
   return generateAuthenticationOptions({
     rpID: input.config.rpId,
     userVerification: "required",
+    ...(input.challenge ? { challenge: input.challenge } : {}),
     // No allowCredentials for the ordinary restore flow (allowCredentialIds
     // unset) — the platform authenticator itself presents the user's synced
     // passkeys. Set only for the backup-verification path above.

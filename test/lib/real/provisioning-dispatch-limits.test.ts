@@ -34,6 +34,7 @@ import { createInMemoryRealAccountRegistry } from "@/lib/real/server/registry";
 import { claimed, completedObservation, failedObservation } from "./fixtures/provisioning-seed";
 import { FAKE_OWNER_ADDRESS, FakeParentTurnkey, type FakeSubmitMode } from "./fixtures/turnkey-parent-fake";
 import { buildAuthenticationResponseJSON, buildRegistrationResponseJSON, createFixtureAuthenticator } from "./fixtures/webauthn";
+import { createInMemoryLoginChallengeUseStore } from "@/lib/real/server/login-challenge-uses";
 
 /**
  * Registration Abuse Protection (Milestone 1, Slice 1): the dispatch
@@ -662,14 +663,15 @@ describe("through the dispatch and the pipeline: a refusal reaches no provider",
 describe("registration, then continuing by signing in", () => {
   async function register(w: ReturnType<typeof pipelineWorld>) {
     const challengeStore = createInMemoryChallengeStore();
+    const loginChallengeUses = createInMemoryLoginChallengeUseStore();
     const authenticator = createFixtureAuthenticator();
     const { optionsJSON } = await beginRegistration({ config, challengeStore });
     const result = await completeRegistration({ config, challengeStore, registry: w.registry, attempts: w.store, publicClient: buildPublicClient(), provisioningDeps: w.turnkey.deps(), response: buildRegistrationResponseJSON({ authenticator, challenge: optionsJSON.challenge, origin: ORIGIN, rpId: config.rpId }) });
     const credentialId = authenticator.credentialIdBase64Url;
     const login = async () => {
-      const { optionsJSON: loginOptions } = await beginLogin({ config, challengeStore });
+      const { optionsJSON: loginOptions } = await beginLogin({ config });
       const userHandle = (await w.store.findByCredentialId(credentialId))!.userHandle;
-      return completeLogin({ config, challengeStore, registry: w.registry, attempts: w.store, publicClient: buildPublicClient(), provisioningDeps: w.turnkey.deps(), response: buildAuthenticationResponseJSON({ authenticator, challenge: loginOptions.challenge, origin: ORIGIN, rpId: config.rpId, userHandle }) });
+      return completeLogin({ config, loginChallengeUses, registry: w.registry, attempts: w.store, publicClient: buildPublicClient(), provisioningDeps: w.turnkey.deps(), response: buildAuthenticationResponseJSON({ authenticator, challenge: loginOptions.challenge, origin: ORIGIN, rpId: config.rpId, userHandle }) });
     };
     return { result, credentialId, login };
   }
@@ -769,7 +771,7 @@ describe("the verify routes", () => {
       return outcome;
     };
     vi.doMock("next/headers", () => ({ cookies: async () => ({ get: () => undefined, set: (name: string) => void cookiesSet.push(name), delete: () => undefined }) }));
-    vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => ({}), getChallengeStore: () => ({}), getRegistrationAttemptStore: () => ({}), getAccountHandleStore: () => ({}) }));
+    vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => ({}), getChallengeStore: () => ({}), getRegistrationAttemptStore: () => ({}), getAccountHandleStore: () => ({}), getLoginChallengeUses: () => ({}) }));
     vi.doMock("@/lib/real/server/registration", () => ({ completeRegistration: complete }));
     vi.doMock("@/lib/real/server/login", () => ({ completeLogin: complete }));
     const post = (url: string) => new Request(`http://localhost${url}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ response: { id: "x" } }) });

@@ -3,7 +3,7 @@ import type { AuthenticationResponseJSON } from "@simplewebauthn/server";
 import { WEBAUTHN_ASSERTION_BODY_MAX_BYTES, disabledResponse, isRealModeEnabled, jsonError, jsonInternalError, readBoundedJsonBody, requestTooLargeResponse, requireRealServerConfig } from "@/lib/real/server/http";
 import { completeLogin } from "@/lib/real/server/login";
 import { readAccountProfileBestEffort } from "@/lib/real/server/handle-claim";
-import { getAccountHandleStore, getChallengeStore, getRealAccountRegistry, getRegistrationAttemptStore } from "@/lib/real/server/runtime";
+import { getAccountHandleStore, getLoginChallengeUses, getRealAccountRegistry, getRegistrationAttemptStore } from "@/lib/real/server/runtime";
 import { REAL_SESSION_COOKIE_NAME, realSessionCookieOptions } from "@/lib/real/server/session";
 
 export async function POST(request: Request) {
@@ -20,7 +20,7 @@ export async function POST(request: Request) {
 
     const result = await completeLogin({
       config,
-      challengeStore: getChallengeStore(),
+      loginChallengeUses: getLoginChallengeUses(),
       registry: getRealAccountRegistry(),
       attempts: getRegistrationAttemptStore(),
       response: body.response,
