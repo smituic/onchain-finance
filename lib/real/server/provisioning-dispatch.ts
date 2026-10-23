@@ -85,6 +85,18 @@ export async function runProvisioningDispatch(input: {
   deps?: ParentTurnkeyDeps;
 }): Promise<ProvisioningDispatchOutcome> {
   const { config, attempts, attempt } = input;
+
+  // 0. ADVISORY refusal pre-check (Milestone 3C-3a): one read-only question — "would the locked claim refuse this right now for the attempt's own
+  // exhausted budget or a full global ceiling?" — asked BEFORE the request body is built or hashed and before the claim is attempted, so a
+  // doomed request costs one cheap read instead of the claim's row lock, global lock and transaction. It writes nothing and NEVER admits:
+  // "proceed" only means "not refused here", and the claim below remains the sole authority (it also decides a lost claim, an inconsistent
+  // ledger, and every race). A failed read throws (the route's generic 500) — it is never treated as "proceed". A stale refusal is accepted
+  // and bounded: nothing is changed, the attempt stays "verified", and it can be resumed. No retry, and no Retry-After.
+  const peek = await attempts.peekProvisioningDispatchRefusal({ credentialId: attempt.credentialId });
+  if (peek.outcome === "attempt_budget_exhausted") return { kind: "attempt_budget_exhausted" };
+  if (peek.outcome === "global_capacity_reached") return { kind: "capacity_reached" };
+  if (peek.outcome !== "proceed") throw new Error("Provisioning dispatch pre-check returned no usable decision.");
+
   const deps = resolveParentTurnkeyDeps(config, input.deps);
 
   // 1-2. ONE clock reading, ONE body, its digest over the exact UTF-8 bytes.

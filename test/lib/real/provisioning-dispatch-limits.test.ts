@@ -534,13 +534,28 @@ describe("through the dispatch and the pipeline: a refusal reaches no provider",
     expect((await w.store.findDispatchesByCredentialId(attempt.credentialId)).map((row) => row.dispatchSeq)).toEqual([1]);
   });
 
-  it("the pipeline does not retry, loop, or re-read on a refusal: one claim attempt per run", async () => {
+  it("the pipeline does not retry, loop, or re-read on a refusal: the advisory pre-check refuses once and the claim is not even attempted", async () => {
     const w = pipelineWorld();
     await w.fill(5);
     const attempt = await w.verified();
+    const peek = vi.fn(w.store.peekProvisioningDispatchRefusal);
     const begin = vi.fn(w.store.beginProvisioningDispatch);
     const find = vi.fn(w.store.findByCredentialId);
-    expect(await w.run(attempt, { ...w.store, beginProvisioningDispatch: begin, findByCredentialId: find })).toEqual(CAPACITY);
+    expect(await w.run(attempt, { ...w.store, peekProvisioningDispatchRefusal: peek, beginProvisioningDispatch: begin, findByCredentialId: find })).toEqual(CAPACITY);
+    expect(peek).toHaveBeenCalledTimes(1);
+    expect(begin).not.toHaveBeenCalled();
+    expect(find).not.toHaveBeenCalled();
+  });
+
+  it("when the pre-check does NOT refuse, the claim is attempted exactly once and remains the authority: it refuses (one claim per run, no retry, no re-read)", async () => {
+    const w = pipelineWorld();
+    await w.fill(5);
+    const attempt = await w.verified();
+    const peek = vi.fn(async () => ({ outcome: "proceed" as const }));
+    const begin = vi.fn(w.store.beginProvisioningDispatch);
+    const find = vi.fn(w.store.findByCredentialId);
+    expect(await w.run(attempt, { ...w.store, peekProvisioningDispatchRefusal: peek, beginProvisioningDispatch: begin, findByCredentialId: find })).toEqual(CAPACITY);
+    expect(peek).toHaveBeenCalledTimes(1);
     expect(begin).toHaveBeenCalledTimes(1);
     expect(find).not.toHaveBeenCalled();
   });

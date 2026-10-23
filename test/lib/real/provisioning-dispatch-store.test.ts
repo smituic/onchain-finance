@@ -288,6 +288,7 @@ describe("the request evidence is immutable", () => {
         "finalize",
         "findByCredentialId",
         "findDispatchesByCredentialId",
+        "peekProvisioningDispatchRefusal", // 3C-3a: an advisory READ that can only refuse; it writes no evidence and admits nothing
         "recordDispatchActivity",
         "recordDispatchObservation",
         "recordDispatchTerminal",

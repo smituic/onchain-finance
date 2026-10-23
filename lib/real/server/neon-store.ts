@@ -1048,7 +1048,10 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
     // Provisioning Evidence Capture: the pre-dispatch durability point, and
     // (Registration Abuse Protection) the ONLY admission gate for an external
     // create. ONE batch = one READ COMMITTED transaction (createNeonSqlClient),
-    // no read before it, no network inside it. The statement ORDER is the
+    // no read of its own before it, no network inside it. (Milestone 3C-3a: the
+    // caller may first ask the ADVISORY, read-only peekProvisioningDispatchRefusal
+    // below; that read can only refuse and admits nothing, so THIS statement
+    // remains the sole authoritative admission.) The statement ORDER is the
     // invariant — each statement takes its own snapshot when it starts:
     //
     //  1. Lock this attempt's row. Same-attempt claimers queue here, before
@@ -1154,6 +1157,46 @@ export function createNeonRegistrationAttemptStore(sql: NeonQueryFunction<false,
       // Unreachable while the guard holds; never dispatch without the persisted row.
       if (!dispatchRow) throw new Error("Provisioning dispatch claim committed without its evidence row.");
       return { outcome: "claimed", attempt: toAttempt(verdictRow), dispatch: toDispatch(dispatchRow) };
+    },
+
+    // ADVISORY refusal pre-check (Milestone 3C-3a). ONE autocommit SELECT — no transaction, no INSERT/UPDATE/DELETE, no row lock and no
+    // advisory lock (an ordinary statement still takes the usual shared table locks; this is not "zero locking"). One statement snapshot and
+    // ONE database-clock reading (`admission`), so the counts and the decision are consistent with each other. The `ledger` CTE and the CASE
+    // below are deliberately written to match the locked claim's, and a test compares them mechanically; the constants are the same ones.
+    // It can only REFUSE: a lost claim, an inconsistent ledger, and 'admit' are all "proceed", because the locked claim — never this read —
+    // decides admission. Because it runs without the claim's locks, it can be stale by the time the claim runs (and a window may roll between
+    // the two); that is accepted and bounded: a stale refusal leaves the attempt "verified" and resumable, and a stale "proceed" is simply
+    // re-decided by the claim. A failed read, no row, or an unexpected decision throws.
+    async peekProvisioningDispatchRefusal({ credentialId }) {
+      const rows = (await sql`
+        WITH admission AS MATERIALIZED (
+          SELECT pg_catalog.clock_timestamp() AS at
+        ),
+        ledger AS MATERIALIZED (
+          SELECT
+            admission.at,
+            (SELECT a.state FROM registration_attempts a WHERE a.credential_id = ${credentialId}) AS attempt_state,
+            (SELECT count(*) FROM registration_provisioning_dispatches d WHERE d.created_at > admission.at - interval '1 hour') AS hour_count,
+            (SELECT count(*) FROM registration_provisioning_dispatches d WHERE d.created_at > admission.at - interval '24 hours') AS day_count,
+            (SELECT count(*) FROM registration_provisioning_dispatches d WHERE d.credential_id = ${credentialId}) AS own_count,
+            (SELECT COALESCE(MAX(d.dispatch_seq), 0) FROM registration_provisioning_dispatches d WHERE d.credential_id = ${credentialId}) AS own_max_seq
+          FROM admission
+        )
+        SELECT
+          CASE
+            WHEN l.attempt_state IS DISTINCT FROM 'verified' THEN 'claim_lost'
+            WHEN l.own_max_seq <> l.own_count THEN 'ledger_inconsistent'
+            WHEN l.own_count >= ${PROVISIONING_ATTEMPT_DISPATCH_BUDGET}::int THEN 'attempt_budget_exhausted'
+            WHEN l.hour_count >= ${PROVISIONING_GLOBAL_HOURLY_DISPATCH_LIMIT}::int OR l.day_count >= ${PROVISIONING_GLOBAL_DAILY_DISPATCH_LIMIT}::int THEN 'global_capacity_reached'
+            ELSE 'admit'
+          END AS decision
+        FROM ledger l
+      `) as Row[];
+      const decision = rows.length === 1 ? rows[0]!.decision : undefined;
+      if (decision === "attempt_budget_exhausted" || decision === "global_capacity_reached") return { outcome: decision };
+      // claim_lost and ledger_inconsistent are the CLAIM's to report; 'admit' admits nothing here.
+      if (decision === "claim_lost" || decision === "ledger_inconsistent" || decision === "admit") return { outcome: "proceed" };
+      throw new Error("Provisioning dispatch pre-check returned no usable decision.");
     },
 
     // First writer wins. The WHERE clause is the write-once guard; a row that

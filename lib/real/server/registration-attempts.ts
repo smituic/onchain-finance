@@ -253,6 +253,23 @@ export type BeginProvisioningDispatchResult =
   | { outcome: "attempt_budget_exhausted" }
   | { outcome: "global_capacity_reached" };
 
+/**
+ * What the ADVISORY refusal pre-check saw (Milestone 3C-3a). It is a read, never an admission.
+ *
+ *   proceed                   the pre-check does not refuse. This GRANTS NOTHING: the locked claim
+ *                             (beginProvisioningDispatch) is still the only authority, and it also decides
+ *                             a lost claim, an inconsistent ledger, and every race. An attempt that is
+ *                             missing or not "verified", and a ledger that is not exactly 1..n for this
+ *                             attempt, are both "proceed" so the claim sees and reports them itself.
+ *   attempt_budget_exhausted  this attempt's ledger is consistent and already full. Permanent.
+ *   global_capacity_reached   an hourly or daily ceiling is full at the read. Temporary, and ADVISORY: a dispatch
+ *                             that ages out of a window a moment later would have let the claim admit; the attempt
+ *                             stays "verified" and resumable.
+ *
+ * Same precedence as the claim: lost claim, inconsistent ledger, attempt budget, global capacity, otherwise possible.
+ */
+export type ProvisioningDispatchPeek = { outcome: "proceed" } | { outcome: "attempt_budget_exhausted" } | { outcome: "global_capacity_reached" };
+
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 function sha256HexOfUtf8(value: string): string {
@@ -325,6 +342,14 @@ export interface RegistrationAttemptStore {
     attemptedAt: string;
     evidence: ProvisioningDispatchEvidence;
   }): Promise<BeginProvisioningDispatchResult>;
+
+  /**
+   * ADVISORY, READ-ONLY (Milestone 3C-3a): would the locked claim below currently refuse this attempt for its own exhausted budget or a
+   * full global ceiling? Writes nothing, takes no row lock and no advisory lock, and NEVER admits anything — every request this does not
+   * refuse still goes through beginProvisioningDispatch, which alone decides admission. A failed read throws; there is no silent
+   * "proceed" after a failure.
+   */
+  peekProvisioningDispatchRefusal(input: { credentialId: string }): Promise<ProvisioningDispatchPeek>;
 
   /** First writer wins: records the activity id (and Turnkey's fingerprint, verbatim) once. A different id never replaces a recorded one. */
   recordDispatchActivity(input: { dispatchId: string; activityId: string; fingerprint: string | null }): Promise<RecordDispatchActivityResult>;
@@ -555,6 +580,24 @@ export function createInMemoryRegistrationAttemptStore(options: { now?: () => nu
       const current = attempts.get(credentialId);
       if (!current) return;
       attempts.set(credentialId, { ...current, counter, updatedAt: new Date().toISOString() });
+    },
+
+    async peekProvisioningDispatchRefusal({ credentialId }) {
+      // Read-only twin of the decision the claim below makes, in the same order and on the same ledger (every row counts, whatever its
+      // terminal status; strict `>` at the window edge). It writes nothing and never returns an admission.
+      const current = attempts.get(credentialId);
+      if (!current || current.state !== "verified") return { outcome: "proceed" };
+      const existing = [...dispatches.values()];
+      const own = existing.filter((row) => row.credentialId === credentialId);
+      const ownMaxSeq = own.reduce((max, row) => Math.max(max, row.dispatchSeq), 0);
+      if (ownMaxSeq !== own.length) return { outcome: "proceed" }; // the claim reports an inconsistent ledger; it is never hidden behind a refusal
+      if (own.length >= PROVISIONING_ATTEMPT_DISPATCH_BUDGET) return { outcome: "attempt_budget_exhausted" };
+      const readAtMs = admissionClock();
+      const within = (windowMs: number) => existing.filter((row) => Date.parse(row.createdAt) > readAtMs - windowMs).length;
+      if (within(PROVISIONING_HOURLY_WINDOW_MS) >= PROVISIONING_GLOBAL_HOURLY_DISPATCH_LIMIT || within(PROVISIONING_DAILY_WINDOW_MS) >= PROVISIONING_GLOBAL_DAILY_DISPATCH_LIMIT) {
+        return { outcome: "global_capacity_reached" };
+      }
+      return { outcome: "proceed" };
     },
 
     async beginProvisioningDispatch({ credentialId, attemptedAt, evidence }) {
