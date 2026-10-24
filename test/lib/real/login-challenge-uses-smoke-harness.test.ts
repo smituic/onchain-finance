@@ -1734,7 +1734,7 @@ describe("L-2: the confirmation is bound to the shared helpers and the Neon clie
       ["the Neon isolation constant", { ...base, neonStoreText: base.neonStoreText.replace('NEON_TRANSACTION_ISOLATION_LEVEL = "ReadCommitted"', 'NEON_TRANSACTION_ISOLATION_LEVEL = "Serializable"') }],
       ["the Neon client factory", { ...base, neonStoreText: base.neonStoreText.replace("return neon(databaseUrl, { isolationLevel: NEON_TRANSACTION_ISOLATION_LEVEL });", "return neon(databaseUrl, { isolationLevel: NEON_TRANSACTION_ISOLATION_LEVEL, fullResults: false });") }],
       ["the Neon store wiring", { ...base, neonStoreText: base.neonStoreText.replace("const sql = createNeonSqlClient(databaseUrl);\n  return {\n    challengeStore", "const sql = createNeonSqlClient(databaseUrl);\n  void 0;\n  return {\n    challengeStore") }],
-      ["the production adapter", { ...base, neonStoreText: base.neonStoreText.replace("LIMIT 64", "LIMIT 65") }],
+      ["the production adapter", { ...base, neonStoreText: base.neonStoreText.replace("interval '1 hour'\n            ORDER BY p.expires_at\n            LIMIT 64", "interval '1 hour'\n            ORDER BY p.expires_at\n            LIMIT 65") }],
       ["the harness fixture", { ...base, harnessFixtureText: `${base.harnessFixtureText}\n// changed` }],
       ["the smoke test", { ...base, harnessSmokeText: `${base.harnessSmokeText}\n// changed` }],
       ["login-challenge.ts", { ...base, loginChallengeText: `${base.loginChallengeText}\n// changed` }],

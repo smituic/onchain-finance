@@ -344,14 +344,31 @@ export function createNeonChallengeStore(sql: NeonQueryFunction<false, false>): 
       const now = new Date();
       const expiresAt = new Date(now.getTime() + ttlMs);
       // S4: opportunistic cleanup in the same statement — every create also
-      // purges challenges that are already past expiry (range scan on
-      // webauthn_challenges_expires_at_idx). Compared against this server's
-      // clock, the same one that wrote expires_at and that consume() checks,
-      // so a challenge consume() would still accept is never purged. No
-      // scheduled job; the table stays bounded by the create rate x TTL.
+      // purges challenges that are already past expiry. Compared against this
+      // server's clock, the same one that wrote expires_at and that consume()
+      // checks, so a challenge consume() would still accept is never purged.
+      // No scheduled job.
+      //
+      // Milestone 3E: the purge is BOUNDED — at most 64 rows per create (a
+      // literal, kept equal to CHALLENGE_PURGE_BATCH_SIZE by a test), oldest
+      // expiry first, FOR UPDATE SKIP LOCKED so concurrent creates never wait on
+      // or fight over the same rows. A backlog drains over later creates; an
+      // expired row left in place is never consumable (consume() still checks
+      // expiry), so deferred cleanup extends nothing. Same cutoff, same
+      // strict less-than, same single autocommit statement as before; the
+      // purge is still purpose-independent. Same parameter order: the cutoff is
+      // the first bound value. Any database error propagates; nothing is retried.
       await sql`
         WITH purged AS (
-          DELETE FROM webauthn_challenges WHERE expires_at < ${now.toISOString()}
+          DELETE FROM webauthn_challenges d
+          WHERE d.challenge IN (
+            SELECT p.challenge
+            FROM webauthn_challenges p
+            WHERE p.expires_at < ${now.toISOString()}
+            ORDER BY p.expires_at
+            LIMIT 64
+            FOR UPDATE SKIP LOCKED
+          )
         )
         INSERT INTO webauthn_challenges (challenge, purpose, context, expires_at)
         VALUES (${challenge}, ${purpose}, ${context === undefined ? null : JSON.stringify(context)}, ${expiresAt.toISOString()})

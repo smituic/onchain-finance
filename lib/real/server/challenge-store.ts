@@ -38,7 +38,7 @@ export type StoredChallenge = {
  * returned by the library, captured after the fact.
  */
 export interface ChallengeStore {
-  /** Records an already-minted challenge (with context, if any) with a TTL. S4: also purges every challenge already past its expiry — no scheduled cleanup job exists. */
+  /** Records an already-minted challenge (with context, if any) with a TTL. S4/3E: also purges up to CHALLENGE_PURGE_BATCH_SIZE (64) challenges already past their expiry, oldest first — no scheduled cleanup job exists, and a backlog drains over later creates. */
   create(input: { challenge: string; purpose: ChallengePurpose; ttlMs: number; context?: unknown }): Promise<StoredChallenge>;
   /**
    * Atomically looks up and removes a challenge. Returns null (never
@@ -50,17 +50,25 @@ export interface ChallengeStore {
   consume(input: { challenge: string; purpose: ChallengePurpose }): Promise<StoredChallenge | null>;
 }
 
+/**
+ * Milestone 3E: the most expired challenges one create() may delete. The Neon
+ * adapter's SQL carries the same number as a literal (a test keeps them equal).
+ */
+export const CHALLENGE_PURGE_BATCH_SIZE = 64;
+
 export function createInMemoryChallengeStore(): ChallengeStore {
   const challenges = new Map<string, StoredChallenge>();
 
   return {
     async create({ challenge, purpose, ttlMs, context }) {
       const now = Date.now();
-      // Same opportunistic purge as the Neon adapter: anything already past
-      // expiry (and therefore never consumable) is dropped on every create.
-      for (const [key, record] of challenges) {
-        if (record.expiresAt < now) challenges.delete(key);
-      }
+      // Same bounded opportunistic purge as the Neon adapter: at most
+      // CHALLENGE_PURGE_BATCH_SIZE already-expired challenges (oldest expiry
+      // first; the stable sort keeps insertion order for ties) are dropped per
+      // create. An expired entry left behind is never consumable — consume()
+      // checks expiry itself.
+      const expired = [...challenges.values()].filter((record) => record.expiresAt < now).sort((a, b) => a.expiresAt - b.expiresAt);
+      for (const record of expired.slice(0, CHALLENGE_PURGE_BATCH_SIZE)) challenges.delete(record.challenge);
       const record: StoredChallenge = { challenge, purpose, createdAt: now, expiresAt: now + ttlMs, context };
       challenges.set(challenge, record);
       return record;

@@ -113,7 +113,7 @@ describe("S4: opportunistic expired-challenge cleanup on create", () => {
     expect((await store.consume({ challenge: "edge", purpose: "login" }))?.challenge).toBe("edge");
   });
 
-  it("Neon: create is ONE statement that deletes only rows with expires_at before now, then inserts — no scheduled job, entropy/consume unchanged", async () => {
+  it("Neon: create is ONE statement that deletes (a bounded batch of) rows with expires_at before now, then inserts — no scheduled job, entropy/consume unchanged", async () => {
     vi.useFakeTimers();
     const now = new Date("2026-01-01T00:00:00Z");
     vi.setSystemTime(now);
@@ -127,11 +127,13 @@ describe("S4: opportunistic expired-challenge cleanup on create", () => {
 
     expect(calls).toHaveLength(1);
     const [{ text, values }] = calls as [{ text: string; values: unknown[] }];
-    expect(text).toMatch(/^WITH purged AS \( DELETE FROM webauthn_challenges WHERE expires_at < \$\? \) INSERT INTO webauthn_challenges/);
+    // Milestone 3E: the purge is a bounded, oldest-first, SKIP LOCKED candidate selection (full SQL pin: challenge-store-bounded-purge.test.ts).
+    expect(text).toMatch(/^WITH purged AS \( DELETE FROM webauthn_challenges d WHERE d\.challenge IN \( SELECT p\.challenge FROM webauthn_challenges p WHERE p\.expires_at < \$\? ORDER BY p\.expires_at LIMIT 64 FOR UPDATE SKIP LOCKED \) \) INSERT INTO webauthn_challenges/);
     // The purge cutoff is "now" (strictly less-than); the new row expires at now + TTL.
     expect(values[0]).toBe(now.toISOString());
     expect(values).toContain(new Date(now.getTime() + 300_000).toISOString());
-    // The purge touches expired rows only — no other predicate, no purpose filter, no live rows.
-    expect(text).not.toMatch(/DELETE FROM webauthn_challenges WHERE (?!expires_at < \$\? \))/);
+    // The purge touches expired rows only — one cutoff predicate, no purpose filter, no live rows.
+    expect(text.match(/expires_at < \$\?/g)).toHaveLength(1);
+    expect(text).not.toMatch(/purpose\s*(=|IN|<>|!=)/i);
   });
 });
