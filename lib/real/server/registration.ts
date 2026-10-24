@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { decodeClientDataJSON } from "@simplewebauthn/server/helpers";
 import type { RegistrationResponseJSON } from "@simplewebauthn/server";
-import { bytesToBase64Url, randomBytes } from "../bytes";
+import { base64UrlToBytes, bytesToBase64Url, randomBytes } from "../bytes";
 import { credentialIdsEqual } from "../credential-id";
 import type { SafeAccountPublicClient } from "../account/safe";
 import type { ChallengeStore } from "./challenge-store";
@@ -21,6 +21,31 @@ const REGISTRATION_CHALLENGE_TTL_MS = 1000 * 60 * 5;
  */
 const SAFE_REGISTRATION_VERIFICATION_FAILED = "Registration could not be verified.";
 
+/** The one rejection for a registration challenge that is unknown, expired, already used — or not even shaped like one of ours. Never says which. */
+const UNKNOWN_REGISTRATION_CHALLENGE = "Unknown, expired, or already-used registration challenge.";
+
+/** Milestone 3C-3b: a registration challenge is the library's 32 random bytes in canonical unpadded base64url: exactly 43 characters. */
+const REGISTRATION_CHALLENGE_CHARS = 43;
+const REGISTRATION_CHALLENGE_BYTES = 32;
+const REGISTRATION_CHALLENGE_SHAPE = /^[A-Za-z0-9_-]{43}$/;
+
+/**
+ * Whether `value` is exactly a canonical registration challenge: a primitive string of 43 characters from the URL-safe base64 alphabet
+ * (no padding, no whitespace, no `+` `/`), that decodes to exactly 32 bytes and re-encodes to the same string (which rejects
+ * non-zero spare trailing bits that a lenient decoder would accept). The cheap type, length and alphabet checks run FIRST, so
+ * attacker-supplied large or odd input is refused before anything is decoded or allocated. Pure: no I/O. It is a SHAPE check, not
+ * proof the challenge exists — only the atomic consume decides that.
+ */
+function isCanonicalRegistrationChallenge(value: unknown): value is string {
+  if (typeof value !== "string" || value.length !== REGISTRATION_CHALLENGE_CHARS || !REGISTRATION_CHALLENGE_SHAPE.test(value)) return false;
+  try {
+    const bytes = base64UrlToBytes(value);
+    return bytes.length === REGISTRATION_CHALLENGE_BYTES && bytesToBase64Url(bytes) === value;
+  } catch {
+    return false;
+  }
+}
+
 type RegistrationContext = { appUserId: string; userHandle: string };
 
 export async function beginRegistration(input: {
@@ -36,6 +61,11 @@ export async function beginRegistration(input: {
     userId: userIdBytes,
     userName: `real-${appUserId.slice(0, 8)}`,
   });
+
+  // Fail closed BEFORE anything is saved or returned: a challenge the verify step would later refuse by shape must never be issued
+  // (the user would create a passkey the application then rejects). It is never normalized or repaired. A throw here is the route's
+  // generic 500; the 3C-1 admission that already counted this start is not refunded.
+  if (!isCanonicalRegistrationChallenge(optionsJSON.challenge)) throw new Error("Registration options refused: the generated challenge is not in the canonical form.");
 
   // The challenge recorded is exactly the one the library minted
   // (optionsJSON.challenge) — never a value we generated ourselves and
@@ -80,8 +110,12 @@ export async function completeRegistration(input: {
     return { outcome: "rejected", reason: "Malformed registration response." };
   }
 
+  // Milestone 3C-3b: a value that is not even shaped like a challenge we issue is refused here — the same rejection as an unknown one —
+  // with ZERO store calls. A well-formed value still goes straight into the unchanged atomic consume below (the one-time-use guarantee).
+  if (!isCanonicalRegistrationChallenge(clientData.challenge)) return { outcome: "rejected", reason: UNKNOWN_REGISTRATION_CHALLENGE };
+
   const stored = await input.challengeStore.consume({ challenge: clientData.challenge, purpose: "registration" });
-  if (!stored) return { outcome: "rejected", reason: "Unknown, expired, or already-used registration challenge." };
+  if (!stored) return { outcome: "rejected", reason: UNKNOWN_REGISTRATION_CHALLENGE };
   const { appUserId, userHandle } = stored.context as RegistrationContext;
 
   let verified;

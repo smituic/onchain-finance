@@ -284,7 +284,9 @@ const SIGNED_ROUTES: RouteCase[] = [
 // --- 3B-4: the two WebAuthn-registration routes (64 KiB). ---
 
 /** A REAL offline registration response (genuine P-256 key, CBOR attestation object, "none" format). */
-const REGISTRATION_RESPONSE = buildRegistrationResponseJSON({ authenticator: createFixtureAuthenticator(), challenge: "Y2hhbGxlbmdlLWZvci10ZXN0cw", origin: "http://localhost:3000", rpId: "localhost", transports: ["internal", "hybrid"] });
+// Milestone 3C-3b: primary registration verify refuses a challenge that is not canonical 32-byte base64url (43 characters) before it
+// touches any store, so the "ordinary valid request reaches the service" cases need a challenge shape the server could have issued.
+const REGISTRATION_RESPONSE = buildRegistrationResponseJSON({ authenticator: createFixtureAuthenticator(), challenge: "A".repeat(43), origin: "http://localhost:3000", rpId: "localhost", transports: ["internal", "hybrid"] });
 const REGISTRATION = "WEBAUTHN_REGISTRATION_BODY_MAX_BYTES" as const;
 
 const REGISTRATION_ROUTES: RouteCase[] = [
