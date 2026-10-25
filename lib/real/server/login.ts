@@ -43,6 +43,24 @@ export async function beginLogin(input: { config: RealServerConfig; nowMs?: numb
 
 export type CompleteLoginResult = OnboardingOutcome;
 
+const MALFORMED_LOGIN_RESPONSE = "Malformed login response.";
+/** Unpadded base64url alphabet. No `m` flag: `$` only matches at the very end of the string. */
+const UNPADDED_BASE64URL = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Pure structural precheck of the assertion envelope, run after the stateless challenge check and BEFORE the first
+ * credential lookup, so a malformed envelope costs no database request. It checks shape only: it proves nothing about
+ * whether a credential exists and is not a rate limit. Deliberately NO maximum credential-id length (a cap needs its
+ * own decision); the request-body ceiling is the only size bound.
+ */
+function isWellFormedLoginEnvelope(response: { id?: unknown; rawId?: unknown; type?: unknown }, clientDataType: unknown): boolean {
+  const id = response.id;
+  if (typeof id !== "string" || id.length === 0 || !UNPADDED_BASE64URL.test(id) || id.length % 4 === 1) return false;
+  if (response.rawId !== id) return false;
+  if (response.type !== "public-key") return false;
+  return clientDataType === "webauthn.get";
+}
+
 /**
  * APP LOGIN — this never talks to Turnkey UNLESS the credential belongs to
  * a still-pending registration attempt (below), in which case a
@@ -70,7 +88,7 @@ export async function completeLogin(input: {
   try {
     clientData = decodeClientDataJSON(input.response.response.clientDataJSON);
   } catch {
-    return { outcome: "rejected", reason: "Malformed login response." };
+    return { outcome: "rejected", reason: MALFORMED_LOGIN_RESPONSE };
   }
 
   // Milestone 3C-2 ordering. The challenge is first checked as a SIGNED, UNEXPIRED, login-purpose token for this
@@ -81,6 +99,9 @@ export async function completeLogin(input: {
   const token = parseLoginChallenge(clientData.challenge, { sessionSecret: input.config.sessionSecret, rpId: input.config.rpId, nowMs: input.nowMs });
   if (!token.ok) return { outcome: "rejected", reason: UNKNOWN_LOGIN_CHALLENGE };
   const expectedChallenge = clientData.challenge;
+
+  // Structural envelope check, still with no database access. Same generic wording as an undecodable clientDataJSON.
+  if (!isWellFormedLoginEnvelope(input.response, clientData.type)) return { outcome: "rejected", reason: MALFORMED_LOGIN_RESPONSE };
 
   const passkey = await input.registry.findPasskeyByCredentialId(input.response.id);
   if (passkey) {
