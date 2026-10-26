@@ -982,7 +982,8 @@ export async function confirmSigningProof(input: {
   }
   if (!addressesEqual(recovered, account.ownerAddress)) return { outcome: "rejected", reason: "The authorization proof did not recover the account owner." };
 
-  const activated = await input.enrollments.activate({ id: enrollment.id, signingProofActivityId: activity.id });
+  // The nonce verified above is the snapshot read before the provider call; activation re-checks it atomically, so a newer prepare that replaced it makes this a no-match.
+  const activated = await input.enrollments.activate({ id: enrollment.id, signingProofActivityId: activity.id, signingProofChallenge: enrollment.signingProofChallenge });
   if (activated) return { outcome: "active" };
   const fresh = await input.enrollments.findById(enrollment.id);
   return fresh?.state === "active" ? { outcome: "active" } : { outcome: "rejected", reason: "Activation could not be completed; check status and retry." };

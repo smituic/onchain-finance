@@ -509,7 +509,10 @@ describe("2g-H / H2 — a pending backup that is live at Turnkey is removable, a
     w.fake.nextMode = "pending_activity";
     await submitRemoval(w, backup, w.primary, attemptId, signed); // dispatched, NOT confirmed
     expect((await confirmProofB(w, enrollmentId, signingActivity)).outcome).toBe("rejected");
-    expect(await w.enrollments.activate({ id: enrollmentId, signingProofActivityId: signingActivity })).toBeNull();
+    // The REAL stored nonce (prepared by seedProofB): the null must come from the removal's state, not from a missing nonce.
+    const storedNonce = (await w.enrollments.findById(enrollmentId))!.signingProofChallenge!;
+    expect(storedNonce).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(await w.enrollments.activate({ id: enrollmentId, signingProofActivityId: signingActivity, signingProofChallenge: storedNonce })).toBeNull();
     expect((await w.enrollments.findById(enrollmentId))?.state).toBe("removal_in_progress");
     expect((await passkey(w, backup))?.status).toBe("revoking");
   });

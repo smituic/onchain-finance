@@ -125,7 +125,10 @@ async function enrollBackup(w: Pick<World, "enrollments" | "fake">, who: Fixture
   expect(await w.enrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: authenticatorId, turnkeyAuthenticatorPublicKey: created.credential.publicKey, turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" })).not.toBeNull();
   if (activate) {
     await w.enrollments.transition({ id: enrollment.id, from: "turnkey_authenticator_created", to: "login_verified", patch: { loginVerifiedAt: new Date().toISOString() } });
-    expect(await w.enrollments.activate({ id: enrollment.id, signingProofActivityId: `proof-${authenticatorId}` })).not.toBeNull();
+    // The intended prepare transition (login_verified -> login_verified) stores the signing nonce the activation must name.
+    const signingProofChallenge = `0x${"ab".repeat(32)}`;
+    expect(await w.enrollments.transition({ id: enrollment.id, from: "login_verified", to: "login_verified", patch: { signingProofChallenge } })).not.toBeNull();
+    expect(await w.enrollments.activate({ id: enrollment.id, signingProofActivityId: `proof-${authenticatorId}`, signingProofChallenge })).not.toBeNull();
   }
   return enrollment.id;
 }

@@ -696,7 +696,9 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
       return rows[0] ? toBackupEnrollment(rows[0]) : null;
     },
 
-    async activate({ id, signingProofActivityId }) {
+    async activate({ id, signingProofActivityId, signingProofChallenge }) {
+      // Fail closed before any SQL: a missing or empty expected nonce can never become a wildcard.
+      if (typeof signingProofChallenge !== "string" || signingProofChallenge === "") return null;
       try {
         const results = await sql.transaction([
           // 2g-H: the same per-account lock as a removal's beginDispatch, so
@@ -706,6 +708,7 @@ export function createNeonBackupPasskeyEnrollmentStore(sql: NeonQueryFunction<fa
           sql`
             UPDATE backup_passkey_enrollments SET state = 'active', signing_proof_activity_id = ${signingProofActivityId}, signing_verified_at = now(), updated_at = now()
             WHERE id = ${id} AND state = 'login_verified' AND login_verified_at IS NOT NULL
+              AND signing_proof_challenge = ${signingProofChallenge}
             RETURNING *
           `,
           sql`

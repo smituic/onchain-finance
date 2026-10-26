@@ -51,7 +51,7 @@ describe("S5 L4: Neon transaction isolation is pinned to READ COMMITTED", () => 
       ["payments.beginDispatch (S1)", () => stores.payments.beginDispatch({ id: UUID })],
       ["revocations.beginDispatch (2g)", () => stores.revocations.beginDispatch({ id: UUID, patch: {} })],
       ["revocations.confirmDeleted (2g)", () => stores.revocations.confirmDeleted({ id: UUID, turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" })],
-      ["backupEnrollments.activate (2g-H)", () => stores.backupEnrollments.activate({ id: UUID, signingProofActivityId: "activity" })],
+      ["backupEnrollments.activate (2g-H)", () => stores.backupEnrollments.activate({ id: UUID, signingProofActivityId: "activity", signingProofChallenge: `0x${"ab".repeat(32)}` })],
       ["attempts.finalize (S5 L3)", () => stores.attempts.finalize({ credentialId: "credential", registry: stores.registry, safeAddress: "0x", safeOwnerAddress: "0x", accountConfigVersion: 1 })],
     ];
     for (const [name, run] of lockingTransactions) {

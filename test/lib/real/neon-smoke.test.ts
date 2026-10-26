@@ -1213,10 +1213,12 @@ describe.skipIf(!enabled)("Neon adapter smoke test — Batch 2g backup passkeys 
     await s.backupEnrollments.transition({ id: enrollment.id, from: "credential_registered", to: "turnkey_enrollment_in_flight", patch: { externalOutcome: "unknown" } });
     expect(await s.backupEnrollments.confirmCreated({ id: enrollment.id, turnkeyAuthenticatorId: id("auth", `${purpose}-new`), turnkeyAuthenticatorPublicKey: "02ab", turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" })).not.toBeNull();
     await s.backupEnrollments.transition({ id: enrollment.id, from: "turnkey_authenticator_created", to: "login_verified", patch: { loginVerifiedAt: new Date().toISOString() } });
+    const signingProofChallenge = `0x${"ab".repeat(32)}`;
+    await s.backupEnrollments.transition({ id: enrollment.id, from: "login_verified", to: "login_verified", patch: { signingProofChallenge } });
     // The pending passkey stops being pending -> statement 2 matches nothing -> guard aborts.
     await sql`UPDATE real_passkeys SET status = 'revoked' WHERE credential_id = ${cred}`;
 
-    expect(await s.backupEnrollments.activate({ id: enrollment.id, signingProofActivityId: "sign-1" })).toBeNull();
+    expect(await s.backupEnrollments.activate({ id: enrollment.id, signingProofActivityId: "sign-1", signingProofChallenge })).toBeNull();
     const after = (await s.backupEnrollments.findById(enrollment.id))!;
     expect(after.state).toBe("login_verified");
     expect(after.signingVerifiedAt).toBeNull();
@@ -1332,6 +1334,10 @@ describe.skipIf(!enabled)("Neon adapter smoke test — Batch 2g backup passkeys 
 
   it("2g-H: removing a pending-but-mapped passkey — the locked dispatch moves the enrollment to 'removal_in_progress' (slot STILL HELD) and the passkey to 'revoking'; only confirmDeleted makes it 'revoked' + 'removed' and frees the slot", async () => {
     const { s, appUserId, primary, pending, enrollmentId } = await pendingLive("pending-removal");
+    // A realistic late activation: the enrollment reached login_verified with a stored signing nonce, so the null below comes from the removal's state, not a missing nonce.
+    const signingProofChallenge = `0x${"cd".repeat(32)}`;
+    await s.backupEnrollments.transition({ id: enrollmentId, from: "turnkey_authenticator_created", to: "login_verified", patch: { loginVerifiedAt: new Date().toISOString() } });
+    await s.backupEnrollments.transition({ id: enrollmentId, from: "login_verified", to: "login_verified", patch: { signingProofChallenge } });
     const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary });
     if (!prepared.ok) throw new Error(JSON.stringify(prepared));
     expect((await s.registry.findPasskeyByCredentialId(pending))?.status).toBe("pending"); // prepare alone changes nothing
@@ -1341,7 +1347,7 @@ describe.skipIf(!enabled)("Neon adapter smoke test — Batch 2g backup passkeys 
     expect((await s.backupEnrollments.findById(enrollmentId))?.state).toBe("removal_in_progress");
     expect(await s.backupEnrollments.findActiveByAppUserId(appUserId)).toMatchObject({ id: enrollmentId, state: "removal_in_progress" });
     expect(await s.backupEnrollments.createStarted({ appUserId })).toBeNull(); // slot held while unresolved
-    expect(await s.backupEnrollments.activate({ id: enrollmentId, signingProofActivityId: "late" })).toBeNull();
+    expect(await s.backupEnrollments.activate({ id: enrollmentId, signingProofActivityId: "late", signingProofChallenge })).toBeNull();
 
     expect(await s.revocations.confirmDeleted({ id: prepared.attempt.id, turnkeyActivityStatus: "ACTIVITY_STATUS_COMPLETED" })).toMatchObject({ state: "confirmed" });
     expect(await s.registry.findPasskeyByCredentialId(pending)).toMatchObject({ status: "revoked", role: "backup" }); // row kept as history
@@ -1458,10 +1464,12 @@ describe.skipIf(!enabled)("Neon adapter smoke test — Batch 2g backup passkeys 
     for (let round = 1; round <= rounds; round += 1) {
       const { s, appUserId, primary, pending, enrollmentId } = await pendingLive(`activation-race-${round}`);
       await s.backupEnrollments.transition({ id: enrollmentId, from: "turnkey_authenticator_created", to: "login_verified", patch: { loginVerifiedAt: new Date().toISOString() } });
+      const signingProofChallenge = `0x${"ef".repeat(32)}`;
+      await s.backupEnrollments.transition({ id: enrollmentId, from: "login_verified", to: "login_verified", patch: { signingProofChallenge } });
       const prepared = await s.revocations.prepare({ appUserId, targetCredentialId: pending, authorizerCredentialId: primary });
       if (!prepared.ok) throw new Error("setup");
       const [activated, dispatched] = await Promise.all([
-        s.backupEnrollments.activate({ id: enrollmentId, signingProofActivityId: `sign-${round}` }),
+        s.backupEnrollments.activate({ id: enrollmentId, signingProofActivityId: `sign-${round}`, signingProofChallenge }),
         s.revocations.beginDispatch({ id: prepared.attempt.id, patch: dispatchPatch }),
       ]);
       expect(dispatched).toMatchObject({ state: "dispatch_in_flight" });

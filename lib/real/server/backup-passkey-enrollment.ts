@@ -182,8 +182,14 @@ export interface BackupPasskeyEnrollmentStore {
    * ONE atomic step, only once both proofs exist: enrollment 'login_verified'
    * (loginVerifiedAt set) -> 'active' and passkey 'pending' -> 'active',
    * together or not at all.
+   *
+   * `signingProofChallenge` is the EXACT nonce the caller verified the activity
+   * against (the snapshot it read, never a fresh re-read). Activation compares
+   * it, in the same atomic step, with the enrollment's CURRENT nonce: a newer
+   * prepareSigningProof that replaced it makes this a no-match (null) with no
+   * change at all. A missing or empty nonce also returns null — never a wildcard.
    */
-  activate(input: { id: string; signingProofActivityId: string }): Promise<BackupPasskeyEnrollment | null>;
+  activate(input: { id: string; signingProofActivityId: string; signingProofChallenge: string }): Promise<BackupPasskeyEnrollment | null>;
 
   /**
    * 2g-H: claims the ONE byte-identical replay of the recorded create —
@@ -379,9 +385,12 @@ export function createInMemoryBackupPasskeyEnrollmentStore(registry: RealAccount
       return save({ ...current, turnkeyActivityId: activityId, turnkeyActivityStatus: activityStatus, turnkeyRequestStamp: null });
     },
 
-    async activate({ id, signingProofActivityId }) {
+    async activate({ id, signingProofActivityId, signingProofChallenge }) {
+      // Fail closed: exact-value equality against the verified nonce, checked before any mutation. No expected nonce, or none stored, never matches.
+      if (typeof signingProofChallenge !== "string" || signingProofChallenge === "") return null;
       const current = enrollments.get(id);
       if (!current || current.state !== "login_verified" || !current.loginVerifiedAt || !current.newCredentialId) return null;
+      if (current.signingProofChallenge !== signingProofChallenge) return null;
       const passkey = passkeysByCredentialId.get(current.newCredentialId);
       if (!passkey || passkey.status !== "pending" || passkey.appUserId !== current.appUserId || !passkey.turnkeyAuthenticatorId) return null;
 

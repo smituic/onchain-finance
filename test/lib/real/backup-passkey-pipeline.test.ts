@@ -625,7 +625,13 @@ describe("backup enrollment — Proof B (Turnkey authorization attributed to the
 
   it("activation is idempotent under retry and concurrency — never 'passkey active + enrollment unfinished' or the reverse", async () => {
     const { w, enrollmentId, backup } = await toLoginVerified();
-    const [a, b] = await Promise.all([w.enrollments.activate({ id: enrollmentId, signingProofActivityId: "x" }), w.enrollments.activate({ id: enrollmentId, signingProofActivityId: "y" })]);
+    const prepared = await pipeline.prepareSigningProof({ config, registry: w.registry, enrollments: w.enrollments, appUserId: "app-user-1", enrollmentId });
+    if (prepared.outcome !== "ready") throw new Error(JSON.stringify(prepared));
+    const signingProofChallenge = prepared.digest;
+    const [a, b] = await Promise.all([
+      w.enrollments.activate({ id: enrollmentId, signingProofActivityId: "x", signingProofChallenge }),
+      w.enrollments.activate({ id: enrollmentId, signingProofActivityId: "y", signingProofChallenge }),
+    ]);
     expect([a, b].filter(Boolean)).toHaveLength(1);
     expect((await w.enrollments.findById(enrollmentId))?.state).toBe("active");
     expect((await w.registry.findPasskeyByCredentialId(backup.credentialIdBase64Url))?.status).toBe("active");
