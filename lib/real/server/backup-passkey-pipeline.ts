@@ -888,8 +888,16 @@ export async function prepareSigningProof(input: {
   return { outcome: "ready", subOrganizationId: account.subOrganizationId, ownerAddress: account.ownerAddress, rpId: input.config.rpId, authorizingCredentialId: enrollment.newCredentialId, digest };
 }
 
-/** "rate_limited": the provider budget refused this confirmation (3A-3) before any Turnkey read — nothing changed and the same activity id may be sent again later. */
-export type ConfirmSigningProofResult = { outcome: "active" } | { outcome: "rejected"; reason: string } | { outcome: "rate_limited"; retryAfterSeconds: number };
+/**
+ * "rate_limited": the provider budget refused this confirmation (3A-3) before any Turnkey read — nothing changed and the same activity id may be sent again later.
+ * "unavailable" (M3D-2): the activity read returned no usable evidence (timeout, transport or SDK failure, not found, malformed answer). That proves neither a
+ * rejection nor a success — nothing changed, the enrollment stays login_verified, and the same activity id may be sent again later.
+ */
+export type ConfirmSigningProofResult =
+  | { outcome: "active" }
+  | { outcome: "rejected"; reason: string }
+  | { outcome: "rate_limited"; retryAfterSeconds: number }
+  | { outcome: "unavailable" };
 
 /**
  * Proof B, attributed to the NEW authenticator specifically. Owner-address
@@ -932,7 +940,9 @@ export async function confirmSigningProof(input: {
   if (!admission.allowed) return { outcome: "rate_limited", retryAfterSeconds: admission.retryAfterSeconds };
 
   const activity = await readTurnkeyActivity({ config: input.config, subOrganizationId: account.subOrganizationId, activityId: input.activityId });
-  if (!activity || activity.id !== input.activityId || activity.organizationId !== account.subOrganizationId || activity.type !== SIGN_ACTIVITY_TYPE) {
+  // No usable evidence is not a rejection: only a READABLE contradiction below is one.
+  if (!activity) return { outcome: "unavailable" };
+  if (activity.id !== input.activityId || activity.organizationId !== account.subOrganizationId || activity.type !== SIGN_ACTIVITY_TYPE) {
     return { outcome: "rejected", reason: "The authorization proof could not be verified." };
   }
   if (activity.status !== COMPLETED_STATUS) return { outcome: "rejected", reason: "The authorization proof isn't complete yet. Try again." };

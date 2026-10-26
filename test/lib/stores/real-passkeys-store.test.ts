@@ -812,6 +812,78 @@ describe("real-passkeys-store — 3A-3 Stage 2A shared Turnkey-check wait", () =
       expect(srv.confirmedIds().slice(3)).toEqual(["act-2", "act-2"]);
     });
 
+    describe("M3D-2 — the server's 'unavailable' answer (HTTP 503)", () => {
+      const UNAVAILABLE_MESSAGE = "We couldn't check your approval just now. Try again in a moment.";
+      // The exact body the confirm route sends: no `code`, no Retry-After.
+      const unavailable = () => json({ error: UNAVAILABLE_MESSAGE, retryable: true }, 503);
+
+      it("shows the server's sentence, keeps the SAME activity id, starts no wait, and a manual Resume confirms with that id — no options, no signing, no passkey prompt", async () => {
+        current.enrollment = LOGIN_VERIFIED;
+        const store = setup();
+        const srv = proofServer([unavailable, unavailable, () => json({ active: true })]);
+        await resume(store);
+        expect(store.getState()).toMatchObject({ setupError: UNAVAILABLE_MESSAGE, isTurnkeyCheckWaiting: false, setupBusy: false });
+        expect(srv.confirmedIds()).toEqual(["act-1"]);
+
+        await resume(store); // another 503
+        expect(store.getState()).toMatchObject({ setupError: UNAVAILABLE_MESSAGE, isTurnkeyCheckWaiting: false });
+        await resume(store); // the server can read it now
+        expect(srv.confirmedIds()).toEqual(["act-1", "act-1", "act-1"]);
+        expect(srv.optionCalls()).toBe(1);
+        expect(signing.signDigest).toHaveBeenCalledTimes(1);
+        expect(srv.calls.some((c) => c.url.endsWith("/submit"))).toBe(false);
+        expect(store.getState().setupError).toBeNull();
+      });
+
+      it("never retries on its own: no request follows however much time passes, and the proof is still usable afterwards", async () => {
+        current.enrollment = LOGIN_VERIFIED;
+        const store = setup();
+        const srv = proofServer([unavailable, () => json({ active: true })]);
+        await resume(store);
+        const sends = srv.calls.length;
+        await vi.advanceTimersByTimeAsync(3_600_000);
+        expect(srv.calls.length).toBe(sends);
+        expect(srv.confirmedIds()).toEqual(["act-1"]);
+        expect(signing.signDigest).toHaveBeenCalledTimes(1);
+
+        await resume(store);
+        expect(srv.confirmedIds()).toEqual(["act-1", "act-1"]);
+        expect(srv.optionCalls()).toBe(1);
+      });
+
+      it("a 503 is never counted as an HTTP 400: 400, 503, 503, 400, 400 discards the proof only after the THIRD genuine 400", async () => {
+        current.enrollment = LOGIN_VERIFIED;
+        const store = setup();
+        const srv = proofServer([bad400, unavailable, unavailable, bad400, bad400, () => json({ active: true })]);
+        await resume(store); // 400 (1)
+        await resume(store); // 503
+        await resume(store); // 503
+        await resume(store); // 400 (2) — still the same proof
+        expect(srv.confirmedIds()).toEqual(Array(4).fill("act-1"));
+        expect(srv.optionCalls()).toBe(1);
+        expect(signing.signDigest).toHaveBeenCalledTimes(1);
+
+        await resume(store); // 400 (3) — uses the kept id one last time, then discards it
+        expect(srv.confirmedIds()).toEqual(Array(5).fill("act-1"));
+        expect(srv.optionCalls()).toBe(1);
+
+        await resume(store); // the next explicit action asks for a fresh proof
+        expect(srv.optionCalls()).toBe(2);
+        expect(signing.signDigest).toHaveBeenCalledTimes(2);
+        expect(srv.confirmedIds()[5]).toBe("act-2");
+      });
+
+      it("only 503s never drop the proof, however many arrive", async () => {
+        current.enrollment = LOGIN_VERIFIED;
+        const store = setup();
+        const srv = proofServer([unavailable, unavailable, unavailable, unavailable, unavailable, () => json({ active: true })]);
+        for (let i = 0; i < 6; i += 1) await resume(store);
+        expect(srv.confirmedIds()).toEqual(Array(6).fill("act-1"));
+        expect(srv.optionCalls()).toBe(1);
+        expect(signing.signDigest).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it("success clears the proof; a status read showing the enrollment gone, different or past login_verified discards it", async () => {
       // success
       current.enrollment = LOGIN_VERIFIED;

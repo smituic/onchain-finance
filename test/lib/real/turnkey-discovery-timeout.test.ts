@@ -713,7 +713,7 @@ const confirmProofB = (w: World, enrollmentId: string, activityId: string) =>
   pipeline.confirmSigningProof({ config, registry: w.registry, enrollments: w.enrollments, appUserId: APP_USER, enrollmentId, activityId, providerBudgetLimiter: openBudget() });
 
 describe("signing-proof confirmation under a Turnkey read timeout", () => {
-  it("a hanging getActivity is a retryable rejection at 5 s: the enrollment is NOT activated, and the same activity id then activates it once Turnkey answers", async () => {
+  it("a hanging getActivity is a retryable 'unavailable' at 5 s (M3D-2): the enrollment is NOT activated, and the same activity id then activates it once Turnkey answers", async () => {
     const w = await world();
     const { enrollmentId } = await toLoginVerified(w);
     const activityId = await seedProofB(w, enrollmentId);
@@ -725,7 +725,7 @@ describe("signing-proof confirmation under a Turnkey read timeout", () => {
     await vi.advanceTimersByTimeAsync(DEADLINE_MS - 1);
     expect(state.settled).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
-    expect(state).toMatchObject({ settled: true, value: { outcome: "rejected", reason: "The authorization proof could not be verified." } });
+    expect(state).toMatchObject({ settled: true, value: { outcome: "unavailable" } });
     expect((await w.enrollments.findById(enrollmentId))?.state).toBe("login_verified");
     expect(hooks.calls.getActivity).toBe(1);
 
