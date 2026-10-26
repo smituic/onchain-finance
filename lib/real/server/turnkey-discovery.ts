@@ -19,10 +19,54 @@ import type { RealServerConfig } from "./config";
  */
 export type TurnkeyUserAuthenticator = { authenticatorId: string; credentialId: string; publicKey: string };
 
+/** Controlled-development default for how long a caller waits on one read — not a provider SLA or a measured production threshold. */
+const READ_DEADLINE_MS = 5_000;
+
+/** A read that did not answer in time. Says nothing about whether Turnkey saw, or will finish, the request. */
+class TurnkeyReadDeadlineError extends Error {
+  constructor() {
+    super("Turnkey did not answer the read in time.");
+    this.name = "TurnkeyReadDeadlineError";
+  }
+}
+
+/**
+ * Bounds how long the CALLER waits for one SDK read — it does not abort the
+ * SDK's socket, which may keep running after the caller has settled. The
+ * timer starts immediately before the single call, is cleared as soon as the
+ * call settles first, and nothing is retried or re-issued. A late result or a
+ * late rejection is swallowed and can never reach the caller. A timeout is an
+ * unavailable answer, never evidence the thing read is absent.
+ */
+function withReadDeadline<T>(read: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new TurnkeyReadDeadlineError()), READ_DEADLINE_MS);
+    let pending: Promise<T>;
+    try {
+      pending = read();
+    } catch (error) {
+      clearTimeout(timer);
+      reject(error);
+      return;
+    }
+    pending.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 /**
  * SERVER-ONLY, parent-key-stamped, READ-ONLY: the current authenticators of
  * exactly one Turnkey user in one child sub-organization, or null if that
- * user isn't present in the response. Parent-key authority here is the
+ * user isn't present in the response. A failed or timed-out read THROWS — it
+ * is never null or [] (callers read those as absence). Parent-key authority here is the
  * same read access turnkey-discovery already had (getUsers) — it never
  * creates, deletes, or approves anything.
  */
@@ -32,7 +76,7 @@ export async function listTurnkeyUserAuthenticators(input: {
   turnkeyUserId: string;
 }): Promise<TurnkeyUserAuthenticator[] | null> {
   const client = createParentTurnkeyClient(input.config);
-  const { users } = await client.getUsers({ organizationId: input.subOrganizationId });
+  const { users } = await withReadDeadline(() => client.getUsers({ organizationId: input.subOrganizationId }));
   const user = (users ?? []).find((candidate) => candidate.userId === input.turnkeyUserId);
   if (!user) return null;
   return (user.authenticators ?? []).map((authenticator) => ({
@@ -91,11 +135,11 @@ export function turnkeyPublicKeysEqual(a: unknown, b: unknown): boolean {
   return left !== null && right !== null && left.length === right.length && left.every((byte, i) => byte === right[i]);
 }
 
-/** SERVER-ONLY, parent-key-stamped, READ-ONLY poll of one child activity — never a resubmission of the mutation it describes. Returns null on any read failure (the caller stays pending). */
+/** SERVER-ONLY, parent-key-stamped, READ-ONLY poll of one child activity — never a resubmission of the mutation it describes. Returns null on any read failure, including a missed 5 s deadline (the caller stays pending): null means "unavailable", never "no such activity" — the SDK read has no not-found result distinct from a failure. */
 export async function readTurnkeyActivity(input: { config: RealServerConfig; subOrganizationId: string; activityId: string }): Promise<TurnkeyActivitySummary | null> {
   try {
     const client = createParentTurnkeyClient(input.config);
-    const response = await client.getActivity({ organizationId: input.subOrganizationId, activityId: input.activityId });
+    const response = await withReadDeadline(() => client.getActivity({ organizationId: input.subOrganizationId, activityId: input.activityId }));
     return summarizeActivity(response.activity);
   } catch {
     return null;
