@@ -785,4 +785,16 @@ describe("R0 — no automatic replay: one forward per claimed removal, reconcile
     // Nothing reconcile-side (or after it) can reach the forwarder.
     expect(code.slice(reconcileStart)).not.toMatch(/forwardSignedRequest/);
   });
+
+  it("TEST 6b: the single DELETE forward is bounded by the 10,000 ms deadline constant, and the constant is not tunable at runtime", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const source = readFileSync(join(process.cwd(), "lib/real/server/passkey-revocation.ts"), "utf8");
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    expect(revocation.REVOCATION_DELETE_FORWARD_DEADLINE_MS).toBe(10_000);
+    expect(code).toMatch(/export const REVOCATION_DELETE_FORWARD_DEADLINE_MS = 10_000;/);
+    const call = /\bforwardSignedRequest\s*\(([\s\S]*?)\}\);/.exec(code)?.[1] ?? "";
+    expect(call).toMatch(/deadlineMs: REVOCATION_DELETE_FORWARD_DEADLINE_MS/);
+    expect(code).not.toMatch(/process\.env|deps\??\.\w*[dD]eadline/);
+  });
 });

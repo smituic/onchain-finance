@@ -316,19 +316,64 @@ export function summarizeActivity(value: unknown): TurnkeyActivitySummary | null
 
 export type ForwardOutcome = { kind: "activity"; activity: TurnkeyActivitySummary } | { kind: "no_activity" };
 
+type ForwardInput = {
+  config: RealServerConfig;
+  endpoint: TurnkeyMutationEndpoint;
+  body: string;
+  stamp: TurnkeyStamp;
+  fetchImpl?: typeof fetch;
+};
+
+/**
+ * Without `deadlineMs` this is exactly the original unbounded forward (the
+ * backup-passkey CREATE path never passes one: its single claimed replay is
+ * not safe to start while the first request may still be running).
+ *
+ * With `deadlineMs` the CALLER stops waiting at that many milliseconds for the
+ * whole forward — response headers, body read and parse — and gets
+ * "no_activity". That is a local bound on waiting only: the abort signal asks
+ * the transport to stop, but nothing here (or at Turnkey) proves the request
+ * did not land, so the caller must keep treating the outcome as unknown. A
+ * result that arrives after the deadline is discarded; this function never
+ * retries, re-sends, or records anything itself.
+ */
+export function forwardSignedRequest(input: ForwardInput & { deadlineMs?: number }): Promise<ForwardOutcome> {
+  const { deadlineMs, ...forward } = input;
+  return deadlineMs === undefined ? forwardSignedRequestUnbounded(forward) : forwardSignedRequestWithinDeadline(forward, deadlineMs);
+}
+
+async function forwardSignedRequestWithinDeadline(input: ForwardInput, deadlineMs: number): Promise<ForwardOutcome> {
+  // Checked before anything is sent: a bad bound must never turn into "no deadline".
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) throw new RangeError("deadlineMs must be a positive integer number of milliseconds.");
+  const controller = new AbortController();
+  const baseFetch = input.fetchImpl ?? fetch;
+  const abortableFetch = ((url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => baseFetch(url, { ...init, signal: controller.signal })) as typeof fetch;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // Started immediately before the one forwarding call below.
+  const deadline = new Promise<ForwardOutcome>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve({ kind: "no_activity" });
+    }, deadlineMs);
+  });
+  const forwarding = forwardSignedRequestUnbounded({ ...input, fetchImpl: abortableFetch });
+  // The race below owns the result; a transport that ignores the abort may still settle later, harmlessly.
+  forwarding.catch(() => undefined);
+  try {
+    return await Promise.race([forwarding, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Raw-forwards the byte-identical signed body with its original stamp
  * header. Any failure to obtain an activity id — network error, timeout,
  * non-2xx, unparseable response — is "no_activity": NOT proof the request
  * didn't land (the caller keeps the outcome "unknown").
  */
-export async function forwardSignedRequest(input: {
-  config: RealServerConfig;
-  endpoint: TurnkeyMutationEndpoint;
-  body: string;
-  stamp: TurnkeyStamp;
-  fetchImpl?: typeof fetch;
-}): Promise<ForwardOutcome> {
+async function forwardSignedRequestUnbounded(input: ForwardInput): Promise<ForwardOutcome> {
   const fetchImpl = input.fetchImpl ?? fetch;
   try {
     const response = await fetchImpl(turnkeyEndpointUrl(input.config, input.endpoint), {

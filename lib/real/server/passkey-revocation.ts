@@ -57,6 +57,13 @@ import {
  */
 const DELETE_ACTIVITY_TYPE = "ACTIVITY_TYPE_DELETE_AUTHENTICATORS";
 
+/**
+ * Total time submit waits for the one DELETE forward (headers + body). A
+ * provisional, unmeasured localhost default — not a Turnkey SLA. Expiry is
+ * "no_activity": the request may still land, and S3 recovery stays the path.
+ */
+export const REVOCATION_DELETE_FORWARD_DEADLINE_MS = 10_000;
+
 function expectedDeleteActivity(account: RealAccountRecord, attempt: PasskeyRevocationAttempt, timestampMs: string) {
   return {
     type: DELETE_ACTIVITY_TYPE,
@@ -200,8 +207,17 @@ export async function submitRevocation(input: {
   await input.registry.updateAuthenticatorCounter({ credentialId: authorizer.credentialId, counter: stampCheck.newCounter });
 
   // The ONLY send of this removal's signed DELETE: beginDispatch admits one
-  // claimant per attempt, and nothing after this ever forwards it again.
-  const forwarded = await forwardSignedRequest({ config: input.config, endpoint: "delete_authenticators", body: signed.body, stamp: signed.stamp, fetchImpl: input.deps?.fetchImpl });
+  // claimant per attempt, and nothing after this ever forwards it again. The
+  // deadline only bounds how long this call waits; at expiry the result is
+  // "no_activity" (outcome unknown, never "didn't happen") and nothing re-sends.
+  const forwarded = await forwardSignedRequest({
+    config: input.config,
+    endpoint: "delete_authenticators",
+    body: signed.body,
+    stamp: signed.stamp,
+    fetchImpl: input.deps?.fetchImpl,
+    deadlineMs: REVOCATION_DELETE_FORWARD_DEADLINE_MS,
+  });
   if (forwarded.kind === "activity") {
     await input.revocations.recordActivity({ id: claimed.id, activityId: forwarded.activity.id, activityStatus: forwarded.activity.status });
   }

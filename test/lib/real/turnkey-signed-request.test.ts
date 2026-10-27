@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RealServerConfig } from "@/lib/real/server/config";
 import {
   forwardSignedRequest,
@@ -101,5 +101,102 @@ describe("turnkey-signed-request", () => {
     expect(isFreshTimestamp(now - TURNKEY_STAMP_FRESHNESS_WINDOW_MS, now)).toBe(true);
     expect(isFreshTimestamp(now - TURNKEY_STAMP_FRESHNESS_WINDOW_MS - 1, now)).toBe(false);
     expect(isFreshTimestamp(now + 120_000, now)).toBe(false);
+  });
+});
+
+describe("forwardSignedRequest — opt-in caller deadline (M3D DELETE forward)", () => {
+  afterEach(() => vi.useRealTimers());
+
+  const bounded = (fetchImpl: typeof fetch, deadlineMs: number) => forwardSignedRequest({ config, endpoint: "delete_authenticators", body: "{}", stamp, fetchImpl, deadlineMs });
+
+  it("keeps the request itself byte-identical and only adds an abort signal", async () => {
+    vi.useFakeTimers();
+    const body = '{ "odd":  "spacing" }';
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ activity: { id: "a1", status: "ACTIVITY_STATUS_PENDING" } }), { status: 200 }));
+    const out = await forwardSignedRequest({ config, endpoint: "delete_authenticators", body, stamp, fetchImpl: fetchImpl as unknown as typeof fetch, deadlineMs: 10_000 });
+    expect(out).toMatchObject({ kind: "activity", activity: { id: "a1" } });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit & { headers: Record<string, string> }];
+    expect(url).toBe("https://api.turnkey.com/public/v1/submit/delete_authenticators");
+    expect(init.body).toBe(body);
+    expect(init.method).toBe("POST");
+    expect(init.redirect).toBe("error");
+    expect(init.headers).toEqual({ "Content-Type": "application/json", "X-Stamp-Webauthn": stamp.stampHeaderValue });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    expect(init.signal?.aborted).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("settles with 'no_activity' at the deadline when the fetch never settles, and aborts the signal", async () => {
+    vi.useFakeTimers();
+    let signal: AbortSignal | undefined;
+    const fetchImpl = vi.fn((_url: string, init?: RequestInit) => {
+      signal = init?.signal ?? undefined;
+      return new Promise<Response>(() => {});
+    });
+    let settled: unknown;
+    void bounded(fetchImpl as unknown as typeof fetch, 5_000).then((value) => (settled = value));
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(settled).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toEqual({ kind: "no_activity" });
+    expect(signal?.aborted).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a response whose body never finishes is bounded by the same total deadline", async () => {
+    vi.useFakeTimers();
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, json: () => new Promise(() => {}) }) as unknown as Response);
+    let settled: unknown;
+    void bounded(fetchImpl as unknown as typeof fetch, 5_000).then((value) => (settled = value));
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(settled).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toEqual({ kind: "no_activity" });
+  });
+
+  it("an answer that arrives after the deadline cannot change the settled result", async () => {
+    vi.useFakeTimers();
+    let release!: (response: Response) => void;
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => (release = resolve)));
+    let settled: unknown;
+    void bounded(fetchImpl as unknown as typeof fetch, 5_000).then((value) => (settled = value));
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(settled).toEqual({ kind: "no_activity" });
+    release(new Response(JSON.stringify({ activity: { id: "late", status: "x" } }), { status: 200 }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toEqual({ kind: "no_activity" });
+  });
+
+  it.each([
+    ["a rejection", () => Promise.reject(new Error("down"))],
+    [
+      "a synchronous exception",
+      () => {
+        throw new Error("boom");
+      },
+    ],
+    ["a non-2xx answer", async () => new Response("{}", { status: 502 })],
+    ["unparseable JSON", async () => new Response("not json", { status: 200 })],
+  ])("%s is still 'no_activity' and clears its timer", async (_label, impl) => {
+    vi.useFakeTimers();
+    expect(await bounded(vi.fn(impl) as unknown as typeof fetch, 5_000)).toEqual({ kind: "no_activity" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("without a deadline there is no signal, no timer, and the exact fetch passed in is used", async () => {
+    vi.useFakeTimers();
+    const inits: Array<RequestInit | undefined> = [];
+    const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => (inits.push(init), new Response(JSON.stringify({ activity: { id: "a1", status: "x" } }), { status: 200 })));
+    await forwardSignedRequest({ config, endpoint: "create_authenticators", body: "{}", stamp, fetchImpl: fetchImpl as unknown as typeof fetch });
+    expect(inits[0]).not.toHaveProperty("signal");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([0, -5, 0.5, Number.NaN, Number.POSITIVE_INFINITY])("rejects an invalid deadline (%s) before sending", async (bad) => {
+    const fetchImpl = vi.fn();
+    await expect(bounded(fetchImpl as unknown as typeof fetch, bad)).rejects.toBeInstanceOf(RangeError);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
