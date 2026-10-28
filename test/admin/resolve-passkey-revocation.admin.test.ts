@@ -72,6 +72,14 @@ import { ADMIN_RUNNERS, requireAdminTarget, requireApprovedTurnkeyConfig, requir
  * env values, keys, request bodies, or stamps.
  */
 const RUNNER = ADMIN_RUNNERS.resolve;
+/**
+ * Explicit Vitest timeout for the one test below (20 minutes; provisional, unmeasured). Vitest's 5 s default would
+ * expire before even one 15 s Turnkey read deadline; the resolver may make ~56 sequential reads (about 14 minutes
+ * if every one ran to its deadline). It is NOT a guaranteed completion bound and does not settle an ambiguous
+ * database commit: if it fires during the commit, the commit may still land with no report — inspect the durable
+ * state before any rerun.
+ */
+const S3_OPERATOR_RUNNER_TIMEOUT_MS = 1_200_000;
 const enabled = process.env.REAL_ADMIN_RESOLVE_PASSKEY_REVOCATION === "1";
 
 describe.skipIf(!enabled)("ADMIN: resolve ONE blocked passkey removal (R2a, read-only Turnkey, dry run unless REAL_ADMIN_RESOLVE_COMMIT=1)", () => {
@@ -104,5 +112,5 @@ describe.skipIf(!enabled)("ADMIN: resolve ONE blocked passkey removal (R2a, read
     // A requested commit that committed nothing is NOT a success: the report above stays printed, and this throws
     // (nonzero exit), naming the outcome and whether it was already resolved, uncertain, or declined. Nothing is retried.
     requireCommitOutcome({ runner: RUNNER, commit, report });
-  });
+  }, S3_OPERATOR_RUNNER_TIMEOUT_MS);
 });

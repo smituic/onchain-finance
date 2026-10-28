@@ -65,14 +65,58 @@ export interface TurnkeyReadOnlyLedger {
   getAuthenticators(input: { organizationId: string; userId: string }): Promise<unknown>;
 }
 
-/** Wraps the parent client so the resolver never holds it — only these four bound reads escape. */
+/** Provisional operator-tool default for how long the CALLER waits on one SDK read — not a Turnkey SLA or a measured latency. */
+export const S3_TURNKEY_READ_DEADLINE_MS = 15_000;
+
+/** A read that did not answer in time. Says nothing about whether Turnkey saw, or will finish, the request. */
+class S3ReadDeadlineError extends Error {
+  constructor() {
+    super("Turnkey did not answer the read in time.");
+    this.name = "S3ReadDeadlineError";
+  }
+}
+
+/**
+ * Bounds how long the CALLER waits for one SDK read — it does not abort the
+ * SDK's socket, which may keep running after the caller has settled. The timer
+ * starts immediately before the single call and is cleared as soon as the call
+ * settles first. A deadline REJECTS: it never resolves a placeholder, and in
+ * particular never `{ activities: [] }`, which the activity-log walk would read
+ * as the end of the log. A late result or late rejection is swallowed and
+ * reaches nobody. Nothing is retried or re-issued.
+ */
+function withS3ReadDeadline<T>(read: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new S3ReadDeadlineError()), S3_TURNKEY_READ_DEADLINE_MS);
+    let pending: Promise<T>;
+    try {
+      pending = read();
+    } catch (error) {
+      clearTimeout(timer);
+      reject(error);
+      return;
+    }
+    pending.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Wraps the parent client so the resolver never holds it — only these four bound reads escape, each with its own caller deadline. */
 export function createReadOnlyTurnkeyLedger(config: RealServerConfig): TurnkeyReadOnlyLedger {
   const client = createParentTurnkeyClient(config);
   return Object.freeze({
-    getActivity: (input: { organizationId: string; activityId: string }) => client.getActivity(input),
-    getActivities: (input: { organizationId: string; paginationOptions: { limit: string; after?: string } }) => client.getActivities(input),
-    getUsers: (input: { organizationId: string }) => client.getUsers(input),
-    getAuthenticators: (input: { organizationId: string; userId: string }) => client.getAuthenticators(input),
+    getActivity: (input: { organizationId: string; activityId: string }) => withS3ReadDeadline(() => client.getActivity(input)),
+    getActivities: (input: { organizationId: string; paginationOptions: { limit: string; after?: string } }) => withS3ReadDeadline(() => client.getActivities(input)),
+    getUsers: (input: { organizationId: string }) => withS3ReadDeadline(() => client.getUsers(input)),
+    getAuthenticators: (input: { organizationId: string; userId: string }) => withS3ReadDeadline(() => client.getAuthenticators(input)),
   });
 }
 
