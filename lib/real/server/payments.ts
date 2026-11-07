@@ -314,8 +314,10 @@ export async function resolvePreparePayment(input: {
   // THE single recipient source for the Safe transfer, for address AND handle
   // payments: what the store actually recorded. Re-validated before it is
   // encoded; if it is somehow unusable, fail closed — never derive another.
+  // The same for the amount: what the store recorded (and what the payer is
+  // shown) must be exactly the amount validated and balance-checked above.
   const attemptRecipient = normalizeAddress(reserved.attempt.recipient);
-  if (!attemptRecipient) {
+  if (!attemptRecipient || reserved.attempt.amountBaseUnits !== amountBaseUnits) {
     await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "failed", patch: { failureReason: SAFE_PREPARE_FAILED } });
     return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
   }
@@ -327,9 +329,12 @@ export async function resolvePreparePayment(input: {
       pimlicoApiKey: input.pimlicoApiKey,
       ownerAddress: ownerAddress as Address,
       recipient: attemptRecipient as Address,
-      amountBaseUnits,
+      amountBaseUnits: reserved.attempt.amountBaseUnits,
     });
   } catch {
+    // Also reached when the provider's preparation changed the callData away
+    // from the reserved transfer (pimlico.ts's PreparedCallDataMismatchError):
+    // the attempt fails here and never becomes awaiting_authorization.
     // Never the raw upstream error — prepareCashTransferUserOperation calls
     // Pimlico over an API-key-bearing URL; a viem HttpRequestError/
     // RpcRequestError's .message can embed that URL verbatim. See SAFE_*.

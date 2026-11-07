@@ -26,13 +26,23 @@ function createServerPimlicoClient(apiKey: string) {
   });
 }
 
+/** The prepared callData is not the locally encoded Cash transfer. Carries no provider text. */
+export class PreparedCallDataMismatchError extends Error {
+  constructor() {
+    super("Prepared callData does not match the expected Cash transfer.");
+    this.name = "PreparedCallDataMismatchError";
+  }
+}
+
 /**
  * Prepares a sponsored Cash transfer UserOperation for `ownerAddress`'s
  * Safe. Uses a READ-ONLY stand-in owner (account/safe.ts's
  * createReadOnlyOwnerAccount) — this never signs, so the server never needs
  * (and never holds) the owner's private key material. `to` is always
  * REAL_CASH_TOKEN.address, hardcoded here — there is no parameter through
- * which a caller could redirect this call to a different contract.
+ * which a caller could redirect this call to a different contract. The
+ * returned callData is the locally encoded Safe execution of exactly this
+ * transfer; a provider response that changed it is refused (throws).
  * Safe-deployment state (factory/factoryData) is decided by permissionless's
  * own toSafeSmartAccount from a live chain read, never assumed from a flag.
  */
@@ -58,17 +68,24 @@ export async function prepareCashTransferUserOperation(input: {
     },
   });
 
-  const callData = encodeCashTransfer(input.recipient, input.amountBaseUnits);
-  const prepared = await smartAccountClient.prepareUserOperation({
-    calls: [{ to: REAL_CASH_TOKEN.address, data: callData, value: BigInt(0) }],
-  });
+  const calls = [{ to: REAL_CASH_TOKEN.address, data: encodeCashTransfer(input.recipient, input.amountBaseUnits), value: BigInt(0) }];
+  // The trusted encoding, built locally before any provider call by the same
+  // Safe account encoder prepareUserOperation itself uses (no network).
+  const expectedCallData = await account.encodeCalls(calls);
+  const prepared = await smartAccountClient.prepareUserOperation({ calls });
+
+  // viem spreads the raw paymaster stub/final responses over the request, so
+  // a `callData` key in either one replaces the local encoding. Refuse any
+  // returned callData that is not exactly the trusted one — never accept an
+  // alternate action because it is well-formed.
+  if (prepared.callData !== expectedCallData) throw new PreparedCallDataMismatchError();
 
   return {
     sender: account.address,
     nonce: prepared.nonce,
     factory: prepared.factory,
     factoryData: prepared.factoryData,
-    callData: prepared.callData,
+    callData: expectedCallData,
     callGasLimit: prepared.callGasLimit,
     verificationGasLimit: prepared.verificationGasLimit,
     preVerificationGas: prepared.preVerificationGas,
