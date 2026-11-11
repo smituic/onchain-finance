@@ -321,7 +321,7 @@ describe("L-2 B — local post-prepare construction fails closed, once", () => {
     expect(h.transition.mock.calls.filter(([input]) => input.to === "awaiting_authorization")).toHaveLength(0);
   });
 
-  it("a cleanup write that throws fails closed with the fixed response, is not retried, and leaks nothing", async () => {
+  it("a cleanup write that throws answers the fixed uncertain outcome (L-2 C-1), is not retried, and leaks nothing", async () => {
     const h = await harness();
     mocks.hash.mockImplementation(() => {
       throw new Error("local failure");
@@ -332,7 +332,8 @@ describe("L-2 B — local post-prepare construction fails closed, once", () => {
 
     const outcome = await h.run();
 
-    expect(outcome).toEqual({ outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED });
+    // L-2 C-1: a thrown cleanup write is no longer reported as an ordinary failure.
+    expect(outcome).toEqual({ outcome: "prepare_outcome_uncertain" });
     expect(JSON.stringify(outcome)).not.toMatch(/postgres|password/);
     expect(h.transition).toHaveBeenCalledTimes(1);
     expect(h.transition).toHaveBeenCalledWith(expect.objectContaining({ from: "prepared", to: "failed" }));
@@ -363,7 +364,8 @@ describe("L-2 B — local post-prepare construction fails closed, once", () => {
       throw new Error("write outcome uncertain");
     });
 
-    await expect(h.run()).rejects.toThrow("write outcome uncertain");
+    // L-2 C-1: the throw is converted to the fixed uncertain outcome (no longer propagated).
+    expect(await h.run()).toEqual({ outcome: "prepare_outcome_uncertain" });
 
     expect(h.transition).toHaveBeenCalledTimes(1);
     expect(h.transition).toHaveBeenCalledWith(expect.objectContaining({ from: "prepared", to: "awaiting_authorization" }));

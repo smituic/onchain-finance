@@ -7,6 +7,13 @@ import { REAL_SESSION_COOKIE_NAME } from "@/lib/real/server/session";
 import { createRealPublicClient } from "@/lib/real/chain/client";
 
 /**
+ * L-2 (C-1): the fixed answer when a prepare-time database write threw and its
+ * outcome is unknown. Deliberately no Retry-After, no detail, and a `code` so a
+ * client can tell it from an ordinary preparation failure.
+ */
+const PREPARE_OUTCOME_UNCERTAIN_MESSAGE = "We couldn't confirm this payment's setup. No money was sent by this request. Refresh the app to check its status before trying again.";
+
+/**
  * Validates and reserves a Cash payment intent, then asks Pimlico to
  * sponsor it — the server derives the sender (Safe address), token, and
  * chain itself; the client supplies only ONE recipient selector (an address,
@@ -75,6 +82,8 @@ export async function POST(request: Request) {
         return jsonError("You already have a payment in progress.", 409);
       case "prepare_failed":
         return jsonError(outcome.reason, 502);
+      case "prepare_outcome_uncertain":
+        return Response.json({ error: PREPARE_OUTCOME_UNCERTAIN_MESSAGE, code: "prepare_outcome_uncertain" }, { status: 500 });
       case "ready":
         return Response.json({ attempt: outcome.attempt, subOrganizationId: outcome.subOrganizationId, authorizingCredentialId: outcome.authorizingCredentialId, serverNowSeconds: outcome.serverNowSeconds });
     }

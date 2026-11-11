@@ -184,21 +184,43 @@ function validateChainClock(value: unknown): { number: bigint; timestamp: bigint
 }
 
 /**
+ * L-2 (C-1): a prepare-time database write THREW. A throw is not proof of
+ * rollback — the write may have committed with its response lost — so the
+ * outcome is neither "failed" nor "safe to retry": it is a distinct, fixed
+ * "could not confirm" answer. Nothing follows it: no second write, no read to
+ * infer the state, no provider call, no reservation release. The caller's
+ * exception text is never carried.
+ */
+const uncertainPrepareOutcome = (): PreparePaymentOutcome => ({ outcome: "prepare_outcome_uncertain" });
+
+/**
+ * The one `prepared -> failed` CAS used by every prepare-time failure path:
+ * literally `prepared` as the source, the exact attempt id, one write, never
+ * repeated. A null result (a concurrent cancel, or anything later, won) is
+ * accepted as-is — not retried and not forced — and answers the ordinary
+ * safe failure. A THROWN write answers prepare_outcome_uncertain (see above).
+ */
+async function failPrepared(store: PaymentAttemptStore, attemptId: string, reason: string): Promise<PreparePaymentOutcome> {
+  try {
+    await store.transition({ id: attemptId, from: "prepared", to: "failed", patch: { failureReason: reason } });
+  } catch {
+    // Deliberately no retry, no read-back, no further write.
+    return uncertainPrepareOutcome();
+  }
+  return { outcome: "prepare_failed", reason };
+}
+
+/**
  * L-2 (B): cleanup after a throw in prepare's local, post-provider
- * construction. Exactly ONE state-conditional CAS, from literally `prepared`,
- * for this exact attempt id — never any other source state, so a concurrent
- * cancellation (or anything later) is left alone: a null result is accepted
- * as-is, not retried and not forced. If the write itself throws, the outcome
- * is the same fixed failure (the row, at worst, stays `prepared` and
- * cancellable) and the write is not repeated. Never carries exception text.
+ * construction. Exactly ONE state-conditional CAS (failPrepared) for this
+ * exact attempt id. A null result is accepted as-is. If the write itself
+ * throws, the outcome is prepare_outcome_uncertain (C-1) and the write is not
+ * repeated. Never carries exception text. NOT used by the final
+ * prepared -> awaiting_authorization write, which must never be followed by a
+ * cleanup.
  */
 async function failPreparedAfterLocalError(store: PaymentAttemptStore, attemptId: string): Promise<PreparePaymentOutcome> {
-  try {
-    await store.transition({ id: attemptId, from: "prepared", to: "failed", patch: { failureReason: SAFE_PREPARE_FAILED } });
-  } catch {
-    // Fail closed; deliberately no retry.
-  }
-  return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
+  return failPrepared(store, attemptId, SAFE_PREPARE_FAILED);
 }
 
 export type PreparePaymentOutcome =
@@ -219,6 +241,8 @@ export type PreparePaymentOutcome =
   | { outcome: "quota_exceeded" }
   | { outcome: "payment_in_progress" }
   | { outcome: "prepare_failed"; reason: string }
+  /** L-2 (C-1): a prepare-time database write threw, so whether it committed is unknown. Fixed, sanitized, no payload; the client must refresh and check status, not assume failure. */
+  | { outcome: "prepare_outcome_uncertain" }
   /** serverNowSeconds: see PaymentStatusOutcome's doc comment — same server wall clock, same advisory-only purpose. */
   | { outcome: "ready"; attempt: PublicPaymentAttempt; subOrganizationId: string; authorizingCredentialId: string; serverNowSeconds: number };
 
@@ -367,8 +391,7 @@ export async function resolvePreparePayment(input: {
   // shown) must be exactly the amount validated and balance-checked above.
   const attemptRecipient = normalizeAddress(reserved.attempt.recipient);
   if (!attemptRecipient || reserved.attempt.amountBaseUnits !== amountBaseUnits) {
-    await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "failed", patch: { failureReason: SAFE_PREPARE_FAILED } });
-    return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
+    return failPrepared(input.paymentStore, reserved.attempt.id, SAFE_PREPARE_FAILED);
   }
 
   let prepared: PreparedUserOperationFields;
@@ -387,8 +410,7 @@ export async function resolvePreparePayment(input: {
     // Never the raw upstream error — prepareCashTransferUserOperation calls
     // Pimlico over an API-key-bearing URL; a viem HttpRequestError/
     // RpcRequestError's .message can embed that URL verbatim. See SAFE_*.
-    await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "failed", patch: { failureReason: SAFE_PREPARE_FAILED } });
-    return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
+    return failPrepared(input.paymentStore, reserved.attempt.id, SAFE_PREPARE_FAILED);
   }
 
   // Defense in depth: prepareCashTransferUserOperation derives its own
@@ -398,8 +420,7 @@ export async function resolvePreparePayment(input: {
   // UserOperation for a different smart account than the one on record;
   // fail closed before the user is ever asked to sign.
   if (!addressesEqual(prepared.sender, safeAddress)) {
-    await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "failed", patch: { failureReason: SAFE_SENDER_MISMATCH } });
-    return { outcome: "prepare_failed", reason: SAFE_SENDER_MISMATCH };
+    return failPrepared(input.paymentStore, reserved.attempt.id, SAFE_SENDER_MISMATCH);
   }
 
   // L-2 (B): ONLY the local hash / validity / patch construction is guarded.
@@ -435,7 +456,16 @@ export async function resolvePreparePayment(input: {
     return failPreparedAfterLocalError(input.paymentStore, reserved.attempt.id);
   }
 
-  const updated = await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization", patch });
+  // L-2 (C-1): if this write THROWS it may nonetheless have committed
+  // (awaiting_authorization) with its response lost. So: no cleanup, no
+  // prepared -> failed, no retry, no read-back, no new provider call — only the
+  // fixed uncertain outcome. A null result (a lost CAS) is unchanged below.
+  let updated: Awaited<ReturnType<PaymentAttemptStore["transition"]>>;
+  try {
+    updated = await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization", patch });
+  } catch {
+    return uncertainPrepareOutcome();
+  }
   if (!updated) {
     return { outcome: "prepare_failed", reason: "Could not persist the prepared payment." };
   }
