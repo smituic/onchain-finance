@@ -11,7 +11,7 @@ import { computeExpectedSafeOpDigest, dispatchPreparedPayment, verifyPreparedPay
 import { splitSafeOpSignature } from "../payments/safe-op-preflight";
 import { credentialIdsEqual } from "../credential-id";
 import { classifyReceipt } from "../payments/reconcile";
-import { computeValidUntil, hasEnoughValidityToDispatch } from "../payments/validity";
+import { computeValidUntil, hasEnoughValidityToDispatch, SAFE_OP_VALIDITY_SECONDS } from "../payments/validity";
 import { readLatestBlockClock, readUserOperationChainState, type EntryPointReader } from "../chain/entry-point";
 import { fetchUserOperationReceipt, prepareCashTransferUserOperation, sendPreparedUserOperation } from "./pimlico";
 import { BASE_SEPOLIA_CHAIN_ID, REAL_CASH_TOKEN } from "../constants";
@@ -160,6 +160,47 @@ function toPreparedFields(attempt: PaymentAttempt): PreparedUserOperationFields 
   });
 }
 
+/** Largest value of a Postgres BIGINT (prepare_block_number / valid_until are BIGINT columns). */
+const MAX_BIGINT_COLUMN = (BigInt(1) << BigInt(63)) - BigInt(1);
+/** A SafeOp's validUntil is a uint48 inside the signature (safe-op-preflight.ts). */
+const MAX_UINT48 = (BigInt(1) << BigInt(48)) - BigInt(1);
+
+/**
+ * L-2 (A): the chain clock as prepare may use it — or null. Pure; touches
+ * nothing but the value it is given. Both fields must be real nonnegative
+ * bigints (block 0 is a legitimate number); the number must fit its BIGINT
+ * column; and the timestamp must leave computeValidUntil's result
+ * (timestamp + the validity window) inside uint48, which is also well inside
+ * Number's safe-integer range, so the later Number(...) conversion is exact.
+ * Nothing is repaired, coerced, or defaulted — a string, a JS number, a
+ * missing field, or a negative value is simply unusable.
+ */
+function validateChainClock(value: unknown): { number: bigint; timestamp: bigint } | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { number, timestamp } = value as { number?: unknown; timestamp?: unknown };
+  if (typeof number !== "bigint" || number < BigInt(0) || number > MAX_BIGINT_COLUMN) return null;
+  if (typeof timestamp !== "bigint" || timestamp < BigInt(0) || timestamp + BigInt(SAFE_OP_VALIDITY_SECONDS) > MAX_UINT48) return null;
+  return { number, timestamp };
+}
+
+/**
+ * L-2 (B): cleanup after a throw in prepare's local, post-provider
+ * construction. Exactly ONE state-conditional CAS, from literally `prepared`,
+ * for this exact attempt id — never any other source state, so a concurrent
+ * cancellation (or anything later) is left alone: a null result is accepted
+ * as-is, not retried and not forced. If the write itself throws, the outcome
+ * is the same fixed failure (the row, at worst, stays `prepared` and
+ * cancellable) and the write is not repeated. Never carries exception text.
+ */
+async function failPreparedAfterLocalError(store: PaymentAttemptStore, attemptId: string): Promise<PreparePaymentOutcome> {
+  try {
+    await store.transition({ id: attemptId, from: "prepared", to: "failed", patch: { failureReason: SAFE_PREPARE_FAILED } });
+  } catch {
+    // Fail closed; deliberately no retry.
+  }
+  return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
+}
+
 export type PreparePaymentOutcome =
   | { outcome: "unauthenticated" }
   | { outcome: "account_not_ready" }
@@ -286,9 +327,17 @@ export async function resolvePreparePayment(input: {
   // The SafeOp's finite window is anchored to the chain's own clock (the one
   // the EntryPoint enforces), read before any row exists — a failed read
   // leaves no trace and nothing is prepared (fail closed).
+  //
+  // L-2 (A): the result is shape- and range-checked HERE, before any row
+  // exists. Everything below (number.toString(), computeValidUntil) used to
+  // run after the reservation, so a malformed clock could throw with a
+  // `prepared` row already written. An unusable clock is the same fail-closed
+  // outcome as an unreadable one: no reservation, no Pimlico call, no row.
   let chainClock: { number: bigint; timestamp: bigint };
   try {
-    chainClock = await readLatestBlockClock(input.publicClient);
+    const validated = validateChainClock(await readLatestBlockClock(input.publicClient));
+    if (!validated) return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
+    chainClock = validated;
   } catch {
     return { outcome: "prepare_failed", reason: SAFE_PREPARE_FAILED };
   }
@@ -353,25 +402,38 @@ export async function resolvePreparePayment(input: {
     return { outcome: "prepare_failed", reason: SAFE_SENDER_MISMATCH };
   }
 
-  const expectedUserOperationHash = computeExpectedUserOperationHash(prepared);
-  const patch: PaymentAttemptPatch = {
-    nonce: prepared.nonce.toString(),
-    callData: prepared.callData,
-    factory: prepared.factory ?? null,
-    factoryData: prepared.factoryData ?? null,
-    callGasLimit: prepared.callGasLimit.toString(),
-    verificationGasLimit: prepared.verificationGasLimit.toString(),
-    preVerificationGas: prepared.preVerificationGas.toString(),
-    maxFeePerGas: prepared.maxFeePerGas.toString(),
-    maxPriorityFeePerGas: prepared.maxPriorityFeePerGas.toString(),
-    paymaster: prepared.paymaster ?? null,
-    paymasterData: prepared.paymasterData ?? null,
-    paymasterVerificationGasLimit: prepared.paymasterVerificationGasLimit?.toString() ?? null,
-    paymasterPostOpGasLimit: prepared.paymasterPostOpGasLimit?.toString() ?? null,
-    expectedUserOperationHash,
-    validUntil: computeValidUntil(chainClock.timestamp),
-    prepareBlockNumber: chainClock.number.toString(),
-  };
+  // L-2 (B): ONLY the local hash / validity / patch construction is guarded.
+  // It is pure local computation (no provider call, no database write), so a
+  // throw here means "this row will never be offered for signing": fail it
+  // with exactly one prepared -> failed CAS, never a retry, never a second
+  // preparation. The final prepared -> awaiting_authorization write below is
+  // deliberately OUTSIDE this try: if it throws, its commit may be uncertain,
+  // and a cleanup must never fail a row that may already be
+  // awaiting_authorization.
+  let patch: PaymentAttemptPatch;
+  try {
+    const expectedUserOperationHash = computeExpectedUserOperationHash(prepared);
+    patch = {
+      nonce: prepared.nonce.toString(),
+      callData: prepared.callData,
+      factory: prepared.factory ?? null,
+      factoryData: prepared.factoryData ?? null,
+      callGasLimit: prepared.callGasLimit.toString(),
+      verificationGasLimit: prepared.verificationGasLimit.toString(),
+      preVerificationGas: prepared.preVerificationGas.toString(),
+      maxFeePerGas: prepared.maxFeePerGas.toString(),
+      maxPriorityFeePerGas: prepared.maxPriorityFeePerGas.toString(),
+      paymaster: prepared.paymaster ?? null,
+      paymasterData: prepared.paymasterData ?? null,
+      paymasterVerificationGasLimit: prepared.paymasterVerificationGasLimit?.toString() ?? null,
+      paymasterPostOpGasLimit: prepared.paymasterPostOpGasLimit?.toString() ?? null,
+      expectedUserOperationHash,
+      validUntil: computeValidUntil(chainClock.timestamp),
+      prepareBlockNumber: chainClock.number.toString(),
+    };
+  } catch {
+    return failPreparedAfterLocalError(input.paymentStore, reserved.attempt.id);
+  }
 
   const updated = await input.paymentStore.transition({ id: reserved.attempt.id, from: "prepared", to: "awaiting_authorization", patch });
   if (!updated) {
