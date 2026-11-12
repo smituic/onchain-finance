@@ -161,6 +161,21 @@ export type RealPaymentStore = {
    * remain. It says nothing about the payment having failed.
    */
   isSubmitRetryBeyondApproval: boolean;
+  /**
+   * L-2 D-1: set when a prepare request ended without a trustworthy answer
+   * (HTTP 500 including the server's `prepare_outcome_uncertain`, HTTP 409, a
+   * network failure or an unreadable reply). A payment MAY exist on the server
+   * even though this page never saw it — and an existing one holds the account's
+   * only active-payment slot. While set, Review is not offered and review() /
+   * confirmAndSend() refuse: the one way out is a successful, current
+   * checkPreparedPayment() (or a new lifecycle). Editing the form never clears
+   * it. Memory only; never persisted; dropped by init/reset/detach.
+   */
+  prepareNeedsCheck: null | "uncertain" | "in_progress";
+  /** L-2 D-1: where the explicit status check stands. "nothing_found" is the confirmation that no active payment exists (shown once; cleared by the next Review). "unavailable" means the check itself failed — it proves nothing about any payment. */
+  prepareCheck: "idle" | "checking" | "unavailable" | "nothing_found";
+  /** L-2 D-1: true while this page's one Cancel request is on its way. A second press is ignored; nothing is retried or released locally. */
+  isCancelling: boolean;
   /** Reload/restore: never signs, never submits, never resends — see server/payments.ts's resolveLatestPayment. */
   init: () => Promise<void>;
   setRecipientInput: (value: string) => void;
@@ -176,6 +191,14 @@ export type RealPaymentStore = {
   resumeAuthorization: () => Promise<void>;
   /** Abandons an awaiting_authorization attempt so it stops occupying the account's one-active-attempt slot. */
   cancel: () => Promise<void>;
+  /**
+   * L-2 D-1: the explicit "Check payment status" action after an unresolved
+   * prepare. Exactly one GET /api/real/payments/latest per call; never signs,
+   * submits, prepares or cancels. Adopts a NON-terminal attempt (the server's
+   * record is the truth, not the form); a missing or terminal attempt only
+   * releases the recovery requirement; a failed check keeps it.
+   */
+  checkPreparedPayment: () => Promise<void>;
   /** The manual "Check status" action: cooldown-limited, and joins any status request already in flight for the attempt. */
   checkStatus: () => Promise<void>;
   /** The one automatic check after a payment becomes (or is restored as) submitted. Waits while the page is hidden; at most once per attempt. */
@@ -239,6 +262,53 @@ const CANCEL_LOST_RACE_MESSAGE = "This payment could not be cancelled — it may
 const STATUS_UNUSABLE_MESSAGE = "We couldn’t check on this payment just now. Try again in a little while.";
 const STATUS_TIMED_OUT_MESSAGE = "Checking is taking longer than usual. Try again in a little while.";
 const CANCEL_UNCONFIRMED_MESSAGE = "Could not confirm whether this payment was cancelled. Check its status before trying again.";
+
+/** L-2 D-1: fixed client copy. Raw "Failed to fetch" / parse errors and the server's own text are never shown for an unresolved prepare. */
+export const PREPARE_UNCERTAIN_MESSAGE = "We couldn't confirm whether your payment was set up. Check its status before trying again.";
+export const PREPARE_IN_PROGRESS_MESSAGE = "A payment may already be in progress. Check its status before trying again.";
+export const PREPARE_CHECK_FAILED_MESSAGE = "We couldn't check right now. Try again in a moment.";
+export const PREPARE_CHECK_NONE_MESSAGE = "No payment is waiting. You can review your payment again.";
+
+/**
+ * L-2 D-1: does a failed prepare leave the payment's existence unknown?
+ * 500 (incl. `prepare_outcome_uncertain`) and a non-ApiError (network failure,
+ * unreadable reply) are "uncertain"; 409 is "in_progress". Everything else —
+ * 400/401/404/429, the known `prepare_failed` 502 — keeps its own handling.
+ */
+function classifyPrepareFailure(error: unknown): "uncertain" | "in_progress" | null {
+  if (!(error instanceof ApiError)) return "uncertain";
+  if (error.status === 500) return "uncertain";
+  if (error.status === 409) return "in_progress";
+  return null;
+}
+
+const KNOWN_ATTEMPT_STATES: ReadonlySet<string> = new Set<RealPaymentAttemptState>(["prepared", "awaiting_authorization", "signed", "submitting", "submitted", "confirmed", "failed", "cancelled", "unknown"]);
+const TERMINAL_ATTEMPT_STATES: ReadonlySet<string> = new Set<RealPaymentAttemptState>(["confirmed", "failed", "cancelled"]);
+
+type LatestPayload = {
+  attempt: RealPaymentAttempt | null;
+  subOrganizationId?: string | null;
+  authorizingCredentialId?: string | null;
+  serverNowSeconds?: number;
+  error?: string;
+};
+
+/**
+ * L-2 D-1: reads a /latest answer for the explicit check, fail-closed. Only an
+ * explicit `attempt: null` is "none" — a missing attempt, a non-object, an
+ * unknown state or a missing id is "unusable", never "no payment exists".
+ */
+function readLatestForCheck(json: unknown): { kind: "none" } | { kind: "terminal" } | { kind: "active"; payload: LatestPayload; attempt: RealPaymentAttempt } | { kind: "unusable" } {
+  if (typeof json !== "object" || json === null || !("attempt" in json)) return { kind: "unusable" };
+  const payload = json as LatestPayload;
+  if (payload.attempt === null) return { kind: "none" };
+  const attempt = payload.attempt as unknown;
+  if (typeof attempt !== "object") return { kind: "unusable" };
+  const { id, state } = attempt as { id?: unknown; state?: unknown };
+  if (typeof id !== "string" || id === "" || typeof state !== "string" || !KNOWN_ATTEMPT_STATES.has(state)) return { kind: "unusable" };
+  if (TERMINAL_ATTEMPT_STATES.has(state)) return { kind: "terminal" };
+  return { kind: "active", payload, attempt: payload.attempt };
+}
 
 /**
  * Part B: cadence of the follow-up /status check while an expired attempt is
@@ -591,6 +661,11 @@ export function createRealPaymentStore() {
   // its own expiry. Memory only: a hard reload loses it (accepted, as in 3A-1).
   let submitCooldown: { subject: string; attemptId: string; untilMs: number } | null = null;
   let submitCooldownTimerId: ReturnType<typeof setTimeout> | null = null;
+  // L-2 D-1: at most one explicit prepared-payment check (one /latest read) and
+  // one Cancel request in flight per lifecycle. Identity markers, not booleans:
+  // a lifecycle change drops them, and a late settle never clears a newer one.
+  let preparedCheck: object | null = null;
+  let cancelRequest: object | null = null;
 
   /** Milliseconds left on the retry deadline for this attempt and the signed-in account; 0 when none. A deadline that no longer applies is dropped on sight. */
   function remainingDeadlineMs(attemptId: string): number {
@@ -650,6 +725,9 @@ export function createRealPaymentStore() {
     inFlightStatus = null;
     cancelRead = null;
     submittedByRead = null;
+    // Their answers are discarded by the generation check; this frees the slots for the new lifecycle.
+    preparedCheck = null;
+    cancelRequest = null;
   }
 
   return create<RealPaymentStore>()((set, get) => {
@@ -1109,6 +1187,36 @@ export function createRealPaymentStore() {
       return view.handle; // unresolved, checking, lookup_failed, or lookup_rate_limited: one lookup per Review press
     }
 
+    /**
+     * Adopts the server's latest attempt as the payment on screen — the single
+     * mapping shared by init() (reload) and checkPreparedPayment() (L-2 D-1).
+     * It never signs, submits, prepares or cancels. Slice S1: awaiting a
+     * signature with no signing context means this session's passkey isn't the
+     * one the payment is bound to (or it predates binding) — cancel-only, never
+     * re-bound here. `extra` is merged into the one state write.
+     */
+    async function adoptLatestAttempt(json: LatestPayload, attempt: RealPaymentAttempt, extra: Partial<RealPaymentStore> = {}): Promise<void> {
+      const notResumable = attempt.state === "awaiting_authorization" && (!json.subOrganizationId || !json.authorizingCredentialId);
+      set({
+        status: notResumable ? "stranded" : mapAttemptStateToStatus(attempt.state),
+        attempt,
+        subOrganizationId: json.subOrganizationId ?? null,
+        authorizingCredentialId: json.authorizingCredentialId ?? null,
+        clockOffsetSeconds: typeof json.serverNowSeconds === "number" ? computeClockOffsetSeconds(json.serverNowSeconds) : 0,
+        error: notResumable ? OTHER_PASSKEY_MESSAGE : null,
+        ...extra,
+      });
+      // A retry deadline the server gave for THIS attempt and account still applies after a remount.
+      const waiting = remainingDeadlineMs(attempt.id);
+      if (waiting > 0) {
+        set({ isStatusDeferred: true, statusRetryAfterSeconds: statusDeadline?.serverSeconds ?? null });
+        beginManualCooldown(waiting);
+      }
+      // Same account, same attempt: the submit wait the server gave still applies. A different attempt or account finds none.
+      if (attempt.state === "awaiting_authorization") publishSubmitCooldown(attempt);
+      await scheduleOrRunExpiryCheck();
+    }
+
     return {
       status: "idle",
       recipientInput: "",
@@ -1126,6 +1234,9 @@ export function createRealPaymentStore() {
       isSubmitCoolingDown: false,
       submitCooldownSeconds: null,
       isSubmitRetryBeyondApproval: false,
+      prepareNeedsCheck: null,
+      prepareCheck: "idle",
+      isCancelling: false,
       clockOffsetSeconds: 0,
       isAttemptPastValidity: false,
       error: null,
@@ -1141,7 +1252,7 @@ export function createRealPaymentStore() {
         // this (see components/real/real-pay-form.tsx's account-change
         // effect). Without this, a stale recipient/amount typed under one
         // account could survive into a different signed-in account.
-        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
+        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, prepareNeedsCheck: null, prepareCheck: "idle", isCancelling: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
         try {
           const response = await fetch("/api/real/payments/latest");
           if (response.status === 401) {
@@ -1159,29 +1270,7 @@ export function createRealPaymentStore() {
             if (myGeneration === generation) set({ status: "editing", attempt: null, subOrganizationId: null, isAttemptPastValidity: false });
             return;
           }
-          if (myGeneration === generation) {
-            // Slice S1: awaiting a signature but with no signing context means
-            // this session's passkey isn't the one the payment is bound to (or
-            // it predates binding) — cancel-only, never re-bound here.
-            const notResumable = json.attempt.state === "awaiting_authorization" && (!json.subOrganizationId || !json.authorizingCredentialId);
-            set({
-              status: notResumable ? "stranded" : mapAttemptStateToStatus(json.attempt.state),
-              attempt: json.attempt,
-              subOrganizationId: json.subOrganizationId ?? null,
-              authorizingCredentialId: json.authorizingCredentialId ?? null,
-              clockOffsetSeconds: typeof json.serverNowSeconds === "number" ? computeClockOffsetSeconds(json.serverNowSeconds) : 0,
-              error: notResumable ? OTHER_PASSKEY_MESSAGE : null,
-            });
-            // A retry deadline the server gave for THIS attempt and account still applies after a remount.
-            const waiting = remainingDeadlineMs(json.attempt.id);
-            if (waiting > 0) {
-              set({ isStatusDeferred: true, statusRetryAfterSeconds: statusDeadline?.serverSeconds ?? null });
-              beginManualCooldown(waiting);
-            }
-            // Same account, same attempt: the submit wait the server gave still applies. A different attempt or account finds none.
-            if (json.attempt.state === "awaiting_authorization") publishSubmitCooldown(json.attempt);
-            await scheduleOrRunExpiryCheck();
-          }
+          if (myGeneration === generation) await adoptLatestAttempt(json, json.attempt);
         } catch {
           if (myGeneration === generation) set({ status: "editing" });
         }
@@ -1201,6 +1290,9 @@ export function createRealPaymentStore() {
       },
 
       review: () => {
+        // L-2 D-1: an unresolved prepare must be checked first — enforced here, not only by the hidden button.
+        if (get().prepareNeedsCheck !== null) return Promise.resolve();
+        if (get().prepareCheck === "nothing_found") set({ prepareCheck: "idle" });
         const handle = reviewNow();
         if (handle === null) return Promise.resolve();
         // Handle path only: look the name up (or join the lookup the field's
@@ -1219,6 +1311,7 @@ export function createRealPaymentStore() {
 
       confirmAndSend: async () => {
         if (get().status !== "reviewing") return; // guards a double-tap from re-firing prepare
+        if (get().prepareNeedsCheck !== null) return; // L-2 D-1: never prepare again over an unresolved prepare
         const view = currentRecipientView();
         const amountBaseUnits = parseCashInputToBaseUnits(get().amountInput);
         // Fails closed: a handle payment goes out only from `found` — the
@@ -1268,6 +1361,12 @@ export function createRealPaymentStore() {
           // stale, so drop it. The typed text stays for the user to fix.
           const staleRecipient = view.kind === "found" && error instanceof ApiError && (error.status === 404 || error.status === 400);
           if (staleRecipient) lookupSequence++;
+          // L-2 D-1: no trustworthy answer — a payment may exist that this page never saw. Nothing is retried, read, cancelled or signed here; the typed text stays and the user is asked to check explicitly. A fixed message replaces the raw network/parse text.
+          const unresolved = classifyPrepareFailure(error);
+          if (unresolved) {
+            set({ status: "editing", error: null, prepareNeedsCheck: unresolved, prepareCheck: "idle" });
+            return;
+          }
           set({
             status: "editing",
             error: error instanceof Error ? error.message : "Could not prepare the payment.",
@@ -1293,14 +1392,29 @@ export function createRealPaymentStore() {
           set({ status: "editing" });
           return;
         }
+        // L-2 D-1: one Cancel request at a time. A repeat press while it is on
+        // its way does nothing — no second request, no local release.
+        if (cancelRequest) return;
         const myGeneration = generation;
+        const cancelSubject = currentSubject();
         // A reset/account switch/new attempt while in flight: this result no longer applies.
-        const isCurrent = () => myGeneration === generation && get().attempt?.id === attempt.id;
+        const isCurrent = () => myGeneration === generation && get().attempt?.id === attempt.id && currentSubject() === cancelSubject;
+
+        const myCancel = {};
+        cancelRequest = myCancel;
+        set({ isCancelling: true });
+        // Frees the slot once THIS request has an answer (or failed). A newer lifecycle already dropped it, and must not be touched.
+        const releaseCancel = () => {
+          if (cancelRequest !== myCancel) return;
+          cancelRequest = null;
+          set({ isCancelling: false });
+        };
 
         let response: Response;
         try {
           response = await fetch(`/api/real/payments/${attempt.id}/cancel`, { method: "POST" });
         } catch {
+          releaseCancel();
           // Part D: a network-level failure means we don't know whether the
           // request ever reached the server — never imply cancellation
           // succeeded and never reset to a fresh editable state on a guess.
@@ -1308,6 +1422,7 @@ export function createRealPaymentStore() {
           if (isCurrent()) set({ error: CANCEL_UNCONFIRMED_MESSAGE });
           return;
         }
+        releaseCancel();
         if (!isCurrent()) return;
 
         if (response.ok) {
@@ -1397,6 +1512,60 @@ export function createRealPaymentStore() {
         }
       },
 
+      checkPreparedPayment: async () => {
+        const before = get();
+        // Only from the editing screen, only while a check is required, never while detached, and never overlapping.
+        if (detached || before.status !== "editing" || before.prepareNeedsCheck === null || preparedCheck !== null) return;
+        const myCheck = {};
+        preparedCheck = myCheck;
+        const myGeneration = generation;
+        const subject = currentSubject();
+        // After the await the call must still belong to the same lifecycle and account, still on the form, still needing the check.
+        const isCurrent = () => !detached && preparedCheck === myCheck && myGeneration === generation && currentSubject() === subject && get().status === "editing" && get().prepareNeedsCheck !== null;
+        set({ prepareCheck: "checking" });
+
+        // The client's own bound on this one read: ends OUR wait only, and proves nothing about any payment.
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const deadline = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new StatusTimeoutError());
+          }, STATUS_REQUEST_DEADLINE_MS);
+        });
+        try {
+          // Exactly one read, and nothing else: no prepare, cancel, status, signing or submit.
+          const json = await Promise.race([api<unknown>("/api/real/payments/latest", { signal: controller.signal }), deadline]);
+          if (!isCurrent()) return;
+          const latest = readLatestForCheck(json);
+          if (latest.kind === "unusable") {
+            // An answer we can't trust is never "no payment": the requirement stays.
+            set({ prepareCheck: "unavailable" });
+            return;
+          }
+          preparedCheck = null;
+          if (latest.kind === "none" || latest.kind === "terminal") {
+            // No ACTIVE payment. A finished one (even a confirmed one) is old news, not this form's result: nothing is adopted or shown as sent.
+            set({ prepareNeedsCheck: null, prepareCheck: "nothing_found", error: null });
+            return;
+          }
+          // An active payment: the server's record, not the form, is the truth. It joins the normal payment lifecycle (epoch bump included, so an older status read can't overwrite it).
+          markTransition();
+          await adoptLatestAttempt(latest.payload, latest.attempt, { prepareNeedsCheck: null, prepareCheck: "idle", pendingSubmission: null, isAuthorizing: false });
+        } catch (error) {
+          if (!isCurrent()) return;
+          if (error instanceof ApiError && error.status === 401) {
+            // Signed out is not "no payment": the requirement stays, and the sign-in flow takes over.
+            set({ prepareCheck: "idle", error: "You're signed out." });
+            return;
+          }
+          set({ prepareCheck: "unavailable" });
+        } finally {
+          if (timer !== null) clearTimeout(timer);
+          if (preparedCheck === myCheck) preparedCheck = null;
+        }
+      },
+
       checkStatus: async () => {
         const attempt = get().attempt;
         if (!attempt || get().isManualCheckCoolingDown) return;
@@ -1455,7 +1624,7 @@ export function createRealPaymentStore() {
         lookupSequence++;
         clearFollowUpState();
         // The submit wait's deadline is kept for the same account and attempt; only what the screen showed goes.
-        set({ isManualCheckCoolingDown: false, isStatusDeferred: false, isSubmitCoolingDown: false });
+        set({ isManualCheckCoolingDown: false, isStatusDeferred: false, isSubmitCoolingDown: false, isCancelling: false, ...(get().prepareCheck === "checking" ? { prepareCheck: "idle" as const } : {}) });
       },
 
       reset: () => {
@@ -1465,7 +1634,7 @@ export function createRealPaymentStore() {
         // A new compose flow / sign-out: the previous attempt's deadline has nothing left to govern.
         clearDeadline();
         submitCooldown = null;
-        set({ isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, status: "editing", recipientLookup: { status: "idle" }, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
+        set({ isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, prepareNeedsCheck: null, prepareCheck: "idle", isCancelling: false, status: "editing", recipientLookup: { status: "idle" }, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
       },
     };
   });

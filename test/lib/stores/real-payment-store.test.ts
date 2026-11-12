@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createRealPaymentStore,
   EXPIRY_FOLLOW_UP_MS,
@@ -971,7 +971,8 @@ describe("real-payment-store — Slice C: paying by @name", () => {
       const api = stubApi({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: () => jsonResponse(409, { error: "You already have a payment in progress." }) });
       const store = await reviewingSmit(api);
       await store.getState().confirmAndSend();
-      expect(store.getState()).toMatchObject({ status: "editing", recipientLookup: { status: "found", handle: "smit" }, error: "You already have a payment in progress." });
+      // L-2 D-1: every prepare 409 now asks for a status check; the fixed client copy replaces the server's sentence (see the D-1 suite).
+      expect(store.getState()).toMatchObject({ status: "editing", recipientLookup: { status: "found", handle: "smit" }, error: null, prepareNeedsCheck: "in_progress" });
     });
   });
 
@@ -4144,5 +4145,522 @@ describe("real-payment-store — 3A-2 Stage 2: submit cooldown and submit-respon
     expect(s.count("/cancel") + s.count("/prepare")).toBe(0);
     expect(store.getState().attempt?.transactionHash).toBeNull();
     store.getState().detach();
+  });
+});
+
+
+/**
+ * L-2 D-1: after a prepare request that ended without a trustworthy answer, the
+ * page must not offer another Review/prepare — a payment may already exist and
+ * hold the account's one active slot. The user checks explicitly (one GET
+ * /latest per click); only a successful, current answer releases the form, and
+ * a finished payment is never adopted. Fake server only: no network, no
+ * signing, no Turnkey, no bundler.
+ */
+describe("real-payment-store — L-2 D-1: unresolved prepare and explicit status check", () => {
+  const ADDRESS = "0x3333333333333333333333333333333333333333";
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const UNCERTAIN_BODY = { error: "We couldn't confirm this payment's setup. No money was sent by this request. Refresh the app to check its status before trying again.", code: "prepare_outcome_uncertain" };
+  const FIXED_UNCERTAIN = "We couldn't confirm whether your payment was set up. Check its status before trying again.";
+  const FIXED_IN_PROGRESS = "A payment may already be in progress. Check its status before trying again.";
+
+  type Key = "prepare" | "latest" | "cancel" | "status" | "submit";
+  type Handler = (n: number) => Response | Promise<Response>;
+  const stores: Array<ReturnType<typeof createRealPaymentStore>> = [];
+
+  beforeEach(() => {
+    vi.mocked(signPreparedPayment).mockClear();
+  });
+
+  afterEach(() => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockClear();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  function server(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key; url: string; method: string }> = [];
+    const counts: Record<Key, number> = { prepare: 0, latest: 0, cancel: 0, status: 0, submit: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/prepare") ? "prepare" : url.endsWith("/api/real/payments/latest") ? "latest" : url.endsWith("/cancel") ? "cancel" : url.endsWith("/status") ? "status" : url.endsWith("/api/real/payments/submit") ? "submit" : null;
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        calls.push({ key, url, method });
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, count: (key: Key) => calls.filter((call) => call.key === key).length, keys: () => calls.map((call) => call.key) };
+  }
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    const promise = new Promise<Response>((res) => (resolve = res));
+    return { promise, resolve };
+  }
+
+  const attemptIn = (state: string, overrides: Record<string, unknown> = {}) => ({ ...baseAttempt(), id: `attempt-${state}`, state, ...overrides }) as never;
+  const latestOf = (state: string, extra: Record<string, unknown> = {}) => () =>
+    jsonResponse(200, { attempt: attemptIn(state), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000), ...extra });
+
+  function newStore() {
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+    const store = createRealPaymentStore();
+    stores.push(store);
+    store.setState({ status: "editing" });
+    store.getState().setRecipientInput(ADDRESS);
+    store.getState().setAmountInput("1");
+    return store;
+  }
+
+  /** Drives a fresh store through Review and Approve; `prepare` decides how the request ends. */
+  async function afterPrepare(prepare: Handler, others: Partial<Record<Key, Handler>> = {}) {
+    const api = server({ prepare, ...others });
+    const store = newStore();
+    await store.getState().review();
+    expect(store.getState().status).toBe("reviewing");
+    await store.getState().confirmAndSend();
+    return { api, store };
+  }
+
+  describe("classifying a failed prepare", () => {
+    it.each([
+      ["the server's prepare_outcome_uncertain (C-1)", () => jsonResponse(500, UNCERTAIN_BODY), "uncertain"],
+      ["a generic HTTP 500", () => jsonResponse(500, { error: "Something went wrong." }), "uncertain"],
+      ["a 500 whose body is not JSON", () => new Response("<html>oops</html>", { status: 500 }), "uncertain"],
+      ["an unreadable success reply", () => new Response("not json", { status: 200 }), "uncertain"],
+      ["an HTTP 409 with the in-progress sentence", () => jsonResponse(409, { error: "You already have a payment in progress." }), "in_progress"],
+      ["an HTTP 409 with no payment_in_progress code (account not ready)", () => jsonResponse(409, { error: "Your account isn't fully set up yet." }), "in_progress"],
+    ] as const)("%s requires a status check, keeps the typed text, and shows no raw server text", async (_name, prepare, expected) => {
+      const { api, store } = await afterPrepare(prepare);
+
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: expected, prepareCheck: "idle", recipientInput: ADDRESS, amountInput: "1", attempt: null, error: null });
+      // Nothing happens by itself: no retry, no /latest, no cancel, no signing, no submit.
+      expect(api.keys()).toEqual(["prepare"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("a network failure is unresolved too, and the raw 'Failed to fetch' text is never kept", async () => {
+      const { api, store } = await afterPrepare(() => {
+        throw new TypeError("Failed to fetch");
+      });
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain", error: null, recipientInput: ADDRESS, amountInput: "1" });
+      expect(JSON.stringify(store.getState().error)).not.toMatch(/fetch/i);
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("the fixed copy is what the form shows (exported constants match the approved wording)", async () => {
+      const { PREPARE_UNCERTAIN_MESSAGE, PREPARE_IN_PROGRESS_MESSAGE, PREPARE_CHECK_FAILED_MESSAGE, PREPARE_CHECK_NONE_MESSAGE } = await import("@/lib/stores/real-payment-store");
+      expect(PREPARE_UNCERTAIN_MESSAGE).toBe(FIXED_UNCERTAIN);
+      expect(PREPARE_IN_PROGRESS_MESSAGE).toBe(FIXED_IN_PROGRESS);
+      expect(PREPARE_CHECK_FAILED_MESSAGE).toBe("We couldn't check right now. Try again in a moment.");
+      expect(PREPARE_CHECK_NONE_MESSAGE).toBe("No payment is waiting. You can review your payment again.");
+    });
+
+    it.each([
+      ["400", () => jsonResponse(400, { error: "Enter a valid Cash amount." })],
+      ["401", () => jsonResponse(401, { error: "Not authenticated." })],
+      ["404", () => jsonResponse(404, { error: "We couldn't find anyone with that name." })],
+      ["429 rate_limited", () => jsonResponse(429, { error: "You're going a bit fast. Try again later.", code: "rate_limited" })],
+      ["429 quota", () => jsonResponse(429, { error: "You've reached the payment limit for now. Try again later." })],
+      ["502 prepare_failed", () => jsonResponse(502, { error: "We couldn't prepare that payment. Please try again." })],
+    ] as const)("HTTP %s keeps its existing handling: the server's message, no status-check requirement", async (_name, prepare) => {
+      const { api, store } = await afterPrepare(prepare);
+      expect(store.getState().prepareNeedsCheck).toBeNull();
+      expect(store.getState().status).toBe("editing");
+      expect(store.getState().error).toBeTruthy();
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("a prepare 500 that arrives after a reset (a new lifecycle) sets nothing", async () => {
+      const gate = held();
+      server({ prepare: () => gate.promise });
+      const store = newStore();
+      await store.getState().review();
+      const pending = store.getState().confirmAndSend();
+      store.getState().reset();
+      gate.resolve(jsonResponse(500, UNCERTAIN_BODY));
+      await pending;
+      expect(store.getState()).toMatchObject({ prepareNeedsCheck: null, prepareCheck: "idle", status: "editing", recipientInput: "" });
+    });
+
+    it("a prepare 500 that arrives after an account switch sets nothing", async () => {
+      const gate = held();
+      server({ prepare: () => gate.promise });
+      const store = newStore();
+      await store.getState().review();
+      const pending = store.getState().confirmAndSend();
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+      gate.resolve(jsonResponse(500, UNCERTAIN_BODY));
+      await pending;
+      expect(store.getState().prepareNeedsCheck).toBeNull();
+    });
+  });
+
+  describe("while a check is required", () => {
+    it("review() and confirmAndSend() refuse in the store, not only on the button; editing never clears the requirement", async () => {
+      const { api, store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY));
+
+      store.getState().setRecipientInput("0x4444444444444444444444444444444444444444");
+      store.getState().setAmountInput("2");
+      await store.getState().review();
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain" });
+
+      // Even a forced "reviewing" cannot start a second prepare.
+      store.setState({ status: "reviewing" });
+      await store.getState().confirmAndSend();
+      expect(api.count("prepare")).toBe(1);
+      expect(store.getState().prepareNeedsCheck).toBe("uncertain");
+    });
+
+    it("the check does nothing when no check is required, off the editing screen, or after detach", async () => {
+      const api = server({ latest: () => jsonResponse(200, { attempt: null }) });
+      const store = newStore();
+      await store.getState().checkPreparedPayment();
+      expect(api.count("latest")).toBe(0);
+
+      store.setState({ prepareNeedsCheck: "uncertain", status: "reviewing" });
+      await store.getState().checkPreparedPayment();
+      expect(api.count("latest")).toBe(0);
+
+      store.setState({ status: "editing" });
+      store.getState().detach();
+      store.setState({ prepareNeedsCheck: "uncertain", status: "editing" });
+      await store.getState().checkPreparedPayment();
+      expect(api.count("latest")).toBe(0);
+    });
+  });
+
+  describe("the check: one GET /latest per click, nothing else", () => {
+    it("no attempt: releases the requirement, keeps the form, confirms plainly, and Review works again", async () => {
+      const { api, store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), { latest: () => jsonResponse(200, { attempt: null }) });
+
+      await store.getState().checkPreparedPayment();
+
+      expect(api.keys()).toEqual(["prepare", "latest"]);
+      expect(api.calls.at(-1)).toMatchObject({ method: "GET" });
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, prepareNeedsCheck: null, prepareCheck: "nothing_found", recipientInput: ADDRESS, amountInput: "1", error: null });
+
+      await store.getState().review();
+      expect(store.getState()).toMatchObject({ status: "reviewing", prepareCheck: "idle" });
+    });
+
+    it.each(["confirmed", "failed", "cancelled"] as const)("a %s latest attempt is NOT adopted (an old payment is not this form's result)", async (state) => {
+      const { api, store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), { latest: latestOf(state) });
+      await store.getState().checkPreparedPayment();
+
+      expect(api.keys()).toEqual(["prepare", "latest"]);
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, prepareNeedsCheck: null, prepareCheck: "nothing_found", recipientInput: ADDRESS, amountInput: "1" });
+    });
+
+    it.each([
+      ["prepared", "stranded"],
+      ["signed", "stranded"],
+      ["submitting", "unknown"],
+      ["submitted", "submitted"],
+      ["unknown", "unknown"],
+    ] as const)("a %s attempt is adopted exactly and shown as %s; nothing is signed, submitted, prepared or cancelled", async (state, shown) => {
+      const { api, store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), { latest: latestOf(state) });
+      await store.getState().checkPreparedPayment();
+
+      expect(store.getState()).toMatchObject({ status: shown, prepareNeedsCheck: null, prepareCheck: "idle", attempt: { id: `attempt-${state}`, state } });
+      expect(api.keys()).toEqual(["prepare", "latest"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("awaiting_authorization with the server's signing context resumes through the existing flow, without prompting", async () => {
+      const { api, store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), { latest: latestOf("awaiting_authorization") });
+      await store.getState().checkPreparedPayment();
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", prepareNeedsCheck: null, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", attempt: { id: "attempt-awaiting_authorization" }, pendingSubmission: null, isAuthorizing: false });
+      expect(api.keys()).toEqual(["prepare", "latest"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("awaiting_authorization WITHOUT signing context is cancel-only (stranded), never re-bound", async () => {
+      const { store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), { latest: latestOf("awaiting_authorization", { subOrganizationId: null, authorizingCredentialId: null }) });
+      await store.getState().checkPreparedPayment();
+      expect(store.getState()).toMatchObject({ status: "stranded", authorizingCredentialId: null, prepareNeedsCheck: null });
+      expect(store.getState().error).toMatch(/different passkey/);
+    });
+
+    it("the server's attempt is the truth: the form's recipient and amount never become the payment's identity", async () => {
+      const { store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), {
+        latest: () => jsonResponse(200, { attempt: attemptIn("prepared", { recipient: "0x9999999999999999999999999999999999999999", amountBaseUnits: "7000000" }), serverNowSeconds: Math.floor(Date.now() / 1000) }),
+      });
+      await store.getState().checkPreparedPayment();
+      expect(store.getState().attempt).toMatchObject({ recipient: "0x9999999999999999999999999999999999999999", amountBaseUnits: "7000000" });
+    });
+
+    it("two rapid clicks send exactly one GET /latest, and the button state says it is checking", async () => {
+      const gate = held();
+      const api = server({ prepare: () => jsonResponse(500, UNCERTAIN_BODY), latest: () => gate.promise });
+      const store = newStore();
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+
+      const first = store.getState().checkPreparedPayment();
+      const second = store.getState().checkPreparedPayment();
+      expect(store.getState().prepareCheck).toBe("checking");
+      gate.resolve(jsonResponse(200, { attempt: null }));
+      await Promise.all([first, second]);
+
+      expect(api.count("latest")).toBe(1);
+      expect(store.getState().prepareCheck).toBe("nothing_found");
+    });
+
+    it("each user-initiated check is its own single GET", async () => {
+      const { api, store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), { latest: (n) => (n === 1 ? jsonResponse(500, { error: "x" }) : jsonResponse(200, { attempt: null })) });
+      await store.getState().checkPreparedPayment();
+      expect(api.count("latest")).toBe(1);
+      await store.getState().checkPreparedPayment();
+      expect(api.count("latest")).toBe(2);
+    });
+  });
+
+  describe("a check that cannot be trusted keeps the requirement", () => {
+    it.each([
+      ["HTTP 500", () => jsonResponse(500, { error: "boom" })],
+      ["HTTP 503", () => jsonResponse(503, { error: "later" })],
+      ["a reply that is not JSON", () => new Response("<html>", { status: 200 })],
+      ["a reply with no attempt field", () => jsonResponse(200, {})],
+      ["an attempt of an unknown state", () => jsonResponse(200, { attempt: { ...baseAttempt(), state: "mystery" } })],
+      ["an attempt with no id", () => jsonResponse(200, { attempt: { ...baseAttempt(), id: "" } })],
+      ["a non-object attempt", () => jsonResponse(200, { attempt: "nope" })],
+      ["a network failure", () => {
+        throw new TypeError("Failed to fetch");
+      }],
+    ] as const)("%s: still required, inputs kept, nothing adopted, then a later check can succeed", async (_name, latest) => {
+      let calls = 0;
+      const { api, store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), {
+        latest: (n) => {
+          calls = n;
+          return n === 1 ? latest() : jsonResponse(200, { attempt: null });
+        },
+      });
+
+      await store.getState().checkPreparedPayment();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, prepareNeedsCheck: "uncertain", prepareCheck: "unavailable", recipientInput: ADDRESS, amountInput: "1" });
+      expect(api.count("latest")).toBe(1);
+      expect(calls).toBe(1); // no automatic retry
+
+      await store.getState().checkPreparedPayment();
+      expect(store.getState()).toMatchObject({ prepareNeedsCheck: null, prepareCheck: "nothing_found" });
+    });
+
+    it("HTTP 401 is not 'no payment': the requirement stays and the signed-out message is shown", async () => {
+      const { store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), { latest: () => jsonResponse(401, { error: "Not authenticated." }) });
+      await store.getState().checkPreparedPayment();
+      expect(store.getState()).toMatchObject({ prepareNeedsCheck: "uncertain", prepareCheck: "idle", attempt: null, error: "You're signed out." });
+    });
+
+    it("a read that never answers ends our wait at the deadline and keeps the requirement", async () => {
+      vi.useFakeTimers();
+      try {
+        server({ prepare: () => jsonResponse(500, UNCERTAIN_BODY), latest: () => new Promise<Response>(() => {}) });
+        const store = newStore();
+        await store.getState().review();
+        await store.getState().confirmAndSend();
+        const pending = store.getState().checkPreparedPayment();
+        await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS + 1);
+        await pending;
+        expect(store.getState()).toMatchObject({ prepareNeedsCheck: "uncertain", prepareCheck: "unavailable" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("stale answers are never applied", () => {
+    async function inFlightCheck() {
+      const gate = held();
+      const api = server({ prepare: () => jsonResponse(500, UNCERTAIN_BODY), latest: () => gate.promise, status: () => jsonResponse(200, { attempt: attemptIn("submitted"), serverNowSeconds: Math.floor(Date.now() / 1000) }) });
+      const store = newStore();
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+      const pending = store.getState().checkPreparedPayment();
+      expect(store.getState().prepareCheck).toBe("checking");
+      const answer = () => gate.resolve(jsonResponse(200, { attempt: attemptIn("prepared"), serverNowSeconds: Math.floor(Date.now() / 1000) }));
+      return { api, store, pending, answer };
+    }
+
+    it("after reset()", async () => {
+      const { store, pending, answer } = await inFlightCheck();
+      store.getState().reset();
+      answer();
+      await pending;
+      expect(store.getState()).toMatchObject({ attempt: null, status: "editing", prepareNeedsCheck: null, prepareCheck: "idle", recipientInput: "" });
+    });
+
+    it("after an account switch", async () => {
+      const { store, pending, answer } = await inFlightCheck();
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+      answer();
+      await pending;
+      expect(store.getState().attempt).toBeNull();
+      expect(store.getState().status).toBe("editing");
+      expect(store.getState().prepareCheck).toBe("checking"); // not applied at all; the lifecycle's init() clears it
+    });
+
+    it("after detach() (the Pay form unmounted)", async () => {
+      const { store, pending, answer } = await inFlightCheck();
+      store.getState().detach();
+      answer();
+      await pending;
+      expect(store.getState().attempt).toBeNull();
+      expect(store.getState().status).toBe("editing");
+      expect(store.getState().prepareCheck).not.toBe("checking");
+    });
+
+    it("after a remount (detach, then init() reads the server itself)", async () => {
+      const { api, store, pending, answer } = await inFlightCheck();
+      store.getState().detach();
+      // The remount's own read answers "no payment" ...
+      (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => jsonResponse(200, { attempt: null }));
+      await store.getState().init();
+      expect(store.getState().attempt).toBeNull();
+      // ... and the old check's late "prepared" answer must not resurrect anything.
+      answer();
+      await pending;
+      expect(store.getState()).toMatchObject({ attempt: null, status: "editing", prepareNeedsCheck: null, prepareCheck: "idle" });
+      expect(api.count("cancel")).toBe(0);
+    });
+
+    it("an older status read for another attempt cannot overwrite the attempt the check adopted", async () => {
+      const status = held();
+      const check = held();
+      const api = server({ latest: () => check.promise, status: () => status.promise });
+      useRealAccountStore.setState({ account: ACCOUNT_A });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      // An older attempt X is on screen with a status read on its way.
+      store.setState({ status: "unknown", attempt: attemptIn("unknown", { id: "attempt-old" }) });
+      const oldRead = store.getState().checkStatus();
+      await vi.waitFor(() => expect(api.count("status")).toBe(1));
+      // The page then needs a check (as after an unresolved prepare) and discovers newer attempt Y.
+      store.setState({ status: "editing", prepareNeedsCheck: "uncertain" });
+      const discovery = store.getState().checkPreparedPayment();
+      check.resolve(jsonResponse(200, { attempt: attemptIn("prepared", { id: "attempt-new" }), serverNowSeconds: Math.floor(Date.now() / 1000) }));
+      await discovery;
+      expect(store.getState()).toMatchObject({ status: "stranded", attempt: { id: "attempt-new" } });
+      // X's late answer arrives afterwards and is dropped.
+      status.resolve(jsonResponse(200, { attempt: attemptIn("confirmed", { id: "attempt-old" }), serverNowSeconds: Math.floor(Date.now() / 1000) }));
+      await oldRead;
+      expect(store.getState()).toMatchObject({ status: "stranded", attempt: { id: "attempt-new", state: "prepared" } });
+    });
+  });
+
+  describe("freshness epoch", () => {
+    it("a status read for the SAME attempt that began before the discovery describes the payment as it WAS and is dropped", async () => {
+      const status = held();
+      const check = held();
+      const api = server({ latest: () => check.promise, status: () => status.promise });
+      useRealAccountStore.setState({ account: ACCOUNT_A });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      store.setState({ status: "unknown", attempt: attemptIn("unknown", { id: "attempt-same" }) });
+      const oldRead = store.getState().checkStatus();
+      await vi.waitFor(() => expect(api.count("status")).toBe(1));
+
+      store.setState({ status: "editing", prepareNeedsCheck: "uncertain" });
+      const discovery = store.getState().checkPreparedPayment();
+      check.resolve(jsonResponse(200, { attempt: attemptIn("submitted", { id: "attempt-same" }), serverNowSeconds: Math.floor(Date.now() / 1000) }));
+      await discovery;
+      expect(store.getState()).toMatchObject({ status: "submitted", attempt: { id: "attempt-same", state: "submitted" } });
+
+      status.resolve(jsonResponse(200, { attempt: attemptIn("failed", { id: "attempt-same" }), serverNowSeconds: Math.floor(Date.now() / 1000) }));
+      await oldRead;
+      expect(store.getState()).toMatchObject({ status: "submitted", attempt: { id: "attempt-same", state: "submitted" } });
+    });
+  });
+
+  describe("Cancel after discovery", () => {
+    it("a cancel refused with 409 re-reads the server and shows what actually happened (no false 'cancelled')", async () => {
+      const { api, store } = await afterPrepare(() => jsonResponse(500, UNCERTAIN_BODY), {
+        latest: latestOf("prepared"),
+        cancel: () => jsonResponse(409, { error: "This payment can no longer be cancelled (state: submitting)." }),
+        status: () => jsonResponse(200, { attempt: attemptIn("submitted", { id: "attempt-prepared" }), serverNowSeconds: Math.floor(Date.now() / 1000) }),
+      });
+      await store.getState().checkPreparedPayment();
+      expect(store.getState().status).toBe("stranded");
+
+      await store.getState().cancel();
+
+      expect(api.count("cancel")).toBe(1);
+      expect(store.getState()).toMatchObject({ status: "submitted", attempt: { id: "attempt-prepared", state: "submitted" } });
+    });
+  });
+
+  describe("Cancel in-flight guard", () => {
+    function strandedStore(cancel: Handler) {
+      const api = server({ cancel });
+      useRealAccountStore.setState({ account: ACCOUNT_A });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      store.setState({ status: "stranded", attempt: attemptIn("prepared") });
+      return { api, store };
+    }
+
+    it("repeated presses while the request is pending issue exactly one POST, and isCancelling tracks it", async () => {
+      const gate = held();
+      const { api, store } = strandedStore(() => gate.promise);
+
+      const first = store.getState().cancel();
+      const second = store.getState().cancel();
+      const third = store.getState().cancel();
+      expect(store.getState().isCancelling).toBe(true);
+      expect(api.count("cancel")).toBe(1);
+
+      gate.resolve(jsonResponse(200, { attempt: attemptIn("cancelled") }));
+      await Promise.all([first, second, third]);
+
+      expect(api.count("cancel")).toBe(1);
+      expect(store.getState()).toMatchObject({ isCancelling: false, status: "editing", attempt: null });
+    });
+
+    it("an uncertain (network) cancel keeps the payment as it was, frees the guard, and nothing retries by itself", async () => {
+      let n = 0;
+      const { api, store } = strandedStore(() => {
+        n += 1;
+        throw new TypeError("Failed to fetch");
+      });
+      await store.getState().cancel();
+      expect(store.getState()).toMatchObject({ isCancelling: false, status: "stranded", attempt: { id: "attempt-prepared" } });
+      expect(store.getState().error).toMatch(/Could not confirm/);
+      expect(n).toBe(1);
+      expect(api.count("cancel")).toBe(1);
+      // A deliberate second press is a new request.
+      await store.getState().cancel();
+      expect(api.count("cancel")).toBe(2);
+    });
+
+    it("a cancel that finishes after the lifecycle was replaced changes nothing for the newer one", async () => {
+      const gate = held();
+      const { store } = strandedStore(() => gate.promise);
+      const pending = store.getState().cancel();
+      store.getState().reset();
+      expect(store.getState().isCancelling).toBe(false);
+      // The new lifecycle has its own payment and its own, independent Cancel slot.
+      store.setState({ status: "stranded", attempt: attemptIn("prepared", { id: "attempt-newer" }) });
+      gate.resolve(jsonResponse(200, { attempt: attemptIn("cancelled") }));
+      await pending;
+      expect(store.getState()).toMatchObject({ status: "stranded", attempt: { id: "attempt-newer" }, isCancelling: false });
+    });
+
+    it("a cancel that finishes after an account switch changes nothing", async () => {
+      const gate = held();
+      const { store } = strandedStore(() => gate.promise);
+      const pending = store.getState().cancel();
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+      gate.resolve(jsonResponse(200, { attempt: attemptIn("cancelled") }));
+      await pending;
+      expect(store.getState()).toMatchObject({ status: "stranded", attempt: { id: "attempt-prepared" } });
+    });
   });
 });

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
@@ -1579,5 +1579,332 @@ describe("RealPayForm — 3A-2 Stage 2: submit wait", () => {
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(calls.submit).toBe(1);
     expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * L-2 D-1: after a prepare that ended without a trustworthy answer the form
+ * shows a recovery notice and "Check payment status" instead of Review. Nothing
+ * is retried, read or cancelled by itself; the check is one explicit GET
+ * /latest per click. A fake server only — no network, no passkey, no provider.
+ */
+describe("RealPayForm — L-2 D-1: unresolved prepare recovery", () => {
+  const UNCERTAIN = "We couldn't confirm whether your payment was set up. Check its status before trying again.";
+  const IN_PROGRESS = "A payment may already be in progress. Check its status before trying again.";
+  const CHECK_FAILED = "We couldn't check right now. Try again in a moment.";
+  const NONE = "No payment is waiting. You can review your payment again.";
+  const C1_BODY = { error: "We couldn't confirm this payment's setup. No money was sent by this request. Refresh the app to check its status before trying again.", code: "prepare_outcome_uncertain" };
+
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Key = "latest" | "prepare" | "cancel" | "submit" | "status";
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    const promise = new Promise<Response>((res) => (resolve = res));
+    return { promise, resolve };
+  }
+
+  function stub(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key; method: string }> = [];
+    const counts: Record<Key, number> = { latest: 0, prepare: 0, cancel: 0, submit: 0, status: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url.endsWith("/api/real/account/balance")) return jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" });
+        const key: Key | null = url.endsWith("/api/real/payments/latest") ? "latest" : url.endsWith("/api/real/payments/prepare") ? "prepare" : url.endsWith("/cancel") ? "cancel" : url.endsWith("/api/real/payments/submit") ? "submit" : url.endsWith("/status") ? "status" : null;
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+        calls.push({ key, method });
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, count: (key: Key) => calls.filter((call) => call.key === key).length };
+  }
+
+  const active = (state: string, overrides: Record<string, unknown> = {}) => attemptFixture({ id: "payment-attempt-1", state, ...overrides });
+  const latestOf = (state: string, extra: Record<string, unknown> = {}, overrides: Record<string, unknown> = {}) => () =>
+    jsonResponse(200, { attempt: active(state, overrides), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000), ...extra });
+
+  /** Types an address payment and approves it; `prepare` decides how the request ends. */
+  async function unresolved(prepare: Handler, others: Partial<Record<Key, Handler>> = {}, amount = "1.00") {
+    const api = stub({ latest: () => jsonResponse(200, { attempt: null }), prepare, ...others });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: amount } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+    return api;
+  }
+
+  /** `others.latest` serves the second and later reads; the first (mount) read says "no payment". */
+  const afterMount = (next: Handler): Handler => (n) => (n === 1 ? jsonResponse(200, { attempt: null }) : next(n));
+
+  it.each([
+    ["the C-1 uncertainty reply", () => jsonResponse(500, C1_BODY), UNCERTAIN],
+    ["a generic HTTP 500", () => jsonResponse(500, { error: "Something went wrong." }), UNCERTAIN],
+    ["a network failure", () => { throw new TypeError("Failed to fetch"); }, UNCERTAIN],
+    ["an unreadable reply", () => new Response("<html>", { status: 502 }), UNCERTAIN],
+    ["an HTTP 409", () => jsonResponse(409, { error: "You already have a payment in progress." }), IN_PROGRESS],
+  ] as const)("%s: fixed notice, Check payment status instead of Review, typed text kept, nothing happens by itself", async (_name, prepare, copy) => {
+    const api = await unresolved(prepare as Handler);
+
+    expect(screen.getByText(copy)).toBeInTheDocument();
+    expect(screen.queryByText(/Failed to fetch|Something went wrong|couldn't confirm this payment's setup/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Check payment status" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    expect(screen.getByLabelText("To")).toHaveValue(RECIPIENT);
+    expect(screen.getByLabelText("Amount")).toHaveValue("1.00");
+    // Only the mount read and the one prepare happened; no retry, cancel, status or signing.
+    expect(api.count("latest")).toBe(1);
+    expect(api.count("prepare")).toBe(1);
+    expect(api.count("cancel") + api.count("status") + api.count("submit")).toBe(0);
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
+
+  it("a known preparation failure (502 with a message) keeps the ordinary form: Review, the server's message, no check", async () => {
+    stub({ latest: () => jsonResponse(200, { attempt: null }), prepare: () => jsonResponse(502, { error: "We couldn't prepare that payment. Please try again." }) });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(screen.getByText("We couldn't prepare that payment. Please try again.")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Review" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Check payment status" })).toBeNull();
+  });
+
+  it("editing the recipient or amount does not bring Review back, and pressing Enter starts nothing", async () => {
+    const api = await unresolved(() => jsonResponse(500, C1_BODY));
+
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: "0x4444444444444444444444444444444444444444" } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "2.00" } });
+    fireEvent.submit(screen.getByTestId("real-pay-form"));
+
+    expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Check payment status" })).toBeInTheDocument();
+    expect(screen.getByText(UNCERTAIN)).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-review")).toBeNull();
+    expect(api.count("prepare")).toBe(1);
+  });
+
+  it("shows a loading state while the check runs, and rapid clicks send one GET /latest", async () => {
+    const gate = held();
+    const api = await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(() => gate.promise) });
+
+    const button = screen.getByRole("button", { name: "Check payment status" });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled());
+    expect(api.count("latest")).toBe(2); // the mount read + exactly one check
+    expect(api.count("prepare")).toBe(1);
+
+    await act(async () => gate.resolve(jsonResponse(200, { attempt: null })));
+    await waitFor(() => expect(screen.getByText(NONE)).toBeInTheDocument());
+    expect(api.count("latest")).toBe(2);
+  });
+
+  it("no payment: says so, keeps the typed text, restores Review", async () => {
+    await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(() => jsonResponse(200, { attempt: null })) });
+
+    fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+    await waitFor(() => expect(screen.getByText(NONE)).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Check payment status" })).toBeNull();
+    expect(screen.queryByText(UNCERTAIN)).toBeNull();
+    expect(screen.getByLabelText("To")).toHaveValue(RECIPIENT);
+    expect(screen.getByLabelText("Amount")).toHaveValue("1.00");
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+  });
+
+  it.each(["confirmed", "failed", "cancelled"] as const)("an old %s payment is not shown as this form's result: no 'Sent', no failure screen, the form returns", async (state) => {
+    await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(latestOf(state, {}, { transactionHash: "0xabc" })) });
+    fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+    await waitFor(() => expect(screen.getByText(NONE)).toBeInTheDocument());
+    expect(screen.queryByTestId("real-pay-confirmed")).toBeNull();
+    expect(screen.queryByTestId("real-pay-failed")).toBeNull();
+    expect(screen.queryByText("Sent")).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["HTTP 500", () => jsonResponse(500, { error: "boom" })],
+    ["a network failure", () => { throw new TypeError("Failed to fetch"); }],
+    ["an unreadable reply", () => new Response("<html>", { status: 200 })],
+  ] as const)("a failed check (%s): says so plainly, keeps the requirement and the text, never claims 'no payment'; a later click can succeed", async (_name, latest) => {
+    await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount((n) => (n === 2 ? (latest as Handler)(n) : jsonResponse(200, { attempt: null }))) });
+
+    fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+    await waitFor(() => expect(screen.getByText(CHECK_FAILED)).toBeInTheDocument());
+    expect(screen.getByText(UNCERTAIN)).toBeInTheDocument();
+    expect(screen.queryByText(NONE)).toBeNull();
+    expect(screen.queryByText(/Failed to fetch|boom/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    expect(screen.getByLabelText("To")).toHaveValue(RECIPIENT);
+    expect(screen.getByRole("button", { name: "Check payment status" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+    await waitFor(() => expect(screen.getByText(NONE)).toBeInTheDocument());
+  });
+
+  describe("an active payment is adopted from the server's record", () => {
+    it("prepared: the stranded screen shows the stored amount and recipient (not the typed ones), Cancel, no Continue", async () => {
+      // The form said 5.00; the server's payment is 1.00 to RECIPIENT. The screen must show the server's.
+      await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(latestOf("prepared", {}, { amountBaseUnits: "1000000", recipient: "0x3333333333333333333333333333333333333333" })) }, "5.00");
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+      await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+      expect(screen.getByTestId("real-pay-stranded-details")).toHaveTextContent("$1.00 to 0x3333…3333");
+      expect(screen.getByTestId("real-pay-stranded-details")).not.toHaveTextContent("5.00");
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+
+    it("a payment to an @name shows the stored name, not an address", async () => {
+      await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(latestOf("prepared", {}, { recipientIdentity: { handle: "smit", displayName: "Smit Patel" } })) });
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-stranded-details")).toHaveTextContent("to Smit Patel (@smit)"));
+      expect(screen.getByTestId("real-pay-stranded-details")).not.toHaveTextContent("0x3333");
+    });
+
+    it("awaiting_authorization with the server's signing context: the normal resume screen, and no passkey prompt", async () => {
+      await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(latestOf("awaiting_authorization")) });
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+      await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+
+    it("awaiting_authorization without that context: cancel-only (the existing different-passkey screen)", async () => {
+      await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(latestOf("awaiting_authorization", { subOrganizationId: null, authorizingCredentialId: null })) });
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+      await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+      expect(screen.getByText(/different passkey/)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeInTheDocument();
+    });
+
+    it("signed: cancel-only, with the stored details", async () => {
+      await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(latestOf("signed")) });
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+      expect(screen.getByTestId("real-pay-stranded-details")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+    });
+
+    it.each(["submitting", "unknown"] as const)("%s: the 'we're checking' screen with Check status, and NO Cancel", async (state) => {
+      await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(latestOf(state)) });
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+      await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Check status" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Cancel/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    });
+
+    it("submitted: the 'Sending…' screen with Check status, and NO Cancel", async () => {
+      await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(latestOf("submitted")), status: () => jsonResponse(200, { attempt: active("submitted"), serverNowSeconds: Math.floor(Date.now() / 1000) }) });
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+      await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+      expect(screen.queryByRole("button", { name: /Cancel/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    });
+  });
+
+  describe("Cancel", () => {
+    it("is disabled while its request is pending and repeated clicks send one request", async () => {
+      const gate = held();
+      const api = await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount(latestOf("prepared")), cancel: () => gate.promise });
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+
+      const cancelButton = screen.getByRole("button", { name: "Cancel payment" });
+      fireEvent.click(cancelButton);
+      fireEvent.click(cancelButton);
+      fireEvent.click(cancelButton);
+
+      await waitFor(() => expect(screen.getByRole("button", { name: "Cancel payment" })).toBeDisabled());
+      expect(api.count("cancel")).toBe(1);
+
+      await act(async () => gate.resolve(jsonResponse(200, { attempt: active("cancelled") })));
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+      expect(api.count("cancel")).toBe(1);
+    });
+
+    it("the approval screen's Cancel has the same guard", async () => {
+      const gate = held();
+      const api = stub({ latest: latestOf("awaiting_authorization"), cancel: () => gate.promise });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+
+      const cancelButton = screen.getByRole("button", { name: "Cancel payment" });
+      fireEvent.click(cancelButton);
+      fireEvent.click(cancelButton);
+      await waitFor(() => expect(screen.getByRole("button", { name: "Cancel payment" })).toBeDisabled());
+      expect(api.count("cancel")).toBe(1);
+
+      await act(async () => gate.resolve(jsonResponse(200, { attempt: active("cancelled") })));
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    });
+
+    it("a refused or lost cancel re-enables the button without releasing the payment", async () => {
+      stub({ latest: latestOf("prepared"), cancel: () => { throw new TypeError("Failed to fetch"); } });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+      await waitFor(() => expect(screen.getByText(/Could not confirm whether this payment was cancelled/)).toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+      expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument();
+    });
+  });
+
+  it("a restored stranded payment (reload path) also shows its stored amount and recipient", async () => {
+    stub({ latest: latestOf("prepared") });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-stranded-details")).toHaveTextContent("$1.00 to 0x3333…3333"));
+  });
+
+  it("unmounting during a check discards the late answer; a remount starts clean from the server's own record", async () => {
+    const gate = held();
+    const api = await unresolved(() => jsonResponse(500, C1_BODY), { latest: afterMount((n) => (n === 2 ? gate.promise : jsonResponse(200, { attempt: null }))) });
+    fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+    await waitFor(() => expect(api.count("latest")).toBe(2));
+
+    cleanup();
+    await act(async () => gate.resolve(latestOf("prepared")()));
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(screen.queryByTestId("real-pay-stranded")).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeInTheDocument();
+    expect(api.count("cancel") + api.count("submit")).toBe(0);
   });
 });

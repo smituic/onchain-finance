@@ -7,7 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Expander } from "@/components/shell/expander";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import { useRealBalanceStore } from "@/lib/stores/real-balance-store";
-import { useRealPaymentStore } from "@/lib/stores/real-payment-store";
+import { PREPARE_CHECK_FAILED_MESSAGE, PREPARE_CHECK_NONE_MESSAGE, PREPARE_IN_PROGRESS_MESSAGE, PREPARE_UNCERTAIN_MESSAGE, useRealPaymentStore } from "@/lib/stores/real-payment-store";
 import { CASH_LABEL, formatCashBaseUnits } from "@/lib/real/display/cash";
 import { REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { exceedsAvailableBalance, parseCashInputToBaseUnits } from "@/lib/real/payments/amount";
@@ -46,6 +46,10 @@ export function RealPayForm() {
   const isSubmitRetryBeyondApproval = useRealPaymentStore((s) => s.isSubmitRetryBeyondApproval);
   const balanceStatus = useRealBalanceStore((s) => s.status);
   const error = useRealPaymentStore((s) => s.error);
+  const prepareNeedsCheck = useRealPaymentStore((s) => s.prepareNeedsCheck);
+  const prepareCheck = useRealPaymentStore((s) => s.prepareCheck);
+  const isCancelling = useRealPaymentStore((s) => s.isCancelling);
+  const checkPreparedPayment = useRealPaymentStore((s) => s.checkPreparedPayment);
   const init = useRealPaymentStore((s) => s.init);
   const setRecipientInput = useRealPaymentStore((s) => s.setRecipientInput);
   const setAmountInput = useRealPaymentStore((s) => s.setAmountInput);
@@ -139,6 +143,8 @@ export function RealPayForm() {
         data-testid="real-pay-form"
         onSubmit={(event) => {
           event.preventDefault();
+          // L-2 D-1: Enter must not start another payment while a check is required (the store refuses too).
+          if (prepareNeedsCheck !== null) return;
           setRecipientTouched(true);
           void review();
         }}
@@ -200,9 +206,30 @@ export function RealPayForm() {
 
         {error && error !== recipientProblem ? <p className="text-sm text-destructive">{error}</p> : null}
 
-        <Button type="submit" size="lg" className="h-12 w-full">
-          Review
-        </Button>
+        {prepareNeedsCheck !== null ? (
+          // L-2 D-1: we don't know whether the last attempt created a payment. Review is not offered until the
+          // status has been checked; editing the fields above does not change that.
+          <div className="flex flex-col gap-3" data-testid="real-pay-prepare-recovery">
+            <div className="flex flex-col gap-1 rounded-xl bg-muted/60 px-4 py-3.5" role="status">
+              <p className="text-sm font-medium">{prepareNeedsCheck === "in_progress" ? PREPARE_IN_PROGRESS_MESSAGE : PREPARE_UNCERTAIN_MESSAGE}</p>
+              {prepareCheck === "unavailable" ? <p className="text-sm text-destructive">{PREPARE_CHECK_FAILED_MESSAGE}</p> : null}
+            </div>
+            <Button type="button" size="lg" className="h-12 w-full" disabled={prepareCheck === "checking"} onClick={() => void checkPreparedPayment()}>
+              {prepareCheck === "checking" ? "Checking…" : "Check payment status"}
+            </Button>
+          </div>
+        ) : (
+          <>
+            {prepareCheck === "nothing_found" ? (
+              <p className="text-sm text-muted-foreground" role="status" data-testid="real-pay-prepare-none">
+                {PREPARE_CHECK_NONE_MESSAGE}
+              </p>
+            ) : null}
+            <Button type="submit" size="lg" className="h-12 w-full">
+              Review
+            </Button>
+          </>
+        )}
       </form>
     );
   }
@@ -317,7 +344,7 @@ export function RealPayForm() {
               Continue
             </Button>
           )}
-          <Button variant="ghost" className="h-11 w-full" onClick={() => void cancel()}>
+          <Button variant="ghost" className="h-11 w-full" disabled={isCancelling} onClick={() => void cancel()}>
             Cancel payment
           </Button>
         </div>
@@ -333,12 +360,18 @@ export function RealPayForm() {
           <p className="text-sm text-muted-foreground">
             {isPastValidity ? "We’re waiting for final confirmation before showing the final result. This can take a while." : "It was never sent. You can safely cancel it and try again."}
           </p>
+          {/* L-2 D-1: what this payment is, from the stored attempt — never from the form's unsent inputs. */}
+          {attempt ? (
+            <p className="break-words text-sm text-muted-foreground" data-testid="real-pay-stranded-details">
+              {formatAmount(attempt.amountBaseUnits)} to {paidTo ? paidTo.label : shortenAddress(attempt.recipient)}
+            </p>
+          ) : null}
           {isFollowUpExhausted ? <p className="text-xs text-muted-foreground">{STILL_WAITING_MESSAGE}</p> : null}
           {showDeferred ? <p className="text-xs text-muted-foreground">{isFollowUpExhausted ? STATUS_DEFERRED_MESSAGE : STATUS_DEFERRED_AUTOMATIC_MESSAGE}</p> : null}
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
         {isFollowUpExhausted ? <CheckStatusButton onClick={() => void checkStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} /> : null}
-        <Button variant="outline" className="h-11 w-full" onClick={() => void cancel()}>
+        <Button variant="outline" className="h-11 w-full" disabled={isCancelling} onClick={() => void cancel()}>
           Cancel payment
         </Button>
       </div>
