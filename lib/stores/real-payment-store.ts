@@ -71,7 +71,17 @@ export type RealPaymentStatus =
    * attempt this session can't approve (bound to another passkey, or
    * prepared before binding existed).
    */
-  | "stranded";
+  | "stranded"
+  /**
+   * L-2 D-3a: the initial read of the latest payment (init's GET /latest) did
+   * not give a trustworthy answer — a non-2xx other than 401, a network
+   * failure, an unreadable or malformed reply, or the client's own wait ran
+   * out. It says ONLY that this page could not tell what the latest payment
+   * is: not that none exists, and not that one failed, was cancelled, expired
+   * or completed. `attempt` stays null, nothing may be prepared, and the one
+   * way forward is the explicit checkPaymentsAgain() (or a new lifecycle).
+   */
+  | "status_unavailable";
 
 export type RealPaymentStore = {
   status: RealPaymentStatus;
@@ -176,7 +186,12 @@ export type RealPaymentStore = {
   prepareCheck: "idle" | "checking" | "unavailable" | "nothing_found";
   /** L-2 D-1: true while this page's one Cancel request is on its way. A second press is ignored; nothing is retried or released locally. */
   isCancelling: boolean;
-  /** Reload/restore: never signs, never submits, never resends — see server/payments.ts's resolveLatestPayment. */
+  /**
+   * Reload/restore: never signs, never submits, never resends — see server/payments.ts's resolveLatestPayment.
+   * L-2 D-3a: one GET /latest, waited on for at most STATUS_REQUEST_DEADLINE_MS;
+   * anything but a trustworthy answer (or a 401) ends in "status_unavailable",
+   * never in the ordinary form. Always resolves; never retries by itself.
+   */
   init: () => Promise<void>;
   setRecipientInput: (value: string) => void;
   setAmountInput: (value: string) => void;
@@ -199,6 +214,13 @@ export type RealPaymentStore = {
    * releases the recovery requirement; a failed check keeps it.
    */
   checkPreparedPayment: () => Promise<void>;
+  /**
+   * L-2 D-3a: the explicit "Check again" action after the initial read failed
+   * ("status_unavailable"). It re-runs init() — one GET /latest — and nothing
+   * else: no mutation, no provider work, no automatic repeat. A no-op in any
+   * other status, so a second press while the retry is loading does nothing.
+   */
+  checkPaymentsAgain: () => Promise<void>;
   /** The manual "Check status" action: cooldown-limited, and joins any status request already in flight for the attempt. */
   checkStatus: () => Promise<void>;
   /** The one automatic check after a payment becomes (or is restored as) submitted. Waits while the page is hidden; at most once per attempt. */
@@ -268,6 +290,10 @@ export const PREPARE_UNCERTAIN_MESSAGE = "We couldn't confirm whether your payme
 export const PREPARE_IN_PROGRESS_MESSAGE = "A payment may already be in progress. Check its status before trying again.";
 export const PREPARE_CHECK_FAILED_MESSAGE = "We couldn't check right now. Try again in a moment.";
 export const PREPARE_CHECK_NONE_MESSAGE = "No payment is waiting. You can review your payment again.";
+
+/** L-2 D-3a: fixed client copy for a failed initial payment check. No network, parse or server text is ever shown with it. */
+export const PAYMENTS_UNAVAILABLE_HEADLINE = "We couldn't check your payments right now.";
+export const PAYMENTS_UNAVAILABLE_DETAIL = "Check again before starting a new payment.";
 
 /**
  * L-2 D-1: does a failed prepare leave the payment's existence unknown?
@@ -1253,27 +1279,91 @@ export function createRealPaymentStore() {
         // effect). Without this, a stale recipient/amount typed under one
         // account could survive into a different signed-in account.
         set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, prepareNeedsCheck: null, prepareCheck: "idle", isCancelling: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
-        try {
-          const response = await fetch("/api/real/payments/latest");
-          if (response.status === 401) {
-            if (myGeneration === generation) set({ status: "editing", attempt: null, subOrganizationId: null, isAttemptPastValidity: false });
-            return;
+        // L-2 D-3a: the answer belongs to the lifecycle (generation) and account
+        // that asked. Each init() is its own generation, so a newer init, a
+        // reset, a detach or another account makes this one's answer — success,
+        // failure or timeout alike — a no-op.
+        const subject = currentSubject();
+        const isCurrent = () => !detached && myGeneration === generation && currentSubject() === subject;
+        // "We could not tell" — never "no payment": no attempt is shown, nothing may be prepared, and no raw error text is kept.
+        const markUnavailable = () => set({ status: "status_unavailable", attempt: null, subOrganizationId: null, authorizingCredentialId: null, isAttemptPastValidity: false, error: null });
+
+        // The client's own bound on this one read (headers AND body). It ends OUR
+        // wait only: the server may still be working, and a timeout proves
+        // nothing about any payment. Nothing is retried when it fires.
+        //
+        // This request is decided exactly once — by its own answer or by the
+        // deadline, whichever comes first. The read keeps its plain awaits (an
+        // answer is applied exactly when it always was); the timer ends the wait
+        // on its own, and an answer or rejection that arrives after it is
+        // dropped by `timedOut`, inside the try/catch — never unhandled.
+        const controller = new AbortController();
+        let timedOut = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const stopTimer = () => {
+          if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
           }
-          const json = (await response.json()) as {
-            attempt: RealPaymentAttempt | null;
-            subOrganizationId?: string | null;
-            authorizingCredentialId?: string | null;
-            serverNowSeconds?: number;
-            error?: string;
-          };
-          if (!response.ok || !json.attempt) {
-            if (myGeneration === generation) set({ status: "editing", attempt: null, subOrganizationId: null, isAttemptPastValidity: false });
-            return;
+        };
+
+        const read = async (): Promise<void> => {
+          try {
+            const response = await fetch("/api/real/payments/latest", { signal: controller.signal });
+            if (timedOut) return;
+            // Only a 2xx carries an answer about payments; its body is read before anything is decided.
+            const json: unknown = response.ok ? await response.json() : null;
+            if (timedOut) return;
+            // Answered: the timer is gone before anything is applied, so it can never fire over a restored payment.
+            stopTimer();
+            if (!isCurrent()) return;
+            if (response.status === 401) {
+              set({ status: "editing", attempt: null, subOrganizationId: null, isAttemptPastValidity: false });
+              return;
+            }
+            // Any other non-2xx is not an answer about payments at all — whatever its body says.
+            if (!response.ok) {
+              markUnavailable();
+              return;
+            }
+            // Fail closed, with D-1's reader: only an explicit `attempt: null` means "no payment".
+            const latest = readLatestForCheck(json);
+            if (latest.kind === "unusable") {
+              markUnavailable();
+              return;
+            }
+            if (latest.kind === "none") {
+              set({ status: "editing", attempt: null, subOrganizationId: null, isAttemptPastValidity: false });
+              return;
+            }
+            // A validated attempt (object, non-empty id, known state) — active OR
+            // terminal. Unlike the D-1 check, a reload restores a finished payment
+            // too (Sent / failed), exactly as before.
+            const payload = json as LatestPayload;
+            await adoptLatestAttempt(payload, payload.attempt as RealPaymentAttempt);
+          } catch {
+            // After the deadline this request has already been answered for: its late rejection (an abort included) is dropped.
+            if (timedOut) return;
+            stopTimer();
+            // A network failure, an unreadable body, or anything unexpected: not evidence that no payment exists.
+            if (isCurrent()) markUnavailable();
           }
-          if (myGeneration === generation) await adoptLatestAttempt(json, json.attempt);
-        } catch {
-          if (myGeneration === generation) set({ status: "editing" });
-        }
+        };
+
+        // Resolves when the read is done with — or when the deadline ends the wait, even if the request itself never settles.
+        await new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            timer = null;
+            timedOut = true;
+            try {
+              controller.abort();
+              if (isCurrent()) markUnavailable();
+            } finally {
+              resolve();
+            }
+          }, STATUS_REQUEST_DEADLINE_MS);
+          void read().then(resolve, resolve);
+        });
       },
 
       setRecipientInput: (value) => {
@@ -1290,6 +1380,8 @@ export function createRealPaymentStore() {
       },
 
       review: () => {
+        // L-2 D-3a: the latest payment is unknown — no review (and so no prepare) until a check succeeds. Enforced here, not only by the hidden form.
+        if (get().status === "status_unavailable") return Promise.resolve();
         // L-2 D-1: an unresolved prepare must be checked first — enforced here, not only by the hidden button.
         if (get().prepareNeedsCheck !== null) return Promise.resolve();
         if (get().prepareCheck === "nothing_found") set({ prepareCheck: "idle" });
@@ -1307,9 +1399,14 @@ export function createRealPaymentStore() {
         });
       },
 
-      editAgain: () => set({ status: "editing", error: null }),
+      editAgain: () => {
+        // L-2 D-3a: not a way out of the unavailable state — only a successful check (or a new lifecycle) is.
+        if (get().status === "status_unavailable") return;
+        set({ status: "editing", error: null });
+      },
 
       confirmAndSend: async () => {
+        if (get().status === "status_unavailable") return; // L-2 D-3a: never prepare while the latest payment is unknown
         if (get().status !== "reviewing") return; // guards a double-tap from re-firing prepare
         if (get().prepareNeedsCheck !== null) return; // L-2 D-1: never prepare again over an unresolved prepare
         const view = currentRecipientView();
@@ -1389,7 +1486,8 @@ export function createRealPaymentStore() {
       cancel: async () => {
         const attempt = get().attempt;
         if (!attempt) {
-          set({ status: "editing" });
+          // L-2 D-3a: nothing to cancel must not turn "we couldn't check" into the ordinary form.
+          if (get().status !== "status_unavailable") set({ status: "editing" });
           return;
         }
         // L-2 D-1: one Cancel request at a time. A repeat press while it is on
@@ -1564,6 +1662,14 @@ export function createRealPaymentStore() {
           if (timer !== null) clearTimeout(timer);
           if (preparedCheck === myCheck) preparedCheck = null;
         }
+      },
+
+      checkPaymentsAgain: async () => {
+        // Only from the unavailable screen, never while detached. init() enters
+        // "idle" synchronously, so a second press finds nothing to do: one GET
+        // /latest per successful press, and nothing else.
+        if (detached || get().status !== "status_unavailable") return;
+        await get().init();
       },
 
       checkStatus: async () => {

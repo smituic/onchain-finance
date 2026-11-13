@@ -1908,3 +1908,388 @@ describe("RealPayForm — L-2 D-1: unresolved prepare recovery", () => {
     expect(api.count("cancel") + api.count("submit")).toBe(0);
   });
 });
+
+/**
+ * L-2 D-3a: when the page cannot tell what the latest payment is (the initial
+ * GET /latest failed, was unreadable, or never answered), it offers no payment
+ * form at all — only fixed copy and an explicit "Check again".
+ */
+describe("RealPayForm — L-2 D-3a: initial payment check unavailable", () => {
+  const HEADLINE = "We couldn't check your payments right now.";
+  const DETAIL = "Check again before starting a new payment.";
+  const RAW_TEXT = /Failed to fetch|boom|Unexpected|JSON|html|Service Unavailable|Not authenticated|longer than usual|abort/i;
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Key = "latest" | "prepare" | "cancel" | "submit" | "status" | "lookup";
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    const promise = new Promise<Response>((res) => (resolve = res));
+    return { promise, resolve };
+  }
+
+  /** Every request is recorded, including one no handler expects. */
+  function stub(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; method: string }> = [];
+    const counts: Record<Key, number> = { latest: 0, prepare: 0, cancel: 0, submit: 0, status: 0, lookup: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url.endsWith("/api/real/account/balance")) return jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" });
+        const key: Key | null = url.endsWith("/api/real/payments/latest")
+          ? "latest"
+          : url.endsWith("/api/real/payments/prepare")
+            ? "prepare"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/api/real/payments/submit")
+                ? "submit"
+                : url.endsWith("/status")
+                  ? "status"
+                  : url.endsWith("/api/real/recipients/lookup")
+                    ? "lookup"
+                    : null;
+        calls.push({ key: key ?? "other", method });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, count: (key: Key) => calls.filter((call) => call.key === key).length, keys: () => calls.map((call) => call.key) };
+  }
+
+  const none = () => jsonResponse(200, { attempt: null });
+  const failing = () => jsonResponse(500, { error: "boom" });
+  const latestOf = (state: string, extra: Record<string, unknown> = {}, overrides: Record<string, unknown> = {}) => () =>
+    jsonResponse(200, { attempt: attemptFixture({ state, ...overrides }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000), ...extra });
+
+  /** Mounts the form with a first read that fails; later reads are `next`. */
+  async function mountUnavailable(next: Handler = none, others: Partial<Record<Key, Handler>> = {}) {
+    const api = stub({ latest: (n) => (n === 1 ? failing() : next(n)), ...others });
+    const view = render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-status-unavailable")).toBeInTheDocument());
+    return { api, view };
+  }
+
+  function expectNoPaymentControls() {
+    expect(screen.queryByTestId("real-pay-form")).toBeNull();
+    expect(screen.queryByLabelText("To")).toBeNull();
+    expect(screen.queryByLabelText("Amount")).toBeNull();
+    expect(screen.queryAllByRole("textbox")).toHaveLength(0);
+    for (const name of ["Review", "Approve", "Send", "Continue", "Edit", "Cancel payment", "Check payment status", "Check status", "Try again", "Send another payment"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+  }
+
+  it("shows the exact approved headline and supporting text, one 'Check again' button, and no payment controls", async () => {
+    const { api, view } = await mountUnavailable();
+
+    const notice = screen.getByRole("status");
+    expect(notice).toHaveTextContent(HEADLINE);
+    expect(notice).toHaveTextContent(DETAIL);
+    expect(screen.getByText(HEADLINE)).toBeInTheDocument();
+    expect(screen.getByText(DETAIL)).toBeInTheDocument();
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Check again" })).toBeEnabled();
+    expectNoPaymentControls();
+    expect(view.container.querySelector("form")).toBeNull();
+    // Only the mount read happened: no retry, and nothing else, by itself.
+    expect(api.keys()).toEqual(["latest"]);
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["HTTP 500", () => jsonResponse(500, { error: "boom" })],
+    ["HTTP 404", () => jsonResponse(404, { error: "boom" })],
+    ["HTTP 503 with an HTML body", () => new Response("<html>Service Unavailable</html>", { status: 503 })],
+    ["a network failure", () => {
+      throw new TypeError("Failed to fetch");
+    }],
+    ["an HTTP 200 that is not JSON", () => new Response("<html>", { status: 200 })],
+    ["a reply with no attempt key", () => jsonResponse(200, {})],
+    ["an attempt of an unknown state", () => jsonResponse(200, { attempt: attemptFixture({ state: "mystery" }) })],
+    ["an attempt with no id", () => jsonResponse(200, { attempt: attemptFixture({ id: "" }) })],
+  ] as const)("%s on mount: the unavailable screen, with no raw fetch, JSON or server text and no payment form", async (_name, latest) => {
+    const api = stub({ latest: latest as Handler });
+    const view = render(<RealPayForm />);
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-status-unavailable")).toBeInTheDocument());
+    expect(screen.getByText(HEADLINE)).toBeInTheDocument();
+    expect(view.container.textContent).not.toMatch(RAW_TEXT);
+    expect(view.container.textContent).toBe(`${HEADLINE}${DETAIL}Check again`);
+    expectNoPaymentControls();
+    expect(api.keys()).toEqual(["latest"]);
+  });
+
+  it("HTTP 401 on mount is unchanged: the ordinary form, not the unavailable screen", async () => {
+    stub({ latest: () => jsonResponse(401, { error: "Not authenticated." }) });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(screen.queryByTestId("real-pay-status-unavailable")).toBeNull();
+  });
+
+  it("Check again: shows the loading skeleton while it runs, rapid clicks send one GET, and a clean answer brings the form back", async () => {
+    const gate = held();
+    const { api } = await mountUnavailable(() => gate.promise);
+
+    const button = screen.getByRole("button", { name: "Check again" });
+    act(() => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-form-loading")).toBeInTheDocument());
+    expect(screen.queryByTestId("real-pay-status-unavailable")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+    expectNoPaymentControls();
+    expect(api.count("latest")).toBe(2); // the mount read + exactly one retry
+
+    await act(async () => gate.resolve(none()));
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(screen.getByLabelText("To")).toHaveValue("");
+    expect(screen.getByLabelText("Amount")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Review" })).toBeInTheDocument();
+    expect(screen.queryByText(HEADLINE)).toBeNull();
+    expect(api.keys()).toEqual(["latest", "latest"]);
+  });
+
+  it("a retry that fails again keeps the unavailable screen — one GET per press, and still no raw text", async () => {
+    const { api, view } = await mountUnavailable((n) => {
+      if (n === 2) throw new TypeError("Failed to fetch");
+      return n === 3 ? new Response("<html>", { status: 200 }) : none();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(api.count("latest")).toBe(2));
+    await waitFor(() => expect(screen.getByTestId("real-pay-status-unavailable")).toBeInTheDocument());
+    expect(view.container.textContent).toBe(`${HEADLINE}${DETAIL}Check again`);
+
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(api.count("latest")).toBe(3));
+    await waitFor(() => expect(screen.getByTestId("real-pay-status-unavailable")).toBeInTheDocument());
+    expect(view.container.textContent).not.toMatch(RAW_TEXT);
+    expectNoPaymentControls();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(api.keys()).toEqual(["latest", "latest", "latest", "latest"]);
+  });
+
+  describe("a successful retry restores the screen for whatever the server has", () => {
+    it("a payment waiting for approval: the resume screen, with no passkey prompt", async () => {
+      const { api } = await mountUnavailable(latestOf("awaiting_authorization"));
+      fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+      expect(screen.getByText("Only continue if you started this payment.")).toBeInTheDocument();
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+      expect(api.keys()).toEqual(["latest", "latest"]);
+    });
+
+    it("a payment bound to another passkey: cancel-only", async () => {
+      await mountUnavailable(latestOf("awaiting_authorization", { subOrganizationId: null, authorizingCredentialId: null }));
+      fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+      expect(screen.getByText(/different passkey/)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+    });
+
+    it.each(["prepared", "signed"] as const)("%s: cancel-only, with the stored amount and recipient", async (state) => {
+      await mountUnavailable(latestOf(state));
+      fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-stranded-details")).toHaveTextContent("$1.00 to 0x3333…3333"));
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+    });
+
+    it.each(["submitting", "unknown"] as const)("%s: the 'we're checking' screen, with no Cancel", async (state) => {
+      await mountUnavailable(latestOf(state));
+      fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+      expect(screen.queryByRole("button", { name: "Cancel payment" })).toBeNull();
+    });
+
+    it("submitted: 'Sending…', followed only by the usual read-only status check", async () => {
+      const { api } = await mountUnavailable(latestOf("submitted", {}, { prepared: null }), {
+        status: () => jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), serverNowSeconds: Math.floor(Date.now() / 1000) }),
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+      await waitFor(() => expect(api.count("status")).toBe(1));
+      expect(api.calls.every((call) => call.method === "GET")).toBe(true);
+      expect(api.count("prepare") + api.count("submit") + api.count("cancel")).toBe(0);
+    });
+
+    it("confirmed: 'Sent', exactly as a reload shows it", async () => {
+      await mountUnavailable(latestOf("confirmed", {}, { transactionHash: "0xabc" }));
+      fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-confirmed")).toBeInTheDocument());
+      expect(screen.getByText("Sent")).toBeInTheDocument();
+    });
+
+    it("failed: the failure screen with the stored reason", async () => {
+      await mountUnavailable(latestOf("failed", {}, { failureReason: "This payment expired before it was sent." }));
+      fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-failed")).toBeInTheDocument());
+      expect(screen.getByText("This payment expired before it was sent.")).toBeInTheDocument();
+    });
+
+    it("cancelled: the ordinary form", async () => {
+      await mountUnavailable(latestOf("cancelled"));
+      fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Review" })).toBeInTheDocument();
+    });
+  });
+
+  it("Enter (or any key) cannot start a payment while unavailable: there is no form to submit and nothing is prepared", async () => {
+    const { api, view } = await mountUnavailable(none, { prepare: () => jsonResponse(200, {}), lookup: () => jsonResponse(200, { found: false }) });
+    // Even with values a previous screen might have left in the store.
+    act(() => {
+      useRealPaymentStore.getState().setRecipientInput(RECIPIENT);
+      useRealPaymentStore.getState().setAmountInput("1.00");
+    });
+
+    const button = screen.getByRole("button", { name: "Check again" });
+    expect(button).toHaveAttribute("type", "button");
+    for (const target of [button, view.container, document.body]) {
+      fireEvent.keyDown(target, { key: "Enter", code: "Enter" });
+      fireEvent.keyPress(target, { key: "Enter", code: "Enter", charCode: 13 });
+      fireEvent.keyUp(target, { key: "Enter", code: "Enter" });
+    }
+    await act(async () => {
+      await useRealPaymentStore.getState().review();
+      await useRealPaymentStore.getState().confirmAndSend();
+    });
+
+    expect(view.container.querySelector("form")).toBeNull();
+    expect(screen.getByTestId("real-pay-status-unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-review")).toBeNull();
+    expect(api.keys()).toEqual(["latest"]);
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
+
+  it("a mount read that never answers shows the skeleton until the 45-second deadline, then the unavailable screen — and nothing retries by itself", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const api = stub({ latest: () => new Promise<Response>(() => {}) });
+    const flush = () =>
+      act(async () => {
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+    render(<RealPayForm />);
+    await flush();
+    expect(screen.getByTestId("real-pay-form-loading")).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(44_999);
+    });
+    await flush();
+    expect(screen.getByTestId("real-pay-form-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-status-unavailable")).toBeNull();
+
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+    });
+    await flush();
+    expect(screen.getByText(HEADLINE)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check again" })).toBeEnabled();
+    expectNoPaymentControls();
+
+    await act(async () => {
+      vi.advanceTimersByTime(60 * 60 * 1000);
+    });
+    await flush();
+    expect(api.keys()).toEqual(["latest"]);
+    expect(screen.getByText(HEADLINE)).toBeInTheDocument();
+  });
+
+  it("switching to another account while unavailable loads that account's own answer; signing out shows nothing", async () => {
+    const { api, view } = await mountUnavailable(none);
+
+    act(() => useRealAccountStore.setState({ account: ACCOUNT_B }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(screen.queryByTestId("real-pay-status-unavailable")).toBeNull();
+    expect(api.count("latest")).toBe(2);
+
+    act(() => useRealAccountStore.setState({ account: null }));
+    expect(view.container).toBeEmptyDOMElement();
+  });
+
+  it("unmounting during a retry discards its late answer; a remount reads the server itself", async () => {
+    const gate = held();
+    const { api } = await mountUnavailable((n) => (n === 2 ? gate.promise : none()));
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(api.count("latest")).toBe(2));
+
+    cleanup();
+    await act(async () => gate.resolve(latestOf("prepared")()));
+    expect(useRealPaymentStore.getState().attempt).toBeNull();
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(screen.queryByTestId("real-pay-stranded")).toBeNull();
+    expect(api.count("latest")).toBe(3);
+    expect(api.count("cancel") + api.count("submit") + api.count("prepare")).toBe(0);
+  });
+
+  it("React Strict Mode's double mount with a failing read still ends on the unavailable screen, and Check again works", async () => {
+    const api = stub({ latest: (n) => (n <= 2 ? failing() : none()) });
+    render(
+      <StrictMode>
+        <RealPayForm />
+      </StrictMode>,
+    );
+    await waitFor(() => expect(screen.getByTestId("real-pay-status-unavailable")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(api.calls.every((call) => call.key === "latest" && call.method === "GET")).toBe(true);
+  });
+
+  describe("D-1's 'Check payment status' experience is unchanged", () => {
+    const UNCERTAIN = "We couldn't confirm whether your payment was set up. Check its status before trying again.";
+    const CHECK_FAILED = "We couldn't check right now. Try again in a moment.";
+
+    it("an unresolved prepare still shows the D-1 notice on the form; a failed D-1 check stays there — never the D-3a screen", async () => {
+      const api = stub({ latest: (n) => (n === 1 ? none() : failing()), prepare: () => jsonResponse(500, { error: "Something went wrong." }) });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+      fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+      fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+      fireEvent.click(screen.getByRole("button", { name: "Review" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+      fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+
+      expect(screen.getByText(UNCERTAIN)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+      await waitFor(() => expect(screen.getByText(CHECK_FAILED)).toBeInTheDocument());
+
+      expect(screen.getByTestId("real-pay-form")).toBeInTheDocument();
+      expect(screen.queryByTestId("real-pay-status-unavailable")).toBeNull();
+      expect(screen.queryByText(HEADLINE)).toBeNull();
+      expect(screen.getByRole("button", { name: "Check payment status" })).toBeEnabled();
+      expect(screen.getByLabelText("To")).toHaveValue(RECIPIENT);
+      expect(screen.getByLabelText("Amount")).toHaveValue("1.00");
+      expect(api.keys()).toEqual(["latest", "prepare", "latest"]);
+    });
+  });
+});

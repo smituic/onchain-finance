@@ -7,7 +7,15 @@ import { Label } from "@/components/ui/label";
 import { Expander } from "@/components/shell/expander";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import { useRealBalanceStore } from "@/lib/stores/real-balance-store";
-import { PREPARE_CHECK_FAILED_MESSAGE, PREPARE_CHECK_NONE_MESSAGE, PREPARE_IN_PROGRESS_MESSAGE, PREPARE_UNCERTAIN_MESSAGE, useRealPaymentStore } from "@/lib/stores/real-payment-store";
+import {
+  PAYMENTS_UNAVAILABLE_DETAIL,
+  PAYMENTS_UNAVAILABLE_HEADLINE,
+  PREPARE_CHECK_FAILED_MESSAGE,
+  PREPARE_CHECK_NONE_MESSAGE,
+  PREPARE_IN_PROGRESS_MESSAGE,
+  PREPARE_UNCERTAIN_MESSAGE,
+  useRealPaymentStore,
+} from "@/lib/stores/real-payment-store";
 import { CASH_LABEL, formatCashBaseUnits } from "@/lib/real/display/cash";
 import { REAL_CASH_TOKEN } from "@/lib/real/constants";
 import { exceedsAvailableBalance, parseCashInputToBaseUnits } from "@/lib/real/payments/amount";
@@ -50,6 +58,7 @@ export function RealPayForm() {
   const prepareCheck = useRealPaymentStore((s) => s.prepareCheck);
   const isCancelling = useRealPaymentStore((s) => s.isCancelling);
   const checkPreparedPayment = useRealPaymentStore((s) => s.checkPreparedPayment);
+  const checkPaymentsAgain = useRealPaymentStore((s) => s.checkPaymentsAgain);
   const init = useRealPaymentStore((s) => s.init);
   const setRecipientInput = useRealPaymentStore((s) => s.setRecipientInput);
   const setAmountInput = useRealPaymentStore((s) => s.setAmountInput);
@@ -112,6 +121,22 @@ export function RealPayForm() {
 
   if (status === "idle") {
     return <div aria-busy="true" aria-label="Loading" className="h-24 animate-pulse rounded-xl bg-muted/60" data-testid="real-pay-form-loading" />;
+  }
+
+  if (status === "status_unavailable") {
+    // L-2 D-3a: we could not tell what the latest payment is, so no payment form is offered — only an explicit
+    // re-check. Fixed copy: nothing from the network or the server is shown.
+    return (
+      <div className="flex flex-col gap-3" data-testid="real-pay-status-unavailable">
+        <div className="flex flex-col gap-1 rounded-xl bg-muted/60 px-4 py-3.5" role="status">
+          <p className="text-sm font-medium">{PAYMENTS_UNAVAILABLE_HEADLINE}</p>
+          <p className="text-sm text-muted-foreground">{PAYMENTS_UNAVAILABLE_DETAIL}</p>
+        </div>
+        <Button type="button" size="lg" className="h-12 w-full" onClick={() => void checkPaymentsAgain()}>
+          Check again
+        </Button>
+      </div>
+    );
   }
 
   // A deferral only matters while its wait is running; the store flips both flags together.

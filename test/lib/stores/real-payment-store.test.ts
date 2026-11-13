@@ -4664,3 +4664,720 @@ describe("real-payment-store — L-2 D-1: unresolved prepare and explicit status
     });
   });
 });
+
+/**
+ * L-2 D-3a: the initial GET /latest (init) must never treat "we could not tell"
+ * as "no payment". Anything but a trustworthy answer is "status_unavailable":
+ * no attempt, no form, no prepare — only an explicit, user-triggered re-check.
+ */
+describe("real-payment-store — L-2 D-3a: safe initial payment status check", () => {
+  const ADDRESS = "0x3333333333333333333333333333333333333333";
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  /** What "unavailable" must look like: no payment on screen, no signing context, no raw error text. */
+  const UNAVAILABLE = { status: "status_unavailable", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAttemptPastValidity: false, error: null };
+  const LATEST_URL = "/api/real/payments/latest";
+
+  type Key = "latest" | "prepare" | "cancel" | "status" | "submit" | "lookup";
+  type Handler = (n: number) => Response | Promise<Response>;
+  const stores: Array<ReturnType<typeof createRealPaymentStore>> = [];
+
+  beforeEach(() => {
+    vi.mocked(signPreparedPayment).mockClear();
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+  });
+
+  afterEach(() => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockClear();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  /** Every fetch is recorded — including one no handler expects — so "nothing else was requested" is checked against all of them. */
+  function server(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string; signal: AbortSignal | null }> = [];
+    const counts: Record<Key, number> = { latest: 0, prepare: 0, cancel: 0, status: 0, submit: 0, lookup: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/prepare")
+          ? "prepare"
+          : url.endsWith(LATEST_URL)
+            ? "latest"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/status")
+                ? "status"
+                : url.endsWith("/api/real/payments/submit")
+                  ? "submit"
+                  : url.endsWith("/api/real/recipients/lookup")
+                    ? "lookup"
+                    : null;
+        calls.push({ key: key ?? "other", url, method, signal: init?.signal ?? null });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, count: (key: Key) => calls.filter((call) => call.key === key).length, keys: () => calls.map((call) => call.key) };
+  }
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    let reject: (error: unknown) => void = () => {};
+    const promise = new Promise<Response>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  /** Lets every already-queued continuation run (a Response body read takes a few turns). */
+  async function settle() {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  }
+
+  const attemptIn = (state: string, overrides: Record<string, unknown> = {}) => ({ ...baseAttempt(), id: `attempt-${state}`, state, ...overrides }) as never;
+  const latestOf = (state: string, extra: Record<string, unknown> = {}) => () =>
+    jsonResponse(200, { attempt: attemptIn(state), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000), ...extra });
+  const none = () => jsonResponse(200, { attempt: null });
+
+  function newStore() {
+    const store = createRealPaymentStore();
+    stores.push(store);
+    return store;
+  }
+
+  /** A store whose first read failed (HTTP 500) and is showing the unavailable state; later reads are `next`. */
+  async function unavailableStore(next: Handler = none, others: Partial<Record<Key, Handler>> = {}) {
+    const api = server({ latest: (n) => (n === 1 ? jsonResponse(500, { error: "boom" }) : next(n)), ...others });
+    const store = newStore();
+    await store.getState().init();
+    expect(store.getState()).toMatchObject(UNAVAILABLE);
+    return { api, store };
+  }
+
+  /** The established reload mapping: server state (and signing context) -> what the page shows. */
+  const RESTORED = [
+    ["prepared", {}, "stranded"],
+    ["signed", {}, "stranded"],
+    ["awaiting_authorization", {}, "awaiting_authorization"],
+    ["awaiting_authorization", { subOrganizationId: null, authorizingCredentialId: null }, "stranded"],
+    ["submitting", {}, "unknown"],
+    ["submitted", {}, "submitted"],
+    ["unknown", {}, "unknown"],
+    ["confirmed", {}, "confirmed"],
+    ["failed", {}, "failed"],
+    ["cancelled", {}, "editing"],
+  ] as const;
+
+  describe("a trustworthy answer keeps the existing behavior", () => {
+    it("200 { attempt: null }: the ordinary form, from exactly one GET that carries an abort signal and leaves no timer behind", async () => {
+      vi.useFakeTimers();
+      const api = server({ latest: none });
+      const store = newStore();
+
+      const pending = store.getState().init();
+      expect(store.getState().status).toBe("idle"); // loading, synchronously
+      await pending;
+
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, error: null, prepareNeedsCheck: null });
+      expect(api.calls).toHaveLength(1);
+      expect(api.calls[0]).toMatchObject({ key: "latest", url: LATEST_URL, method: "GET" });
+      expect(api.calls[0].signal).toBeInstanceOf(AbortSignal);
+      // Settled: the deadline timer is gone, and it never fires afterwards.
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS * 3);
+      expect(api.calls[0].signal?.aborted).toBe(false);
+      expect(store.getState().status).toBe("editing");
+      expect(api.calls).toHaveLength(1);
+    });
+
+    it.each(RESTORED)("a valid %s attempt (%j) is restored as %s — nothing is signed, submitted, prepared or cancelled", async (state, extra, shown) => {
+      const api = server({ latest: latestOf(state, extra) });
+      const store = newStore();
+      await store.getState().init();
+
+      expect(store.getState()).toMatchObject({ status: shown, attempt: { id: `attempt-${state}`, state } });
+      expect(store.getState().status).not.toBe("status_unavailable");
+      expect(api.keys()).toEqual(["latest"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("the signing context comes only from the server: present -> resumable, absent -> cancel-only with the different-passkey message", async () => {
+      server({ latest: (n) => (n === 1 ? latestOf("awaiting_authorization")() : latestOf("awaiting_authorization", { subOrganizationId: null, authorizingCredentialId: null })()) });
+      const store = newStore();
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", error: null });
+
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "stranded", subOrganizationId: null, authorizingCredentialId: null });
+      expect(store.getState().error).toMatch(/different passkey/);
+    });
+
+    it("HTTP 401 keeps its old behavior: the plain form, no attempt, no error — and it is not 'unavailable'", async () => {
+      const api = server({ latest: () => jsonResponse(401, { error: "Not authenticated." }) });
+      const store = newStore();
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, subOrganizationId: null, error: null });
+      expect(api.count("latest")).toBe(1);
+    });
+  });
+
+  describe("anything else is 'status_unavailable' — never 'no payment'", () => {
+    const hostile = { ...baseAttempt(), id: "attempt-hostile", state: "awaiting_authorization" };
+    it.each([
+      ["HTTP 404", () => jsonResponse(404, { error: "Not found." })],
+      ["HTTP 404 whose body claims there is no payment", () => jsonResponse(404, { attempt: null })],
+      ["HTTP 403", () => jsonResponse(403, { error: "Forbidden." })],
+      ["HTTP 409", () => jsonResponse(409, { error: "Conflict." })],
+      ["HTTP 429", () => jsonResponse(429, { error: "Slow down.", code: "rate_limited" })],
+      ["HTTP 500", () => jsonResponse(500, { error: "boom" })],
+      ["HTTP 500 whose body claims there is no payment", () => jsonResponse(500, { attempt: null })],
+      ["HTTP 500 whose body carries an attempt", () => jsonResponse(500, { attempt: hostile, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" })],
+      ["HTTP 503 with an HTML body", () => new Response("<html>Service Unavailable</html>", { status: 503 })],
+      ["a network failure", () => {
+        throw new TypeError("Failed to fetch");
+      }],
+      ["an HTTP 200 that is not JSON", () => new Response("<html>", { status: 200 })],
+      ["an HTTP 200 with an empty body", () => new Response("", { status: 200 })],
+      ["an HTTP 200 of JSON null", () => jsonResponse(200, null)],
+      ["an HTTP 200 of a JSON array", () => jsonResponse(200, [])],
+      ["a reply with no attempt key", () => jsonResponse(200, {})],
+      ["a reply with no attempt key but a signing context", () => jsonResponse(200, { subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" })],
+      ["a string attempt", () => jsonResponse(200, { attempt: "nope" })],
+      ["a numeric attempt", () => jsonResponse(200, { attempt: 7 })],
+      ["a false attempt", () => jsonResponse(200, { attempt: false })],
+      ["an array attempt", () => jsonResponse(200, { attempt: [] })],
+      ["an attempt of an unknown state", () => jsonResponse(200, { attempt: { ...baseAttempt(), state: "mystery" } })],
+      ["an attempt with no state", () => jsonResponse(200, { attempt: { ...baseAttempt(), state: undefined } })],
+      ["an attempt with no id", () => jsonResponse(200, { attempt: { ...baseAttempt(), id: undefined } })],
+      ["an attempt with an empty id", () => jsonResponse(200, { attempt: { ...baseAttempt(), id: "" } })],
+      ["an attempt with a numeric id", () => jsonResponse(200, { attempt: { ...baseAttempt(), id: 12 } })],
+    ] as const)("%s: unavailable, nothing shown or kept, one GET, no retry — then an explicit check can succeed", async (_name, latest) => {
+      const api = server({ latest: (n) => (n === 1 ? latest() : none()) });
+      const store = newStore();
+      store.setState({ recipientInput: ADDRESS, amountInput: "5" });
+
+      await store.getState().init();
+
+      expect(store.getState()).toMatchObject({ ...UNAVAILABLE, recipientInput: "", amountInput: "", prepareNeedsCheck: null, prepareCheck: "idle" });
+      // No network, parse or server text reaches the state the page renders from.
+      expect(JSON.stringify(store.getState())).not.toMatch(/Failed to fetch|boom|html|Unexpected|JSON|Not found|Forbidden|Conflict|Slow down|attempt-hostile/);
+      expect(api.keys()).toEqual(["latest"]); // exactly one read: no automatic retry, nothing else
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+
+      await store.getState().checkPaymentsAgain();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, error: null });
+      expect(api.keys()).toEqual(["latest", "latest"]);
+    });
+
+    it("nothing happens by itself afterwards: no retry, polling, prepare, cancel, submit or signing — however long the page stays open", async () => {
+      vi.useFakeTimers();
+      const { api, store } = await unavailableStore();
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      store.getState().setPageVisible(false);
+      store.getState().setPageVisible(true);
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      expect(api.keys()).toEqual(["latest"]);
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("an unexpected failure while restoring a payment fails closed: init() still resolves, and no half-restored payment or signing context is left on screen", async () => {
+      const api = server({ latest: latestOf("awaiting_authorization") });
+      const store = newStore();
+      // A subscriber that throws exactly once, the moment the attempt is applied — i.e. in the middle of adoption.
+      let thrown = false;
+      const unsubscribe = store.subscribe((state) => {
+        if (state.attempt && !thrown) {
+          thrown = true;
+          throw new Error("render exploded");
+        }
+      });
+
+      await expect(store.getState().init()).resolves.toBeUndefined();
+      unsubscribe();
+
+      expect(thrown).toBe(true);
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+      expect(JSON.stringify(store.getState())).not.toMatch(/render exploded|sub-org-1|credential-1/);
+      expect(api.keys()).toEqual(["latest"]);
+    });
+
+    it("a failed init clears a previous unresolved-prepare (D-1) flag — and Review is blocked by the unavailable state instead", async () => {
+      const api = server({ latest: () => jsonResponse(500, { error: "boom" }) });
+      const store = newStore();
+      store.setState({ status: "editing", prepareNeedsCheck: "uncertain", prepareCheck: "unavailable" });
+
+      await store.getState().init();
+
+      expect(store.getState()).toMatchObject({ ...UNAVAILABLE, prepareNeedsCheck: null, prepareCheck: "idle" });
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      expect(store.getState().status).toBe("status_unavailable");
+      expect(api.keys()).toEqual(["latest"]);
+    });
+  });
+
+  describe("the 45-second client deadline", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    it("a GET that never answers stays loading until the deadline, then is unavailable; the request is aborted; nothing is retried", async () => {
+      const api = server({ latest: () => new Promise<Response>(() => {}) });
+      const store = newStore();
+      const pending = store.getState().init();
+
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS - 1);
+      expect(store.getState().status).toBe("idle");
+      expect(api.calls[0].signal?.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+      expect(api.calls[0].signal?.aborted).toBe(true);
+      expect(JSON.stringify(store.getState())).not.toMatch(/longer than usual|abort|timed out/i);
+
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS * 10);
+      expect(api.keys()).toEqual(["latest"]);
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+    });
+
+    it("a reply whose BODY never arrives is bounded by the same deadline", async () => {
+      const api = server({ latest: () => ({ status: 200, ok: true, json: () => new Promise(() => {}) }) as unknown as Response });
+      const store = newStore();
+      const pending = store.getState().init();
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await pending;
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+      expect(api.calls[0].signal?.aborted).toBe(true);
+    });
+
+    it("headers in time but a body that arrives only AFTER the deadline: that late body is ignored, even when it carries a payment", async () => {
+      let deliver: (json: unknown) => void = () => {};
+      const body = new Promise<unknown>((resolve) => (deliver = resolve));
+      const api = server({ latest: () => ({ status: 200, ok: true, json: () => body }) as unknown as Response });
+      const store = newStore();
+      const pending = store.getState().init();
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await pending;
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+
+      deliver({ attempt: attemptIn("awaiting_authorization"), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await settle();
+
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+      expect(api.keys()).toEqual(["latest"]);
+    });
+
+    it.each([
+      ["a network failure", () => Promise.reject(new TypeError("Failed to fetch"))],
+      ["an HTTP 500", () => jsonResponse(500, { error: "boom" })],
+      ["a malformed reply", () => jsonResponse(200, {})],
+    ] as const)("a read that fails outright (%s) leaves no timer behind and is never aborted later", async (_name, latest) => {
+      const api = server({ latest: latest as Handler });
+      const store = newStore();
+      await store.getState().init();
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS * 2);
+      expect(api.calls[0].signal?.aborted).toBe(false);
+      expect(api.keys()).toEqual(["latest"]);
+    });
+
+    it.each([
+      ["a payment waiting for approval", (gate: ReturnType<typeof held>) => gate.resolve(latestOf("awaiting_authorization")())],
+      ["'no payment'", (gate: ReturnType<typeof held>) => gate.resolve(none())],
+      ["a rejection", (gate: ReturnType<typeof held>) => gate.reject(new TypeError("Failed to fetch"))],
+      ["an abort rejection", (gate: ReturnType<typeof held>) => gate.reject(new DOMException("The operation was aborted.", "AbortError"))],
+    ] as const)("an answer that arrives after the deadline (%s) is ignored — and is never an unhandled rejection", async (_name, late) => {
+      const gate = held();
+      const api = server({ latest: () => gate.promise });
+      const store = newStore();
+      const pending = store.getState().init();
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await pending;
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+
+      late(gate);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await settle();
+
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+      expect(api.keys()).toEqual(["latest"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("the deadline never fires over a restored payment: adoption's own slow status read does not turn into 'unavailable'", async () => {
+      // Already past its validity window, so adoption itself starts one (held) status read.
+      const expired = { ...baseAttempt(), prepared: { ...PREPARED_FIELDS, validUntil: 1 } };
+      const api = server({
+        latest: () => jsonResponse(200, { attempt: expired, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) }),
+        status: () => new Promise<Response>(() => {}),
+      });
+      const store = newStore();
+      const pending = store.getState().init();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: "attempt-1" } });
+      expect(api.keys()).toEqual(["latest", "status"]);
+
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS * 2);
+      await pending;
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: "attempt-1" } });
+      expect(api.calls[0].signal?.aborted).toBe(false); // the /latest read was never aborted: it had settled
+      expect(api.count("latest")).toBe(1);
+    });
+
+    it("after a timeout another explicit check is allowed, is its own single GET, and can time out again", async () => {
+      const api = server({ latest: (n) => (n < 3 ? new Promise<Response>(() => {}) : latestOf("prepared")()) });
+      const store = newStore();
+      const first = store.getState().init();
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await first;
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+
+      const second = store.getState().checkPaymentsAgain();
+      expect(store.getState().status).toBe("idle");
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await second;
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+      expect(api.count("latest")).toBe(2);
+
+      await store.getState().checkPaymentsAgain();
+      expect(store.getState()).toMatchObject({ status: "stranded", attempt: { id: "attempt-prepared" } });
+      expect(api.keys()).toEqual(["latest", "latest", "latest"]);
+    });
+
+    it("an OLD request's timeout fires after a newer init already restored a payment: the newer state is untouched", async () => {
+      const api = server({ latest: (n) => (n === 1 ? new Promise<Response>(() => {}) : latestOf("awaiting_authorization")()) });
+      const store = newStore();
+      const older = store.getState().init();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await store.getState().init(); // e.g. the form's effect ran again
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: "attempt-awaiting_authorization" } });
+
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await older;
+
+      expect(api.calls[0].signal?.aborted).toBe(true); // only the old request's own wait ended
+      expect(api.calls[1].signal?.aborted).toBe(false);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: "attempt-awaiting_authorization" }, authorizingCredentialId: "credential-1" });
+    });
+
+    it("a timeout after an account switch is not applied to the other account", async () => {
+      const api = server({ latest: (n) => (n === 1 ? new Promise<Response>(() => {}) : none()) });
+      const store = newStore();
+      const forA = store.getState().init();
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await forA;
+      // Not applied at all: account B's own init() (the form's account effect) decides what B sees.
+      expect(store.getState().status).toBe("idle");
+
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
+      expect(api.count("latest")).toBe(2);
+    });
+
+    it("a timeout after reset() or detach() changes nothing", async () => {
+      server({ latest: () => new Promise<Response>(() => {}) });
+      const afterReset = newStore();
+      const one = afterReset.getState().init();
+      afterReset.getState().reset();
+      const afterDetach = newStore();
+      const two = afterDetach.getState().init();
+      afterDetach.getState().detach();
+
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await Promise.all([one, two]);
+
+      expect(afterReset.getState()).toMatchObject({ status: "editing", attempt: null, error: null });
+      expect(afterDetach.getState()).toMatchObject({ status: "idle", attempt: null, error: null });
+    });
+  });
+
+  describe("stale answers never touch a newer lifecycle", () => {
+    const LATE: ReadonlyArray<readonly [string, (gate: ReturnType<typeof held>) => void]> = [
+      ["a payment", (gate) => gate.resolve(latestOf("awaiting_authorization")())],
+      ["an HTTP 500", (gate) => gate.resolve(jsonResponse(500, { error: "boom" }))],
+      ["a malformed reply", (gate) => gate.resolve(jsonResponse(200, {}))],
+      ["a network failure", (gate) => gate.reject(new TypeError("Failed to fetch"))],
+    ];
+
+    it.each(LATE)("reset() during the GET, then %s: still the reset's clean form", async (_name, late) => {
+      const gate = held();
+      server({ latest: () => gate.promise });
+      const store = newStore();
+      const pending = store.getState().init();
+      store.getState().reset();
+      late(gate);
+      await pending;
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, subOrganizationId: null, error: null });
+    });
+
+    it.each(LATE)("detach() during the GET, then %s: nothing is applied", async (_name, late) => {
+      const gate = held();
+      server({ latest: () => gate.promise });
+      const store = newStore();
+      const pending = store.getState().init();
+      store.getState().detach();
+      late(gate);
+      await pending;
+      expect(store.getState()).toMatchObject({ status: "idle", attempt: null, subOrganizationId: null, error: null });
+    });
+
+    it.each(LATE)("an account switch during the GET, then %s: nothing is applied to the other account", async (_name, late) => {
+      const gate = held();
+      server({ latest: () => gate.promise });
+      const store = newStore();
+      const pending = store.getState().init();
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+      late(gate);
+      await pending;
+      expect(store.getState()).toMatchObject({ status: "idle", attempt: null, subOrganizationId: null, authorizingCredentialId: null, error: null });
+    });
+
+    it.each(LATE)("a remount (detach, init) while the first GET is pending, then %s from the first: only the remount's own answer counts", async (_name, late) => {
+      const first = held();
+      const second = held();
+      const api = server({ latest: (n) => (n === 1 ? first.promise : second.promise) });
+      const store = newStore();
+      const older = store.getState().init();
+      store.getState().detach();
+      const newer = store.getState().init();
+
+      late(first);
+      await older;
+      expect(store.getState()).toMatchObject({ status: "idle", attempt: null }); // the remount is still loading
+
+      second.resolve(latestOf("prepared")());
+      await newer;
+      expect(store.getState()).toMatchObject({ status: "stranded", attempt: { id: "attempt-prepared" } });
+      expect(api.count("latest")).toBe(2);
+    });
+
+    it.each(LATE)("an older init answering with %s AFTER a newer init succeeded cannot overwrite it", async (_name, late) => {
+      const first = held();
+      server({ latest: (n) => (n === 1 ? first.promise : latestOf("submitted")()) });
+      const store = newStore();
+      const older = store.getState().init();
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "submitted", attempt: { id: "attempt-submitted" } });
+
+      late(first);
+      await older;
+      expect(store.getState()).toMatchObject({ status: "submitted", attempt: { id: "attempt-submitted", state: "submitted" }, error: null });
+    });
+
+    it("a retry while the earlier request is still settling: the earlier answer is dropped, the retry's answer is the one applied", async () => {
+      vi.useFakeTimers();
+      const first = held();
+      const second = held();
+      const api = server({ latest: (n) => (n === 1 ? first.promise : n === 2 ? second.promise : none()) });
+      const store = newStore();
+      const initial = store.getState().init();
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS);
+      await initial;
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+
+      const retry = store.getState().checkPaymentsAgain();
+      // The first request finally answers — with a payment — while the retry is loading.
+      first.resolve(latestOf("awaiting_authorization")());
+      await vi.advanceTimersByTimeAsync(0);
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "idle", attempt: null, authorizingCredentialId: null });
+
+      second.resolve(jsonResponse(503, { error: "later" }));
+      await retry;
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+
+      await store.getState().checkPaymentsAgain();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
+      expect(api.keys()).toEqual(["latest", "latest", "latest"]);
+    });
+  });
+
+  describe("nothing can be prepared while unavailable (store-level, not only the hidden form)", () => {
+    it.each([
+      ["an address", ADDRESS],
+      ["an @name", "@smit"],
+    ] as const)("review() refuses for %s: no review screen, no lookup, no request", async (_name, recipient) => {
+      const { api, store } = await unavailableStore(none, { lookup: () => jsonResponse(200, { found: true, handle: "smit", displayName: "Smit Patel", isSelf: false }) });
+      store.getState().setRecipientInput(recipient);
+      store.getState().setAmountInput("1");
+
+      await store.getState().review();
+
+      expect(store.getState()).toMatchObject({ status: "status_unavailable", attempt: null, error: null });
+      expect(api.keys()).toEqual(["latest"]);
+    });
+
+    it("confirmAndSend() refuses: no prepare, no signing, state unchanged", async () => {
+      const { api, store } = await unavailableStore(none, { prepare: () => jsonResponse(200, { attempt: attemptIn("awaiting_authorization"), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1 }) });
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("1");
+
+      await store.getState().confirmAndSend();
+
+      expect(store.getState()).toMatchObject({ status: "status_unavailable", attempt: null });
+      expect(api.count("prepare")).toBe(0);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("the same inputs DO reach prepare once the state is the ordinary form — the refusal above is the unavailable state's, not the fixture's", async () => {
+      const api = server({ latest: none, prepare: () => jsonResponse(200, { attempt: attemptIn("awaiting_authorization"), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) }) });
+      const store = newStore();
+      await store.getState().init();
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      expect(store.getState().status).toBe("reviewing");
+      await store.getState().confirmAndSend();
+      expect(api.count("prepare")).toBe(1);
+    });
+
+    it("no other action is a way out: editAgain, cancel, resumeAuthorization, lookupRecipient, checkStatus, checkSubmittedStatus, checkPreparedPayment and typing all leave it unavailable and send nothing", async () => {
+      const { api, store } = await unavailableStore(none, { cancel: () => jsonResponse(200, { attempt: null }), lookup: () => jsonResponse(200, { found: false }) });
+
+      store.getState().editAgain();
+      await store.getState().cancel();
+      await store.getState().resumeAuthorization();
+      store.getState().setRecipientInput("@smit");
+      store.getState().setAmountInput("1");
+      await store.getState().lookupRecipient();
+      await store.getState().checkStatus();
+      await store.getState().checkSubmittedStatus();
+      store.setState({ prepareNeedsCheck: "uncertain" });
+      await store.getState().checkPreparedPayment();
+
+      expect(store.getState()).toMatchObject({ status: "status_unavailable", attempt: null });
+      expect(api.keys()).toEqual(["latest"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("checkPaymentsAgain(): the explicit retry", () => {
+    it.each(["idle", "editing", "reviewing", "preparing", "awaiting_authorization", "submitting", "submitted", "confirmed", "failed", "unknown", "stranded"] as const)("does nothing while the status is %s", async (status) => {
+      const api = server({ latest: none });
+      const store = newStore();
+      store.setState({ status, recipientInput: ADDRESS, amountInput: "1" });
+
+      await store.getState().checkPaymentsAgain();
+
+      expect(api.calls).toHaveLength(0);
+      expect(store.getState()).toMatchObject({ status, recipientInput: ADDRESS, amountInput: "1" });
+    });
+
+    it("does nothing after detach() (the Pay form is gone)", async () => {
+      const { api, store } = await unavailableStore();
+      store.getState().detach();
+      expect(store.getState().status).toBe("status_unavailable");
+
+      await store.getState().checkPaymentsAgain();
+
+      expect(api.keys()).toEqual(["latest"]);
+      expect(store.getState().status).toBe("status_unavailable");
+    });
+
+    it("rapid repeated presses send exactly one GET, and the page is loading meanwhile", async () => {
+      const gate = held();
+      const { api, store } = await unavailableStore(() => gate.promise);
+
+      const first = store.getState().checkPaymentsAgain();
+      const second = store.getState().checkPaymentsAgain();
+      const third = store.getState().checkPaymentsAgain();
+      expect(store.getState().status).toBe("idle");
+      expect(api.count("latest")).toBe(2); // the failed mount read + exactly one retry
+
+      gate.resolve(none());
+      await Promise.all([first, second, third]);
+
+      expect(api.keys()).toEqual(["latest", "latest"]);
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
+    });
+
+    it("a retry that fails again stays unavailable; each press is its own single GET", async () => {
+      const { api, store } = await unavailableStore((n) => (n === 2 ? jsonResponse(200, {}) : n === 3 ? Promise.reject(new TypeError("Failed to fetch")) : none()));
+
+      await store.getState().checkPaymentsAgain();
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+      expect(api.count("latest")).toBe(2);
+
+      await store.getState().checkPaymentsAgain();
+      expect(store.getState()).toMatchObject(UNAVAILABLE);
+      expect(api.count("latest")).toBe(3);
+
+      await store.getState().checkPaymentsAgain();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
+      expect(api.keys()).toEqual(["latest", "latest", "latest", "latest"]);
+    });
+
+    it("a retry that finds the session gone (401) shows the plain form, as init always has", async () => {
+      const { store } = await unavailableStore(() => jsonResponse(401, { error: "Not authenticated." }));
+      await store.getState().checkPaymentsAgain();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, error: null });
+    });
+
+    it.each(RESTORED)("a successful retry restores a %s attempt (%j) as %s — by reading only, with no prepare, submit, cancel or signing", async (state, extra, shown) => {
+      const { api, store } = await unavailableStore(latestOf(state, extra));
+
+      await store.getState().checkPaymentsAgain();
+
+      expect(store.getState()).toMatchObject({ status: shown, attempt: { id: `attempt-${state}`, state } });
+      expect(api.keys()).toEqual(["latest", "latest"]);
+      expect(api.calls.every((call) => call.method === "GET")).toBe(true);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("D-1's prepare recovery is unchanged", () => {
+    /** Review and Approve an address payment whose prepare ends in HTTP 500; later /latest reads are `latest`. */
+    async function afterUnresolvedPrepare(latest: Handler) {
+      const api = server({ latest: (n) => (n === 1 ? none() : latest(n)), prepare: () => jsonResponse(500, { error: "Something went wrong." }) });
+      const store = newStore();
+      await store.getState().init();
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain", prepareCheck: "idle" });
+      return { api, store };
+    }
+
+    it("a failed D-1 check stays on the form with its own 'unavailable' check result — it never becomes status_unavailable, and Check again does nothing there", async () => {
+      const { api, store } = await afterUnresolvedPrepare(() => jsonResponse(500, { error: "boom" }));
+
+      await store.getState().checkPreparedPayment();
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain", prepareCheck: "unavailable", recipientInput: ADDRESS, amountInput: "1" });
+
+      await store.getState().checkPaymentsAgain();
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain", prepareCheck: "unavailable", recipientInput: ADDRESS, amountInput: "1" });
+      expect(api.keys()).toEqual(["latest", "prepare", "latest"]);
+    });
+
+    it.each(["confirmed", "failed"] as const)("the same %s answer: the D-1 check does NOT adopt it, while a reload (init) still restores it", async (state) => {
+      const { store } = await afterUnresolvedPrepare(latestOf(state));
+
+      await store.getState().checkPreparedPayment();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, prepareNeedsCheck: null, prepareCheck: "nothing_found" });
+
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: state, attempt: { id: `attempt-${state}`, state } });
+    });
+  });
+});
