@@ -5381,3 +5381,453 @@ describe("real-payment-store — L-2 D-3a: safe initial payment status check", (
     });
   });
 });
+
+/**
+ * L-2 D-2: the prepare route answers HTTP 409 for two different things. Only
+ * the exact pair "HTTP 409 + code 'account_not_ready'" is a definitive refusal
+ * (nothing was started; there is nothing to check): the ordinary form returns
+ * with fixed copy and the typed text. Every other 409 keeps D-1's "check the
+ * payment's status" requirement, and nothing uncertain (500, network failure,
+ * unreadable reply) ever becomes a definitive refusal. Fake server only: no
+ * network, no signing, no Turnkey, no bundler.
+ */
+describe("real-payment-store — L-2 D-2: prepare 409 disambiguation (account not ready)", () => {
+  const ADDRESS = "0x3333333333333333333333333333333333333333";
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const SERVER_SENTENCE = "Your account isn't fully set up yet.";
+  const NOT_READY_BODY = { error: SERVER_SENTENCE, code: "account_not_ready" };
+  const FIXED_NOT_READY = "We can't send payments from this account right now. This payment wasn't started.";
+  const UNCERTAIN_BODY = { error: "We couldn't confirm this payment's setup. No money was sent by this request. Refresh the app to check its status before trying again.", code: "prepare_outcome_uncertain" };
+
+  type Key = "prepare" | "latest" | "cancel" | "status" | "submit";
+  type Handler = (n: number) => Response | Promise<Response>;
+  const stores: Array<ReturnType<typeof createRealPaymentStore>> = [];
+
+  beforeEach(() => {
+    vi.mocked(signPreparedPayment).mockClear();
+  });
+
+  afterEach(() => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockClear();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  function server(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key; url: string; method: string }> = [];
+    const counts: Record<Key, number> = { prepare: 0, latest: 0, cancel: 0, status: 0, submit: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/prepare") ? "prepare" : url.endsWith("/api/real/payments/latest") ? "latest" : url.endsWith("/cancel") ? "cancel" : url.endsWith("/status") ? "status" : url.endsWith("/api/real/payments/submit") ? "submit" : null;
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        calls.push({ key, url, method });
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, count: (key: Key) => calls.filter((call) => call.key === key).length, keys: () => calls.map((call) => call.key) };
+  }
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    const promise = new Promise<Response>((res) => (resolve = res));
+    return { promise, resolve };
+  }
+
+  function newStore() {
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+    const store = createRealPaymentStore();
+    stores.push(store);
+    store.setState({ status: "editing" });
+    store.getState().setRecipientInput(ADDRESS);
+    store.getState().setAmountInput("1");
+    return store;
+  }
+
+  /** Drives a fresh store through Review and Approve; `prepare` decides how the request ends. */
+  async function afterPrepare(prepare: Handler, others: Partial<Record<Key, Handler>> = {}) {
+    const api = server({ prepare, ...others });
+    const store = newStore();
+    await store.getState().review();
+    expect(store.getState().status).toBe("reviewing");
+    await store.getState().confirmAndSend();
+    return { api, store };
+  }
+
+  const notReady = () => jsonResponse(409, NOT_READY_BODY);
+
+  describe("the exact refusal: HTTP 409 + code 'account_not_ready'", () => {
+    it("returns to ordinary editing with the fixed copy, the typed text, no status-check requirement, and nothing else happens", async () => {
+      const { api, store } = await afterPrepare(notReady);
+
+      expect(store.getState()).toMatchObject({
+        status: "editing",
+        error: FIXED_NOT_READY,
+        recipientInput: ADDRESS,
+        amountInput: "1",
+        prepareNeedsCheck: null,
+        prepareCheck: "idle",
+        attempt: null,
+        subOrganizationId: null,
+        authorizingCredentialId: null,
+        pendingSubmission: null,
+        isAuthorizing: false,
+        isCancelling: false,
+      });
+      // One prepare and nothing else: no /latest, no retry, no cancel, no status read, no signing, no submit.
+      expect(api.keys()).toEqual(["prepare"]);
+      expect(api.calls[0]).toMatchObject({ method: "POST" });
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("the exported constant is the approved wording, and the server's own sentence is never kept", async () => {
+      const { PREPARE_ACCOUNT_NOT_READY_MESSAGE } = await import("@/lib/stores/real-payment-store");
+      expect(PREPARE_ACCOUNT_NOT_READY_MESSAGE).toBe(FIXED_NOT_READY);
+
+      const { store } = await afterPrepare(notReady);
+      expect(store.getState().error).toBe(FIXED_NOT_READY);
+      expect(JSON.stringify(store.getState())).not.toContain(SERVER_SENTENCE);
+    });
+
+    it.each([
+      ["a different sentence", { error: "Anything at all — <b>not shown</b>.", code: "account_not_ready" }],
+      ["no sentence", { code: "account_not_ready" }],
+      ["extra fields", { error: SERVER_SENTENCE, code: "account_not_ready", retryable: true, detail: "0xdeadbeef" }],
+    ] as const)("is decided by status and code only, never by the sentence (%s)", async (_name, body) => {
+      const { api, store } = await afterPrepare(() => jsonResponse(409, body));
+
+      expect(store.getState()).toMatchObject({ status: "editing", error: FIXED_NOT_READY, prepareNeedsCheck: null, recipientInput: ADDRESS, amountInput: "1" });
+      expect(JSON.stringify(store.getState())).not.toMatch(/not shown|deadbeef/);
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("nothing follows by itself — a day later there has still been exactly one request", async () => {
+      vi.useFakeTimers();
+      const { api, store } = await afterPrepare(notReady);
+
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+
+      expect(api.keys()).toEqual(["prepare"]);
+      expect(store.getState()).toMatchObject({ status: "editing", error: FIXED_NOT_READY, prepareNeedsCheck: null });
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("'Check payment status' and Cancel have nothing to act on: neither sends a request", async () => {
+      const { api, store } = await afterPrepare(notReady, { latest: () => jsonResponse(200, { attempt: null }), cancel: () => jsonResponse(200, {}) });
+
+      await store.getState().checkPreparedPayment();
+      await store.getState().cancel();
+      await store.getState().resumeAuthorization();
+
+      expect(api.keys()).toEqual(["prepare"]);
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: null, prepareCheck: "idle", attempt: null });
+    });
+
+    it("editing a field clears the message like any other form error", async () => {
+      const { store } = await afterPrepare(notReady);
+
+      store.getState().setAmountInput("2");
+
+      expect(store.getState()).toMatchObject({ status: "editing", error: null, amountInput: "2", recipientInput: ADDRESS, prepareNeedsCheck: null });
+    });
+
+    it("a handle payment gets the same answer and keeps its resolved name (the refusal is not about the recipient)", async () => {
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          calls.push(url);
+          if (url.endsWith("/api/real/recipients/lookup")) return jsonResponse(200, { found: true, handle: "smit", displayName: "Smit Patel", isSelf: false });
+          if (url.endsWith("/api/real/payments/prepare")) return notReady();
+          throw new Error(`unexpected fetch: ${url}`);
+        }),
+      );
+      useRealAccountStore.setState({ account: ACCOUNT_A });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      store.setState({ status: "editing" });
+      store.getState().setRecipientInput("@smit");
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      expect(store.getState().status).toBe("reviewing");
+
+      await store.getState().confirmAndSend();
+
+      expect(store.getState()).toMatchObject({ status: "editing", error: FIXED_NOT_READY, recipientInput: "@smit", amountInput: "1", prepareNeedsCheck: null, recipientLookup: { status: "found", handle: "smit", displayName: "Smit Patel", isSelf: false } });
+      expect(calls.filter((url) => url.endsWith("/prepare"))).toHaveLength(1);
+      expect(calls.filter((url) => url.endsWith("/lookup"))).toHaveLength(1);
+    });
+  });
+
+  describe("every other HTTP 409 keeps D-1's status-check requirement", () => {
+    it.each([
+      ["no code (the in-progress sentence)", { error: "You already have a payment in progress." }],
+      ["no code (the account sentence alone is not enough)", { error: SERVER_SENTENCE }],
+      ["code 'payment_in_progress'", { error: "You already have a payment in progress.", code: "payment_in_progress" }],
+      ["an unknown code", { error: SERVER_SENTENCE, code: "account_locked" }],
+      ["an empty code", { error: SERVER_SENTENCE, code: "" }],
+      ["upper case", { error: SERVER_SENTENCE, code: "ACCOUNT_NOT_READY" }],
+      ["mixed case", { error: SERVER_SENTENCE, code: "Account_Not_Ready" }],
+      ["leading whitespace", { error: SERVER_SENTENCE, code: " account_not_ready" }],
+      ["trailing whitespace", { error: SERVER_SENTENCE, code: "account_not_ready\n" }],
+      ["a longer code that contains it", { error: SERVER_SENTENCE, code: "account_not_ready_yet" }],
+      ["a hyphenated look-alike", { error: SERVER_SENTENCE, code: "account-not-ready" }],
+      ["a numeric code", { error: SERVER_SENTENCE, code: 409 }],
+      ["a null code", { error: SERVER_SENTENCE, code: null }],
+      ["a boolean code", { error: SERVER_SENTENCE, code: true }],
+      ["an array code", { error: SERVER_SENTENCE, code: ["account_not_ready"] }],
+      ["an object code", { error: SERVER_SENTENCE, code: { value: "account_not_ready" } }],
+      ["the code as the error text", { error: "account_not_ready" }],
+      ["the code under another key", { error: SERVER_SENTENCE, outcome: "account_not_ready", reason: "account_not_ready" }],
+      ["a nested code", { error: SERVER_SENTENCE, data: { code: "account_not_ready" } }],
+      ["a JSON string body", "account_not_ready"],
+      ["a JSON array body", [{ code: "account_not_ready" }]],
+    ] as const)("%s: in_progress, no fixed refusal copy, Review refused until checked", async (_name, body) => {
+      const { api, store } = await afterPrepare(() => jsonResponse(409, body));
+
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "in_progress", prepareCheck: "idle", error: null, recipientInput: ADDRESS, amountInput: "1", attempt: null });
+      expect(api.keys()).toEqual(["prepare"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+
+      // D-1's safeguard is intact: no second prepare while the check is outstanding.
+      await store.getState().review();
+      expect(store.getState().status).toBe("editing");
+      store.setState({ status: "reviewing" });
+      await store.getState().confirmAndSend();
+      expect(api.count("prepare")).toBe(1);
+      expect(store.getState().prepareNeedsCheck).toBe("in_progress");
+    });
+
+    it("a real in-progress 409 still leads to the explicit check, which adopts the server's active payment", async () => {
+      const active = { ...baseAttempt(), id: "attempt-active", state: "submitted" };
+      const { api, store } = await afterPrepare(() => jsonResponse(409, { error: "You already have a payment in progress." }), {
+        latest: () => jsonResponse(200, { attempt: active, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) }),
+        status: () => jsonResponse(200, { attempt: active, reconciliationDeferred: false, serverNowSeconds: Math.floor(Date.now() / 1000) }),
+      });
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "in_progress" });
+      expect(api.keys()).toEqual(["prepare"]);
+
+      await store.getState().checkPreparedPayment();
+
+      expect(store.getState()).toMatchObject({ status: "submitted", attempt: { id: "attempt-active", state: "submitted" }, prepareNeedsCheck: null });
+      expect(api.keys().slice(0, 2)).toEqual(["prepare", "latest"]);
+      expect(api.count("prepare")).toBe(1);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("nothing uncertain becomes a definitive refusal", () => {
+    it.each([
+      ["an HTTP 409 with an HTML body", () => new Response("<html>409 Conflict</html>", { status: 409 })],
+      ["an HTTP 409 with an empty body", () => new Response("", { status: 409 })],
+      ["an HTTP 409 whose plain-text body names the code", () => new Response("account_not_ready", { status: 409 })],
+      ["an HTTP 409 with truncated JSON", () => new Response('{"error":"Your account isn\'t fully set up yet.","code":"account_not_ready"', { status: 409 })],
+      ["an HTTP 409 whose JSON body is null", () => jsonResponse(409, null)],
+      ["an HTTP 500 carrying the code", () => jsonResponse(500, NOT_READY_BODY)],
+      ["an HTTP 500 carrying the code and no sentence", () => jsonResponse(500, { code: "account_not_ready" })],
+      ["the server's prepare_outcome_uncertain (C-1)", () => jsonResponse(500, UNCERTAIN_BODY)],
+      ["a generic HTTP 500", () => jsonResponse(500, { error: "Something went wrong. Please try again." })],
+      ["an unreadable success reply that names the code", () => new Response("account_not_ready", { status: 200 })],
+    ] as const)("%s: uncertain — a status check is required and no refusal copy is shown", async (_name, prepare) => {
+      const { api, store } = await afterPrepare(prepare);
+
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain", prepareCheck: "idle", error: null, recipientInput: ADDRESS, amountInput: "1", attempt: null });
+      expect(api.keys()).toEqual(["prepare"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a rejected fetch ('Failed to fetch')", new TypeError("Failed to fetch")],
+      ["a rejected fetch whose message names the code", new Error("account_not_ready")],
+      ["a rejected fetch shaped like the refusal", Object.assign(new Error(SERVER_SENTENCE), { status: 409, code: "account_not_ready" })],
+    ] as const)("%s: uncertain — only a real HTTP answer can be a refusal", async (_name, failure) => {
+      const { api, store } = await afterPrepare(() => {
+        throw failure;
+      });
+
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain", error: null, recipientInput: ADDRESS, amountInput: "1" });
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it.each([400, 401, 404, 429, 502, 503] as const)("HTTP %i carrying the code keeps its existing handling: the server's message, no fixed refusal copy, no check requirement", async (status) => {
+      const { api, store } = await afterPrepare(() => jsonResponse(status, { error: "The server's own message.", code: "account_not_ready" }));
+
+      expect(store.getState()).toMatchObject({ status: "editing", error: "The server's own message.", prepareNeedsCheck: null, recipientInput: ADDRESS, amountInput: "1" });
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+  });
+
+  describe("a late refusal is discarded", () => {
+    async function pendingPrepare() {
+      const gate = held();
+      const api = server({ prepare: () => gate.promise, latest: () => jsonResponse(200, { attempt: null }) });
+      const store = newStore();
+      await store.getState().review();
+      const pending = store.getState().confirmAndSend();
+      expect(store.getState().status).toBe("preparing");
+      return { api, store, pending, answer: () => gate.resolve(notReady()) };
+    }
+
+    it("after reset(): the fresh form shows no refusal and no typed text", async () => {
+      const { api, store, pending, answer } = await pendingPrepare();
+
+      store.getState().reset();
+      answer();
+      await pending;
+
+      expect(store.getState()).toMatchObject({ status: "editing", error: null, prepareNeedsCheck: null, prepareCheck: "idle", recipientInput: "", amountInput: "", attempt: null });
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("after detach(): nothing is written", async () => {
+      const { api, store, pending, answer } = await pendingPrepare();
+
+      store.getState().detach();
+      const before = store.getState();
+      answer();
+      await pending;
+
+      expect(store.getState()).toBe(before);
+      expect(store.getState()).toMatchObject({ error: null, prepareNeedsCheck: null });
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("after an account switch: the other account never sees it", async () => {
+      const { api, store, pending, answer } = await pendingPrepare();
+
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+      const before = store.getState();
+      answer();
+      await pending;
+
+      expect(store.getState()).toBe(before);
+      expect(store.getState()).toMatchObject({ error: null, prepareNeedsCheck: null });
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("after a new lifecycle's init(): the new page keeps what init found", async () => {
+      const { api, store, pending, answer } = await pendingPrepare();
+
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "editing", error: null, recipientInput: "" });
+      answer();
+      await pending;
+
+      expect(store.getState()).toMatchObject({ status: "editing", error: null, prepareNeedsCheck: null, recipientInput: "", amountInput: "" });
+      expect(api.keys()).toEqual(["prepare", "latest"]);
+    });
+
+    it("after sign-out: nothing is written", async () => {
+      const { store, pending, answer } = await pendingPrepare();
+
+      useRealAccountStore.setState({ account: null });
+      const before = store.getState();
+      answer();
+      await pending;
+
+      expect(store.getState()).toBe(before);
+    });
+  });
+
+  describe("a second explicit Review", () => {
+    it("sends exactly one further prepare; the same refusal returns the same state (the accepted repeat)", async () => {
+      const { api, store } = await afterPrepare(notReady);
+      expect(api.count("prepare")).toBe(1);
+
+      await store.getState().review();
+      expect(store.getState()).toMatchObject({ status: "reviewing", error: null });
+      expect(api.count("prepare")).toBe(1); // Review alone prepares nothing
+
+      await store.getState().confirmAndSend();
+
+      expect(api.keys()).toEqual(["prepare", "prepare"]);
+      expect(store.getState()).toMatchObject({ status: "editing", error: FIXED_NOT_READY, prepareNeedsCheck: null, recipientInput: ADDRESS, amountInput: "1", attempt: null });
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("a later attempt that the server accepts proceeds normally, with the message gone", async () => {
+      // The passkey prompt is dismissed (set here, not left to whatever an earlier suite installed), so the accepted payment simply waits.
+      vi.mocked(signPreparedPayment).mockRejectedValueOnce(Object.assign(new Error("dismissed"), { name: "NotAllowedError" }));
+      const ready = { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) };
+      const { api, store } = await afterPrepare((n) => (n === 1 ? notReady() : jsonResponse(200, ready)));
+
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+
+      expect(api.keys()).toEqual(["prepare", "prepare"]);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: "attempt-1" }, prepareNeedsCheck: null });
+      expect(store.getState().error).not.toBe(FIXED_NOT_READY);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1); // the stubbed passkey prompt, dismissed — for the accepted payment only
+      expect(api.count("submit")).toBe(0);
+    });
+
+    it("a later 409 without the code asks for the status check as before", async () => {
+      const { api, store } = await afterPrepare((n) => (n === 1 ? notReady() : jsonResponse(409, { error: "You already have a payment in progress." })));
+
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+
+      expect(api.keys()).toEqual(["prepare", "prepare"]);
+      expect(store.getState()).toMatchObject({ status: "editing", error: null, prepareNeedsCheck: "in_progress", prepareCheck: "idle" });
+    });
+
+    it("the old loop is closed: 409 in progress -> check finds nothing -> Review -> the refusal ends on the form, not on another check", async () => {
+      const { api, store } = await afterPrepare((n) => (n === 1 ? jsonResponse(409, { error: "You already have a payment in progress." }) : notReady()), { latest: () => jsonResponse(200, { attempt: null }) });
+      expect(store.getState().prepareNeedsCheck).toBe("in_progress");
+
+      await store.getState().checkPreparedPayment();
+      expect(store.getState()).toMatchObject({ prepareNeedsCheck: null, prepareCheck: "nothing_found" });
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+
+      expect(api.keys()).toEqual(["prepare", "latest", "prepare"]);
+      expect(store.getState()).toMatchObject({ status: "editing", error: FIXED_NOT_READY, prepareNeedsCheck: null, prepareCheck: "idle" });
+    });
+  });
+
+  describe("D-3a is untouched", () => {
+    it("the refusal never becomes status_unavailable, and 'Check again' does nothing on the form", async () => {
+      const { api, store } = await afterPrepare(notReady, { latest: () => jsonResponse(200, { attempt: null }) });
+
+      await store.getState().checkPaymentsAgain();
+
+      expect(store.getState()).toMatchObject({ status: "editing", error: FIXED_NOT_READY, prepareNeedsCheck: null });
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("a failed first read is still status_unavailable — even when its 409 carries the code — and nothing can be prepared there", async () => {
+      const api = server({ latest: () => jsonResponse(409, NOT_READY_BODY), prepare: notReady });
+      useRealAccountStore.setState({ account: ACCOUNT_A });
+      const store = createRealPaymentStore();
+      stores.push(store);
+
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "status_unavailable", error: null, attempt: null });
+
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+
+      expect(store.getState().status).toBe("status_unavailable");
+      expect(api.keys()).toEqual(["latest"]);
+    });
+
+    it("a new lifecycle's init() drops the refusal message and reads /latest once", async () => {
+      const { api, store } = await afterPrepare(notReady, { latest: () => jsonResponse(200, { attempt: null }) });
+
+      await store.getState().init();
+
+      expect(store.getState()).toMatchObject({ status: "editing", error: null, prepareNeedsCheck: null, recipientInput: "", amountInput: "" });
+      expect(api.keys()).toEqual(["prepare", "latest"]);
+    });
+  });
+});

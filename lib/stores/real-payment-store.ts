@@ -173,8 +173,9 @@ export type RealPaymentStore = {
   isSubmitRetryBeyondApproval: boolean;
   /**
    * L-2 D-1: set when a prepare request ended without a trustworthy answer
-   * (HTTP 500 including the server's `prepare_outcome_uncertain`, HTTP 409, a
-   * network failure or an unreadable reply). A payment MAY exist on the server
+   * (HTTP 500 including the server's `prepare_outcome_uncertain`, HTTP 409 —
+   * except, since L-2 D-2, the exact `account_not_ready` refusal — a network
+   * failure or an unreadable reply). A payment MAY exist on the server
    * even though this page never saw it — and an existing one holds the account's
    * only active-payment slot. While set, Review is not offered and review() /
    * confirmAndSend() refuse: the one way out is a successful, current
@@ -300,12 +301,31 @@ export const PAYMENTS_UNAVAILABLE_DETAIL = "Check again before starting a new pa
  * 500 (incl. `prepare_outcome_uncertain`) and a non-ApiError (network failure,
  * unreadable reply) are "uncertain"; 409 is "in_progress". Everything else —
  * 400/401/404/429, the known `prepare_failed` 502 — keeps its own handling.
+ * (L-2 D-2: the caller takes the exact `account_not_ready` 409 out first — see
+ * isAccountNotReadyRefusal below.)
  */
 function classifyPrepareFailure(error: unknown): "uncertain" | "in_progress" | null {
   if (!(error instanceof ApiError)) return "uncertain";
   if (error.status === 500) return "uncertain";
   if (error.status === 409) return "in_progress";
   return null;
+}
+
+/** L-2 D-2: fixed client copy for the one definitive prepare 409. The server's own sentence is never shown. */
+export const PREPARE_ACCOUNT_NOT_READY_MESSAGE = "We can't send payments from this account right now. This payment wasn't started.";
+
+/**
+ * L-2 D-2: the ONE prepare 409 that is a definitive refusal rather than "a
+ * payment may exist" — HTTP 409 AND the body's `code` exactly
+ * "account_not_ready" (the server decides it before any charge, provider call
+ * or row). Exact status and exact string only: no sentence matching, no case
+ * folding, no trimming. Every other 409 (no code, another code, a non-string
+ * code) stays "in_progress" in classifyPrepareFailure above, which is
+ * deliberately left unaware of this exception — if this check is ever removed
+ * the answer falls back to D-1's status check, never to a plain form.
+ */
+function isAccountNotReadyRefusal(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409 && error.code === "account_not_ready";
 }
 
 const KNOWN_ATTEMPT_STATES: ReadonlySet<string> = new Set<RealPaymentAttemptState>(["prepared", "awaiting_authorization", "signed", "submitting", "submitted", "confirmed", "failed", "cancelled", "unknown"]);
@@ -1458,6 +1478,11 @@ export function createRealPaymentStore() {
           // stale, so drop it. The typed text stays for the user to fix.
           const staleRecipient = view.kind === "found" && error instanceof ApiError && (error.status === 404 || error.status === 400);
           if (staleRecipient) lookupSequence++;
+          // L-2 D-2: the server refused this request outright (exact 409 + code) — no payment was started by it, so there is nothing to check. Back to the ordinary form with fixed copy and the typed text; nothing is read, retried, cancelled or signed. Checked BEFORE the D-1 classification, which would otherwise ask for a status check that can never resolve it.
+          if (isAccountNotReadyRefusal(error)) {
+            set({ status: "editing", error: PREPARE_ACCOUNT_NOT_READY_MESSAGE });
+            return;
+          }
           // L-2 D-1: no trustworthy answer — a payment may exist that this page never saw. Nothing is retried, read, cancelled or signed here; the typed text stays and the user is asked to check explicitly. A fixed message replaces the raw network/parse text.
           const unresolved = classifyPrepareFailure(error);
           if (unresolved) {

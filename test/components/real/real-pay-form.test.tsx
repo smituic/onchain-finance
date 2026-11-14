@@ -2293,3 +2293,235 @@ describe("RealPayForm — L-2 D-3a: initial payment check unavailable", () => {
     });
   });
 });
+
+/**
+ * L-2 D-2: the one definitive prepare 409 (HTTP 409 + code "account_not_ready")
+ * returns to the ordinary form with fixed copy — no recovery block, Review still
+ * there, the typed text kept. Every other 409 keeps D-1's "Check payment
+ * status". A fake server only — no network, no passkey, no provider.
+ */
+describe("RealPayForm — L-2 D-2: prepare refused because the account can't send", () => {
+  const NOT_READY = "We can't send payments from this account right now. This payment wasn't started.";
+  const SERVER_SENTENCE = "Your account isn't fully set up yet.";
+  const NOT_READY_BODY = { error: SERVER_SENTENCE, code: "account_not_ready" };
+  const UNCERTAIN = "We couldn't confirm whether your payment was set up. Check its status before trying again.";
+  const IN_PROGRESS = "A payment may already be in progress. Check its status before trying again.";
+  const NONE = "No payment is waiting. You can review your payment again.";
+
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Key = "latest" | "prepare" | "cancel" | "submit" | "status" | "lookup";
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  /** Every request is recorded, including one no handler expects. */
+  function stub(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; method: string }> = [];
+    const counts: Record<Key, number> = { latest: 0, prepare: 0, cancel: 0, submit: 0, status: 0, lookup: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url.endsWith("/api/real/account/balance")) return jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" });
+        const key: Key | null = url.endsWith("/api/real/payments/latest")
+          ? "latest"
+          : url.endsWith("/api/real/payments/prepare")
+            ? "prepare"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/api/real/payments/submit")
+                ? "submit"
+                : url.endsWith("/status")
+                  ? "status"
+                  : url.endsWith("/api/real/recipients/lookup")
+                    ? "lookup"
+                    : null;
+        calls.push({ key: key ?? "other", method });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, count: (key: Key) => calls.filter((call) => call.key === key).length, keys: () => calls.map((call) => call.key) };
+  }
+
+  const none = () => jsonResponse(200, { attempt: null });
+
+  async function typeAndReview(amount = "1.00") {
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: amount } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+  }
+
+  /** Mounts the form, types an address payment and approves it; `prepare` decides how the request ends. */
+  async function approve(prepare: Handler, others: Partial<Record<Key, Handler>> = {}) {
+    const api = stub({ latest: none, prepare, ...others });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    await typeAndReview();
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    return api;
+  }
+
+  it("shows the fixed message on the ordinary form: no recovery block, Review available, typed values kept, the server's wording never displayed", async () => {
+    const api = await approve(() => jsonResponse(409, NOT_READY_BODY));
+
+    await waitFor(() => expect(screen.getByText(NOT_READY)).toBeInTheDocument());
+
+    expect(screen.getByTestId("real-pay-form")).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-prepare-recovery")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Check payment status" })).toBeNull();
+    expect(screen.queryByTestId("real-pay-prepare-none")).toBeNull();
+    expect(screen.queryByTestId("real-pay-status-unavailable")).toBeNull();
+    expect(screen.queryByTestId("real-pay-review")).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeEnabled();
+    expect(screen.getByLabelText("To")).toHaveValue(RECIPIENT);
+    expect(screen.getByLabelText("Amount")).toHaveValue("1.00");
+    // Fixed client copy only: not the server's sentence, not D-1's notices, no code.
+    expect(screen.queryByText(SERVER_SENTENCE)).toBeNull();
+    expect(screen.queryByText(/fully set up|account_not_ready|Request failed/)).toBeNull();
+    expect(screen.queryByText(IN_PROGRESS)).toBeNull();
+    expect(screen.queryByText(UNCERTAIN)).toBeNull();
+    for (const name of ["Approve", "Continue", "Cancel payment", "Check again", "Check status", "Try again"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+    // The mount read and the one prepare — nothing else, and nothing by itself.
+    expect(api.keys()).toEqual(["latest", "prepare"]);
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
+
+  it("the server's sentence does not matter: a different one still shows only the fixed message", async () => {
+    await approve(() => jsonResponse(409, { error: "Internal: safe_address failed validation for app-user-1", code: "account_not_ready" }));
+
+    await waitFor(() => expect(screen.getByText(NOT_READY)).toBeInTheDocument());
+
+    expect(screen.queryByText(/safe_address|app-user-1|Internal/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeEnabled();
+  });
+
+  it("a second explicit Review and Approve sends exactly one further prepare; the same refusal shows the same form again", async () => {
+    const api = await approve(() => jsonResponse(409, NOT_READY_BODY));
+    await waitFor(() => expect(screen.getByText(NOT_READY)).toBeInTheDocument());
+    expect(api.count("prepare")).toBe(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    // Opening Review prepares nothing and drops the old message.
+    expect(api.count("prepare")).toBe(1);
+    expect(screen.queryByText(NOT_READY)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(screen.getByText(NOT_READY)).toBeInTheDocument());
+
+    expect(api.keys()).toEqual(["latest", "prepare", "prepare"]);
+    expect(screen.getByRole("button", { name: "Review" })).toBeEnabled();
+    expect(screen.queryByTestId("real-pay-prepare-recovery")).toBeNull();
+    expect(screen.getByLabelText("To")).toHaveValue(RECIPIENT);
+    expect(screen.getByLabelText("Amount")).toHaveValue("1.00");
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
+
+  it("editing a field clears the message and keeps Review", async () => {
+    await approve(() => jsonResponse(409, NOT_READY_BODY));
+    await waitFor(() => expect(screen.getByText(NOT_READY)).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "2.00" } });
+
+    expect(screen.queryByText(NOT_READY)).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeEnabled();
+    expect(screen.queryByTestId("real-pay-prepare-recovery")).toBeNull();
+  });
+
+  it.each([
+    ["no code", { error: "You already have a payment in progress." }],
+    ["the account sentence without the code", { error: SERVER_SENTENCE }],
+    ["code 'payment_in_progress'", { error: "You already have a payment in progress.", code: "payment_in_progress" }],
+    ["an unknown code", { error: SERVER_SENTENCE, code: "account_locked" }],
+    ["the code in the wrong case", { error: SERVER_SENTENCE, code: "ACCOUNT_NOT_READY" }],
+    ["a non-string code", { error: SERVER_SENTENCE, code: 409 }],
+  ] as const)("an HTTP 409 with %s still shows D-1's recovery: the in-progress notice and Check payment status instead of Review", async (_name, body) => {
+    const api = await approve(() => jsonResponse(409, body));
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+
+    expect(screen.getByText(IN_PROGRESS)).toBeInTheDocument();
+    expect(screen.queryByText(NOT_READY)).toBeNull();
+    expect(screen.queryByText(SERVER_SENTENCE)).toBeNull();
+    expect(screen.getByRole("button", { name: "Check payment status" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    expect(screen.getByLabelText("To")).toHaveValue(RECIPIENT);
+    expect(screen.getByLabelText("Amount")).toHaveValue("1.00");
+    expect(api.keys()).toEqual(["latest", "prepare"]);
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an HTTP 500 carrying the code", () => jsonResponse(500, NOT_READY_BODY)],
+    ["an HTTP 409 with an unreadable body", () => new Response("<html>409</html>", { status: 409 })],
+    ["a network failure", () => { throw new TypeError("Failed to fetch"); }],
+  ] as const)("%s is still an unresolved prepare: the uncertain notice and Check payment status, never the refusal", async (_name, prepare) => {
+    const api = await approve(prepare as Handler);
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+
+    expect(screen.getByText(UNCERTAIN)).toBeInTheDocument();
+    expect(screen.queryByText(NOT_READY)).toBeNull();
+    expect(screen.queryByText(/Failed to fetch|fully set up/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    expect(api.keys()).toEqual(["latest", "prepare"]);
+  });
+
+  it("a real in-progress 409 still needs the explicit check, which shows the server's active payment — the refusal copy never appears", async () => {
+    const api = await approve(() => jsonResponse(409, { error: "You already have a payment in progress." }), {
+      latest: (n) => (n === 1 ? none() : jsonResponse(200, { attempt: attemptFixture({ state: "prepared", prepared: null }), subOrganizationId: null, authorizingCredentialId: null, serverNowSeconds: Math.floor(Date.now() / 1000) })),
+    });
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+    expect(api.count("latest")).toBe(1); // nothing was checked automatically
+
+    fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+    expect(screen.queryByText(NOT_READY)).toBeNull();
+    expect(api.keys()).toEqual(["latest", "prepare", "latest"]);
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+  });
+
+  it("the old loop ends on the form: in-progress 409 -> check finds nothing -> Review -> the refusal, with Review (not another check) on offer", async () => {
+    const api = await approve((n) => (n === 1 ? jsonResponse(409, { error: "You already have a payment in progress." }) : jsonResponse(409, NOT_READY_BODY)));
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+    await waitFor(() => expect(screen.getByText(NONE)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(screen.getByText(NOT_READY)).toBeInTheDocument());
+
+    expect(screen.queryByTestId("real-pay-prepare-recovery")).toBeNull();
+    expect(screen.queryByText(NONE)).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeEnabled();
+    expect(api.keys()).toEqual(["latest", "prepare", "latest", "prepare"]);
+  });
+
+  it("a remount starts clean: the message is gone and the page does its one ordinary first read", async () => {
+    const api = await approve(() => jsonResponse(409, NOT_READY_BODY));
+    await waitFor(() => expect(screen.getByText(NOT_READY)).toBeInTheDocument());
+
+    cleanup();
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+
+    expect(screen.queryByText(NOT_READY)).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeEnabled();
+    expect(api.keys()).toEqual(["latest", "prepare", "latest"]);
+  });
+});

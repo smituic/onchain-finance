@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { createInMemoryRealAccountRegistry, getInMemoryRegistryInternals } from "@/lib/real/server/registry";
@@ -8,7 +10,11 @@ import { createInMemoryAccountHandleStore } from "@/lib/real/server/account-hand
 import { createSessionPayload, serializeSession } from "@/lib/real/server/session";
 import type { PaymentAttemptStore } from "@/lib/real/server/payment-attempts";
 import { GENERIC_SERVER_ERROR_MESSAGE } from "@/lib/real/server/http";
+import { createPublicClient, custom, encodeAbiParameters } from "viem";
+import { baseSepolia } from "viem/chains";
+import { rpcBlock } from "./fixtures/chain-block";
 import { openBudget, scriptedBudget } from "./fixtures/chain-read-budget";
+import { recordingRateLimiter } from "./fixtures/rate-limit";
 
 /**
  * Pre-2f hardening: this repo's other tests exercise the resolveX functions
@@ -435,5 +441,223 @@ describe("2g-H: backup setup routes require a fresh step-up by the session crede
     }
     expect(await enrollments.findActiveByAppUserId("app-user-1")).toBeNull();
     expect(created.filter((c) => c.purpose === "backup_registration")).toHaveLength(0);
+  });
+});
+
+/**
+ * L-2 D-2: the prepare route's two 409s. `account_not_ready` (a stored Safe or
+ * owner address that fails validation) is decided before any budget charge,
+ * chain read, reservation or provider call, and now carries an additive `code`
+ * so the client can tell it from "a payment already exists". Every other body —
+ * `payment_in_progress` above all — is exactly what it was. The actual route.ts
+ * code, an in-memory registry and payment store, an in-process fake chain RPC
+ * and a Pimlico module that fails the test if it is ever reached.
+ */
+describe("POST /api/real/payments/prepare — L-2 D-2: 409 response bodies (actual route.ts code)", () => {
+  const RECIPIENT = "0x2222222222222222222222222222222222222222";
+  const CASH_TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+  const ACCOUNT_SENTENCE = "Your account isn't fully set up yet.";
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.doUnmock("next/headers");
+    vi.doUnmock("@/lib/real/server/runtime");
+    vi.doUnmock("@/lib/real/chain/client");
+    vi.doUnmock("@/lib/real/server/pimlico");
+  });
+
+  /** `account` overrides what the registry returns for the signed-in account (how a malformed stored address is simulated). */
+  async function setup(options: { account?: { safeAddress?: string; ownerAddress?: string }; signedIn?: boolean } = {}) {
+    vi.resetModules();
+    stubRequiredConfigEnv();
+    const seeded = await seedRegistry();
+    const stored = await seeded.findAccountByAppUserId("app-user-1");
+    const registry = options.account ? { ...seeded, findAccountByAppUserId: async () => ({ ...stored!, ...options.account }) } : seeded;
+    const { createInMemoryPaymentAttemptStore } = await import("@/lib/real/server/payment-attempts");
+    const paymentStore = createInMemoryPaymentAttemptStore();
+    const storeCalls: string[] = [];
+    const countedStore: PaymentAttemptStore = {
+      ...paymentStore,
+      reserve: async (input) => {
+        storeCalls.push("reserve");
+        return paymentStore.reserve(input);
+      },
+      reserveHandlePayment: async (input) => {
+        storeCalls.push("reserveHandlePayment");
+        return paymentStore.reserveHandlePayment(input);
+      },
+      transition: async (input) => {
+        storeCalls.push("transition");
+        return paymentStore.transition(input);
+      },
+    };
+    const { limiter, charges } = recordingRateLimiter();
+    const rpc: string[] = [];
+    const pimlico = { calls: 0 };
+    const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
+    const cookieValue = serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: "credential-1", sessionEpoch: 0 }), REAL_SESSION_SECRET_VALUE);
+    vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar(options.signedIn === false ? {} : { [REAL_SESSION_COOKIE_NAME]: cookieValue }) }));
+    vi.doMock("@/lib/real/server/runtime", () => ({
+      getRealAccountRegistry: () => registry,
+      getPaymentAttemptStore: () => countedStore,
+      getRateLimiter: () => limiter,
+      getProviderBudgetLimiter: () => openBudget(),
+    }));
+    vi.doMock("@/lib/real/chain/client", () => ({
+      createRealPublicClient: () =>
+        createPublicClient({
+          chain: baseSepolia,
+          transport: custom({
+            request: async ({ method, params }: { method: string; params?: unknown[] }) => {
+              rpc.push(method);
+              if (method === "eth_chainId") return `0x${baseSepolia.id.toString(16)}`;
+              if (method === "eth_getBlockByNumber") return rpcBlock({ timestamp: BigInt(1_900_000_000) });
+              if (method === "eth_call") {
+                const selector = ((params?.[0] ?? {}) as { data?: string }).data?.slice(0, 10);
+                if (selector === "0x70a08231") return encodeAbiParameters([{ type: "uint256" }], [BigInt(100_000_000)]);
+                if (selector === "0x313ce567") return encodeAbiParameters([{ type: "uint8" }], [6]);
+              }
+              throw new Error(`Unexpected RPC method in an offline test: ${method}`);
+            },
+          }),
+        }),
+    }));
+    const reached = async () => {
+      pimlico.calls += 1;
+      throw new Error("Pimlico must not be reached in this test");
+    };
+    vi.doMock("@/lib/real/server/pimlico", () => ({ prepareCashTransferUserOperation: reached, sendPreparedUserOperation: reached, fetchUserOperationReceipt: reached }));
+    const { POST } = await import("@/app/api/real/payments/prepare/route");
+    const prepare = (body: unknown = { recipient: RECIPIENT, amountBaseUnits: "1000000" }) =>
+      POST(new Request("http://localhost/api/real/payments/prepare", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+    return { prepare, paymentStore, storeCalls, charges, rpc, pimlico, registry };
+  }
+
+  it.each([
+    ["a stored Safe address that fails validation", { safeAddress: "not-an-address" }],
+    ["an empty stored Safe address", { safeAddress: "" }],
+    ["a stored owner address that fails validation", { ownerAddress: "0x1234" }],
+    ["both addresses unusable", { safeAddress: "0x", ownerAddress: "" }],
+  ] as const)("account_not_ready (%s): HTTP 409 with the existing sentence and exactly the additive code — nothing charged, read, reserved or sent", async (_name, account) => {
+    const { prepare, paymentStore, storeCalls, charges, rpc, pimlico } = await setup({ account });
+
+    const response = await prepare();
+
+    expect(response.status).toBe(409);
+    expect(response.headers.get("content-type")).toMatch(/^application\/json/);
+    expect(response.headers.get("Retry-After")).toBeNull();
+    const raw = await response.text();
+    const body = JSON.parse(raw) as Record<string, unknown>;
+    expect(body).toEqual({ error: ACCOUNT_SENTENCE, code: "account_not_ready" });
+    expect(Object.keys(body).sort()).toEqual(["code", "error"]);
+    // Nothing about the account leaves the server with it.
+    expect(raw).not.toMatch(/not-an-address|0x1234|app-user-1|sub-org-1|credential-1/);
+    // Decided before the budget, the chain, the reservation and the provider.
+    expect(charges).toHaveLength(0);
+    expect(rpc).toHaveLength(0);
+    expect(storeCalls).toHaveLength(0);
+    expect(pimlico.calls).toBe(0);
+    expect(await paymentStore.findLatestByAppUserId("app-user-1")).toBeNull();
+  });
+
+  it("account_not_ready wins over a malformed selector and amount: the same body whatever the request asked for", async () => {
+    const { prepare, charges, storeCalls } = await setup({ account: { safeAddress: "not-an-address" } });
+
+    for (const body of [{ recipient: "nope", amountBaseUnits: "abc" }, { recipientHandle: "smit", amountBaseUnits: "1000000" }, {}]) {
+      const response = await prepare(body);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ error: ACCOUNT_SENTENCE, code: "account_not_ready" });
+    }
+    expect(charges).toHaveLength(0);
+    expect(storeCalls).toHaveLength(0);
+  });
+
+  it("payment_in_progress is unchanged: HTTP 409, its existing sentence, and NO code — with the existing payment untouched", async () => {
+    const { prepare, paymentStore, storeCalls, charges, pimlico } = await setup();
+    const existing = await paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SAFE_ADDRESS, recipient: RECIPIENT, amountBaseUnits: "10000", chainId: 84532, tokenAddress: CASH_TOKEN, authorizingCredentialId: "credential-1" });
+    if (!existing.ok) throw new Error("expected reservation");
+    const before = structuredClone(await paymentStore.findById(existing.attempt.id));
+
+    const response = await prepare();
+
+    expect(response.status).toBe(409);
+    expect(response.headers.get("Retry-After")).toBeNull();
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body).toEqual({ error: "You already have a payment in progress." });
+    expect(Object.keys(body)).toEqual(["error"]);
+    expect(body).not.toHaveProperty("code");
+    // The request got as far as the reservation, which refused it; nothing was prepared or changed.
+    expect(charges).toHaveLength(1);
+    expect(storeCalls).toEqual(["reserve"]);
+    expect(pimlico.calls).toBe(0);
+    expect(await paymentStore.findById(existing.attempt.id)).toEqual(before);
+  });
+
+  it("the two 409s differ only as intended: same status, different sentence, and the code on account_not_ready alone", async () => {
+    const notReady = await (await setup({ account: { safeAddress: "not-an-address" } })).prepare();
+    const world = await setup();
+    await world.paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SAFE_ADDRESS, recipient: RECIPIENT, amountBaseUnits: "10000", chainId: 84532, tokenAddress: CASH_TOKEN, authorizingCredentialId: "credential-1" });
+    const inProgress = await world.prepare();
+
+    expect([notReady.status, inProgress.status]).toEqual([409, 409]);
+    const [a, b] = [(await notReady.json()) as Record<string, unknown>, (await inProgress.json()) as Record<string, unknown>];
+    expect(a.code).toBe("account_not_ready");
+    expect("code" in b).toBe(false);
+    expect(a.error).not.toBe(b.error);
+  });
+
+  it("the other refusals keep their exact bodies, with no code added", async () => {
+    const signedOut = await (await setup({ signedIn: false })).prepare();
+    expect(signedOut.status).toBe(401);
+    expect(await signedOut.json()).toEqual({ error: "Not authenticated." });
+
+    const { prepare } = await setup();
+    const cases: Array<[unknown, number, unknown]> = [
+      [{ recipient: "nope", amountBaseUnits: "1000000" }, 400, { error: "Enter a valid recipient address." }],
+      [{ recipient: RECIPIENT, recipientHandle: "smit", amountBaseUnits: "1000000" }, 400, { error: "Enter a valid recipient address." }],
+      [{ recipientHandle: "@Smit", amountBaseUnits: "1000000" }, 400, { error: "Enter a valid @name." }],
+      [{ recipient: RECIPIENT, amountBaseUnits: "0" }, 400, { error: "Enter a valid Cash amount." }],
+      [{ recipient: RECIPIENT, amountBaseUnits: "999000000" }, 400, { error: "Enter a valid Cash amount." }],
+      [{ recipient: RECIPIENT, amountBaseUnits: "100000001" }, 400, { error: "Enter a valid Cash amount." }],
+    ];
+    for (const [body, status, expected] of cases) {
+      const response = await prepare(body);
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual(expected);
+    }
+  });
+
+  it("an unexpected exception is still the generic 500 — never a 409, never the code", async () => {
+    const { prepare, registry } = await setup();
+    (registry as { findAccountByAppUserId: unknown }).findAccountByAppUserId = async () => {
+      throw new Error("ECONNREFUSED postgres://user:pass@host/db account_not_ready");
+    };
+
+    const response = await prepare();
+
+    expect(response.status).toBe(500);
+    const raw = await response.text();
+    expect(JSON.parse(raw)).toEqual({ error: GENERIC_SERVER_ERROR_MESSAGE });
+    expect(raw).not.toMatch(/account_not_ready|postgres|ECONNREFUSED/);
+  });
+
+  it("the balance route's account_not_ready is NOT given the code (out of scope, unchanged)", async () => {
+    await setup({ account: { safeAddress: "not-an-address" } });
+    const { GET } = await import("@/app/api/real/account/balance/route");
+
+    const response = await GET();
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: ACCOUNT_SENTENCE });
+  });
+
+  it("source guard: the route names the code once, on the account_not_ready case, and gives payment_in_progress none", () => {
+    const source = readFileSync(resolve(process.cwd(), "app/api/real/payments/prepare/route.ts"), "utf8");
+    expect(source.match(/code: "account_not_ready"/g)).toHaveLength(1);
+    const accountCase = source.slice(source.indexOf('case "account_not_ready":'), source.indexOf('case "invalid_recipient":'));
+    expect(accountCase).toContain('{ error: "Your account isn\'t fully set up yet.", code: "account_not_ready" }, { status: 409 }');
+    const inProgressCase = source.slice(source.indexOf('case "payment_in_progress":'), source.indexOf('case "prepare_failed":'));
+    expect(inProgressCase).toContain('return jsonError("You already have a payment in progress.", 409);');
+    expect(inProgressCase).not.toContain("code");
   });
 });

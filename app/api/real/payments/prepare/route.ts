@@ -59,7 +59,12 @@ export async function POST(request: Request) {
       case "unauthenticated":
         return jsonError("Not authenticated.", 401);
       case "account_not_ready":
-        return jsonError("Your account isn't fully set up yet.", 409);
+        // L-2 D-2: this route's two 409s mean different things, so this one
+        // carries a `code`. It is a definitive refusal decided before any
+        // budget charge, provider call or row: no payment was started by this
+        // request. `payment_in_progress` below deliberately stays code-less —
+        // the client treats every other 409 as "check the payment's status".
+        return Response.json({ error: "Your account isn't fully set up yet.", code: "account_not_ready" }, { status: 409 });
       case "invalid_recipient":
         return jsonError("Enter a valid recipient address.", 400);
       case "invalid_recipient_handle":
