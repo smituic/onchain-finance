@@ -53,7 +53,13 @@ export async function POST(request: Request) {
       case "wrong_state":
         return jsonError(`This payment is no longer awaiting authorization (state: ${outcome.state}).`, 409);
       case "wrong_passkey":
-        return jsonError("This payment was started with a different passkey. Cancel it and start a new payment.", 409);
+        // L-2 D-4: this route's two 409s mean different things, so this one
+        // carries a `code`. It is decided before this request's claim, budget
+        // charge or any provider call, on a row still awaiting authorization:
+        // THIS request sent nothing. (It is not a statement about any other
+        // session.) `wrong_state` above deliberately stays code-less — the
+        // client treats every other 409 as "check the payment's status".
+        return Response.json({ error: "This payment was started with a different passkey. Cancel it and start a new payment.", code: "wrong_passkey" }, { status: 409 });
       case "authorization_unavailable":
         // Nothing changed and nothing was sent — the same signature may be retried.
         return Response.json({ error: "We couldn't confirm your passkey approval yet. Try again in a moment.", retryable: true }, { status: 503 });

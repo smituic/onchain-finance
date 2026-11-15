@@ -3974,7 +3974,9 @@ describe("real-payment-store — 3A-2 Stage 2: submit cooldown and submit-respon
     s.script(jsonResponse(500, { error: "Something went wrong. Please try again." }));
     await store.getState().resumeAuthorization();
 
-    expect(store.getState()).toMatchObject({ status: "unknown", isSubmitCoolingDown: false, error: "Something went wrong. Please try again." });
+    // L-2 D-4: the outcome is as conservative as before; the detail shown is now fixed client copy, not the server's sentence.
+    expect(store.getState()).toMatchObject({ status: "unknown", isSubmitCoolingDown: false, error: "We couldn't confirm whether this payment was sent. Check its status before trying again." });
+    expect(JSON.stringify(store.getState())).not.toContain("Something went wrong");
     store.getState().detach();
   });
 
@@ -5828,6 +5830,875 @@ describe("real-payment-store — L-2 D-2: prepare 409 disambiguation (account no
 
       expect(store.getState()).toMatchObject({ status: "editing", error: null, prepareNeedsCheck: null, recipientInput: "", amountInput: "" });
       expect(api.keys()).toEqual(["prepare", "latest"]);
+    });
+  });
+});
+
+/**
+ * L-2 D-4: the submit route answers HTTP 409 for two different things. Only the
+ * exact pair "HTTP 409 + code 'wrong_passkey'" is definitive about THIS request
+ * (the server refused it before any claim or dispatch, because the payment is
+ * bound to another passkey): the page goes straight to the cancel-only screen a
+ * reload would give — the approval and the credential it was made with are
+ * dropped, the payment and the account context stay, and nothing is cancelled,
+ * retried, signed or sent by itself. Every other failed submit stays "unknown"
+ * with its approval kept, and shows fixed copy instead of the server's sentence
+ * or raw network/parse text. Fake server and fake clock only: no network, no
+ * passkey ceremony, no Turnkey, no bundler.
+ */
+describe("real-payment-store — L-2 D-4: submit refusal disambiguation (exact wrong_passkey)", () => {
+  const ADDRESS = "0x3333333333333333333333333333333333333333";
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const T0_MS = 1_800_000_000_000; // a whole second, so boundary arithmetic is exact
+  const OTHER_PASSKEY = "This payment was started with a different passkey. Cancel it and start a new payment.";
+  const NEUTRAL = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
+  const CANCEL_LOST_RACE = "This payment could not be cancelled — it may already be on its way.";
+  const CANCEL_UNCONFIRMED = "Could not confirm whether this payment was cancelled. Check its status before trying again.";
+  const UNAVAILABLE_SENTENCE = "We couldn't confirm your passkey approval yet. Try again in a moment.";
+  const BUDGET_SENTENCE = "Too many tries right now. Wait a moment, then tap Continue.";
+  const WRONG_PASSKEY_BODY = { error: OTHER_PASSKEY, code: "wrong_passkey" };
+  /** What the one passkey approval of this suite produces, and so what /submit is sent. */
+  const APPROVAL = { attemptId: "attempt-1", signature: "0xsig-d4", activityId: "activity-d4" };
+  /** Server sentences, state names and raw network/parse text that must never be kept for display. */
+  const RAW_TEXT = /Failed to fetch|Cannot read|Unexpected|not valid JSON|Not authenticated|Payment not found|no longer awaiting|\(state:|could not be verified|Something went wrong|Request failed|boom|aborted/;
+
+  type Key = "prepare" | "latest" | "cancel" | "status" | "submit" | "balance";
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Store = ReturnType<typeof createRealPaymentStore>;
+  const stores: Store[] = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0_MS);
+    // Self-contained: whatever an earlier suite left on the shared signing mock
+    // (a persistent implementation or queued one-time ones) is dropped first,
+    // and this suite installs its own approval for every test.
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+  });
+
+  afterEach(async () => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    // Nothing of this suite's stays on the shared mock or the shared stores.
+    vi.mocked(signPreparedPayment).mockReset();
+    useRealAccountStore.setState({ account: null });
+    (await import("@/lib/stores/real-balance-store")).useRealBalanceStore.getState().reset();
+  });
+
+  /** Every request is recorded — including one no handler expects, which also fails the request. */
+  function server(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string; body: unknown }> = [];
+    const counts: Record<Key, number> = { prepare: 0, latest: 0, cancel: 0, status: 0, submit: 0, balance: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/prepare")
+          ? "prepare"
+          : url.endsWith("/api/real/payments/latest")
+            ? "latest"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/status")
+                ? "status"
+                : url.endsWith("/api/real/payments/submit")
+                  ? "submit"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : null;
+        calls.push({ key: key ?? "other", url, method, body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return {
+      calls,
+      keys: () => calls.map((call) => call.key),
+      count: (key: Key) => calls.filter((call) => call.key === key).length,
+      /** Everything that is not a read. */
+      writes: () => calls.filter((call) => call.method !== "GET").map((call) => call.key),
+    };
+  }
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    let reject: (error: unknown) => void = () => {};
+    const promise = new Promise<Response>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  const settle = () => vi.advanceTimersByTimeAsync(0);
+  /** The advisory clock offset that puts the approval window's end `secondsBeforeExpiry` after T0. */
+  const offsetFor = (secondsBeforeExpiry: number) => VALID_UNTIL - secondsBeforeExpiry - T0_MS / 1000;
+  const serverNow = (secondsBeforeExpiry = 100_000) => Math.floor(Date.now() / 1000) + offsetFor(secondsBeforeExpiry);
+  const wrongPasskey = () => jsonResponse(409, WRONG_PASSKEY_BODY);
+  const statusReply = (state: string, secondsBeforeExpiry = 100_000) =>
+    jsonResponse(200, { attempt: { ...baseAttempt(), state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null }, serverNowSeconds: serverNow(secondsBeforeExpiry), reconciliationDeferred: false });
+  /** What /latest answers for a payment this session's passkey CAN approve. */
+  const latestResumable = () => jsonResponse(200, { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() });
+  /** Everything in the store that is state (functions drop out) — for "nothing changed" comparisons. */
+  const visible = (store: Store) => JSON.parse(JSON.stringify(store.getState())) as Record<string, unknown>;
+
+  /** A payment waiting for this session's approval, as /prepare or /latest would have left it. */
+  function awaiting(secondsBeforeExpiry = 100_000, attempt: ReturnType<typeof baseAttempt> = baseAttempt()): Store {
+    const store = createRealPaymentStore();
+    stores.push(store);
+    store.setState({ attempt, status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: offsetFor(secondsBeforeExpiry) });
+    return store;
+  }
+
+  /** One Continue (one passkey approval, one POST /submit) answered by `submit`. */
+  async function afterSubmit(submit: Handler, options: { others?: Partial<Record<Key, Handler>>; secondsBeforeExpiry?: number; attempt?: ReturnType<typeof baseAttempt> } = {}) {
+    const api = server({ submit, ...options.others });
+    const store = awaiting(options.secondsBeforeExpiry, options.attempt);
+    const before = structuredClone(store.getState().attempt);
+    await store.getState().resumeAuthorization();
+    return { api, store, before };
+  }
+
+  /** One Continue answered by the exact refusal. */
+  const refused = (options: Parameters<typeof afterSubmit>[1] = {}) => afterSubmit(wrongPasskey, options);
+
+  describe("the exact refusal: HTTP 409 + code 'wrong_passkey'", () => {
+    it("goes straight to cancel-only: the approval and its credential are dropped, the payment and the account context are kept", async () => {
+      const { api, store, before } = await refused();
+
+      expect(store.getState()).toMatchObject({
+        status: "stranded",
+        error: OTHER_PASSKEY,
+        authorizingCredentialId: null,
+        pendingSubmission: null,
+        isAuthorizing: false,
+        // The account context stays: without it a later Continue would claim "You're signed out."
+        subOrganizationId: "sub-org-1",
+        isAttemptPastValidity: false,
+        isCancelling: false,
+        isSubmitCoolingDown: false,
+        prepareNeedsCheck: null,
+        prepareCheck: "idle",
+      });
+      // The payment itself is exactly the one that was on screen: same id, amount, recipient, stored state.
+      expect(store.getState().attempt).toEqual(before);
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "awaiting_authorization", amountBaseUnits: "1000000", recipient: "0x2222222222222222222222222222222222222222", failureReason: null, transactionHash: null });
+      // One approval, one submit of exactly that approval — and nothing else.
+      expect(api.calls.map(({ key, method, body }) => ({ key, method, body }))).toEqual([{ key: "submit", method: "POST", body: APPROVAL }]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(signPreparedPayment).mock.calls[0]![0]).toMatchObject({ authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
+    });
+
+    it("the fresh flow (Review, Approve, prepare, passkey, submit) ends the same way, on the server's attempt", async () => {
+      const api = server({
+        prepare: () => jsonResponse(200, { attempt: { ...baseAttempt(), id: "attempt-fresh", recipient: ADDRESS }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() }),
+        submit: wrongPasskey,
+      });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      store.setState({ status: "editing" });
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      expect(store.getState().status).toBe("reviewing");
+
+      await store.getState().confirmAndSend();
+
+      expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, subOrganizationId: "sub-org-1", prepareNeedsCheck: null });
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-fresh", state: "awaiting_authorization", amountBaseUnits: "1000000", recipient: ADDRESS });
+      expect(api.keys()).toEqual(["prepare", "submit"]);
+      expect(api.calls[1]!.body).toEqual({ attemptId: "attempt-fresh", signature: APPROVAL.signature, activityId: APPROVAL.activityId });
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["a different sentence", { error: "Internal: credential-backup is not credential-1 <b>not shown</b>", code: "wrong_passkey" }],
+      ["no sentence", { code: "wrong_passkey" }],
+      ["extra fields", { error: OTHER_PASSKEY, code: "wrong_passkey", retryable: false, detail: "0xdeadbeef", attempt: { id: "attempt-1", state: "confirmed" } }],
+    ] as const)("is decided by status and code only, never by the sentence, and shows the client's own copy (%s)", async (_name, body) => {
+      const { api, store, before } = await afterSubmit(() => jsonResponse(409, body));
+
+      expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY, authorizingCredentialId: null, pendingSubmission: null, subOrganizationId: "sub-org-1" });
+      // Nothing in the body is adopted: not its sentence, not its extra fields, not an "attempt".
+      expect(store.getState().attempt).toEqual(before);
+      expect(JSON.stringify(store.getState())).not.toMatch(/not shown|deadbeef|credential-backup|confirmed/);
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it("a handle payment keeps the server's stored recipient identity", async () => {
+      const attempt = { ...baseAttempt(), recipientIdentity: { handle: "smit", displayName: "Smit Patel" } };
+      const { store } = await refused({ attempt });
+
+      expect(store.getState().status).toBe("stranded");
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", recipientIdentity: { handle: "smit", displayName: "Smit Patel" }, amountBaseUnits: "1000000" });
+    });
+
+    it("an approval kept after a retryable 503, re-sent by Continue and then refused, is dropped — one passkey prompt in all", async () => {
+      const api = server({ submit: (n) => (n === 1 ? jsonResponse(503, { error: UNAVAILABLE_SENTENCE, retryable: true }) : wrongPasskey()) });
+      const store = awaiting();
+
+      await store.getState().resumeAuthorization();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1" });
+
+      await store.getState().resumeAuthorization();
+
+      expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY, pendingSubmission: null, authorizingCredentialId: null, subOrganizationId: "sub-org-1" });
+      expect(api.calls.map((call) => call.body)).toEqual([APPROVAL, APPROVAL]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("an approval re-sent after a submit wait (429) has run out and then refused leaves no wait and no approval behind", async () => {
+      const denial = () => new Response(JSON.stringify({ error: BUDGET_SENTENCE, code: "rate_limited", retryable: true }), { status: 429, headers: { "content-type": "application/json", "Retry-After": "60" } });
+      const api = server({ submit: (n) => (n === 1 ? denial() : wrongPasskey()) });
+      const store = awaiting();
+
+      await store.getState().resumeAuthorization();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isSubmitCoolingDown: true, pendingSubmission: APPROVAL });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(store.getState().isSubmitCoolingDown).toBe(false);
+      expect(api.count("submit")).toBe(1); // the wait ending sends nothing
+
+      await store.getState().resumeAuthorization();
+
+      expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY, pendingSubmission: null, authorizingCredentialId: null, isSubmitCoolingDown: false, subOrganizationId: "sub-org-1" });
+      expect(api.keys()).toEqual(["submit", "submit"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("nothing follows the refusal by itself", () => {
+    it("no request, passkey prompt, cancel or new payment — right up to the end of the approval window", async () => {
+      const { api, store } = await refused({ secondsBeforeExpiry: 100_000 });
+
+      await vi.advanceTimersByTimeAsync(99_000_000); // 99,000 s: still inside the window
+
+      expect(api.keys()).toEqual(["submit"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY, authorizingCredentialId: null, pendingSubmission: null });
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "awaiting_authorization", transactionHash: null, failureReason: null });
+    });
+
+    it("Continue cannot sign or send again: every resume and approve action is a no-op in the cancel-only state", async () => {
+      const { api, store } = await refused();
+      const before = visible(store);
+
+      await store.getState().resumeAuthorization();
+      await Promise.all([1, 2, 3].map(() => store.getState().resumeAuthorization()));
+      await store.getState().confirmAndSend();
+      await settle();
+
+      expect(visible(store)).toEqual(before);
+      expect(api.keys()).toEqual(["submit"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("a later read-only status answer of 'still waiting for approval' does not bring the passkey back: Continue falls back to cancel-only with no prompt and no request", async () => {
+      const { api, store } = await refused({ others: { status: () => statusReply("awaiting_authorization") } });
+
+      await store.getState().checkStatus();
+
+      // The existing status mapping shows the payment as waiting again — but nothing this session could sign with came back.
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", authorizingCredentialId: null, pendingSubmission: null, subOrganizationId: "sub-org-1" });
+      expect(api.calls.map(({ key, method }) => `${method} ${key}`)).toEqual(["POST submit", "GET status"]);
+
+      await store.getState().resumeAuthorization();
+
+      expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false });
+      expect(api.count("submit")).toBe(1);
+      expect(api.writes()).toEqual(["submit"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["cancelled", "editing"],
+      ["failed", "failed"],
+      ["confirmed", "confirmed"],
+      ["submitted", "submitted"],
+    ] as const)("a later status answer of '%s' is simply shown (%s): the finished or sent payment is not turned back into something to approve", async (state, shown) => {
+      const { api, store } = await refused({ others: { status: () => statusReply(state), balance: () => jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "0" }) } });
+
+      await store.getState().checkStatus();
+      expect(store.getState().status).toBe(shown);
+      expect(store.getState().attempt?.state).toBe(state);
+
+      await store.getState().resumeAuthorization();
+      await settle();
+
+      expect(store.getState().status).toBe(shown);
+      expect(store.getState()).toMatchObject({ authorizingCredentialId: null, pendingSubmission: null });
+      expect(api.writes()).toEqual(["submit"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("Cancel stays explicit and server-decided", () => {
+    it("an explicit Cancel sends exactly one request for this payment, and a server 'yes' frees the form", async () => {
+      const { api, store } = await refused({ others: { cancel: () => jsonResponse(200, { attempt: { ...baseAttempt(), state: "cancelled", prepared: null } }) } });
+      expect(api.count("cancel")).toBe(0); // never by itself
+
+      await store.getState().cancel();
+
+      expect(api.keys()).toEqual(["submit", "cancel"]);
+      expect(api.calls[1]).toMatchObject({ method: "POST", url: "/api/real/payments/attempt-1/cancel" });
+      expect(api.calls[1]!.body).toBeUndefined();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, error: null });
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("two presses while the request is on its way are one request", async () => {
+      const gate = held();
+      const { api, store } = await refused({ others: { cancel: () => gate.promise } });
+
+      const first = store.getState().cancel();
+      const second = store.getState().cancel();
+      await settle();
+      expect(store.getState().isCancelling).toBe(true);
+      gate.resolve(jsonResponse(200, { attempt: { ...baseAttempt(), state: "cancelled", prepared: null } }));
+      await Promise.all([first, second]);
+
+      expect(api.count("cancel")).toBe(1);
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, isCancelling: false });
+    });
+
+    it("a refused Cancel (another session already sent the payment) is reconciled by the existing status read — never shown as cancelled, never cancelled again", async () => {
+      const { api, store } = await refused({ others: { cancel: () => jsonResponse(409, { error: "This payment can no longer be cancelled (state: submitted)." }), status: () => statusReply("submitted") } });
+
+      await store.getState().cancel();
+
+      expect(api.calls.map(({ key, method }) => `${method} ${key}`)).toEqual(["POST submit", "POST cancel", "GET status"]);
+      expect(store.getState()).toMatchObject({ status: "submitted", error: CANCEL_LOST_RACE, authorizingCredentialId: null, pendingSubmission: null });
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "submitted" });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(api.count("cancel")).toBe(1);
+      expect(api.count("submit")).toBe(1);
+    });
+
+    it("a refused Cancel whose status read still says 'waiting' leaves a payment this session still cannot approve", async () => {
+      const { api, store } = await refused({ others: { cancel: () => jsonResponse(409, { error: "Not now." }), status: () => statusReply("awaiting_authorization") } });
+
+      await store.getState().cancel();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: CANCEL_LOST_RACE, authorizingCredentialId: null, pendingSubmission: null });
+
+      await store.getState().resumeAuthorization();
+
+      expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY });
+      expect(api.writes()).toEqual(["submit", "cancel"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("a Cancel that never gets an answer changes nothing and is not retried", async () => {
+      const { api, store } = await refused({
+        others: {
+          cancel: () => {
+            throw new TypeError("Failed to fetch");
+          },
+        },
+      });
+
+      await store.getState().cancel();
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(store.getState()).toMatchObject({ status: "stranded", error: CANCEL_UNCONFIRMED, authorizingCredentialId: null, pendingSubmission: null, isCancelling: false });
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "awaiting_authorization" });
+      expect(api.keys()).toEqual(["submit", "cancel"]);
+    });
+  });
+
+  describe("every other failed submit stays 'unknown', keeps its approval, and shows fixed copy", () => {
+    /** Conservative, in full: unknown, the fixed detail, the approval and the whole signing context kept, the payment untouched, and nothing sent after the one submit. */
+    function expectUnconfirmed(api: ReturnType<typeof server>, store: Store, before: unknown) {
+      const state = store.getState();
+      expect(state.status).toBe("unknown");
+      expect(state.error).toBe(NEUTRAL);
+      expect(state.pendingSubmission).toEqual(APPROVAL);
+      expect(state.authorizingCredentialId).toBe("credential-1");
+      expect(state.subOrganizationId).toBe("sub-org-1");
+      expect(state.isAuthorizing).toBe(false);
+      expect(state.isSubmitCoolingDown).toBe(false);
+      expect(state.attempt).toEqual(before);
+      expect(JSON.stringify(state)).not.toMatch(RAW_TEXT);
+      expect(JSON.stringify(state)).not.toContain("different passkey");
+      expect(api.keys()).toEqual(["submit"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    }
+
+    it("the exported constant is the approved wording", async () => {
+      const { SUBMIT_UNCONFIRMED_MESSAGE } = await import("@/lib/stores/real-payment-store");
+      expect(SUBMIT_UNCONFIRMED_MESSAGE).toBe(NEUTRAL);
+    });
+
+    it.each([
+      ["no code (the wrong_state sentence)", { error: "This payment is no longer awaiting authorization (state: submitted)." }],
+      ["no code (the passkey sentence alone is not enough)", { error: OTHER_PASSKEY }],
+      ["code 'wrong_state'", { error: "This payment is no longer awaiting authorization (state: signed).", code: "wrong_state" }],
+      ["an unknown code", { error: OTHER_PASSKEY, code: "wrong_credential" }],
+      ["the code in upper case", { error: OTHER_PASSKEY, code: "WRONG_PASSKEY" }],
+      ["the code in mixed case", { error: OTHER_PASSKEY, code: "Wrong_Passkey" }],
+      ["a leading space", { error: OTHER_PASSKEY, code: " wrong_passkey" }],
+      ["a trailing space", { error: OTHER_PASSKEY, code: "wrong_passkey " }],
+      ["a trailing newline", { error: OTHER_PASSKEY, code: "wrong_passkey\n" }],
+      ["a longer look-alike (suffix)", { error: OTHER_PASSKEY, code: "wrong_passkey_" }],
+      ["a longer look-alike (plural)", { error: OTHER_PASSKEY, code: "wrong_passkeys" }],
+      ["a longer look-alike (prefix)", { error: OTHER_PASSKEY, code: "xwrong_passkey" }],
+      ["a hyphenated look-alike", { error: OTHER_PASSKEY, code: "wrong-passkey" }],
+      ["an empty code", { error: OTHER_PASSKEY, code: "" }],
+      ["a numeric code", { error: OTHER_PASSKEY, code: 409 }],
+      ["a null code", { error: OTHER_PASSKEY, code: null }],
+      ["a boolean code", { error: OTHER_PASSKEY, code: true }],
+      ["an object code", { error: OTHER_PASSKEY, code: { value: "wrong_passkey" } }],
+      ["an array code", { error: OTHER_PASSKEY, code: ["wrong_passkey"] }],
+      ["the code nested under error", { error: { code: "wrong_passkey" } }],
+      ["the code nested under data", { error: OTHER_PASSKEY, data: { code: "wrong_passkey" } }],
+      ["the code under another key", { error: OTHER_PASSKEY, errorCode: "wrong_passkey", Code: "wrong_passkey", reason: "wrong_passkey" }],
+    ] as const)("an HTTP 409 with %s is not the refusal", async (_name, body) => {
+      const { api, store, before } = await afterSubmit(() => jsonResponse(409, body));
+
+      expectUnconfirmed(api, store, before);
+    });
+
+    it.each([
+      ["an HTML body", "<html><body>409 Conflict wrong_passkey</body></html>"],
+      ["an empty body", ""],
+      ["a truncated body", '{"error":"This payment was started with a different passkey.","code":"wrong_pass'],
+      ["a JSON null body", "null"],
+      ["a bare JSON string", '"wrong_passkey"'],
+      ["a JSON array", '[{"code":"wrong_passkey"}]'],
+    ] as const)("an HTTP 409 with %s is not the refusal", async (_name, text) => {
+      const { api, store, before } = await afterSubmit(() => new Response(text, { status: 409 }));
+
+      expectUnconfirmed(api, store, before);
+    });
+
+    it.each([400, 401, 403, 404, 410, 422, 429, 500, 502, 503, 504] as const)("an HTTP %i carrying the exact refusal body is not the refusal: the status decides first", async (status) => {
+      const { api, store, before } = await afterSubmit(() => jsonResponse(status, WRONG_PASSKEY_BODY));
+
+      expectUnconfirmed(api, store, before);
+    });
+
+    it.each([
+      ["401 (signed out)", 401, { error: "Not authenticated." }],
+      ["404 (not this account's payment)", 404, { error: "Payment not found." }],
+      ["400 (signature refused)", 400, { error: "This payment's signature could not be verified." }],
+      ["409 wrong_state (prepared)", 409, { error: "This payment is no longer awaiting authorization (state: prepared)." }],
+      ["409 wrong_state (signed)", 409, { error: "This payment is no longer awaiting authorization (state: signed)." }],
+      ["409 wrong_state (submitting)", 409, { error: "This payment is no longer awaiting authorization (state: submitting)." }],
+      ["409 wrong_state (submitted)", 409, { error: "This payment is no longer awaiting authorization (state: submitted)." }],
+      ["409 wrong_state (confirmed)", 409, { error: "This payment is no longer awaiting authorization (state: confirmed)." }],
+      ["409 wrong_state (failed)", 409, { error: "This payment is no longer awaiting authorization (state: failed)." }],
+      ["409 wrong_state (cancelled)", 409, { error: "This payment is no longer awaiting authorization (state: cancelled)." }],
+      ["409 wrong_state (unknown)", 409, { error: "This payment is no longer awaiting authorization (state: unknown)." }],
+      ["500 (the generic server error)", 500, { error: "Something went wrong. Please try again." }],
+      ["a non-budget 429", 429, { error: "You've reached the payment limit.", code: "rate_limited" }],
+    ] as const)("the server's real %s answer stays conservative, and its sentence is never kept", async (_name, status, body) => {
+      const { api, store, before } = await afterSubmit(() => jsonResponse(status, body));
+
+      expectUnconfirmed(api, store, before);
+      expect(JSON.stringify(store.getState())).not.toContain(body.error);
+    });
+
+    const THROWN: Array<[string, () => unknown]> = [
+      ["a network failure", () => new TypeError("Failed to fetch")],
+      ["an aborted request", () => new DOMException("The operation was aborted.", "AbortError")],
+      ["a thrown plain object shaped like the refusal", () => ({ status: 409, code: "wrong_passkey", retryable: false, message: OTHER_PASSKEY })],
+      ["a thrown Error dressed up as the refusal", () => Object.assign(new Error(OTHER_PASSKEY), { name: "ApiError", status: 409, code: "wrong_passkey", retryable: false })],
+      ["a thrown Error dressed up as a retryable refusal", () => Object.assign(new Error("boom"), { name: "ApiError", status: 409, code: "wrong_passkey", retryable: true })],
+      ["a thrown string", () => "wrong_passkey"],
+    ];
+
+    it.each(THROWN)("%s is not the refusal: only a real answer from this page's own request helper counts", async (_name, thrown) => {
+      const { api, store, before } = await afterSubmit(() => {
+        throw thrown();
+      });
+
+      expectUnconfirmed(api, store, before);
+    });
+
+    it.each([
+      ["an empty object", () => jsonResponse(200, {})],
+      ["a JSON null", () => new Response("null", { status: 200 })],
+      ["a null attempt", () => jsonResponse(200, { attempt: null })],
+      ["an HTML page", () => new Response("<html>ok</html>", { status: 200 })],
+      ["an empty body", () => new Response("", { status: 200 })],
+      ["a refusal-shaped body with no attempt", () => jsonResponse(200, WRONG_PASSKEY_BODY)],
+    ] as const)("an HTTP 200 with %s is not a result and not the refusal", async (_name, reply) => {
+      const { api, store, before } = await afterSubmit(reply);
+
+      expectUnconfirmed(api, store, before);
+    });
+
+    it("nothing follows an unconfirmed submit by itself — a day later there has still been exactly one request", async () => {
+      const { api, store, before } = await afterSubmit(() => jsonResponse(409, { error: "This payment is no longer awaiting authorization (state: submitted)." }));
+
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      await store.getState().resumeAuthorization(); // not offered in "unknown", and refused by the store
+      await store.getState().confirmAndSend();
+
+      expectUnconfirmed(api, store, before);
+    });
+
+    it("the kept approval works exactly as before: an explicit status check that finds the payment still waiting lets Continue re-send the SAME approval — no second passkey prompt", async () => {
+      const api = server({
+        submit: (n) => (n === 1 ? jsonResponse(500, { error: "Something went wrong. Please try again." }) : jsonResponse(200, { attempt: { ...baseAttempt(), state: "submitted", prepared: null } })),
+        status: () => statusReply("awaiting_authorization"),
+      });
+      const store = awaiting();
+      await store.getState().resumeAuthorization();
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL });
+      expect(api.keys()).toEqual(["submit"]); // the check is the user's action, never automatic
+
+      await store.getState().checkStatus();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: null, authorizingCredentialId: "credential-1", pendingSubmission: APPROVAL });
+
+      await store.getState().resumeAuthorization();
+
+      expect(store.getState()).toMatchObject({ status: "submitted", pendingSubmission: null });
+      expect(api.calls.filter((call) => call.key === "submit").map((call) => call.body)).toEqual([APPROVAL, APPROVAL]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("the retryable answers are exactly as before", () => {
+    it("the submit budget's 429 still starts its wait and keeps the approval and the credential", async () => {
+      const { api, store } = await afterSubmit(() => new Response(JSON.stringify({ error: BUDGET_SENTENCE, code: "rate_limited", retryable: true }), { status: 429, headers: { "content-type": "application/json", "Retry-After": "120" } }));
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: null, isSubmitCoolingDown: true, submitCooldownSeconds: 120, isSubmitRetryBeyondApproval: false, pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it("the retryable 503 still returns to the waiting screen with its message, the approval and the credential", async () => {
+      const { api, store } = await afterSubmit(() => jsonResponse(503, { error: UNAVAILABLE_SENTENCE, retryable: true }));
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: UNAVAILABLE_SENTENCE, isSubmitCoolingDown: false, pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it.each([
+      ["a budget 429", 429, { error: BUDGET_SENTENCE, code: "wrong_passkey", retryable: true }],
+      ["a retryable 503", 503, { error: UNAVAILABLE_SENTENCE, code: "wrong_passkey", retryable: true }],
+      // The existing retryable handling is decided first, whatever the status: an answer that says "send the same approval again" is never the refusal.
+      ["a retryable 409", 409, { error: UNAVAILABLE_SENTENCE, code: "wrong_passkey", retryable: true }],
+    ] as const)("%s that also carries the code keeps the existing retryable handling: waiting, approval and credential kept, never cancel-only", async (_name, status, body) => {
+      const { api, store } = await afterSubmit(() => jsonResponse(status, body));
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: body.error, pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1", isSubmitCoolingDown: false });
+      expect(api.keys()).toEqual(["submit"]);
+    });
+  });
+
+  describe("late answers are never applied", () => {
+    const WAYS: Array<[string, (store: Store) => void | Promise<void>]> = [
+      ["reset()", (store) => store.getState().reset()],
+      ["detach() (the Pay form unmounted)", (store) => store.getState().detach()],
+      [
+        "a remount (detach, then init)",
+        async (store) => {
+          store.getState().detach();
+          await store.getState().init();
+        },
+      ],
+      ["a new init() without a detach", (store) => store.getState().init()],
+      ["another account signing in (no reset)", () => useRealAccountStore.setState({ account: ACCOUNT_B })],
+      [
+        "another account signing in (reset, then init)",
+        async (store) => {
+          useRealAccountStore.setState({ account: ACCOUNT_B });
+          store.getState().reset();
+          await store.getState().init();
+        },
+      ],
+      ["the payment on screen being replaced by another", (store) => store.setState({ attempt: { ...baseAttempt(), id: "attempt-2" } })],
+    ];
+    const LATE: Array<[string, (gate: ReturnType<typeof held>) => void]> = [
+      ["exact wrong_passkey refusal", (gate) => gate.resolve(wrongPasskey())],
+      ["code-less 409", (gate) => gate.resolve(jsonResponse(409, { error: "This payment is no longer awaiting authorization (state: submitted)." }))],
+      ["network failure", (gate) => gate.reject(new TypeError("Failed to fetch"))],
+    ];
+
+    it.each(WAYS.flatMap(([way, move]) => LATE.map(([late, end]) => [way, late, move, end] as const)))("after %s, a late %s writes nothing and sends nothing", async (_way, _late, move, end) => {
+      const gate = held();
+      const api = server({ submit: () => gate.promise, latest: latestResumable });
+      const store = awaiting();
+      const sending = store.getState().resumeAuthorization();
+      await settle();
+      expect(store.getState().status).toBe("submitting");
+
+      await move(store);
+      await settle();
+      const before = visible(store);
+      const callsBefore = api.calls.length;
+
+      end(gate);
+      await sending;
+      await settle();
+
+      expect(visible(store)).toEqual(before);
+      expect(store.getState().status).not.toBe("stranded");
+      expect(store.getState().error).not.toBe(OTHER_PASSKEY);
+      expect(store.getState().error).not.toBe(NEUTRAL);
+      expect(api.calls).toHaveLength(callsBefore);
+      expect(api.count("cancel")).toBe(0);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("a status read already on its way when the refusal arrived describes the payment as it WAS: it is never applied over the cancel-only screen", async () => {
+      const submitGate = held();
+      const statusGate = held();
+      const api = server({ submit: () => submitGate.promise, status: () => statusGate.promise });
+      const store = awaiting();
+      const sending = store.getState().resumeAuthorization();
+      await settle();
+      const checking = store.getState().checkStatus(); // begun while the submit is still in flight
+      await settle();
+      expect(api.keys()).toEqual(["submit", "status"]);
+
+      submitGate.resolve(wrongPasskey());
+      await sending;
+      expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY, authorizingCredentialId: null });
+      const before = visible(store);
+
+      statusGate.resolve(statusReply("awaiting_authorization"));
+      await checking;
+      await settle();
+
+      expect(visible(store)).toEqual(before);
+      expect(api.keys()).toEqual(["submit", "status"]);
+    });
+
+    it.each([
+      ["cancelled elsewhere", "cancelled", "editing"],
+      ["failed", "failed", "failed"],
+      ["confirmed", "confirmed", "confirmed"],
+      ["already sent by another session", "submitted", "submitted"],
+      ["of unknown outcome", "unknown", "unknown"],
+    ] as const)("a payment that a status read has meanwhile shown as %s is not pulled back to cancel-only by the late refusal", async (_name, state, shown) => {
+      const gate = held();
+      const api = server({ submit: () => gate.promise, status: () => statusReply(state), balance: () => jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "0" }) });
+      const store = awaiting();
+      const sending = store.getState().resumeAuthorization();
+      await settle();
+
+      await store.getState().checkStatus();
+      await settle();
+      expect(store.getState().status).toBe(shown);
+      const before = visible(store);
+
+      gate.resolve(wrongPasskey());
+      await sending;
+      await settle();
+
+      expect(visible(store)).toEqual(before);
+      expect(store.getState().attempt?.state).toBe(state);
+      expect(store.getState().error).not.toBe(OTHER_PASSKEY);
+      expect(api.count("cancel")).toBe(0);
+      expect(api.count("submit")).toBe(1);
+    });
+  });
+
+  describe("the existing expiry schedule after the refusal", () => {
+    it("still inside the window: exactly one timer, for the moment the window ends, and what it runs is one read", async () => {
+      const { api, store } = await refused({ secondsBeforeExpiry: 1_000, others: { status: () => statusReply("awaiting_authorization", 1_000) } });
+
+      await vi.advanceTimersByTimeAsync(1_000_000); // exactly the end of the window: not yet past it
+      expect(api.keys()).toEqual(["submit"]);
+      expect(store.getState()).toMatchObject({ status: "stranded", isAttemptPastValidity: false });
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(api.calls.map(({ key, method }) => `${method} ${key}`)).toEqual(["POST submit", "GET status"]);
+      expect(api.calls[1]!.url).toBe("/api/real/payments/attempt-1/status");
+      // The server's answer is shown by the existing mapping; no passkey came back with it.
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isAttemptPastValidity: true, authorizingCredentialId: null, pendingSubmission: null });
+    });
+
+    it("the follow-ups after that stay reads, stay bounded, and Continue still cannot sign", async () => {
+      const { api, store } = await refused({ secondsBeforeExpiry: 1_000, others: { status: () => statusReply("awaiting_authorization", 1_000) } });
+
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+
+      expect(api.writes()).toEqual(["submit"]);
+      expect(api.count("status")).toBe(1 + MAX_AUTOMATIC_FOLLOW_UPS);
+      expect(api.calls.every((call) => call.key === "submit" || (call.key === "status" && call.method === "GET"))).toBe(true);
+      expect(store.getState().isFollowUpExhausted).toBe(true);
+
+      await store.getState().resumeAuthorization();
+
+      expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY });
+      expect(api.writes()).toEqual(["submit"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("a window that ended while the submit was on its way: the schedule's own read-only check runs once, at once — and nothing else", async () => {
+      const gate = held();
+      const api = server({ submit: () => gate.promise, status: () => statusReply("failed", 30) });
+      const store = awaiting(30);
+      const sending = store.getState().resumeAuthorization();
+      await settle();
+      await vi.advanceTimersByTimeAsync(60_000); // the approval window ends while the request is in flight
+      expect(api.keys()).toEqual(["submit"]);
+
+      gate.resolve(wrongPasskey());
+      await sending;
+      await settle();
+
+      expect(api.calls.map(({ key, method }) => `${method} ${key}`)).toEqual(["POST submit", "GET status"]);
+      // The server's own verdict is what is shown — never one the page made up.
+      expect(store.getState().status).toBe("failed");
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "failed" });
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      expect(api.keys()).toEqual(["submit", "status"]);
+    });
+
+    it("that read's answer is dropped when the lifecycle has moved on before it arrives", async () => {
+      const submitGate = held();
+      const statusGate = held();
+      const api = server({ submit: () => submitGate.promise, status: () => statusGate.promise });
+      const store = awaiting(30);
+      const sending = store.getState().resumeAuthorization();
+      await settle();
+      await vi.advanceTimersByTimeAsync(60_000);
+      submitGate.resolve(wrongPasskey());
+      await settle();
+      expect(api.keys()).toEqual(["submit", "status"]);
+      expect(store.getState()).toMatchObject({ status: "stranded", isAttemptPastValidity: true });
+
+      store.getState().reset();
+      const before = visible(store);
+      statusGate.resolve(statusReply("failed", 30));
+      await sending;
+      await settle();
+
+      expect(visible(store)).toEqual(before);
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
+      expect(api.keys()).toEqual(["submit", "status"]);
+    });
+
+    it.each([
+      ["detach()", (store: Store) => store.getState().detach()],
+      ["reset()", (store: Store) => store.getState().reset()],
+    ] as const)("%s after the refusal takes the timer with it: nothing is ever requested", async (_name, end) => {
+      const { api, store } = await refused({ secondsBeforeExpiry: 1_000, others: { status: () => statusReply("awaiting_authorization", 1_000) } });
+
+      end(store);
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it("a hidden page runs no check when the window ends; coming back runs at most the one", async () => {
+      const { api, store } = await refused({ secondsBeforeExpiry: 1_000, others: { status: () => statusReply("awaiting_authorization", 1_000) } });
+
+      store.getState().setPageVisible(false);
+      await vi.advanceTimersByTimeAsync(2_000_000);
+      expect(api.keys()).toEqual(["submit"]);
+
+      store.getState().setPageVisible(true);
+      await settle();
+
+      expect(api.calls.map(({ key, method }) => `${method} ${key}`)).toEqual(["POST submit", "GET status"]);
+    });
+  });
+
+  describe("the code means something only on a submit answer; D-1, D-2, D-3a and C-1 are untouched", () => {
+    async function approveFromForm(prepare: Handler, others: Partial<Record<Key, Handler>> = {}) {
+      const api = server({ prepare, ...others });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      store.setState({ status: "editing" });
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      expect(store.getState().status).toBe("reviewing");
+      await store.getState().confirmAndSend();
+      return { api, store };
+    }
+
+    it("a PREPARE 409 carrying the code is still D-1's 'a payment may be in progress' — never cancel-only", async () => {
+      const { api, store } = await approveFromForm(wrongPasskey);
+
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "in_progress", error: null, attempt: null });
+      expect(api.keys()).toEqual(["prepare"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("D-2's exact account_not_ready refusal is unchanged", async () => {
+      const { api, store } = await approveFromForm(() => jsonResponse(409, { error: "Your account isn't fully set up yet.", code: "account_not_ready" }));
+
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: null, error: "We can't send payments from this account right now. This payment wasn't started.", attempt: null });
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("C-1's uncertain prepare answer is unchanged", async () => {
+      const { api, store } = await approveFromForm(() => jsonResponse(500, { error: "We couldn't confirm this payment's setup. No money was sent by this request. Refresh the app to check its status before trying again.", code: "prepare_outcome_uncertain" }));
+
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain", error: null, attempt: null });
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("a first read (GET /latest) answering 409 with the code is still D-3a's status_unavailable", async () => {
+      const api = server({ latest: wrongPasskey });
+      const store = createRealPaymentStore();
+      stores.push(store);
+
+      await store.getState().init();
+
+      expect(store.getState()).toMatchObject({ status: "status_unavailable", attempt: null, error: null, authorizingCredentialId: null });
+      expect(api.keys()).toEqual(["latest"]);
+    });
+
+    it("D-1's explicit check answering 409 with the code keeps the requirement", async () => {
+      const { api, store } = await approveFromForm(() => jsonResponse(409, { error: "You already have a payment in progress." }), { latest: wrongPasskey });
+
+      await store.getState().checkPreparedPayment();
+
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "in_progress", prepareCheck: "unavailable", attempt: null });
+      expect(api.keys()).toEqual(["prepare", "latest"]);
+    });
+
+    it("a status read answering 409 with the code changes neither the payment's screen nor its signing context", async () => {
+      const api = server({ status: wrongPasskey });
+      const store = awaiting();
+
+      await store.getState().checkStatus();
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1", pendingSubmission: null });
+      expect(api.keys()).toEqual(["status"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("a Cancel answering 409 with the code is an ordinary refused cancel: reconciled by a status read, signing context untouched", async () => {
+      const api = server({ cancel: wrongPasskey, status: () => statusReply("awaiting_authorization") });
+      const store = awaiting();
+
+      await store.getState().cancel();
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: CANCEL_LOST_RACE, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
+      expect(api.keys()).toEqual(["cancel", "status"]);
+    });
+
+    it("a dismissed passkey prompt is unchanged: the same pending payment, nothing sent", async () => {
+      vi.mocked(signPreparedPayment).mockReset();
+      vi.mocked(signPreparedPayment).mockRejectedValue(Object.assign(new Error("dismissed"), { name: "NotAllowedError" }));
+      const api = server({ submit: wrongPasskey });
+      const store = awaiting();
+
+      await store.getState().resumeAuthorization();
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: null, isAuthorizing: false, authorizingCredentialId: "credential-1", pendingSubmission: null });
+      expect(api.keys()).toEqual([]);
+    });
+
+    it("an accepted submit is unchanged: the server's attempt is shown and the approval is released", async () => {
+      const { api, store } = await afterSubmit(() => jsonResponse(200, { attempt: { ...baseAttempt(), state: "submitted", prepared: null } }));
+
+      expect(store.getState()).toMatchObject({ status: "submitted", error: null, pendingSubmission: null, authorizingCredentialId: "credential-1" });
+      expect(api.keys()).toEqual(["submit"]);
     });
   });
 });

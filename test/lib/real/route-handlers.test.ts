@@ -661,3 +661,352 @@ describe("POST /api/real/payments/prepare — L-2 D-2: 409 response bodies (actu
     expect(inProgressCase).not.toContain("code");
   });
 });
+
+/**
+ * L-2 D-4: the submit route's two 409s. `wrong_passkey` (the session's passkey
+ * is not the one the payment is bound to) is decided before this request's
+ * claim, budget charge or any provider call, on a row still awaiting
+ * authorization, and now carries an additive `code` so the client can show the
+ * cancel-only screen directly. `wrong_state` stays code-less, and every other
+ * body is exactly what it was. The actual route.ts code: first over the real
+ * resolver with an in-memory registry and payment store (Turnkey and Pimlico
+ * fail the test if reached), then over every resolver outcome in turn.
+ */
+describe("POST /api/real/payments/submit — L-2 D-4: 409 response bodies (actual route.ts code)", () => {
+  const SIGNATURE = `0x${"00".repeat(12)}${"11".repeat(64)}1b`;
+  const PASSKEY_SENTENCE = "This payment was started with a different passkey. Cancel it and start a new payment.";
+  const UNAVAILABLE_SENTENCE = "We couldn't confirm your passkey approval yet. Try again in a moment.";
+  const BUDGET_SENTENCE = "Too many tries right now. Wait a moment, then tap Continue.";
+  const OTHER_STATES = ["prepared", "signed", "submitting", "submitted", "confirmed", "failed", "cancelled", "unknown"] as const;
+  const wrongStateSentence = (state: string) => `This payment is no longer awaiting authorization (state: ${state}).`;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.doUnmock("next/headers");
+    vi.doUnmock("@/lib/real/server/runtime");
+    vi.doUnmock("@/lib/real/server/pimlico");
+    vi.doUnmock("@/lib/real/server/payments");
+    vi.doUnmock("@turnkey/http");
+  });
+
+  /**
+   * The real resolver behind the real route. `session` is the signed-in passkey
+   * (null: signed out); `view` overrides what the store reports for the row —
+   * how a row in another state, or another account's row, is simulated.
+   */
+  async function setup(options: { session?: "credential-1" | "credential-backup" | null; view?: { state?: string; appUserId?: string }; limiter?: ReturnType<typeof openBudget> } = {}) {
+    vi.resetModules();
+    stubRequiredConfigEnv();
+    const registry = await seedRegistry();
+    const primary = (await registry.findPasskeyByCredentialId("credential-1"))!;
+    getInMemoryRegistryInternals(registry).passkeysByCredentialId.set("credential-backup", { ...primary, credentialId: "credential-backup", role: "backup" });
+    const { createInMemoryPaymentAttemptStore } = await import("@/lib/real/server/payment-attempts");
+    const paymentStore = createInMemoryPaymentAttemptStore();
+    const reserved = await paymentStore.reserve({ appUserId: "app-user-1", safeAddress: SAFE_ADDRESS, recipient: "0x2222222222222222222222222222222222222222", amountBaseUnits: "10000", chainId: 84532, tokenAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", authorizingCredentialId: "credential-1" });
+    if (!reserved.ok) throw new Error("expected reservation");
+    await paymentStore.transition({
+      id: reserved.attempt.id,
+      from: "prepared",
+      to: "awaiting_authorization",
+      patch: { nonce: "0", callData: "0x1234", callGasLimit: "80000", verificationGasLimit: "150000", preVerificationGas: "60000", maxFeePerGas: "2000000", maxPriorityFeePerGas: "1000000", expectedUserOperationHash: `0x${"ab".repeat(32)}`, validUntil: Math.floor(Date.now() / 1000) + 600, prepareBlockNumber: "1" },
+    });
+    // Every write the submit path could make is recorded: a claim (transition) or a dispatch admission.
+    const writes: string[] = [];
+    const countedStore: PaymentAttemptStore = {
+      ...paymentStore,
+      findById: async (id) => {
+        const row = await paymentStore.findById(id);
+        return row && options.view ? ({ ...row, ...options.view } as typeof row) : row;
+      },
+      transition: async (input) => {
+        writes.push("transition");
+        return paymentStore.transition(input);
+      },
+      beginDispatch: async (input) => {
+        writes.push("beginDispatch");
+        return paymentStore.beginDispatch(input);
+      },
+    };
+    const budget = scriptedBudget({ allowed: true });
+    const limiter = options.limiter ?? budget.limiter;
+    const session = options.session === undefined ? "credential-1" : options.session;
+    const { REAL_SESSION_COOKIE_NAME } = await import("@/lib/real/server/session");
+    const cookieValue = session === null ? null : serializeSession(createSessionPayload({ appUserId: "app-user-1", credentialId: session, sessionEpoch: 0 }), REAL_SESSION_SECRET_VALUE);
+    vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar(cookieValue === null ? {} : { [REAL_SESSION_COOKIE_NAME]: cookieValue }) }));
+    vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => registry, getPaymentAttemptStore: () => countedStore, getProviderBudgetLimiter: () => limiter }));
+    const turnkeyReads = { count: 0 };
+    // Turnkey is unreachable: the parent-key read-back throws (and is counted).
+    vi.doMock("@turnkey/http", () => ({
+      TurnkeyClient: vi.fn().mockImplementation(function TurnkeyClientMock() {
+        return {
+          getActivity: async () => {
+            turnkeyReads.count += 1;
+            throw new Error("ECONNRESET api.turnkey.com");
+          },
+          getUsers: async () => ({ users: [] }),
+        };
+      }),
+    }));
+    const pimlico = { calls: 0 };
+    const reached = async () => {
+      pimlico.calls += 1;
+      throw new Error("Pimlico must not be reached in this test");
+    };
+    vi.doMock("@/lib/real/server/pimlico", () => ({ prepareCashTransferUserOperation: reached, sendPreparedUserOperation: reached, fetchUserOperationReceipt: reached }));
+    const { POST } = await import("@/app/api/real/payments/submit/route");
+    const attemptId = reserved.attempt.id;
+    const submit = (body: unknown = { attemptId, signature: SIGNATURE, activityId: "activity-1" }) =>
+      POST(new Request("http://localhost/api/real/payments/submit", { method: "POST", headers: { "content-type": "application/json" }, body: typeof body === "string" ? body : JSON.stringify(body) }));
+    return { submit, paymentStore, attemptId, writes, budgetCalls: budget.calls, turnkeyReads, pimlico };
+  }
+
+  it("wrong_passkey: HTTP 409 with the existing sentence and exactly the additive code — nothing claimed, charged, read or sent, the row untouched", async () => {
+    const { submit, paymentStore, attemptId, writes, budgetCalls, turnkeyReads, pimlico } = await setup({ session: "credential-backup" });
+    const before = structuredClone(await paymentStore.findById(attemptId));
+
+    const response = await submit();
+
+    expect(response.status).toBe(409);
+    expect(response.headers.get("content-type")).toMatch(/^application\/json/);
+    expect(response.headers.get("Retry-After")).toBeNull();
+    const raw = await response.text();
+    const body = JSON.parse(raw) as Record<string, unknown>;
+    expect(body).toEqual({ error: PASSKEY_SENTENCE, code: "wrong_passkey" });
+    expect(Object.keys(body).sort()).toEqual(["code", "error"]);
+    expect(body).not.toHaveProperty("retryable");
+    // Nothing about the account, either passkey or the payment leaves the server with it.
+    expect(raw).not.toMatch(/credential-1|credential-backup|app-user-1|sub-org-1|awaiting_authorization/);
+    expect(raw).not.toContain(attemptId);
+    // Decided before the claim, the budget, Turnkey and the bundler.
+    expect(writes).toHaveLength(0);
+    expect(budgetCalls).toHaveLength(0);
+    expect(turnkeyReads.count).toBe(0);
+    expect(pimlico.calls).toBe(0);
+    expect(await paymentStore.findById(attemptId)).toEqual(before);
+    expect(before).toMatchObject({ state: "awaiting_authorization", authorizingCredentialId: "credential-1" });
+  });
+
+  it("wrong_passkey is the same body however often it is asked, and whatever else the request carries", async () => {
+    const { submit, paymentStore, attemptId, writes, budgetCalls } = await setup({ session: "credential-backup" });
+
+    for (const extra of [{}, { authorizingCredentialId: "credential-backup" }, { code: "ok", state: "submitted" }]) {
+      const response = await submit({ attemptId, signature: SIGNATURE, activityId: "activity-1", ...extra });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ error: PASSKEY_SENTENCE, code: "wrong_passkey" });
+    }
+    expect(writes).toHaveLength(0);
+    expect(budgetCalls).toHaveLength(0);
+    expect((await paymentStore.findById(attemptId))?.state).toBe("awaiting_authorization");
+  });
+
+  it.each(OTHER_STATES)("wrong_state (%s) is unchanged: HTTP 409, its existing sentence, and NO code — for the bound passkey's session", async (state) => {
+    const { submit, writes, budgetCalls, turnkeyReads, pimlico } = await setup({ view: { state } });
+
+    const response = await submit();
+
+    expect(response.status).toBe(409);
+    expect(response.headers.get("Retry-After")).toBeNull();
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body).toEqual({ error: wrongStateSentence(state) });
+    expect(Object.keys(body)).toEqual(["error"]);
+    expect(body).not.toHaveProperty("code");
+    expect(writes).toHaveLength(0);
+    expect(budgetCalls).toHaveLength(0);
+    expect(turnkeyReads.count).toBe(0);
+    expect(pimlico.calls).toBe(0);
+  });
+
+  it.each(OTHER_STATES)("wrong_state (%s) wins over the passkey check: another passkey's session still gets the code-less 409, never the code", async (state) => {
+    const { submit, writes } = await setup({ session: "credential-backup", view: { state } });
+
+    const response = await submit();
+
+    expect(response.status).toBe(409);
+    const raw = await response.text();
+    expect(JSON.parse(raw)).toEqual({ error: wrongStateSentence(state) });
+    expect(raw).not.toContain("wrong_passkey");
+    expect(raw).not.toContain("code");
+    expect(writes).toHaveLength(0);
+  });
+
+  it("the two 409s differ only as intended: same status, different sentence, and the code on wrong_passkey alone", async () => {
+    const passkey = await (await setup({ session: "credential-backup" })).submit();
+    const state = await (await setup({ view: { state: "submitted" } })).submit();
+
+    expect([passkey.status, state.status]).toEqual([409, 409]);
+    const [a, b] = [(await passkey.json()) as Record<string, unknown>, (await state.json()) as Record<string, unknown>];
+    expect(a.code).toBe("wrong_passkey");
+    expect("code" in b).toBe(false);
+    expect(a.error).not.toBe(b.error);
+  });
+
+  it("the other refusals keep their exact bodies, with no code added (401, 404, 400)", async () => {
+    const signedOut = await (await setup({ session: null })).submit();
+    expect(signedOut.status).toBe(401);
+    expect(await signedOut.json()).toEqual({ error: "Not authenticated." });
+
+    const { submit, attemptId, paymentStore, writes, budgetCalls } = await setup();
+    const cases: Array<[unknown, number, unknown]> = [
+      [{ attemptId: "11111111-1111-4111-8111-111111111111", signature: SIGNATURE, activityId: "activity-1" }, 404, { error: "Payment not found." }],
+      [{ attemptId: "not-a-uuid", signature: SIGNATURE, activityId: "activity-1" }, 404, { error: "Payment not found." }],
+      [{ attemptId: 42, signature: SIGNATURE, activityId: "activity-1" }, 404, { error: "Payment not found." }],
+      [{ attemptId, activityId: "activity-1" }, 404, { error: "Payment not found." }],
+      [{ attemptId, signature: "0xzz", activityId: "activity-1" }, 400, { error: "This payment's signature could not be verified." }],
+      [{ attemptId, signature: "0x123", activityId: "activity-1" }, 400, { error: "This payment's signature could not be verified." }],
+      [{ attemptId, signature: SIGNATURE }, 400, { error: "This payment's signature could not be verified." }],
+      ["{not valid json", 400, { error: "Invalid request body." }],
+    ];
+    for (const [body, status, expected] of cases) {
+      const response = await submit(body);
+      expect(response.status, JSON.stringify(body)).toBe(status);
+      expect(response.headers.get("Retry-After")).toBeNull();
+      expect(await response.json(), JSON.stringify(body)).toEqual(expected);
+    }
+    expect(writes).toHaveLength(0);
+    expect(budgetCalls).toHaveLength(0);
+    expect((await paymentStore.findById(attemptId))?.state).toBe("awaiting_authorization");
+  });
+
+  it("another account's payment is still 404 — never a 409 of either kind", async () => {
+    const { submit, writes } = await setup({ session: "credential-backup", view: { appUserId: "someone-else" } });
+
+    const response = await submit();
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: "Payment not found." });
+    expect(writes).toHaveLength(0);
+  });
+
+  it("the retryable answers are unchanged: 429 (budget) and 503 (approval not confirmable yet)", async () => {
+    const denied = scriptedBudget({ allowed: false, retryAfterSeconds: 90 });
+    const limited = await setup({ limiter: denied.limiter });
+    const tooMany = await limited.submit();
+    expect(tooMany.status).toBe(429);
+    expect(tooMany.headers.get("Retry-After")).toBe("90");
+    expect(await tooMany.json()).toEqual({ error: BUDGET_SENTENCE, code: "rate_limited", retryable: true });
+    expect(limited.turnkeyReads.count).toBe(0);
+    expect(limited.writes).toHaveLength(0);
+
+    const world = await setup();
+    const unavailable = await world.submit();
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers.get("Retry-After")).toBeNull();
+    const body = (await unavailable.json()) as Record<string, unknown>;
+    expect(body).toEqual({ error: UNAVAILABLE_SENTENCE, retryable: true });
+    expect(body).not.toHaveProperty("code");
+    expect(world.budgetCalls).toHaveLength(1);
+    expect(world.writes).toHaveLength(0);
+    expect(world.pimlico.calls).toBe(0);
+    expect((await world.paymentStore.findById(world.attemptId))?.state).toBe("awaiting_authorization");
+  });
+
+  it("an unexpected exception is still the generic 500 — never a 409, never the code", async () => {
+    const failing = scriptedBudget(new Error("ECONNREFUSED postgres://user:pass@host/db wrong_passkey"));
+    const { submit, writes, turnkeyReads } = await setup({ limiter: failing.limiter });
+
+    const response = await submit();
+
+    expect(response.status).toBe(500);
+    const raw = await response.text();
+    expect(JSON.parse(raw)).toEqual({ error: GENERIC_SERVER_ERROR_MESSAGE });
+    expect(raw).not.toMatch(/wrong_passkey|postgres|ECONNREFUSED/);
+    expect(writes).toHaveLength(0);
+    expect(turnkeyReads.count).toBe(0);
+  });
+
+  it("a definitive 200 is unchanged: { attempt } only — here a signature the server refuses before any claim", async () => {
+    const { submit, attemptId, paymentStore, budgetCalls, turnkeyReads, pimlico } = await setup();
+
+    // Well-formed hex, but not a 65-byte owner signature behind the validity prefix.
+    const response = await submit({ attemptId, signature: `0x${"00".repeat(12)}${"11".repeat(40)}`, activityId: "activity-1" });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { attempt: { id: string; state: string } };
+    expect(Object.keys(body)).toEqual(["attempt"]);
+    expect(body.attempt).toMatchObject({ id: attemptId, state: "failed" });
+    expect((await paymentStore.findById(attemptId))?.state).toBe("failed");
+    expect(budgetCalls).toHaveLength(0);
+    expect(turnkeyReads.count).toBe(0);
+    expect(pimlico.calls).toBe(0);
+  });
+
+  /** The route's own translation, outcome by outcome: the resolver is replaced, so each wire shape is pinned exactly. */
+  describe("every resolver outcome, translated by the route", () => {
+    const ATTEMPT = { id: "11111111-1111-4111-8111-111111111111", state: "submitted", recipient: "0x2222222222222222222222222222222222222222", recipientIdentity: null, amountBaseUnits: "10000", transactionHash: null, failureReason: null };
+
+    async function translate(outcome: unknown) {
+      vi.resetModules();
+      stubRequiredConfigEnv();
+      vi.doMock("next/headers", () => ({ cookies: async () => makeCookieJar() }));
+      vi.doMock("@/lib/real/server/runtime", () => ({ getRealAccountRegistry: () => ({}), getPaymentAttemptStore: () => ({}), getProviderBudgetLimiter: () => ({}) }));
+      const resolver = vi.fn(async () => {
+        if (outcome instanceof Error) throw outcome;
+        return outcome;
+      });
+      vi.doMock("@/lib/real/server/payments", () => ({ resolveSubmitPayment: resolver }));
+      const { POST } = await import("@/app/api/real/payments/submit/route");
+      const response = await POST(new Request("http://localhost/api/real/payments/submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ attemptId: ATTEMPT.id, signature: SIGNATURE, activityId: "activity-1" }) }));
+      expect(resolver).toHaveBeenCalledTimes(1);
+      return response;
+    }
+
+    it.each([
+      ["unauthenticated", { outcome: "unauthenticated" }, 401, { error: "Not authenticated." }],
+      ["not_found", { outcome: "not_found" }, 404, { error: "Payment not found." }],
+      ["invalid_signature", { outcome: "invalid_signature" }, 400, { error: "This payment's signature could not be verified." }],
+      ...OTHER_STATES.map((state) => [`wrong_state (${state})`, { outcome: "wrong_state", state }, 409, { error: wrongStateSentence(state) }] as const),
+      ["wrong_passkey", { outcome: "wrong_passkey" }, 409, { error: PASSKEY_SENTENCE, code: "wrong_passkey" }],
+      ["authorization_unavailable", { outcome: "authorization_unavailable" }, 503, { error: UNAVAILABLE_SENTENCE, retryable: true }],
+      ["submitted", { outcome: "submitted", attempt: ATTEMPT }, 200, { attempt: ATTEMPT }],
+      ["failed", { outcome: "failed", attempt: { ...ATTEMPT, state: "failed", failureReason: "This payment could not be sent. No money moved." } }, 200, { attempt: { ...ATTEMPT, state: "failed", failureReason: "This payment could not be sent. No money moved." } }],
+      ["unknown", { outcome: "unknown", attempt: { ...ATTEMPT, state: "unknown" } }, 200, { attempt: { ...ATTEMPT, state: "unknown" } }],
+    ] as ReadonlyArray<readonly [string, unknown, number, unknown]>)("%s: exact status and body, no Retry-After, and a code only on wrong_passkey", async (name, outcome, status, expected) => {
+      const response = await translate(outcome);
+
+      expect(response.status).toBe(status);
+      expect(response.headers.get("Retry-After")).toBeNull();
+      const body = (await response.json()) as Record<string, unknown>;
+      expect(body).toEqual(expected);
+      expect("code" in body).toBe(name === "wrong_passkey");
+      expect("retryable" in body).toBe(name === "authorization_unavailable");
+    });
+
+    it("rate_limited: 429, Retry-After, its own code and retryable flag — unchanged", async () => {
+      const response = await translate({ outcome: "rate_limited", retryAfterSeconds: 90 });
+
+      expect(response.status).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe("90");
+      expect(await response.json()).toEqual({ error: BUDGET_SENTENCE, code: "rate_limited", retryable: true });
+    });
+
+    it("a resolver exception: the generic 500, whatever its text", async () => {
+      const response = await translate(new Error("wrong_passkey: credential-backup != credential-1"));
+
+      expect(response.status).toBe(500);
+      const raw = await response.text();
+      expect(JSON.parse(raw)).toEqual({ error: GENERIC_SERVER_ERROR_MESSAGE });
+      expect(raw).not.toMatch(/wrong_passkey|credential/);
+    });
+  });
+
+  it("source guard: the route names the code once, on the wrong_passkey case, and gives wrong_state none", () => {
+    const source = readFileSync(resolve(process.cwd(), "app/api/real/payments/submit/route.ts"), "utf8");
+    expect(source.match(/code: "wrong_passkey"/g)).toHaveLength(1);
+    expect(source.match(/\bcode:/g)).toHaveLength(1);
+    const passkeyCase = source.slice(source.indexOf('case "wrong_passkey":'), source.indexOf('case "authorization_unavailable":'));
+    expect(passkeyCase).toContain('{ error: "This payment was started with a different passkey. Cancel it and start a new payment.", code: "wrong_passkey" }, { status: 409 }');
+    expect(passkeyCase).not.toMatch(/Retry-After|retryable/);
+    const stateCase = source.slice(source.indexOf('case "wrong_state":'), source.indexOf('case "wrong_passkey":'));
+    expect(stateCase).toContain("return jsonError(`This payment is no longer awaiting authorization (state: ${outcome.state}).`, 409);");
+    expect(stateCase).not.toContain("code");
+    // The resolver decides wrong_passkey before the budget charge and the claim: the order the code's meaning rests on.
+    const resolver = readFileSync(resolve(process.cwd(), "lib/real/server/payments.ts"), "utf8");
+    const submitBody = resolver.slice(resolver.indexOf("export async function resolveSubmitPayment("));
+    const refusal = submitBody.indexOf('return { outcome: "wrong_passkey" };');
+    expect(refusal).toBeGreaterThan(-1);
+    expect(submitBody.indexOf('if (attempt.state !== "awaiting_authorization") return { outcome: "wrong_state", state: attempt.state };')).toBeLessThan(refusal);
+    expect(refusal).toBeLessThan(submitBody.indexOf("consumePaySubmitBudget("));
+    expect(refusal).toBeLessThan(submitBody.indexOf("verifyPaymentAuthorization("));
+    expect(refusal).toBeLessThan(submitBody.indexOf('to: "signed"'));
+  });
+});

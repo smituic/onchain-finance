@@ -69,7 +69,8 @@ export type RealPaymentStatus =
    * restoring an attempt a crash left mid-flight. The only action offered
    * is cancel; no resend/retry. Slice S1: also an awaiting_authorization
    * attempt this session can't approve (bound to another passkey, or
-   * prepared before binding existed).
+   * prepared before binding existed). L-2 D-4: also entered when /submit
+   * itself answers the exact `wrong_passkey` refusal (HTTP 409 + that code).
    */
   | "stranded"
   /**
@@ -397,6 +398,29 @@ function isSubmitBudgetDenial(error: unknown): error is ApiError {
   return error instanceof ApiError && error.status === 429 && error.code === "rate_limited" && error.retryable === true;
 }
 
+/**
+ * L-2 D-4: fixed client copy for a submit that ended without an answer this
+ * page can act on (a refusal it cannot interpret, a server error, a network
+ * failure, an unreadable reply). The server's sentence and raw network/parse
+ * text are never shown; nothing here says the payment was or was not sent.
+ */
+export const SUBMIT_UNCONFIRMED_MESSAGE = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
+
+/**
+ * L-2 D-4: the ONE submit refusal that is definitive about THIS request — HTTP
+ * 409 AND the body's `code` exactly "wrong_passkey". The server decides it
+ * before this request's claim, budget charge or any provider call, on a row it
+ * found still awaiting authorization: this request sent nothing, and this
+ * session's passkey can never approve the payment. Exact status and exact
+ * string only: no sentence matching, no case folding, no trimming. Every other
+ * 409 (no code, `wrong_state`, another or a non-string code) stays "unknown".
+ * It says nothing about what another signed-in session may do with the same
+ * payment — Cancel stays the server's decision.
+ */
+function isWrongPasskeyRefusal(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409 && error.code === "wrong_passkey";
+}
+
 /** Stage 2C-2: how many times one caller waits behind an older-epoch read before giving up (each wait is itself bounded by the request deadline). */
 const MAX_STALE_READ_WAITS = 2;
 
@@ -631,6 +655,22 @@ async function authorizeAndSubmit(
       await scheduleExpiryCheck();
       return;
     }
+    if (isWrongPasskeyRefusal(error)) {
+      // L-2 D-4: the server refused THIS request before any claim or dispatch —
+      // the payment is bound to another passkey, so nothing this session signs
+      // can ever send it. The same cancel-only screen a reload gives: the
+      // approval and the credential it was made with are dropped (Continue can
+      // neither re-send nor prompt again), the attempt and the account context
+      // stay. Nothing is cancelled, retried, signed, prepared or sent because of
+      // it. The existing expiry schedule is re-armed for the screen now shown,
+      // exactly as on every other return to a waiting screen: one timer for the
+      // moment the approval window ends — or, if it has ALREADY ended, that
+      // schedule's own read-only status check, under its usual stale guards.
+      markTransition();
+      set({ status: "stranded", authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, error: OTHER_PASSKEY_MESSAGE });
+      await scheduleExpiryCheck();
+      return;
+    }
     // A thrown error here means either a definitive HTTP-level refusal or a
     // network failure after a signature exists (the request may have
     // reached the server, or even the bundler, before failing) — either way
@@ -638,8 +678,10 @@ async function authorizeAndSubmit(
     // The approval stays in memory: if a status check later shows the
     // attempt still awaiting, "Continue" re-sends it (the server's CAS keeps
     // that to at most one dispatch) rather than asking for a new signature.
+    // L-2 D-4: the detail shown is fixed — never the server's sentence, a state
+    // name, or raw network/parse text.
     markTransition();
-    set({ status: "unknown", error: error instanceof Error ? error.message : "Lost connection while sending the payment." });
+    set({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE });
   }
 }
 
