@@ -381,9 +381,9 @@ export function RealPayForm() {
     return (
       <div className="flex flex-col gap-4" data-testid="real-pay-stranded">
         <div className="flex flex-col gap-1 rounded-xl bg-muted/60 px-4 py-3.5">
-          <p className="text-sm font-medium">{isPastValidity ? "This payment’s approval window expired" : "This payment didn’t go through"}</p>
+          <p className="text-sm font-medium">{isPastValidity ? "This payment’s approval window expired" : "This payment can’t be continued here"}</p>
           <p className="text-sm text-muted-foreground">
-            {isPastValidity ? "We’re waiting for final confirmation before showing the final result. This can take a while." : "It was never sent. You can safely cancel it and try again."}
+            {isPastValidity ? "We’re waiting for final confirmation before showing the final result. This can take a while." : "This payment may still go through. Select Cancel payment and wait for the result before starting another payment."}
           </p>
           {/* L-2 D-1: what this payment is, from the stored attempt — never from the form's unsent inputs. */}
           {attempt ? (

@@ -2543,9 +2543,9 @@ describe("RealPayForm — L-2 D-4: submit refused for another passkey, and uncon
   /** The checking screen's own fixed wording — outside this slice, and pinned here as unchanged. */
   const UNKNOWN_HEADLINE = "We're checking on this payment";
   const UNKNOWN_DETAIL = "It may have already gone through. We'll show the result here once we know — sending another payment is disabled until this one resolves.";
-  /** The cancel-only screen's own fixed wording — also unchanged. */
-  const STRANDED_HEADLINE = "This payment didn’t go through";
-  const STRANDED_DETAIL = "It was never sent. You can safely cancel it and try again.";
+  /** The cancel-only screen's own fixed wording before its approval window ends. D-4 did not change it; L-2 D-5 later replaced it (it no longer says the payment was never sent). */
+  const STRANDED_HEADLINE = "This payment can’t be continued here";
+  const STRANDED_DETAIL = "This payment may still go through. Select Cancel payment and wait for the result before starting another payment.";
   const RAW_TEXT = /Failed to fetch|Cannot read|Unexpected|not valid JSON|Not authenticated|Payment not found|no longer awaiting|\(state:|could not be verified|Something went wrong|Request failed|wrong_passkey|wrong_state|awaiting_authorization|TypeError|SyntaxError/;
   const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d4", activityId: "activity-d4" };
 
@@ -2637,7 +2637,7 @@ describe("RealPayForm — L-2 D-4: submit refused for another passkey, and uncon
 
       expect(screen.getByTestId("real-pay-stranded-details")).toHaveTextContent("$1.00 to 0x3333…3333");
       expect(screen.getByText(OTHER_PASSKEY)).toBeInTheDocument();
-      // The screen's own wording is the existing one, untouched.
+      // The screen's own wording: the neutral L-2 D-5 copy — the refusal proves only that THIS request sent nothing.
       expect(screen.getByText(STRANDED_HEADLINE)).toBeInTheDocument();
       expect(screen.getByText(STRANDED_DETAIL)).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
@@ -2863,5 +2863,744 @@ describe("RealPayForm — L-2 D-4: submit refused for another passkey, and uncon
       expect(screen.queryByTestId("real-pay-stranded")).toBeNull();
       expect(api.keys()).toEqual(["latest", "prepare"]);
     });
+  });
+});
+
+/**
+ * L-2 D-5: the cancel-only ("stranded") screen used to say "This payment didn’t
+ * go through" / "It was never sent. You can safely cancel it and try again." No
+ * way of reaching that screen can promise that: another session may still send
+ * the payment, and a Cancel may lose that race. Before the approval window ends
+ * the screen now says only what holds on every path — the payment can't be
+ * continued here, it may still go through, cancel and wait for the result.
+ * Two string literals changed in the component. The expired wording, the
+ * controls, the store, the server and every request are exactly as they were.
+ */
+describe("RealPayForm — L-2 D-5: stranded screen copy safety", () => {
+  const HEADLINE = "This payment can’t be continued here";
+  const DETAIL = "This payment may still go through. Select Cancel payment and wait for the result before starting another payment.";
+  /** The wording once the approval window has ended — not part of this slice, pinned here as unchanged. */
+  const EXPIRED_HEADLINE = "This payment’s approval window expired";
+  const EXPIRED_DETAIL = "We’re waiting for final confirmation before showing the final result. This can take a while.";
+  const STILL_WAITING = "This is taking longer than usual. Your payment is still waiting for an update.";
+  /** What the card must no longer claim (compared in lower case). */
+  const OLD_CLAIMS = ["didn’t go through", "didn't go through", "never sent", "safely cancel", "try again"];
+  const OTHER_PASSKEY = "This payment was started with a different passkey. Cancel it and start a new payment.";
+  const CANCEL_LOST_RACE = "This payment could not be cancelled — it may already be on its way.";
+  const CANCEL_UNCONFIRMED = "Could not confirm whether this payment was cancelled. Check its status before trying again.";
+  const C1_BODY = { error: "We couldn't confirm this payment's setup. No money was sent by this request. Refresh the app to check its status before trying again.", code: "prepare_outcome_uncertain" };
+  const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d5", activityId: "activity-d5" };
+  const ADDRESS_DETAILS = "$1.00 to 0x3333…3333";
+  const NO_CONTEXT = { subOrganizationId: null, authorizingCredentialId: null };
+  const CONTEXT = { subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" };
+
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Key = "latest" | "prepare" | "cancel" | "submit" | "status" | "lookup";
+  type Overrides = Record<string, unknown>;
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    // Self-contained: this suite installs its own passkey approval for every test.
+    signPreparedPaymentMock.mockReset();
+    signPreparedPaymentMock.mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId });
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    cleanup();
+    useRealPaymentStore.getState().reset(); // also drops any expiry or follow-up timer a test left armed
+    signPreparedPaymentMock.mockReset();
+    vi.useRealTimers();
+  });
+
+  /** Every request is recorded, including one no handler expects. */
+  function stub(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; method: string; body: unknown }> = [];
+    const counts: Record<Key, number> = { latest: 0, prepare: 0, cancel: 0, submit: 0, status: 0, lookup: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url.endsWith("/api/real/account/balance")) return jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" });
+        const key: Key | null = url.endsWith("/api/real/payments/latest")
+          ? "latest"
+          : url.endsWith("/api/real/payments/prepare")
+            ? "prepare"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/api/real/payments/submit")
+                ? "submit"
+                : url.endsWith("/status")
+                  ? "status"
+                  : url.endsWith("/api/real/recipients/lookup")
+                    ? "lookup"
+                    : null;
+        calls.push({ key: key ?? "other", method, body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return {
+      calls,
+      count: (key: Key) => calls.filter((call) => call.key === key).length,
+      keys: () => calls.map((call) => call.key),
+      /** Everything that could change a payment: the requests that are not reads. */
+      writes: () => calls.filter((call) => call.method !== "GET").map((call) => call.key),
+    };
+  }
+  type Api = ReturnType<typeof stub>;
+
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  const none = () => jsonResponse(200, { attempt: null });
+  /** What the server stores once a payment has reached approval: a window that is still comfortably open. */
+  const openWindow = (): Overrides => ({ prepared: { ...PREPARED_FIELDS, validUntil: nowSeconds() + 3_600 } });
+  /** A payment stopped between its reservation and its preparation carries no prepared fields, and so no window at all. */
+  const halfPrepared = (attempt: Overrides): Overrides => ({ ...attempt, prepared: null });
+  const latestOf =
+    (state: string, attempt: Overrides = {}, context: Overrides = CONTEXT): Handler =>
+    () =>
+      jsonResponse(200, { attempt: attemptFixture({ state, ...attempt }), ...context, serverNowSeconds: nowSeconds() });
+  const statusOf =
+    (state: string, attempt: Overrides = {}): Handler =>
+    () =>
+      jsonResponse(200, { attempt: attemptFixture({ state, ...attempt }), serverNowSeconds: nowSeconds(), reconciliationDeferred: false });
+  const prepareOk =
+    (attempt: Overrides = {}, context: Overrides = CONTEXT): Handler =>
+    () =>
+      jsonResponse(200, { attempt: attemptFixture(attempt), ...context, serverNowSeconds: nowSeconds() });
+  const wrongPasskey: Handler = () => jsonResponse(409, { error: OTHER_PASSKEY, code: "wrong_passkey" });
+  const cancelRefused: Handler = () => jsonResponse(409, { error: "This payment can no longer be cancelled." });
+  const cancelled: Handler = () => jsonResponse(200, { attempt: attemptFixture({ state: "cancelled" }) });
+
+  function mount(handlers: Partial<Record<Key, Handler>>): Api {
+    const api = stub(handlers);
+    render(<RealPayForm />);
+    return api;
+  }
+
+  /** Mounts the form (no payment yet), types an address payment and presses Approve; the handlers decide the rest. */
+  async function approve(handlers: Partial<Record<Key, Handler>>): Promise<Api> {
+    const api = stub({ latest: none, ...handlers });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    return api;
+  }
+
+  /** D-1's explicit check after an unresolved prepare: the second GET /latest answers `found`. */
+  async function checkAfterUnresolvedPrepare(found: Handler): Promise<Api> {
+    const api = await approve({ latest: (n) => (n === 1 ? none() : found(n)), prepare: () => jsonResponse(500, C1_BODY) });
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+    return api;
+  }
+
+  const stranded = () => screen.getByTestId("real-pay-stranded");
+  /** The card itself: the headline, the detail, the payment's own line (and nothing about the controls or the error line below it). */
+  const card = () => stranded().firstElementChild as HTMLElement;
+  const onStranded = () => waitFor(() => expect(stranded()).toBeInTheDocument());
+  /** Long enough for anything the screen would start by itself to have started. */
+  const quiet = () =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+  /** Under fake timers: lets every already-answered request and its follow-on work finish. */
+  const settle = () =>
+    act(async () => {
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+    });
+  const advance = async (ms: number) => {
+    await act(async () => {
+      vi.advanceTimersByTime(ms);
+    });
+    await settle();
+  };
+
+  function expectNeutralCard(details: string) {
+    expect(screen.getByText(HEADLINE)).toBeInTheDocument();
+    expect(screen.getByText(DETAIL)).toBeInTheDocument();
+    expect(screen.getByTestId("real-pay-stranded-details")).toHaveTextContent(details);
+    // The whole card, in order: nothing else is on it.
+    expect(card().textContent).toBe(`${HEADLINE}${DETAIL}${details}`);
+    const text = card().textContent!.toLowerCase();
+    for (const claim of OLD_CLAIMS) expect(text, claim).not.toContain(claim);
+    expect(screen.queryByText(EXPIRED_HEADLINE)).toBeNull();
+    expect(screen.queryByText(EXPIRED_DETAIL)).toBeNull();
+  }
+
+  function expectExpiredCard(details: string, extra = "") {
+    expect(screen.getByText(EXPIRED_HEADLINE)).toBeInTheDocument();
+    expect(screen.getByText(EXPIRED_DETAIL)).toBeInTheDocument();
+    expect(card().textContent).toBe(`${EXPIRED_HEADLINE}${EXPIRED_DETAIL}${details}${extra}`);
+    expect(screen.queryByText(HEADLINE)).toBeNull();
+    expect(screen.queryByText(DETAIL)).toBeNull();
+    expect(stranded().textContent).not.toContain("may still go through");
+  }
+
+  /** Cancel payment is the screen's only control. */
+  function expectCancelOnly() {
+    expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    for (const name of ["Continue", "Review", "Approve", "Edit", "Check status", "Checked just now", "Check available later", "Check payment status", "Check again", "Try again", "Send another payment"]) {
+      expect(screen.queryByRole("button", { name }), name).toBeNull();
+    }
+    for (const id of ["real-pay-form", "real-pay-review", "real-pay-preparing", "real-pay-resume", "real-pay-authorizing", "real-pay-sending", "real-pay-unknown", "real-pay-failed", "real-pay-confirmed", "real-pay-status-unavailable", "real-pay-prepare-recovery"]) {
+      expect(screen.queryByTestId(id), id).toBeNull();
+    }
+  }
+
+  /**
+   * The eight ways the screen is reached (P1–P8 of the D-5 scope audit), each
+   * driven through the form and the fake server exactly as the existing suites
+   * do — the store is never set by hand. `keys` is every request the path
+   * makes, in order; `signs` is how many passkey approvals it involves.
+   */
+  type Path = { name: string; arrive: (attempt: Overrides) => Promise<Api>; keys: Array<Key | "other">; signs: number; error: string | null; onlyWithoutWindow?: true };
+  const PATHS: Path[] = [
+    {
+      name: "P1 — the submit is refused for another passkey (the exact coded 409)",
+      arrive: (attempt) => approve({ prepare: prepareOk(attempt), submit: wrongPasskey }),
+      keys: ["latest", "prepare", "submit"],
+      signs: 1,
+      error: OTHER_PASSKEY,
+    },
+    {
+      name: "P2 — a reload finds a payment waiting for approval, with no signing context for this session",
+      arrive: async (attempt) => mount({ latest: latestOf("awaiting_authorization", attempt, NO_CONTEXT) }),
+      keys: ["latest"],
+      signs: 0,
+      error: OTHER_PASSKEY,
+    },
+    {
+      name: "P2 — the same answer to D-1's explicit check",
+      arrive: (attempt) => checkAfterUnresolvedPrepare(latestOf("awaiting_authorization", attempt, NO_CONTEXT)),
+      keys: ["latest", "prepare", "latest"],
+      signs: 0,
+      error: OTHER_PASSKEY,
+    },
+    {
+      name: "P3 — Approve with no authorizing passkey in the prepare answer",
+      arrive: (attempt) => approve({ prepare: prepareOk(attempt, { subOrganizationId: "sub-org-1" }) }),
+      keys: ["latest", "prepare"],
+      signs: 0,
+      error: OTHER_PASSKEY,
+    },
+    {
+      name: "P3 — Continue after the refusal, once a status read shows the payment waiting again",
+      arrive: async (attempt) => {
+        const api = await approve({ prepare: prepareOk(attempt), submit: wrongPasskey, cancel: cancelRefused, status: statusOf("awaiting_authorization", attempt) });
+        await onStranded();
+        fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+        await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+        fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+        return api;
+      },
+      keys: ["latest", "prepare", "submit", "cancel", "status"],
+      signs: 1,
+      error: OTHER_PASSKEY,
+    },
+    {
+      name: "P4 — a reload finds a prepared payment",
+      arrive: async (attempt) => mount({ latest: latestOf("prepared", halfPrepared(attempt)) }),
+      keys: ["latest"],
+      signs: 0,
+      error: null,
+      onlyWithoutWindow: true,
+    },
+    {
+      name: "P4 — D-1's explicit check finds a prepared payment",
+      arrive: (attempt) => checkAfterUnresolvedPrepare(latestOf("prepared", halfPrepared(attempt))),
+      keys: ["latest", "prepare", "latest"],
+      signs: 0,
+      error: null,
+      onlyWithoutWindow: true,
+    },
+    {
+      name: "P5 — a reload finds a signed payment",
+      arrive: async (attempt) => mount({ latest: latestOf("signed", attempt) }),
+      keys: ["latest"],
+      signs: 0,
+      error: null,
+    },
+    {
+      name: "P5 — D-1's explicit check finds a signed payment",
+      arrive: (attempt) => checkAfterUnresolvedPrepare(latestOf("signed", attempt)),
+      keys: ["latest", "prepare", "latest"],
+      signs: 0,
+      error: null,
+    },
+    {
+      name: "P6 — Check status (after an unconfirmed submit) reads a signed payment",
+      arrive: async (attempt) => {
+        const api = await approve({ prepare: prepareOk(attempt), submit: () => jsonResponse(500, { error: "Something went wrong. Please try again." }), status: statusOf("signed", attempt) });
+        await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+        fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+        return api;
+      },
+      keys: ["latest", "prepare", "submit", "status"],
+      signs: 1,
+      error: null,
+    },
+    {
+      name: "P6 — Check status (after an unconfirmed submit) reads a prepared payment",
+      arrive: async (attempt) => {
+        const api = await approve({ prepare: prepareOk(attempt), submit: () => jsonResponse(500, { error: "Something went wrong. Please try again." }), status: statusOf("prepared", halfPrepared(attempt)) });
+        await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+        fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+        return api;
+      },
+      keys: ["latest", "prepare", "submit", "status"],
+      signs: 1,
+      error: null,
+      onlyWithoutWindow: true,
+    },
+    {
+      name: "P7 — Cancel is refused on the approval screen and the read that follows shows a signed payment",
+      arrive: async (attempt) => {
+        const api = mount({ latest: latestOf("awaiting_authorization", attempt), cancel: cancelRefused, status: statusOf("signed", attempt) });
+        await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+        fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+        return api;
+      },
+      keys: ["latest", "cancel", "status"],
+      signs: 0,
+      error: CANCEL_LOST_RACE,
+    },
+    {
+      name: "P7 — Cancel is refused on this screen and the read that follows shows the payment still prepared",
+      arrive: async (attempt) => {
+        const api = mount({ latest: latestOf("prepared", halfPrepared(attempt)), cancel: cancelRefused, status: statusOf("prepared", halfPrepared(attempt)) });
+        await onStranded();
+        fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+        return api;
+      },
+      keys: ["latest", "cancel", "status"],
+      signs: 0,
+      error: CANCEL_LOST_RACE,
+      onlyWithoutWindow: true,
+    },
+    {
+      name: "P8 — the submit answers with a stale signed payment",
+      arrive: (attempt) => approve({ prepare: prepareOk(attempt), submit: () => jsonResponse(200, { attempt: attemptFixture({ state: "signed", ...attempt }) }) }),
+      keys: ["latest", "prepare", "submit"],
+      signs: 1,
+      error: null,
+    },
+  ];
+
+  describe.each([
+    ["while the approval window is still open", true],
+    ["with no stored approval window (an older or half-prepared payment)", false],
+  ] as const)("every way onto the screen shows the same neutral wording — %s", (_name, withWindow) => {
+    it.each(PATHS.filter((path) => !(withWindow && path.onlyWithoutWindow)))("$name", async (path) => {
+      const api = await path.arrive(withWindow ? openWindow() : {});
+
+      await onStranded();
+      if (path.error !== null) await waitFor(() => expect(screen.getByText(path.error!)).toBeInTheDocument());
+      await quiet();
+
+      // A, C, E: the new headline and detail, the payment's own amount and recipient, and none of the old claims.
+      expectNeutralCard(ADDRESS_DETAILS);
+      // G, H, I: Cancel payment and nothing else — no Continue, no Review, no Check status.
+      expectCancelOnly();
+      // The whole screen: the card, the path's own (unchanged) explanation if it has one, and the one button.
+      expect(stranded().textContent).toBe(`${HEADLINE}${DETAIL}${ADDRESS_DETAILS}${path.error ?? ""}Cancel payment`);
+      // J: showing the screen asked for nothing — these are exactly the requests that led here.
+      expect(api.keys()).toEqual(path.keys);
+      expect(signPreparedPaymentMock).toHaveBeenCalledTimes(path.signs);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "stranded", isAttemptPastValidity: false, isAuthorizing: false, isCancelling: false });
+    });
+  });
+
+  describe("the payment's own line is unchanged", () => {
+    it.each([
+      ["a name and its @handle", { handle: "smit", displayName: "Smit Patel" }, "$1.00 to Smit Patel (@smit)"],
+      ["an @handle with no name", { handle: "smit", displayName: null }, "$1.00 to @smit"],
+    ] as const)("F — %s, from the server's stored attempt", async (_name, recipientIdentity, details) => {
+      mount({ latest: latestOf("signed", { ...openWindow(), recipientIdentity }) });
+
+      await onStranded();
+
+      expectNeutralCard(details);
+      expect(screen.getByTestId("real-pay-stranded-details")).not.toHaveTextContent("0x3333");
+      expectCancelOnly();
+    });
+
+    it("E — the amount and recipient come from the stored attempt, never from what was typed into the form", async () => {
+      // The form said 5.00 to another address; the server's payment is 1.00 to RECIPIENT.
+      const api = stub({ latest: (n) => (n === 1 ? none() : latestOf("signed", openWindow())(n)), prepare: () => jsonResponse(500, C1_BODY) });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+      fireEvent.change(screen.getByLabelText("To"), { target: { value: "0x4444444444444444444444444444444444444444" } });
+      fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "5.00" } });
+      fireEvent.click(screen.getByRole("button", { name: "Review" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+      fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+      fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+      await onStranded();
+
+      expectNeutralCard(ADDRESS_DETAILS);
+      expect(stranded().textContent).not.toMatch(/5\.00|0x4444/);
+      expect(api.keys()).toEqual(["latest", "prepare", "latest"]);
+    });
+  });
+
+  describe("D — once the approval window has ended, the wording is exactly what it was", () => {
+    it("a payment found already past its window: the unchanged expiry headline and detail, Cancel payment, and the one status read it always made", async () => {
+      const validUntil = 1_900_000_600;
+      const attempt = { prepared: { ...PREPARED_FIELDS, validUntil } };
+      const expired = (state: string) => () => jsonResponse(200, { attempt: attemptFixture({ state, ...attempt }), ...CONTEXT, serverNowSeconds: validUntil + 100 });
+      const api = mount({ latest: expired("signed"), status: expired("signed") });
+
+      await waitFor(() => expect(screen.getByText(EXPIRED_HEADLINE)).toBeInTheDocument());
+      await quiet();
+
+      expectExpiredCard(ADDRESS_DETAILS);
+      expect(stranded().textContent).toBe(`${EXPIRED_HEADLINE}${EXPIRED_DETAIL}${ADDRESS_DETAILS}Cancel payment`);
+      // While the automatic follow-ups are still scheduled there is no extra control.
+      expectCancelOnly();
+      expect(api.keys()).toEqual(["latest", "status"]);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "stranded", isAttemptPastValidity: true, isFollowUpExhausted: false });
+    });
+
+    it("a payment to a name, found already past its window: the same unchanged wording above the name line", async () => {
+      const validUntil = 1_900_000_600;
+      const attempt = { prepared: { ...PREPARED_FIELDS, validUntil }, recipientIdentity: { handle: "smit", displayName: "Smit Patel" } };
+      const expired = () => jsonResponse(200, { attempt: attemptFixture({ state: "signed", ...attempt }), ...CONTEXT, serverNowSeconds: validUntil + 100 });
+      mount({ latest: expired, status: expired });
+
+      await waitFor(() => expect(screen.getByText(EXPIRED_HEADLINE)).toBeInTheDocument());
+
+      expectExpiredCard("$1.00 to Smit Patel (@smit)");
+      expectCancelOnly();
+    });
+
+    it("the same screen switches at the window's end — neutral wording until then, the unchanged expiry wording after — with the one status read it always made", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      const attempt = { prepared: { ...PREPARED_FIELDS, validUntil: nowSeconds() + 600 } };
+      const api = stub({ latest: latestOf("signed", attempt), status: statusOf("signed", attempt) });
+      render(<RealPayForm />);
+      await settle();
+
+      expectNeutralCard(ADDRESS_DETAILS);
+      expectCancelOnly();
+      expect(api.keys()).toEqual(["latest"]);
+
+      // One millisecond before the store's own timer (the window's end, plus the second the server allows).
+      await advance(600_999);
+      expectNeutralCard(ADDRESS_DETAILS);
+      expect(api.keys()).toEqual(["latest"]);
+
+      await advance(1);
+      expectExpiredCard(ADDRESS_DETAILS);
+      expectCancelOnly();
+      expect(api.keys()).toEqual(["latest", "status"]);
+      expect(api.writes()).toEqual([]);
+    });
+  });
+
+  describe("I — Check status appears only where it already did", () => {
+    it("after the window ends: not while follow-ups are scheduled; once all eight have run, with the still-waiting line — and then nothing more by itself", async () => {
+      const { followUpDelayMs, MAX_AUTOMATIC_FOLLOW_UPS } = await import("@/lib/stores/real-payment-store");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      const validUntil = nowSeconds() - 100;
+      const attempt = { prepared: { ...PREPARED_FIELDS, validUntil } };
+      const api = stub({ latest: latestOf("signed", attempt), status: statusOf("signed", attempt) });
+      render(<RealPayForm />);
+      await settle();
+
+      expectExpiredCard(ADDRESS_DETAILS);
+      expectCancelOnly();
+      expect(api.keys()).toEqual(["latest", "status"]);
+
+      for (let i = 0; i < MAX_AUTOMATIC_FOLLOW_UPS; i++) {
+        expect(screen.queryByRole("button", { name: "Check status" }), `before follow-up ${i + 1}`).toBeNull();
+        await advance(followUpDelayMs(i));
+        expect(api.count("status"), `after follow-up ${i + 1}`).toBe(i + 2);
+      }
+
+      expectExpiredCard(ADDRESS_DETAILS, STILL_WAITING);
+      expect(screen.getByRole("button", { name: "Check status" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+      expect(stranded().textContent).toBe(`${EXPIRED_HEADLINE}${EXPIRED_DETAIL}${ADDRESS_DETAILS}${STILL_WAITING}Check statusCancel payment`);
+
+      // Exhausted: no automatic request of any kind, however long the page stays open.
+      await advance(24 * 60 * 60 * 1000);
+      expect(api.count("status")).toBe(MAX_AUTOMATIC_FOLLOW_UPS + 1);
+
+      // The manual check is one read per press.
+      fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+      await settle();
+      expect(api.count("status")).toBe(MAX_AUTOMATIC_FOLLOW_UPS + 2);
+      expect(screen.getByRole("button", { name: "Checked just now" })).toBeDisabled();
+      expect(api.writes()).toEqual([]);
+      expectExpiredCard(ADDRESS_DETAILS, STILL_WAITING);
+    });
+
+    it("before the window ends: only if the follow-ups have already run out (the existing stale-flag case), beside the neutral wording", async () => {
+      const api = mount({ latest: latestOf("signed", openWindow()), status: statusOf("signed", openWindow()) });
+      await onStranded();
+      expectCancelOnly();
+
+      // The same way the existing LOW-1 test reaches it: the follow-up budget is spent while the validity flag is still false.
+      act(() => useRealPaymentStore.setState({ isFollowUpExhausted: true, isAttemptPastValidity: false }));
+
+      expect(card().textContent).toBe(`${HEADLINE}${DETAIL}${ADDRESS_DETAILS}${STILL_WAITING}`);
+      expect(stranded().textContent).toBe(`${HEADLINE}${DETAIL}${ADDRESS_DETAILS}${STILL_WAITING}Check statusCancel payment`);
+      expect(api.keys()).toEqual(["latest"]);
+
+      fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+      await waitFor(() => expect(api.count("status")).toBe(1));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Checked just now" })).toBeDisabled());
+      expect(api.keys()).toEqual(["latest", "status"]);
+      expect(screen.getByText(HEADLINE)).toBeInTheDocument();
+      expect(screen.getByText(DETAIL)).toBeInTheDocument();
+    });
+  });
+
+  describe("J — showing the screen sends nothing", () => {
+    it("an open window: no request for as long as the window lasts", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      const attempt = { prepared: { ...PREPARED_FIELDS, validUntil: nowSeconds() + 3_600 } };
+      const api = stub({ latest: latestOf("signed", attempt) });
+      render(<RealPayForm />);
+      await settle();
+      expectNeutralCard(ADDRESS_DETAILS);
+
+      await advance(3_600_000); // up to the window's end; the store's own timer is one second later
+
+      expect(api.keys()).toEqual(["latest"]);
+      expectNeutralCard(ADDRESS_DETAILS);
+      expectCancelOnly();
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+
+    it("no stored window (a prepared payment): no request and no change of wording, however long the page stays open", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      const api = stub({ latest: latestOf("prepared", halfPrepared({})) });
+      render(<RealPayForm />);
+      await settle();
+      expectNeutralCard(ADDRESS_DETAILS);
+
+      await advance(7 * 24 * 60 * 60 * 1000);
+
+      // Such a payment never reaches the expiry wording (stale prepared rows are a separate, open question — L-2 E).
+      expect(api.keys()).toEqual(["latest"]);
+      expectNeutralCard(ADDRESS_DETAILS);
+      expectCancelOnly();
+    });
+  });
+
+  describe("Cancel is exactly what it was", () => {
+    it("K — the server's 'yes' brings the empty form back: one POST, sent only when pressed", async () => {
+      const api = mount({ latest: latestOf("signed", openWindow()), cancel: cancelled });
+      await onStranded();
+      await quiet();
+      expect(api.count("cancel")).toBe(0);
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+      expect(api.keys()).toEqual(["latest", "cancel"]);
+      expect(api.calls[1]).toMatchObject({ key: "cancel", method: "POST", body: undefined });
+      expect(screen.getByLabelText("To")).toHaveValue("");
+      expect(screen.getByLabelText("Amount")).toHaveValue("");
+      expect(screen.getByRole("button", { name: "Review" })).toBeEnabled();
+      expect(screen.queryByTestId("real-pay-stranded")).toBeNull();
+      expect(document.body.textContent).not.toContain(HEADLINE);
+      expect(document.body.textContent).not.toContain(DETAIL);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, error: null });
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+
+    it("L — a refused Cancel whose follow-up read shows the payment sent: 'Sending…' with the lost-race line, never the form and never 'cancelled'", async () => {
+      const api = mount({ latest: latestOf("signed", openWindow()), cancel: cancelRefused, status: statusOf("submitted", openWindow()) });
+      await onStranded();
+      expectNeutralCard(ADDRESS_DETAILS);
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+
+      await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+      await quiet();
+      expect(screen.getByText(CANCEL_LOST_RACE)).toBeInTheDocument();
+      expect(screen.queryByTestId("real-pay-stranded")).toBeNull();
+      expect(screen.queryByTestId("real-pay-form")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Cancel payment" })).toBeNull();
+      expect(document.body.textContent).not.toContain(HEADLINE);
+      // One Cancel, the one read that follows a refusal, and nothing else.
+      expect(api.keys()).toEqual(["latest", "cancel", "status"]);
+      expect(api.writes()).toEqual(["cancel"]);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "submitted" });
+    });
+
+    it("M — a refused Cancel, and a second one inside the same wait: the neutral wording stands beside the refusal, and there is one follow-up read, not two", async () => {
+      const api = mount({ latest: latestOf("signed", openWindow()), cancel: cancelRefused, status: statusOf("signed", openWindow()) });
+      await onStranded();
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+      await waitFor(() => expect(screen.getByText(CANCEL_LOST_RACE)).toBeInTheDocument());
+      await waitFor(() => expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled());
+      const afterFirst = `${HEADLINE}${DETAIL}${ADDRESS_DETAILS}${CANCEL_LOST_RACE}Cancel payment`;
+      expect(stranded().textContent).toBe(afterFirst);
+      expect(api.keys()).toEqual(["latest", "cancel", "status"]);
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+      await waitFor(() => expect(api.count("cancel")).toBe(2));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled());
+      await quiet();
+
+      // Still the same payment, the same wording and the same refusal: "may still go through" and "may already be on its way" agree.
+      expectNeutralCard(ADDRESS_DETAILS);
+      expect(stranded().textContent).toBe(afterFirst);
+      expect(api.keys()).toEqual(["latest", "cancel", "status", "cancel"]);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "stranded", error: CANCEL_LOST_RACE });
+    });
+
+    it.each([
+      [
+        "the Cancel request itself fails on the network",
+        {
+          cancel: () => {
+            throw new TypeError("Failed to fetch");
+          },
+        },
+        ["latest", "cancel"],
+      ],
+      ["the Cancel is refused and the read that follows fails", { cancel: cancelRefused, status: () => jsonResponse(500, { error: "boom" }) }, ["latest", "cancel", "status"]],
+    ] as Array<[string, Partial<Record<Key, Handler>>, string[]]>)("N — %s: the payment stays as it is, with the existing unconfirmed line and no raw text", async (_name, handlers, keys) => {
+      const api = mount({ latest: latestOf("signed", openWindow()), ...handlers });
+      await onStranded();
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+
+      await waitFor(() => expect(screen.getByText(CANCEL_UNCONFIRMED)).toBeInTheDocument());
+      await waitFor(() => expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled());
+      await quiet();
+      expectNeutralCard(ADDRESS_DETAILS);
+      expectCancelOnly();
+      expect(stranded().textContent).toBe(`${HEADLINE}${DETAIL}${ADDRESS_DETAILS}${CANCEL_UNCONFIRMED}Cancel payment`);
+      expect(document.body.textContent).not.toMatch(/Failed to fetch|boom|TypeError/);
+      expect(api.keys()).toEqual(keys);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "stranded" });
+      expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "signed" });
+    });
+  });
+
+  it("O — after the wrong-passkey refusal nothing is signed or sent again: not by waiting, not at the window's end, not by calling the store directly", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const attempt = { prepared: { ...PREPARED_FIELDS, validUntil: nowSeconds() + 600 } };
+    const api = stub({ latest: none, prepare: prepareOk(attempt), submit: wrongPasskey, status: statusOf("awaiting_authorization", attempt) });
+    render(<RealPayForm />);
+    await settle();
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await settle();
+
+    expectNeutralCard(ADDRESS_DETAILS);
+    expectCancelOnly();
+    expect(screen.getByText(OTHER_PASSKEY)).toBeInTheDocument();
+    expect(api.keys()).toEqual(["latest", "prepare", "submit"]);
+    expect(api.calls[2]!.body).toEqual(APPROVAL);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "stranded", authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false });
+
+    // The store refuses too: neither action has anything to do from this screen.
+    await act(async () => {
+      await useRealPaymentStore.getState().resumeAuthorization();
+      await useRealPaymentStore.getState().confirmAndSend();
+    });
+    await settle();
+    expect(api.keys()).toEqual(["latest", "prepare", "submit"]);
+
+    // Up to the window's end: nothing at all.
+    await advance(600_999);
+    expect(api.keys()).toEqual(["latest", "prepare", "submit"]);
+    expectNeutralCard(ADDRESS_DETAILS);
+
+    // At its end and afterwards: the existing read-only status checks, and only those.
+    await advance(1);
+    await advance(75_000);
+    expect(api.keys()).toEqual(["latest", "prepare", "submit", "status", "status"]);
+    expect(api.writes()).toEqual(["prepare", "submit"]);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+  });
+
+  describe("P — the other screens are what they were, and the new wording is on none of them", () => {
+    const D1_UNCERTAIN = "We couldn't confirm whether your payment was set up. Check its status before trying again.";
+    const D2_ACCOUNT_NOT_READY = "We can't send payments from this account right now. This payment wasn't started.";
+    const D3A_HEADLINE = "We couldn't check your payments right now.";
+    const D3A_DETAIL = "Check again before starting a new payment.";
+    const EXPIRED_REASON = "This payment expired before it was included on-chain. No money moved.";
+
+    const SCREENS: Array<{ name: string; arrive: () => Promise<unknown>; testId: string; texts: string[]; buttons: string[] }> = [
+      { name: "the ordinary form", arrive: async () => mount({ latest: none }), testId: "real-pay-form", texts: [], buttons: ["Review"] },
+      { name: "D-1: an unresolved preparation", arrive: () => approve({ prepare: () => jsonResponse(500, C1_BODY) }), testId: "real-pay-prepare-recovery", texts: [D1_UNCERTAIN], buttons: ["Check payment status"] },
+      {
+        name: "D-2: the account can't send",
+        arrive: () => approve({ prepare: () => jsonResponse(409, { error: "Your account isn't fully set up yet.", code: "account_not_ready" }) }),
+        testId: "real-pay-form",
+        texts: [D2_ACCOUNT_NOT_READY],
+        buttons: ["Review"],
+      },
+      { name: "D-3a: the first payment check is unavailable", arrive: async () => mount({ latest: () => jsonResponse(500, { error: "boom" }) }), testId: "real-pay-status-unavailable", texts: [D3A_HEADLINE, D3A_DETAIL], buttons: ["Check again"] },
+      {
+        name: "a payment waiting for this session's approval",
+        arrive: async () => mount({ latest: latestOf("awaiting_authorization", openWindow()) }),
+        testId: "real-pay-resume",
+        texts: ["A payment is waiting for your approval", "Only continue if you started this payment."],
+        buttons: ["Continue", "Cancel payment"],
+      },
+      { name: "a payment being checked", arrive: async () => mount({ latest: latestOf("submitting") }), testId: "real-pay-unknown", texts: ["We're checking on this payment"], buttons: ["Check status"] },
+      { name: "a payment being sent", arrive: async () => mount({ latest: latestOf("submitted"), status: statusOf("submitted") }), testId: "real-pay-sending", texts: ["Sending…"], buttons: [] },
+      { name: "a failed payment", arrive: async () => mount({ latest: latestOf("failed", { failureReason: EXPIRED_REASON }) }), testId: "real-pay-failed", texts: [EXPIRED_REASON], buttons: ["Try again"] },
+      { name: "a sent payment", arrive: async () => mount({ latest: latestOf("confirmed", { transactionHash: "0xabc" }) }), testId: "real-pay-confirmed", texts: ["Sent"], buttons: ["Send another payment"] },
+    ];
+
+    it.each(SCREENS)("$name", async ({ arrive, testId, texts, buttons }) => {
+      await arrive();
+
+      await waitFor(() => {
+        expect(screen.getByTestId(testId)).toBeInTheDocument();
+        for (const text of texts) expect(screen.getByText(text)).toBeInTheDocument();
+      });
+      for (const name of buttons) expect(screen.getByRole("button", { name }), name).toBeInTheDocument();
+      expect(screen.queryByTestId("real-pay-stranded")).toBeNull();
+      expect(document.body.textContent).not.toContain(HEADLINE);
+      expect(document.body.textContent).not.toContain(DETAIL);
+      expect(document.body.textContent).not.toContain("may still go through");
+    });
+  });
+
+  it("Q — Practice Mode is untouched: showing the screen and cancelling from it never writes Practice state or its storage", async () => {
+    const { SIMULATION_STORE_NAME, useSimulationStore } = await import("@/lib/stores/simulation-store");
+    const practiceBefore = useSimulationStore.getState().state;
+    const storedBefore = localStorage.getItem(SIMULATION_STORE_NAME);
+
+    mount({ latest: latestOf("signed", openWindow()), cancel: cancelled });
+    await onStranded();
+    expectNeutralCard(ADDRESS_DETAILS);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+
+    // Reference equality: the Practice store's set() was never called, and nothing was persisted.
+    expect(useSimulationStore.getState().state).toBe(practiceBefore);
+    expect(localStorage.getItem(SIMULATION_STORE_NAME)).toBe(storedBefore);
   });
 });
