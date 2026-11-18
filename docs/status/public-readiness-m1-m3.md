@@ -295,3 +295,12 @@ This update **supersedes, on one point only,** the wording above and in the 3C-2
 - **Rollback (unchanged):** roll the budget-consulting code back first; `DROP TABLE real_provider_budgets` removes everything the block adds; no rollback is authorized. Evidence files, spent branches and run ids stay protected.
 - **Correction to the 3C-2 appendix above:** its "Documentation status" bullet says "no commit exists"; that record has since been committed at `f313d61` ("docs: record 3C-2 application database migration", visible in `git log`). Whether an independent audit preceded that checkpoint is not recorded here.
 - **Documentation status:** the migration and the operator's balance check are COMPLETE. **This documentation update is PENDING an independent documentation audit and the operator's Git checkpoint; it is not committed or closed, and no commit exists.**
+
+## Retrospective status update (2026-11-17) — the 3C-2 and 3A operational records are COMMITTED
+
+This update **supersedes, on documentation-checkpoint status only,** the "Documentation status" bullets of the two operational updates above that say their documentation is "PENDING … no commit exists". Those bullets were accurate when written and are left unchanged as history.
+
+- **3C-2 operational record:** committed at `f313d61a0d2082b620099e7d62f105763f17f316` ("docs: record 3C-2 application database migration", verified against `git log`).
+- **3A Provider Budgets operational record:** committed at `a4e8849214a931428629107f60325bbe7da84f62` ("docs: record 3A provider budgets application migration", verified against `git log`). Whether an independent documentation audit preceded each checkpoint is not recorded in this archive beyond the operator's reports.
+- **Unchanged current state:** 3A APPLIED; 3C-2 APPLIED; **3C-1 (`real_registration_admission`) NOT applied and NOT authorized**; the Cash balance load and the passkey logins remain operator-reported; no new payment is proven. Milestone 3 as a whole is OPEN; broader L-2 C and D and L-2 overall are OPEN; L-2 E is NOT AUTHORIZED; Real Mode stays localhost-only and testnet-only; public deployment and mainnet are NOT AUTHORIZED. No migration, evidence file or frozen digest changed.
+- **Documentation status:** this retrospective update is PENDING an independent documentation audit and the operator's Git checkpoint; it is not committed or closed, and no commit exists.
