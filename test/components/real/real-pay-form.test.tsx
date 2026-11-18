@@ -3604,3 +3604,232 @@ describe("RealPayForm — L-2 D-5: stranded screen copy safety", () => {
     expect(localStorage.getItem(SIMULATION_STORE_NAME)).toBe(storedBefore);
   });
 });
+
+describe("RealPayForm — L-2 D-6: bounded submit wait", () => {
+  const NEUTRAL = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
+  const UNKNOWN_HEADLINE = "We're checking on this payment";
+  const UNKNOWN_DETAIL = "It may have already gone through. We'll show the result here once we know — sending another payment is disabled until this one resolves.";
+  const OTHER_PASSKEY = "This payment was started with a different passkey. Cancel it and start a new payment.";
+  const RAW_TEXT = /Failed to fetch|Cannot read|Unexpected|not valid JSON|Not authenticated|Payment not found|no longer awaiting|\(state:|Something went wrong|Request failed|wrong_passkey|TypeError|SyntaxError|aborted/;
+  const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d6", activityId: "activity-d6" };
+  const DEADLINE = 60_000;
+
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Key = "latest" | "prepare" | "cancel" | "submit" | "status" | "balance";
+
+  beforeEach(() => {
+    // Real time keeps flowing (so waitFor's polling works); the 60 s deadline is crossed by advancing the fake clock.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    signPreparedPaymentMock.mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId });
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    cleanup();
+    useRealPaymentStore.getState().reset();
+    signPreparedPaymentMock.mockReset();
+    vi.useRealTimers();
+  });
+
+  function stub(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; method: string; body: unknown }> = [];
+    const counts: Record<Key, number> = { latest: 0, prepare: 0, cancel: 0, submit: 0, status: 0, balance: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/latest")
+          ? "latest"
+          : url.endsWith("/api/real/payments/prepare")
+            ? "prepare"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/api/real/payments/submit")
+                ? "submit"
+                : url.endsWith("/status")
+                  ? "status"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : null;
+        calls.push({ key: key ?? "other", method, body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, count: (key: Key) => calls.filter((call) => call.key === key).length, keys: () => calls.map((call) => call.key) };
+  }
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    let reject: (error: unknown) => void = () => {};
+    const promise = new Promise<Response>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  const statusOf = (state: string) => jsonResponse(200, { attempt: attemptFixture({ state }), serverNowSeconds: nowSeconds(), reconciliationDeferred: false });
+  const absentButtons = (names: string[]) => {
+    for (const name of names) expect(screen.queryByRole("button", { name }), name).toBeNull();
+  };
+  const advance = (ms: number) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
+
+  /** Mounts the form and approves an address payment (one passkey approval); POST /submit is answered by `submit`. */
+  async function send(submit: Handler, others: Partial<Record<Key, Handler>> = {}) {
+    const api = stub({
+      latest: () => jsonResponse(200, { attempt: null }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
+      balance: () => jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }),
+      submit,
+      ...others,
+    });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    return api;
+  }
+
+  it("before 60 s the form says 'Sending…' with no way to act; at 60 s the existing checking screen appears with Check status", async () => {
+    const gate = held();
+    const api = await send(() => gate.promise);
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    expect(screen.getByText("Sending…")).toBeInTheDocument();
+    absentButtons(["Check status", "Continue", "Cancel payment", "Review", "Approve"]);
+
+    // (The exact 60 s boundary is pinned in the store tests; with real time also flowing here, a 2 s margin keeps this one stable.)
+    await advance(DEADLINE - 2_000);
+    expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+
+    await advance(4_000);
+
+    expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument();
+    expect(screen.getByText(UNKNOWN_HEADLINE)).toBeInTheDocument();
+    expect(screen.getByText(UNKNOWN_DETAIL)).toBeInTheDocument();
+    expect(screen.getByText(NEUTRAL)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check status" })).toBeEnabled();
+    // Nothing that acts on the payment, or starts another one, is offered here.
+    absentButtons(["Review", "Continue", "Cancel payment", "Approve", "Edit", "Try again", "Send another payment", "Check payment status", "Check again"]);
+    for (const id of ["real-pay-sending", "real-pay-resume", "real-pay-stranded", "real-pay-form", "real-pay-review", "real-pay-failed", "real-pay-confirmed", "real-pay-status-unavailable"]) {
+      expect(screen.queryByTestId(id), id).toBeNull();
+    }
+    expect(screen.queryByText("Sending…")).toBeNull();
+    expect(document.body.textContent ?? "").not.toMatch(RAW_TEXT);
+    // The mount read, one prepare, one submit of the one approval — nothing else, and nothing by itself.
+    expect(api.keys()).toEqual(["latest", "prepare", "submit"]);
+    expect(api.calls[2]!.body).toEqual(APPROVAL);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1" });
+
+    gate.resolve(jsonResponse(200, { attempt: attemptFixture({ state: "failed", failureReason: "nope" }) }));
+  });
+
+  it("a late answer after the checking screen appeared changes nothing on screen and asks for nothing", async () => {
+    const gate = held();
+    const api = await send(() => gate.promise);
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    await advance(DEADLINE);
+    expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument();
+    const before = document.body.innerHTML;
+
+    gate.resolve(jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc" }) }));
+    await advance(1_000);
+
+    expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument();
+    expect(document.body.innerHTML).toBe(before);
+    expect(screen.queryByTestId("real-pay-confirmed")).toBeNull();
+    expect(api.keys()).toEqual(["latest", "prepare", "submit"]); // no status read, no balance refresh
+  });
+
+  it("Check status 'still waiting for approval' leads to Continue: the retained approval is re-sent — no second passkey prompt, exactly one more submit", async () => {
+    const gate = held();
+    const api = await send((n) => (n === 1 ? gate.promise : statusOf("submitted")), {
+      status: () => jsonResponse(200, { attempt: attemptFixture(), serverNowSeconds: nowSeconds(), reconciliationDeferred: false }),
+    });
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    await advance(DEADLINE);
+    expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument();
+    expect(api.count("submit")).toBe(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    expect(api.count("status")).toBe(1);
+    expect(api.count("submit")).toBe(1); // checking is not sending
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+
+    expect(api.count("submit")).toBe(2);
+    expect(api.calls.filter((call) => call.key === "submit").map((call) => call.body)).toEqual([APPROVAL, APPROVAL]);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    gate.resolve(jsonResponse(500, { error: "late" }));
+  });
+
+  it.each([
+    ["submitted", "real-pay-sending"],
+    ["failed", "real-pay-failed"],
+    ["confirmed", "real-pay-confirmed"],
+  ] as const)("Check status after the checking screen can show a '%s' payment", async (state, testId) => {
+    const gate = held();
+    const api = await send(() => gate.promise, { status: () => statusOf(state) });
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    await advance(DEADLINE);
+    expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+
+    await waitFor(() => expect(screen.getByTestId(testId)).toBeInTheDocument());
+    expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+    expect(api.count("submit")).toBe(1);
+    gate.resolve(jsonResponse(409, { error: OTHER_PASSKEY, code: "wrong_passkey" }));
+  });
+
+  it("a prompt open longer than the deadline does not show the checking screen", async () => {
+    let approve: (value: { signature: string; activityId: string }) => void = () => {};
+    signPreparedPaymentMock.mockReset();
+    signPreparedPaymentMock.mockReturnValue(new Promise((resolve) => (approve = resolve)));
+    const gate = held();
+    const api = await send(() => gate.promise);
+    await waitFor(() => expect(screen.getByTestId("real-pay-authorizing")).toBeInTheDocument());
+
+    await advance(5 * DEADLINE);
+    expect(screen.getByTestId("real-pay-authorizing")).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+    expect(api.count("submit")).toBe(0);
+
+    await act(async () => approve({ signature: APPROVAL.signature, activityId: APPROVAL.activityId }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    await advance(DEADLINE - 2_000);
+    expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument();
+    await advance(4_000);
+    expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument();
+    gate.resolve(jsonResponse(500, { error: "late" }));
+  });
+
+  it("a timely answer is exactly what it always was, and the clock passing afterwards changes nothing", async () => {
+    const api = await send(() => jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }) }), { status: () => statusOf("submitted") });
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    const requests = api.calls.length;
+
+    await advance(10 * DEADLINE);
+
+    expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+    expect(api.count("submit")).toBe(1);
+    expect(api.calls.length).toBeGreaterThanOrEqual(requests); // the existing post-submit status check may follow; no second submit ever
+  });
+});

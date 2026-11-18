@@ -407,6 +407,14 @@ function isSubmitBudgetDenial(error: unknown): error is ApiError {
 export const SUBMIT_UNCONFIRMED_MESSAGE = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
 
 /**
+ * L-2 D-6: the client's own bound on one POST /submit, counted from the moment
+ * the request is sent (never during the passkey prompt). It ends OUR wait only:
+ * the request is NOT aborted, and the server may still be working on it — the
+ * outcome is then simply unknown, never "failed" and never "not sent".
+ */
+export const SUBMIT_REQUEST_DEADLINE_MS = 60_000;
+
+/**
  * L-2 D-4: the ONE submit refusal that is definitive about THIS request — HTTP
  * 409 AND the body's `code` exactly "wrong_passkey". The server decides it
  * before this request's claim, budget charge or any provider call, on a row it
@@ -533,6 +541,14 @@ type SubmitHooks = {
   isSubmitWaiting: (attemptId: string) => boolean;
   /** Records a valid submit-budget denial for this attempt and account (header unparsed). */
   noteSubmitDenied: (attempt: RealPaymentAttempt, retryAfterHeader: string | null) => void;
+  /**
+   * L-2 D-6: arms the ONE client deadline for the submit request about to be
+   * sent. `onDeadline` runs only if this very request is still the active one
+   * when SUBMIT_REQUEST_DEADLINE_MS passes (not stopped, not superseded, not
+   * dropped by a lifecycle change). Returns the function that stops it — called
+   * the moment the request settles. Nothing is aborted.
+   */
+  startSubmitDeadline: (onDeadline: () => void) => () => void;
 };
 
 async function authorizeAndSubmit(
@@ -618,11 +634,31 @@ async function authorizeAndSubmit(
     const shown = get().status;
     return shown === "submitting" || shown === "awaiting_authorization";
   };
+
+  // L-2 D-6: the client's own bound on this one request, started where the
+  // request is (never during the passkey prompt above). The request keeps its
+  // plain await — an answer is applied exactly when it always was — and is NOT
+  // aborted: abandoning it proves nothing about the server. If the timer wins,
+  // this request is decided: its outcome is "unknown", and whatever it later
+  // answers (or rejects with) is dropped by `timedOut` — inside the try/catch,
+  // so never unhandled — leaving the approval, the attempt and the account
+  // context exactly as they are for the user's own explicit Check status.
+  let timedOut = false;
+  const stopDeadline = hooks.startSubmitDeadline(() => {
+    timedOut = true;
+    // Only the lifecycle, attempt and account that sent it, and only while it is still shown as sending.
+    if (!isCurrent() || get().status !== "submitting") return;
+    markTransition();
+    set({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE });
+  });
   try {
     const result = await api<{ attempt: RealPaymentAttempt }>("/api/real/payments/submit", {
       method: "POST",
       body: JSON.stringify({ attemptId: signed.attemptId, signature: signed.signature, activityId: signed.activityId }),
     });
+    stopDeadline();
+    // After the deadline this request was already answered for: its late answer is dropped, whatever it says.
+    if (timedOut) return;
     // The server did answer, so its answer is the payment's state — but only
     // for the context that asked. (After an unmount the next init() reads it.)
     if (!isCurrent()) return;
@@ -637,6 +673,9 @@ async function authorizeAndSubmit(
     set({ status: nextStatus, attempt: result.attempt, pendingSubmission: null, error: null });
     if (result.attempt.state === "confirmed") void useRealBalanceStore.getState().fetchBalance();
   } catch (error) {
+    stopDeadline();
+    // A late rejection (network failure, abort-ignoring fetch) after the deadline is dropped like a late answer.
+    if (timedOut) return;
     if (!isCurrent() || !stillOpen()) return;
     if (isSubmitBudgetDenial(error)) {
       // Decided before any provider work: nothing changed, nothing was sent.
@@ -754,6 +793,18 @@ export function createRealPaymentStore() {
   // a lifecycle change drops them, and a late settle never clears a newer one.
   let preparedCheck: object | null = null;
   let cancelRequest: object | null = null;
+  // L-2 D-6: at most ONE submit deadline timer per store — the active submit
+  // request's. An identity marker, not a boolean: a stopped, superseded or
+  // lifecycle-dropped request's timer can never act for a newer one.
+  let submitRequest: { timerId: ReturnType<typeof setTimeout> } | null = null;
+
+  /** Ends the active submit request's deadline timer, if any. Idempotent; the request itself is untouched. */
+  function clearSubmitRequestDeadline() {
+    if (submitRequest !== null) {
+      clearTimeout(submitRequest.timerId);
+      submitRequest = null;
+    }
+  }
 
   /** Milliseconds left on the retry deadline for this attempt and the signed-in account; 0 when none. A deadline that no longer applies is dropped on sight. */
   function remainingDeadlineMs(attemptId: string): number {
@@ -816,6 +867,8 @@ export function createRealPaymentStore() {
     // Their answers are discarded by the generation check; this frees the slots for the new lifecycle.
     preparedCheck = null;
     cancelRequest = null;
+    // L-2 D-6: a submit request's deadline never outlives its lifecycle (the request's own answer is discarded by its generation check).
+    clearSubmitRequestDeadline();
   }
 
   return create<RealPaymentStore>()((set, get) => {
@@ -1196,6 +1249,24 @@ export function createRealPaymentStore() {
       detached: () => detached,
       isSubmitWaiting,
       noteSubmitDenied,
+      startSubmitDeadline: (onDeadline) => {
+        // A submit starts only from a screen with no request in flight; a leftover marker is dropped, never allowed to act.
+        clearSubmitRequestDeadline();
+        const marker: { timerId: ReturnType<typeof setTimeout> } = {
+          timerId: setTimeout(() => {
+            // Stopped, superseded or dropped with its lifecycle: not this request's deadline any more.
+            if (submitRequest !== marker) return;
+            submitRequest = null;
+            onDeadline();
+          }, SUBMIT_REQUEST_DEADLINE_MS),
+        };
+        submitRequest = marker;
+        return () => {
+          if (submitRequest !== marker) return;
+          clearTimeout(marker.timerId);
+          submitRequest = null;
+        };
+      },
     };
 
     function currentRecipientView(): RecipientView {
@@ -1592,6 +1663,7 @@ export function createRealPaymentStore() {
 
         if (response.ok) {
           clearExpiryTimeout();
+          clearSubmitRequestDeadline();
           endManualCooldown();
           clearDeadline();
           submitCooldown = null;

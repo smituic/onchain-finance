@@ -10,6 +10,8 @@ import {
   parseSubmitRetryAfter,
   STATUS_FALLBACK_DEADLINE_MS,
   STATUS_REQUEST_DEADLINE_MS,
+  SUBMIT_REQUEST_DEADLINE_MS,
+  SUBMIT_UNCONFIRMED_MESSAGE,
 } from "@/lib/stores/real-payment-store";
 import { useRealAccountStore } from "@/lib/stores/real-account-store";
 import { signPreparedPayment } from "@/lib/real/payments/client-sign";
@@ -6540,7 +6542,7 @@ describe("real-payment-store — L-2 D-4: submit refusal disambiguation (exact w
       const store = awaiting(30);
       const sending = store.getState().resumeAuthorization();
       await settle();
-      await vi.advanceTimersByTimeAsync(60_000); // the approval window ends while the request is in flight
+      await vi.advanceTimersByTimeAsync(45_000); // the 30 s approval window ends while the request is in flight (and before the 60 s L-2 D-6 submit deadline)
       expect(api.keys()).toEqual(["submit"]);
 
       gate.resolve(wrongPasskey());
@@ -6562,7 +6564,7 @@ describe("real-payment-store — L-2 D-4: submit refusal disambiguation (exact w
       const store = awaiting(30);
       const sending = store.getState().resumeAuthorization();
       await settle();
-      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(45_000); // past the 30 s window, before the 60 s L-2 D-6 submit deadline
       submitGate.resolve(wrongPasskey());
       await settle();
       expect(api.keys()).toEqual(["submit", "status"]);
@@ -6699,6 +6701,546 @@ describe("real-payment-store — L-2 D-4: submit refusal disambiguation (exact w
 
       expect(store.getState()).toMatchObject({ status: "submitted", error: null, pendingSubmission: null, authorizingCredentialId: "credential-1" });
       expect(api.keys()).toEqual(["submit"]);
+    });
+  });
+});
+
+describe("real-payment-store — L-2 D-6: bounded submit wait", () => {
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const T0_MS = 1_800_000_000_000; // a whole second, so boundary arithmetic is exact
+  const NEUTRAL = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
+  const OTHER_PASSKEY = "This payment was started with a different passkey. Cancel it and start a new payment.";
+  const UNAVAILABLE_SENTENCE = "We couldn't confirm your passkey approval yet. Try again in a moment.";
+  const APPROVAL = { attemptId: "attempt-1", signature: "0xsig-d6", activityId: "activity-d6" };
+  const DEADLINE = SUBMIT_REQUEST_DEADLINE_MS;
+
+  type Key = "prepare" | "latest" | "cancel" | "status" | "submit" | "balance";
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Store = ReturnType<typeof createRealPaymentStore>;
+  const stores: Store[] = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0_MS);
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+  });
+
+  afterEach(async () => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockReset();
+    useRealAccountStore.setState({ account: null });
+    (await import("@/lib/stores/real-balance-store")).useRealBalanceStore.getState().reset();
+  });
+
+  /** Every request is recorded — including one no handler expects, which also fails the request. */
+  function server(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string; body: unknown; signal: unknown }> = [];
+    const counts: Record<Key, number> = { prepare: 0, latest: 0, cancel: 0, status: 0, submit: 0, balance: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/prepare")
+          ? "prepare"
+          : url.endsWith("/api/real/payments/latest")
+            ? "latest"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/status")
+                ? "status"
+                : url.endsWith("/api/real/payments/submit")
+                  ? "submit"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : null;
+        calls.push({ key: key ?? "other", url, method, body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined, signal: init?.signal });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return {
+      calls,
+      keys: () => calls.map((call) => call.key),
+      count: (key: Key) => calls.filter((call) => call.key === key).length,
+      writes: () => calls.filter((call) => call.method !== "GET").map((call) => call.key),
+    };
+  }
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    let reject: (error: unknown) => void = () => {};
+    const promise = new Promise<Response>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  const settle = () => vi.advanceTimersByTimeAsync(0);
+  const offsetFor = (secondsBeforeExpiry: number) => VALID_UNTIL - secondsBeforeExpiry - T0_MS / 1000;
+  const serverNow = (secondsBeforeExpiry = 100_000) => Math.floor(Date.now() / 1000) + offsetFor(secondsBeforeExpiry);
+  const statusReply = (state: string, secondsBeforeExpiry = 100_000) =>
+    jsonResponse(200, { attempt: { ...baseAttempt(), state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null }, serverNowSeconds: serverNow(secondsBeforeExpiry), reconciliationDeferred: false });
+  const latestResumable = () => jsonResponse(200, { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() });
+  const balanceReply = () => jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "0" });
+  const visible = (store: Store) => JSON.parse(JSON.stringify(store.getState())) as Record<string, unknown>;
+  const wrongPasskey = () => jsonResponse(409, { error: OTHER_PASSKEY, code: "wrong_passkey" });
+  const accepted = (state: string) => () => jsonResponse(200, { attempt: { ...baseAttempt(), state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null } });
+
+  function awaiting(secondsBeforeExpiry = 100_000): Store {
+    const store = createRealPaymentStore();
+    stores.push(store);
+    store.setState({ attempt: baseAttempt(), status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: offsetFor(secondsBeforeExpiry) });
+    return store;
+  }
+
+  /** One Continue whose POST /submit is held open; returns once the request is on its way. */
+  async function sending(handlers: Partial<Record<Key, Handler>> = {}) {
+    const gate = held();
+    const api = server({ submit: () => gate.promise, ...handlers });
+    const store = awaiting();
+    const done = store.getState().resumeAuthorization();
+    await settle();
+    expect(store.getState().status).toBe("submitting");
+    return { gate, api, store, done };
+  }
+
+  /** What stays exactly as it was when the page gives up waiting: the payment, the approval, the account context. */
+  const RETAINED = { pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1", isAuthorizing: false };
+
+  describe("A. a submit that never settles", () => {
+    it("is 'submitting' until 60 s, then the existing 'unknown' with the exact conservative message — approval and payment kept, one submit, nothing else", async () => {
+      const { api, store } = await sending();
+      const attemptBefore = structuredClone(store.getState().attempt);
+
+      await vi.advanceTimersByTimeAsync(DEADLINE - 1);
+      expect(store.getState()).toMatchObject({ status: "submitting", error: null });
+
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(DEADLINE).toBe(60_000);
+      expect(store.getState()).toMatchObject({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE, ...RETAINED });
+      expect(SUBMIT_UNCONFIRMED_MESSAGE).toBe(NEUTRAL);
+      // The payment is exactly the one that was on screen — never marked failed, cancelled or sent.
+      expect(store.getState().attempt).toEqual(attemptBefore);
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "awaiting_authorization", failureReason: null, transactionHash: null });
+      expect(api.calls.map(({ key, method, body }) => ({ key, method, body }))).toEqual([{ key: "submit", method: "POST", body: APPROVAL }]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("the fresh flow (Review, Approve, prepare, passkey, submit) is bounded the same way", async () => {
+      const gate = held();
+      const api = server({
+        prepare: () => jsonResponse(200, { attempt: { ...baseAttempt(), id: "attempt-fresh" }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() }),
+        submit: () => gate.promise,
+      });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      store.setState({ status: "editing" });
+      store.getState().setRecipientInput("0x3333333333333333333333333333333333333333");
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      void store.getState().confirmAndSend();
+      await settle();
+      expect(store.getState().status).toBe("submitting");
+
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, pendingSubmission: { attemptId: "attempt-fresh", signature: APPROVAL.signature, activityId: APPROVAL.activityId } });
+      expect(api.keys()).toEqual(["prepare", "submit"]);
+    });
+  });
+
+  describe("B. a fetch that ignores abort", () => {
+    it("the request is never aborted (no signal at all), the deadline still works, and the timer does not repeat", async () => {
+      const { api, store } = await sending();
+      expect(vi.getTimerCount()).toBe(1); // exactly the one deadline timer
+
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+      const atDeadline = visible(store);
+      expect(vi.getTimerCount()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(10 * DEADLINE);
+
+      expect(visible(store)).toEqual(atDeadline);
+      expect(api.calls[0]!.signal).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it("a late rejection after the deadline is observed: no unhandled rejection, no state change", async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        const { gate, store, done } = await sending();
+        await vi.advanceTimersByTimeAsync(DEADLINE);
+        const atDeadline = visible(store);
+
+        gate.reject(new TypeError("Failed to fetch"));
+        await done;
+        // Real macrotask turns, so Node gets its chance to report an unhandled rejection.
+        vi.useRealTimers();
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+        expect(visible(store)).toEqual(atDeadline);
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
+    });
+  });
+
+  /** Every way a submit can end, with what the page has always shown for it. */
+  const OUTCOMES: Array<[string, Handler, Record<string, unknown>]> = [
+    ["submitted", accepted("submitted"), { status: "submitted", error: null, pendingSubmission: null }],
+    ["failed", accepted("failed"), { status: "failed", error: null, pendingSubmission: null }],
+    ["unknown", accepted("unknown"), { status: "unknown", error: null, pendingSubmission: null }],
+    ["submitting (state)", accepted("submitting"), { status: "unknown", error: null, pendingSubmission: null }],
+    ["signed", accepted("signed"), { status: "stranded", error: null, pendingSubmission: null }],
+    ["confirmed", accepted("confirmed"), { status: "confirmed", error: null, pendingSubmission: null }],
+    [
+      "budget 429",
+      () => new Response(JSON.stringify({ error: "Too many tries.", code: "rate_limited", retryable: true }), { status: 429, headers: { "content-type": "application/json", "Retry-After": "86000" } }),
+      { status: "awaiting_authorization", error: null, isSubmitCoolingDown: true, pendingSubmission: APPROVAL },
+    ],
+    ["retryable 503", () => jsonResponse(503, { error: UNAVAILABLE_SENTENCE, retryable: true }), { status: "awaiting_authorization", error: UNAVAILABLE_SENTENCE, pendingSubmission: APPROVAL }],
+    ["wrong_passkey", wrongPasskey, { status: "stranded", error: OTHER_PASSKEY, authorizingCredentialId: null, pendingSubmission: null }],
+    ["code-less 409", () => jsonResponse(409, { error: "This payment is no longer awaiting authorization (state: submitted)." }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
+    ["HTTP 401", () => jsonResponse(401, { error: "Not authenticated." }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
+    ["HTTP 404", () => jsonResponse(404, { error: "Payment not found." }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
+    ["HTTP 500", () => jsonResponse(500, { error: "Something went wrong." }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
+    ["network error", () => Promise.reject(new TypeError("Failed to fetch")), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
+    ["malformed HTTP 200", () => jsonResponse(200, { nothing: true }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
+  ];
+
+  describe("C. timely responses are exactly what they were, and time passing changes nothing", () => {
+    it.each(OUTCOMES)("%s", async (_name, handler, expected) => {
+      const gate = held();
+      const api = server({ submit: () => gate.promise, balance: balanceReply });
+      const store = awaiting();
+      const done = store.getState().resumeAuthorization();
+      await settle();
+      await vi.advanceTimersByTimeAsync(DEADLINE - 1); // as late as a timely answer can be
+      const answer = handler(1);
+      // A rejecting handler is wired to the gate so it settles exactly when the answer is delivered.
+      Promise.resolve(answer).then(gate.resolve, gate.reject);
+      await done;
+      await settle();
+
+      expect(store.getState()).toMatchObject(expected);
+      const settled = visible(store);
+      const callsAfterAnswer = api.calls.length;
+
+      await vi.advanceTimersByTimeAsync(3 * DEADLINE);
+
+      // The deadline no longer exists: nothing moves, nothing is asked.
+      expect(visible(store)).toEqual(settled);
+      expect(api.calls).toHaveLength(callsAfterAnswer);
+      expect(api.count("submit")).toBe(1);
+      expect(api.count("cancel")).toBe(0);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(OUTCOMES.filter(([, , expected]) => !["awaiting_authorization", "stranded"].includes(expected.status as string)))("%s: no timer is left running once the request has settled", async (_name, handler) => {
+      const api = server({ submit: handler, balance: balanceReply });
+      const store = awaiting();
+
+      await store.getState().resumeAuthorization();
+      await settle();
+
+      expect(vi.getTimerCount()).toBe(0);
+      expect(api.count("submit")).toBe(1);
+    });
+  });
+
+  describe("D. a late response is stale, whatever it says", () => {
+    it.each(OUTCOMES)("%s delivered after the deadline writes nothing and sends nothing", async (_name, handler) => {
+      const { gate, api, store, done } = await sending({ balance: balanceReply, latest: latestResumable, status: () => statusReply("confirmed") });
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+      const atDeadline = visible(store);
+      const callsBefore = api.calls.length;
+
+      Promise.resolve(handler(1)).then(gate.resolve, gate.reject);
+      await done;
+      await settle();
+      await vi.advanceTimersByTimeAsync(3 * DEADLINE);
+
+      expect(visible(store)).toEqual(atDeadline);
+      expect(api.calls).toHaveLength(callsBefore);
+      expect(api.count("balance")).toBe(0); // no refresh, even for a late "confirmed"
+      expect(api.count("cancel")).toBe(0);
+      expect(api.count("submit")).toBe(1);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0); // no new countdown from a late 429 / 503
+    });
+  });
+
+  describe("E. a deadline can never act for a context that has moved on", () => {
+    const WAYS: Array<[string, (store: Store) => void | Promise<void>]> = [
+      ["reset()", (store) => store.getState().reset()],
+      ["detach() (the Pay form unmounted)", (store) => store.getState().detach()],
+      [
+        "a remount (detach, then init)",
+        async (store) => {
+          store.getState().detach();
+          await store.getState().init();
+        },
+      ],
+      ["a new init() without a detach", (store) => store.getState().init()],
+      ["another account signing in (no reset)", () => useRealAccountStore.setState({ account: ACCOUNT_B })],
+      [
+        "another account signing in (reset, then init)",
+        async (store) => {
+          useRealAccountStore.setState({ account: ACCOUNT_B });
+          store.getState().reset();
+          await store.getState().init();
+        },
+      ],
+      ["the payment on screen being replaced by another", (store) => store.setState({ attempt: { ...baseAttempt(), id: "attempt-2" } })],
+    ];
+
+    it.each(WAYS)("after %s the deadline writes nothing and sends nothing", async (_name, move) => {
+      const { api, store } = await sending({ latest: latestResumable });
+      await move(store);
+      await settle();
+      const before = visible(store);
+      const callsBefore = api.calls.length;
+
+      await vi.advanceTimersByTimeAsync(5 * DEADLINE);
+
+      expect(visible(store)).toEqual(before);
+      expect(store.getState().status).not.toBe("unknown");
+      expect(store.getState().error).not.toBe(NEUTRAL);
+      expect(api.calls).toHaveLength(callsBefore);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["reset()", (store: Store) => store.getState().reset()],
+      ["detach()", (store: Store) => store.getState().detach()],
+    ] as const)("%s takes the deadline timer with it — no timer is left to fire", async (_name, end) => {
+      const { store } = await sending();
+      expect(vi.getTimerCount()).toBe(1);
+
+      end(store);
+
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("a request that settled in time leaves no timer that could act for the NEXT submit", async () => {
+      const never = held();
+      const apiB = server({ submit: (n) => (n === 1 ? jsonResponse(503, { error: UNAVAILABLE_SENTENCE, retryable: true }) : never.promise) });
+      const second = awaiting();
+
+      await second.getState().resumeAuthorization(); // answered at once: awaiting again, approval kept
+      expect(second.getState()).toMatchObject({ status: "awaiting_authorization", pendingSubmission: APPROVAL });
+      await vi.advanceTimersByTimeAsync(40_000);
+      void second.getState().resumeAuthorization(); // the second submit starts at t = 40 s
+      await settle();
+      expect(second.getState().status).toBe("submitting");
+
+      // t = 60 s: the FIRST request's deadline would have fired by now. It must not act for the second.
+      await vi.advanceTimersByTimeAsync(DEADLINE - 40_000 + 1);
+      expect(second.getState().status).toBe("submitting");
+
+      // The second request's own deadline is 60 s after ITS start.
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect(second.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL });
+      expect(apiB.count("submit")).toBe(2);
+    });
+
+    it("a successful Cancel takes the deadline timer with it", async () => {
+      const { store } = await sending({ cancel: () => jsonResponse(200, { attempt: { ...baseAttempt(), state: "cancelled" } }) });
+      expect(vi.getTimerCount()).toBe(1);
+
+      await store.getState().cancel();
+
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, pendingSubmission: null });
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(5 * DEADLINE);
+      expect(store.getState().status).toBe("editing");
+    });
+
+    it("a status read already on its way when the deadline fires describes the payment as it WAS: it is never applied over the unknown screen", async () => {
+      const statusGate = held();
+      const { api, store } = await sending({ status: () => statusGate.promise });
+      await vi.advanceTimersByTimeAsync(30_000);
+      const checking = store.getState().checkStatus(); // begun while the submit is still in flight; its own 45 s wait outlives the submit deadline
+      await settle();
+      expect(api.keys()).toEqual(["submit", "status"]);
+
+      await vi.advanceTimersByTimeAsync(DEADLINE - 30_000);
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL });
+      const atDeadline = visible(store);
+
+      statusGate.resolve(statusReply("awaiting_authorization"));
+      await checking;
+      await settle();
+
+      expect(visible(store)).toEqual(atDeadline);
+      expect(api.count("status")).toBe(1);
+    });
+
+    it("a payment already shown as terminal when the deadline fires is not moved to unknown", async () => {
+      const { store } = await sending();
+      store.setState({ status: "confirmed", attempt: { ...baseAttempt(), state: "confirmed", prepared: null } });
+      const before = visible(store);
+
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+
+      expect(visible(store)).toEqual(before);
+    });
+  });
+
+  describe("D2. a late outcome never overwrites what Check status has since shown", () => {
+    it.each(OUTCOMES)("%s arriving after Check status re-opened the payment writes nothing", async (_name, handler) => {
+      const { gate, api, store, done } = await sending({ status: () => statusReply("awaiting_authorization"), balance: balanceReply });
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+      await store.getState().checkStatus();
+      // Awaiting again: the one state in which a stray late answer could be mistaken for current.
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", pendingSubmission: APPROVAL });
+      const afterCheck = visible(store);
+      const callsBefore = api.calls.length;
+
+      Promise.resolve(handler(1)).then(gate.resolve, gate.reject);
+      await done;
+      await settle();
+
+      expect(visible(store)).toEqual(afterCheck);
+      expect(api.calls).toHaveLength(callsBefore);
+      expect(api.count("submit")).toBe(1);
+      expect(api.count("balance")).toBe(0);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("F. the way forward is the user's own explicit action", () => {
+    it("Check status after the deadline sends one read; 'still awaiting' leads to Continue with the RETAINED approval — no second prompt, exactly one more submit", async () => {
+      const { gate, api, store, done } = await sending({ status: () => statusReply("awaiting_authorization") });
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+      expect(api.count("status")).toBe(0); // nothing automatic
+      expect(store.getState().status).toBe("unknown");
+
+      await store.getState().checkStatus();
+      expect(api.count("status")).toBe(1);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
+      expect(api.count("submit")).toBe(1);
+
+      // The old request finally answers: it must not overwrite Check status's result.
+      const afterCheck = visible(store);
+      gate.resolve(jsonResponse(200, { attempt: { ...baseAttempt(), state: "failed", prepared: null } }));
+      await done;
+      await settle();
+      expect(visible(store)).toEqual(afterCheck);
+
+      // Only now, on the user's explicit action, does one more submit go out — the same approval, no passkey prompt.
+      const second = held();
+      server({ submit: () => second.promise, status: () => statusReply("awaiting_authorization") });
+      void store.getState().resumeAuthorization();
+      await settle();
+      second.resolve(accepted("submitted")());
+      await settle();
+
+      expect(store.getState()).toMatchObject({ status: "submitted", pendingSubmission: null });
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("the retained approval is what the second submit sends, byte for byte", async () => {
+      const { store } = await sending({ status: () => statusReply("awaiting_authorization") });
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+      await store.getState().checkStatus();
+      const second = server({ submit: accepted("submitted") });
+
+      await store.getState().resumeAuthorization();
+
+      expect(second.calls.map((call) => call.body)).toEqual([APPROVAL]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["submitted", "submitted"],
+      ["failed", "failed"],
+      ["confirmed", "confirmed"],
+    ] as const)("Check status can apply '%s' after the deadline", async (state, shown) => {
+      const { api, store } = await sending({ status: () => statusReply(state), balance: balanceReply });
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+
+      await store.getState().checkStatus();
+      await settle();
+
+      expect(store.getState().status).toBe(shown);
+      expect(store.getState().attempt?.state).toBe(state);
+      expect(api.count("status")).toBe(1);
+      expect(api.count("submit")).toBe(1);
+      expect(api.count("balance")).toBe(state === "confirmed" ? 1 : 0);
+    });
+  });
+
+  describe("G. the passkey prompt is not part of the wait", () => {
+    it("a prompt open for much longer than 60 s never trips the submit deadline; the clock starts when the request is sent", async () => {
+      let approve: (value: { signature: string; activityId: string }) => void = () => {};
+      vi.mocked(signPreparedPayment).mockReset();
+      vi.mocked(signPreparedPayment).mockReturnValue(new Promise((resolve) => (approve = resolve)) as never);
+      const gate = held();
+      const api = server({ submit: () => gate.promise });
+      const store = awaiting();
+      const done = store.getState().resumeAuthorization();
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isAuthorizing: true });
+
+      await vi.advanceTimersByTimeAsync(5 * DEADLINE);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isAuthorizing: true, error: null });
+      expect(api.calls).toHaveLength(0);
+
+      approve({ signature: APPROVAL.signature, activityId: APPROVAL.activityId });
+      await settle();
+      expect(store.getState().status).toBe("submitting");
+
+      await vi.advanceTimersByTimeAsync(DEADLINE - 1);
+      expect(store.getState().status).toBe("submitting");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+      expect(api.count("submit")).toBe(1);
+      gate.resolve(wrongPasskey());
+      await done;
+    });
+  });
+
+  describe("H. a very long time changes nothing", () => {
+    it("one day later: still one submit, one approval, no read, no cancel — the page is still asking the user", async () => {
+      const { api, store } = await sending({ status: () => statusReply("confirmed"), latest: latestResumable, balance: balanceReply });
+
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+      expect(api.keys()).toEqual(["submit"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+  });
+
+  describe("an unknown screen reached by the deadline behaves like every other unknown screen", () => {
+    it("reset() still leaves the form, and the abandoned request's late answer cannot bring the payment back", async () => {
+      const { store, gate, done } = await sending();
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+      expect(store.getState().status).toBe("unknown");
+
+      store.getState().reset();
+      expect(store.getState()).toMatchObject({ status: "editing", pendingSubmission: null, attempt: null });
+      gate.resolve(wrongPasskey());
+      await done;
+      expect(store.getState()).toMatchObject({ status: "editing", pendingSubmission: null, attempt: null });
     });
   });
 });
