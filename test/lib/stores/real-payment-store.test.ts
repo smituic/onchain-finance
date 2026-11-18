@@ -6907,7 +6907,8 @@ describe("real-payment-store — L-2 D-6: bounded submit wait", () => {
     ["unknown", accepted("unknown"), { status: "unknown", error: null, pendingSubmission: null }],
     ["submitting (state)", accepted("submitting"), { status: "unknown", error: null, pendingSubmission: null }],
     ["signed", accepted("signed"), { status: "stranded", error: null, pendingSubmission: null }],
-    ["confirmed", accepted("confirmed"), { status: "confirmed", error: null, pendingSubmission: null }],
+    // L-2 D-7: the submit route never answers "confirmed" in HTTP 200; one that does is not adopted (unknown + explicit Check status).
+    ["confirmed", accepted("confirmed"), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
     [
       "budget 429",
       () => new Response(JSON.stringify({ error: "Too many tries.", code: "rate_limited", retryable: true }), { status: 429, headers: { "content-type": "application/json", "Retry-After": "86000" } }),
@@ -7241,6 +7242,504 @@ describe("real-payment-store — L-2 D-6: bounded submit wait", () => {
       gate.resolve(wrongPasskey());
       await done;
       expect(store.getState()).toMatchObject({ status: "editing", pendingSubmission: null, attempt: null });
+    });
+  });
+});
+
+/**
+ * L-2 D-7: a submit HTTP 200 is adopted only if it is THIS request's own
+ * attempt (exact id, an allowed state, the held recipient and amount, showable
+ * failureReason / transactionHash). Anything else is "we couldn't confirm":
+ * the held payment, the retained approval and the account context stay, and
+ * only the user's own Check status moves forward. No D-7 test touches a real
+ * network, database, provider or passkey.
+ */
+describe("real-payment-store — L-2 D-7: malformed submit response recovery", () => {
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const T0_MS = 1_800_000_000_000;
+  const NEUTRAL = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
+  const APPROVAL = { attemptId: "attempt-1", signature: "0xsig-d7", activityId: "activity-d7" };
+  const DEADLINE = SUBMIT_REQUEST_DEADLINE_MS;
+  const MARKER = "D7-RAW-MARKER-must-never-be-shown";
+
+  type Key = "prepare" | "latest" | "cancel" | "status" | "submit" | "balance";
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Store = ReturnType<typeof createRealPaymentStore>;
+  const stores: Store[] = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0_MS);
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+  });
+
+  afterEach(async () => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockReset();
+    useRealAccountStore.setState({ account: null });
+    (await import("@/lib/stores/real-balance-store")).useRealBalanceStore.getState().reset();
+  });
+
+  /** Every request is recorded — including one no handler expects, which also fails the request. */
+  function server(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string; body: unknown }> = [];
+    const counts: Record<Key, number> = { prepare: 0, latest: 0, cancel: 0, status: 0, submit: 0, balance: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/prepare")
+          ? "prepare"
+          : url.endsWith("/api/real/payments/latest")
+            ? "latest"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/status")
+                ? "status"
+                : url.endsWith("/api/real/payments/submit")
+                  ? "submit"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : null;
+        calls.push({ key: key ?? "other", url, method, body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return {
+      calls,
+      keys: () => calls.map((call) => call.key),
+      count: (key: Key) => calls.filter((call) => call.key === key).length,
+    };
+  }
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    const promise = new Promise<Response>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  const settle = () => vi.advanceTimersByTimeAsync(0);
+  const offsetFor = (secondsBeforeExpiry: number) => VALID_UNTIL - secondsBeforeExpiry - T0_MS / 1000;
+  const serverNow = (secondsBeforeExpiry = 100_000) => Math.floor(Date.now() / 1000) + offsetFor(secondsBeforeExpiry);
+  const statusReply = (state: string) =>
+    jsonResponse(200, { attempt: { ...baseAttempt(), state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null }, serverNowSeconds: serverNow(), reconciliationDeferred: false });
+  const balanceReply = () => jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "0" });
+  const visible = (store: Store) => JSON.parse(JSON.stringify(store.getState())) as Record<string, unknown>;
+
+  /** A well-formed submit answer for the held payment; `over` changes (or, with undefined, drops) a field. */
+  const honest = (over: Record<string, unknown> = {}) => ({ ...baseAttempt(), state: "submitted", prepared: null, ...over });
+  const answer = (body: unknown) => () => jsonResponse(200, body);
+
+  function awaiting(): Store {
+    const store = createRealPaymentStore();
+    stores.push(store);
+    store.setState({ attempt: baseAttempt(), status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: offsetFor(100_000) });
+    return store;
+  }
+
+  async function sending(handlers: Partial<Record<Key, Handler>> = {}) {
+    const gate = held();
+    const api = server({ submit: () => gate.promise, ...handlers });
+    const store = awaiting();
+    const done = store.getState().resumeAuthorization();
+    await settle();
+    expect(store.getState().status).toBe("submitting");
+    return { gate, api, store, done };
+  }
+
+  /** What stays exactly as it was when the page cannot trust an answer. */
+  const RETAINED = { pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1", isAuthorizing: false };
+
+  async function submitOnce(body: unknown) {
+    const api = server({ submit: answer(body) });
+    const store = awaiting();
+    const attemptBefore = structuredClone(store.getState().attempt);
+    await store.getState().resumeAuthorization();
+    await settle();
+    return { api, store, attemptBefore };
+  }
+
+  /** The one assertion every malformed answer must satisfy. */
+  async function expectRejected(body: unknown) {
+    const { api, store, attemptBefore } = await submitOnce(body);
+    expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+    expect(store.getState().attempt).toEqual(attemptBefore); // never replaced, never given an invalid state
+    expect(store.getState().attempt?.state).toBe("awaiting_authorization");
+    expect(JSON.stringify(visible(store))).not.toContain(MARKER); // nothing of the answer is displayed
+    expect(api.keys()).toEqual(["submit"]); // one request: no status, balance, cancel, prepare or second submit
+    expect(signPreparedPayment).toHaveBeenCalledTimes(1); // no extra signature
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(10 * DEADLINE);
+    expect(api.keys()).toEqual(["submit"]); // and nothing later, on its own
+    expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+  }
+
+  // ---- The matrix of malformed answers. Every body carries MARKER somewhere a leak would show.
+  const leak = { failureReason: MARKER };
+  const MALFORMED: Array<[string, unknown]> = [
+    // A / B / C — the attempt object
+    ["A: no attempt key", { nothing: true, note: MARKER }],
+    ["A: empty object", {}],
+    ["B: attempt null", { attempt: null }],
+    ["C: attempt is a number", { attempt: 5 }],
+    ["C: attempt is a string", { attempt: MARKER }],
+    ["C: attempt is true", { attempt: true }],
+    ["C: attempt is false", { attempt: false }],
+    ["C: attempt is 0", { attempt: 0 }],
+    ["C: attempt is an empty string", { attempt: "" }],
+    ["C: attempt is an array", { attempt: [honest()] }],
+    ["C: attempt is an empty array", { attempt: [] }],
+    // D — the id
+    ["D: id missing", { attempt: honest({ id: undefined, ...leak }) }],
+    ["D: id null", { attempt: honest({ id: null, ...leak }) }],
+    ["D: id numeric", { attempt: honest({ id: 1, ...leak }) }],
+    ["D: id empty", { attempt: honest({ id: "", ...leak }) }],
+    ["D: id an object", { attempt: honest({ id: { id: "attempt-1" }, ...leak }) }],
+    ["D: id an array", { attempt: honest({ id: ["attempt-1"], ...leak }) }],
+    // E — the wrong id, with every allowed state
+    ...["submitted", "failed", "unknown", "signed", "submitting"].map((state): [string, unknown] => [`E: another attempt's id with state ${state}`, { attempt: honest({ id: "attempt-0", state, ...leak }) }]),
+    ["E: an older-looking id", { attempt: honest({ id: "attempt-10", ...leak }) }],
+    ["E: id differs by case", { attempt: honest({ id: "ATTEMPT-1", ...leak }) }],
+    ["E: id has a leading space", { attempt: honest({ id: " attempt-1", ...leak }) }],
+    ["E: id has a trailing space", { attempt: honest({ id: "attempt-1 ", ...leak }) }],
+    // F — unusable state strings
+    ...["SUBMITTED", "Submitted", " submitted", "submitted ", "pending", "bogus", "", "sent"].map((state): [string, unknown] => [`F: state ${JSON.stringify(state)}`, { attempt: honest({ state, ...leak }) }]),
+    // G — missing or non-string state
+    ["G: state missing", { attempt: honest({ state: undefined, ...leak }) }],
+    ["G: state null", { attempt: honest({ state: null, ...leak }) }],
+    ["G: state numeric", { attempt: honest({ state: 5, ...leak }) }],
+    ["G: state an object", { attempt: honest({ state: { value: "submitted" }, ...leak }) }],
+    ["G: state an array", { attempt: honest({ state: ["submitted"], ...leak }) }],
+    ["G: state boolean", { attempt: honest({ state: true, ...leak }) }],
+    // H — supporting fields
+    ["H: recipient missing", { attempt: honest({ recipient: undefined, ...leak }) }],
+    ["H: recipient null", { attempt: honest({ recipient: null, ...leak }) }],
+    ["H: recipient numeric", { attempt: honest({ recipient: 2, ...leak }) }],
+    ["H: recipient an object", { attempt: honest({ recipient: { address: "0x2222222222222222222222222222222222222222" }, ...leak }) }],
+    ["H: recipient is a different address", { attempt: honest({ recipient: "0x3333333333333333333333333333333333333333", ...leak }) }],
+    ["H: recipient has padding", { attempt: honest({ recipient: " 0x2222222222222222222222222222222222222222", ...leak }) }],
+    ["H: recipient differs by case only", { attempt: honest({ recipient: "0X2222222222222222222222222222222222222222", ...leak }) }],
+    ["H: amount missing", { attempt: honest({ amountBaseUnits: undefined, ...leak }) }],
+    ["H: amount null", { attempt: honest({ amountBaseUnits: null, ...leak }) }],
+    ["H: amount a number", { attempt: honest({ amountBaseUnits: 1000000, ...leak }) }],
+    ["H: amount an object", { attempt: honest({ amountBaseUnits: { value: "1000000" }, ...leak }) }],
+    ["H: amount empty", { attempt: honest({ amountBaseUnits: "", ...leak }) }],
+    ["H: amount with a fraction", { attempt: honest({ amountBaseUnits: "1000000.0", ...leak }) }],
+    ["H: amount in exponent form", { attempt: honest({ amountBaseUnits: "1e6", ...leak }) }],
+    ["H: amount padded", { attempt: honest({ amountBaseUnits: " 1000000", ...leak }) }],
+    ["H: amount with a trailing newline", { attempt: honest({ amountBaseUnits: "1000000\n", ...leak }) }],
+    ["H: amount negative", { attempt: honest({ amountBaseUnits: "-1000000", ...leak }) }],
+    ["H: amount with a leading zero (digits, but not the held amount)", { attempt: honest({ amountBaseUnits: "01000000", ...leak }) }],
+    ["H: amount a different digit string", { attempt: honest({ amountBaseUnits: "2000000", ...leak }) }],
+    ["H: amount smaller", { attempt: honest({ amountBaseUnits: "999999", ...leak }) }],
+    ["H: amount in non-ASCII digits", { attempt: honest({ amountBaseUnits: "１０００００００", ...leak }) }],
+    ["H: failureReason an object", { attempt: honest({ failureReason: { message: MARKER } }) }],
+    ["H: failureReason an array", { attempt: honest({ failureReason: [MARKER] }) }],
+    ["H: failureReason numeric", { attempt: honest({ failureReason: 5, note: MARKER }) }],
+    ["H: failureReason boolean", { attempt: honest({ failureReason: false, note: MARKER }) }],
+    ["H: failureReason omitted (the server always sends string-or-null)", { attempt: honest({ failureReason: undefined, note: MARKER }) }],
+    ["H: transactionHash an object", { attempt: honest({ transactionHash: { hash: MARKER }, ...leak }) }],
+    ["H: transactionHash an array", { attempt: honest({ transactionHash: [MARKER] }) }],
+    ["H: transactionHash numeric", { attempt: honest({ transactionHash: 5, ...leak }) }],
+    ["H: transactionHash boolean", { attempt: honest({ transactionHash: true, ...leak }) }],
+    ["H: transactionHash omitted (the server always sends string-or-null)", { attempt: honest({ transactionHash: undefined, note: MARKER }) }],
+    // J — states this route cannot honestly answer in a 200
+    ...["confirmed", "prepared", "awaiting_authorization", "cancelled"].map((state): [string, unknown] => [`J: disallowed state ${state}`, { attempt: honest({ state, transactionHash: state === "confirmed" ? "0xabc" : null, ...leak }) }]),
+    // K — the top level
+    ["K: top level an array", [{ attempt: honest() }]],
+    ["K: top level an empty array", []],
+    ["K: top level null", null],
+    ["K: top level a string", MARKER],
+    ["K: top level a number", 5],
+    ["K: top level true", true],
+    ["K: top level false", false],
+  ];
+
+  describe("a malformed or mismatched HTTP 200 is never adopted", () => {
+    it.each(MALFORMED)("%s", async (_name, body) => {
+      await expectRejected(body);
+    });
+
+    it("the matrix really covers every group, with no accidental duplicates", () => {
+      expect(new Set(MALFORMED.map(([name]) => name)).size).toBe(MALFORMED.length);
+      for (const group of ["A:", "B:", "C:", "D:", "E:", "F:", "G:", "H:", "J:", "K:"]) expect(MALFORMED.some(([name]) => name.startsWith(group))).toBe(true);
+    });
+
+    it("the amount must be digits even when it equals a (corrupt) held amount — equality alone is not enough", async () => {
+      server({ submit: answer({ attempt: honest({ amountBaseUnits: "1.5", ...leak }) }) });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      store.setState({ attempt: { ...baseAttempt(), amountBaseUnits: "1.5" }, status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: offsetFor(100_000) });
+      await store.getState().resumeAuthorization();
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+      expect(store.getState().attempt).toMatchObject({ amountBaseUnits: "1.5", state: "awaiting_authorization" });
+    });
+
+    it("an unparseable 200 body is the pre-existing 'unknown' too (unchanged by D-7)", async () => {
+      server({ submit: () => new Response("not json", { status: 200, headers: { "content-type": "application/json" } }) });
+      const store = awaiting();
+      await store.getState().resumeAuthorization();
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+    });
+  });
+
+  describe("an honest HTTP 200 behaves exactly as before D-7", () => {
+    const CASES: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+      ["submitted", { state: "submitted" }, { status: "submitted", error: null, pendingSubmission: null }],
+      ["failed with a reason", { state: "failed", failureReason: "The payment could not be sent." }, { status: "failed", error: null, pendingSubmission: null }],
+      ["failed without a reason", { state: "failed" }, { status: "failed", error: null, pendingSubmission: null }],
+      ["unknown", { state: "unknown", failureReason: "We could not confirm it." }, { status: "unknown", error: null, pendingSubmission: null }],
+      ["submitting (a lost conditional write)", { state: "submitting" }, { status: "unknown", error: null, pendingSubmission: null }],
+      ["signed (a lost conditional write)", { state: "signed" }, { status: "stranded", error: null, pendingSubmission: null }],
+    ];
+
+    it.each(CASES)("%s is adopted: the answer replaces the attempt, the approval is spent, one request, nothing else", async (_name, over, shown) => {
+      const body = { attempt: honest(over) };
+      const { api, store } = await submitOnce(body);
+
+      expect(store.getState()).toMatchObject(shown);
+      expect(store.getState().attempt).toEqual(body.attempt);
+      expect(api.keys()).toEqual(["submit"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("a transaction hash string and extra keys are accepted and kept", async () => {
+      const body = { attempt: honest({ state: "submitted", transactionHash: "0xabc123", somethingNew: { nested: true } }), extra: 1 };
+      const { store } = await submitOnce(body);
+      expect(store.getState()).toMatchObject({ status: "submitted", pendingSubmission: null });
+      expect(store.getState().attempt).toMatchObject({ transactionHash: "0xabc123" });
+    });
+
+    it("a valid recipientIdentity is accepted; so are a missing prepared, createdAt, updatedAt and recipientIdentity (not D-7 requirements)", async () => {
+      const withIdentity = await submitOnce({ attempt: honest({ recipientIdentity: { handle: "smit", displayName: "Smit Patel" } }) });
+      expect(withIdentity.store.getState()).toMatchObject({ status: "submitted" });
+
+      const lean = await submitOnce({ attempt: { id: "attempt-1", state: "submitted", recipient: baseAttempt().recipient, amountBaseUnits: "1000000", transactionHash: null, failureReason: null } });
+      expect(lean.store.getState()).toMatchObject({ status: "submitted", pendingSubmission: null });
+    });
+
+    it("the held recipient and amount are compared exactly — a handle payment's held attempt is accepted when the answer carries the same address", async () => {
+      const api = server({ submit: answer({ attempt: honest({ recipientIdentity: { handle: "smit", displayName: null } }) }) });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      store.setState({ attempt: { ...baseAttempt(), recipientIdentity: { handle: "smit", displayName: null } }, status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: offsetFor(100_000) });
+      await store.getState().resumeAuthorization();
+      expect(store.getState().status).toBe("submitted");
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it("'confirmed' is no longer accepted from a submit 200 — unknown, with the approval kept and no balance refresh", async () => {
+      const { api, store } = await submitOnce({ attempt: honest({ state: "confirmed", transactionHash: "0xabc" }) });
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it("'confirmed' is still established through the authoritative status path (with its balance refresh)", async () => {
+      const { api, store } = await submitOnce({ attempt: honest({ state: "confirmed", transactionHash: "0xabc" }) });
+      server({ status: () => statusReply("confirmed"), balance: balanceReply });
+      await store.getState().checkStatus();
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "confirmed" });
+      expect(store.getState().attempt?.state).toBe("confirmed");
+      expect(api.count("submit")).toBe(1);
+    });
+  });
+
+  describe("after a rejected answer the way forward is the user's own Check status — on the ORIGINAL payment", () => {
+    const WRONG = { attempt: honest({ id: "attempt-evil", state: "submitted", ...leak }) };
+
+    it("Check status asks about the held payment's id, never the returned one, and sends nothing else", async () => {
+      const { api, store } = await submitOnce(WRONG);
+      const second = server({ status: () => statusReply("submitted") });
+      await store.getState().checkStatus();
+      await settle();
+
+      expect(second.calls.filter((call) => call.key === "status").map((call) => call.url)).toEqual([expect.stringContaining("/attempt-1/status")]);
+      expect(second.calls.some((call) => call.url.includes("attempt-evil"))).toBe(false);
+      expect(second.keys()).toEqual(["status"]);
+      expect(api.count("submit")).toBe(1);
+      expect(store.getState()).toMatchObject({ status: "submitted" });
+    });
+
+    it("Check status 'still waiting for approval' leads to an explicit Continue: the SAME retained approval is re-sent, no second passkey prompt, one more submit", async () => {
+      const { store } = await submitOnce(WRONG);
+      server({ status: () => statusReply("awaiting_authorization") });
+      await store.getState().checkStatus();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
+
+      const again = server({ submit: answer({ attempt: honest({ state: "submitted" }) }) });
+      await store.getState().resumeAuthorization();
+
+      expect(again.calls.map((call) => call.body)).toEqual([APPROVAL]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      expect(store.getState()).toMatchObject({ status: "submitted", pendingSubmission: null });
+    });
+
+    it("a second malformed answer rejects the same way — the approval is still kept, still nothing automatic", async () => {
+      const { store } = await submitOnce(WRONG);
+      server({ status: () => statusReply("awaiting_authorization") });
+      await store.getState().checkStatus();
+      const again = server({ submit: answer(WRONG) });
+      await store.getState().resumeAuthorization();
+
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+      expect(again.keys()).toEqual(["submit"]);
+    });
+
+    it.each([
+      ["submitted", "submitted", 0],
+      ["failed", "failed", 0],
+      ["confirmed", "confirmed", 1],
+    ] as const)("Check status can establish '%s' through the existing status path", async (state, shown, balances) => {
+      const { store } = await submitOnce(WRONG);
+      const next = server({ status: () => statusReply(state), balance: balanceReply });
+      await store.getState().checkStatus();
+      await settle();
+
+      expect(store.getState().status).toBe(shown);
+      expect(next.count("balance")).toBe(balances);
+      expect(next.count("submit")).toBe(0);
+    });
+  });
+
+  describe("D-6 interleavings", () => {
+    const MALFORMED_BODY = { attempt: honest({ id: "attempt-other", ...leak }) };
+
+    it("a malformed answer just before 60 s is rejected at once; the deadline timer is gone and nothing changes at or after 60 s", async () => {
+      const { gate, api, store, done } = await sending();
+      await vi.advanceTimersByTimeAsync(DEADLINE - 1);
+      expect(store.getState().status).toBe("submitting");
+
+      gate.resolve(jsonResponse(200, MALFORMED_BODY));
+      await done;
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, ...RETAINED });
+      expect(vi.getTimerCount()).toBe(0);
+      const rejected = visible(store);
+
+      await vi.advanceTimersByTimeAsync(10 * DEADLINE);
+      expect(visible(store)).toEqual(rejected);
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it("the deadline fires first: a late malformed answer writes nothing", async () => {
+      const { gate, api, store, done } = await sending();
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+      const atDeadline = visible(store);
+
+      gate.resolve(jsonResponse(200, MALFORMED_BODY));
+      await done;
+      await settle();
+
+      expect(visible(store)).toEqual(atDeadline);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it("the deadline fired and Check status re-opened the payment: a late malformed answer still writes nothing (not even to 'unknown')", async () => {
+      const { gate, api, store, done } = await sending({ status: () => statusReply("awaiting_authorization") });
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+      await store.getState().checkStatus();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", pendingSubmission: APPROVAL });
+      const afterCheck = visible(store);
+      const callsBefore = api.calls.length;
+
+      gate.resolve(jsonResponse(200, MALFORMED_BODY));
+      await done;
+      await settle();
+
+      expect(visible(store)).toEqual(afterCheck);
+      expect(api.calls).toHaveLength(callsBefore);
+    });
+
+    it("a status read already on its way becomes stale at the rejection: its answer is never applied over the unknown screen", async () => {
+      const statusGate = held();
+      const { gate, api, store, done } = await sending({ status: () => statusGate.promise });
+      const checking = store.getState().checkStatus();
+      await settle();
+      expect(api.keys()).toEqual(["submit", "status"]);
+
+      gate.resolve(jsonResponse(200, MALFORMED_BODY));
+      await done;
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL });
+      const rejected = visible(store);
+
+      statusGate.resolve(statusReply("awaiting_authorization"));
+      await checking;
+      await settle();
+
+      expect(visible(store)).toEqual(rejected);
+      expect(api.count("status")).toBe(1);
+    });
+
+    const MOVES: Array<[string, (store: Store) => void | Promise<void>]> = [
+      ["reset()", (store) => store.getState().reset()],
+      ["detach()", (store) => store.getState().detach()],
+      [
+        "a remount (detach, then init)",
+        async (store) => {
+          store.getState().detach();
+          await store.getState().init();
+        },
+      ],
+      ["a new init() without a detach", (store) => store.getState().init()],
+      ["another account signing in (no reset)", () => useRealAccountStore.setState({ account: ACCOUNT_B })],
+      [
+        "another account signing in (reset, then init)",
+        async (store) => {
+          useRealAccountStore.setState({ account: ACCOUNT_B });
+          store.getState().reset();
+          await store.getState().init();
+        },
+      ],
+      ["the payment on screen being replaced by another", (store) => store.setState({ attempt: { ...baseAttempt(), id: "attempt-2" } })],
+    ];
+
+    it.each(MOVES)("a malformed answer arriving after %s writes nothing and sends nothing", async (_name, move) => {
+      const { gate, api, store, done } = await sending({ latest: () => jsonResponse(200, { attempt: null }) });
+      await move(store);
+      await settle();
+      const before = visible(store);
+      const callsBefore = api.calls.length;
+
+      gate.resolve(jsonResponse(200, MALFORMED_BODY));
+      await done;
+      await settle();
+
+      expect(visible(store)).toEqual(before);
+      expect(store.getState().error).not.toBe(NEUTRAL);
+      expect(api.calls).toHaveLength(callsBefore);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+
+    it("a payment already shown as terminal is not moved to unknown by a malformed answer", async () => {
+      const { gate, store, done } = await sending();
+      store.setState({ status: "confirmed", attempt: { ...baseAttempt(), state: "confirmed", prepared: null } });
+      const before = visible(store);
+
+      gate.resolve(jsonResponse(200, MALFORMED_BODY));
+      await done;
+
+      expect(visible(store)).toEqual(before);
+    });
+
+    it("the rejection schedules no new timer and starts no request of its own", async () => {
+      const { gate, api, store, done } = await sending();
+      gate.resolve(jsonResponse(200, MALFORMED_BODY));
+      await done;
+      expect(vi.getTimerCount()).toBe(0);
+      expect(api.keys()).toEqual(["submit"]);
+      expect(store.getState().status).toBe("unknown");
     });
   });
 });

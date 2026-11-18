@@ -429,6 +429,44 @@ function isWrongPasskeyRefusal(error: unknown): boolean {
   return error instanceof ApiError && error.status === 409 && error.code === "wrong_passkey";
 }
 
+/**
+ * L-2 D-7: the attempt states an HTTP 200 from POST /submit can honestly carry
+ * (resolveSubmitPayment: submitted, failed, unknown — and `signed` /
+ * `submitting` when a state-conditional write is lost and the stored row is
+ * returned). Deliberately narrower than KNOWN_ATTEMPT_STATES: this route never
+ * answers `confirmed` (that comes only from the status path), nor `prepared`,
+ * `awaiting_authorization` or `cancelled`.
+ */
+const SUBMIT_RESPONSE_STATES: ReadonlySet<string> = new Set<RealPaymentAttemptState>(["signed", "submitting", "submitted", "failed", "unknown"]);
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * L-2 D-7: is this submit HTTP 200 body the attempt THIS request submitted,
+ * in a shape the page can safely show? Pure; strict; no trimming, case folding
+ * or repair. It checks only what the submit-response-to-render path reads: the
+ * id (exactly the submitted id), the state (the allow-list above), the
+ * recipient and amount (exactly the held attempt's — a payment's intent never
+ * changes after prepare), and failureReason / transactionHash, which the
+ * server's serializer always sends as string-or-null and the form prints.
+ * Additional keys are allowed and ignored. A rejection says nothing about what
+ * happened to the payment.
+ */
+function isHonestSubmitResponse(json: unknown, held: { id: string; recipient: string; amountBaseUnits: string }): json is { attempt: RealPaymentAttempt } {
+  if (!isJsonObject(json)) return false;
+  const attempt = json.attempt;
+  if (!isJsonObject(attempt)) return false;
+  if (typeof attempt.id !== "string" || attempt.id !== held.id) return false;
+  if (typeof attempt.state !== "string" || !SUBMIT_RESPONSE_STATES.has(attempt.state)) return false;
+  if (typeof attempt.recipient !== "string" || attempt.recipient !== held.recipient) return false;
+  if (typeof attempt.amountBaseUnits !== "string" || !/^\d+$/.test(attempt.amountBaseUnits) || attempt.amountBaseUnits !== held.amountBaseUnits) return false;
+  if (attempt.failureReason !== null && typeof attempt.failureReason !== "string") return false;
+  if (attempt.transactionHash !== null && typeof attempt.transactionHash !== "string") return false;
+  return true;
+}
+
 /** Stage 2C-2: how many times one caller waits behind an older-epoch read before giving up (each wait is itself bounded by the request deadline). */
 const MAX_STALE_READ_WAITS = 2;
 
@@ -662,6 +700,19 @@ async function authorizeAndSubmit(
     // The server did answer, so its answer is the payment's state — but only
     // for the context that asked. (After an unmount the next init() reads it.)
     if (!isCurrent()) return;
+    // L-2 D-7: a 200 that is not this request's own attempt in a showable shape
+    // is NOT adopted — it proves nothing about the payment. Explicit rejection
+    // (no throw): the held attempt, the retained approval, the credential and
+    // the account context stay exactly as they are; the page says only that it
+    // could not confirm, and nothing is checked, retried, signed, cancelled or
+    // refreshed automatically — the user's own Check status is the way forward.
+    // Runs after the D-6 and lifecycle guards above, never before them.
+    if (!isHonestSubmitResponse(result as unknown, { id: attempt.id, recipient: attempt.recipient, amountBaseUnits: attempt.amountBaseUnits })) {
+      if (!stillOpen()) return;
+      markTransition();
+      set({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE });
+      return;
+    }
     const nextStatus = mapAttemptStateToStatus(result.attempt.state);
     const shown = get().status;
     // Terminal is final: a late answer never moves a confirmed or failed payment to anything else.

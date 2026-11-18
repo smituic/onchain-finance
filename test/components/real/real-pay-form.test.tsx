@@ -185,7 +185,11 @@ describe("RealPayForm", () => {
         return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" });
       }
       if (url.endsWith("/api/real/payments/submit") && method === "POST") {
-        return jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123" }) });
+        // L-2 D-7: submit never answers "confirmed" in HTTP 200 — it answers "submitted", and the existing status path establishes "confirmed".
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted", transactionHash: "0xabc123" }) });
+      }
+      if (url.includes("/status") && method === "GET") {
+        return jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123" }), serverNowSeconds: 1_900_000_000 });
       }
       if (url.endsWith("/api/real/account/balance") && method === "GET") {
         balanceFetchCount += 1;
@@ -690,7 +694,9 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     const { prepares, lookups } = stubRoutes({
       lookup: () => jsonResponse(200, FOUND_SMIT), // advisory: "Smit Patel"
       prepare: () => jsonResponse(200, { attempt: attemptFixture({ recipientIdentity: STORED }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 }),
-      submit: () => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123", recipientIdentity: STORED }) }),
+      // L-2 D-7: submit answers "submitted"; the existing status path establishes "confirmed".
+      submit: () => jsonResponse(200, { attempt: attemptFixture({ state: "submitted", transactionHash: "0xabc123", recipientIdentity: STORED }) }),
+      status: () => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123", recipientIdentity: STORED }), serverNowSeconds: 1_900_000_000 }),
     });
     signPreparedPaymentMock.mockRejectedValueOnce(Object.assign(new Error("cancelled"), { name: "NotAllowedError" }));
     let finishSigning: (value: { signature: string; activityId: string }) => void = () => {};
@@ -855,7 +861,9 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     const { lookups, prepares } = stubRoutes({
       lookup: () => jsonResponse(200, FOUND_SMIT),
       prepare: prepareOk,
-      submit: () => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123" }) }),
+      // L-2 D-7: submit answers "submitted"; the existing status path establishes "confirmed".
+      submit: () => jsonResponse(200, { attempt: attemptFixture({ state: "submitted", transactionHash: "0xabc123" }) }),
+      status: () => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123" }), serverNowSeconds: 1_900_000_000 }),
     });
     signPreparedPaymentMock.mockResolvedValueOnce({ signature: "0xsignature", activityId: "activity-1" });
     const input = await renderForm();
@@ -3831,5 +3839,196 @@ describe("RealPayForm — L-2 D-6: bounded submit wait", () => {
     expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
     expect(api.count("submit")).toBe(1);
     expect(api.calls.length).toBeGreaterThanOrEqual(requests); // the existing post-submit status check may follow; no second submit ever
+  });
+});
+
+/**
+ * L-2 D-7: what the person sees when POST /submit answers HTTP 200 with
+ * something that is not this payment's own attempt in a showable shape. The
+ * page says only that it could not confirm; Check status is the way forward and
+ * asks about the ORIGINAL payment. Mocked fetch only: no network, provider or
+ * passkey.
+ */
+describe("RealPayForm — L-2 D-7: malformed submit response recovery", () => {
+  const NEUTRAL = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
+  const UNKNOWN_HEADLINE = "We're checking on this payment";
+  const MARKER = "D7-RAW-MARKER-must-never-be-shown";
+  const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d7", activityId: "activity-d7" };
+  const RAW_TEXT = /Cannot read|Unexpected|not valid JSON|Objects are not valid|\[object Object\]|undefined|TypeError|wrong_passkey/;
+
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Key = "latest" | "prepare" | "submit" | "status" | "balance" | "cancel";
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    signPreparedPaymentMock.mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId });
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    cleanup();
+    useRealPaymentStore.getState().reset();
+    signPreparedPaymentMock.mockReset();
+  });
+
+  function stub(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string; body: unknown }> = [];
+    const counts: Record<Key, number> = { latest: 0, prepare: 0, submit: 0, status: 0, balance: 0, cancel: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/latest")
+          ? "latest"
+          : url.endsWith("/api/real/payments/prepare")
+            ? "prepare"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/api/real/payments/submit")
+                ? "submit"
+                : url.endsWith("/status")
+                  ? "status"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : null;
+        calls.push({ key: key ?? "other", url, method, body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, count: (key: Key) => calls.filter((call) => call.key === key).length, keys: () => calls.map((call) => call.key) };
+  }
+
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  const statusOf = (state: string) => jsonResponse(200, { attempt: attemptFixture({ state }), serverNowSeconds: nowSeconds(), reconciliationDeferred: false });
+  const absentButtons = (names: string[]) => {
+    for (const name of names) expect(screen.queryByRole("button", { name }), name).toBeNull();
+  };
+
+  async function send(submit: Handler, others: Partial<Record<Key, Handler>> = {}) {
+    const api = stub({
+      latest: () => jsonResponse(200, { attempt: null }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
+      submit,
+      ...others,
+    });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    return api;
+  }
+
+  const MALFORMED: Array<[string, unknown]> = [
+    ["an unknown state", { attempt: attemptFixture({ state: "teleported", failureReason: MARKER }) }],
+    ["an empty attempt object", { attempt: {} }],
+    ["a wrong-id 'submitted' attempt", { attempt: attemptFixture({ id: "payment-attempt-evil", state: "submitted", failureReason: MARKER }) }],
+    ["a disallowed 'confirmed' state", { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123", failureReason: MARKER }) }],
+    ["a disallowed 'cancelled' state", { attempt: attemptFixture({ state: "cancelled", failureReason: MARKER }) }],
+    ["a disallowed 'awaiting_authorization' state", { attempt: attemptFixture({ state: "awaiting_authorization", failureReason: MARKER }) }],
+    ["an object failureReason on a 'failed' attempt", { attempt: attemptFixture({ state: "failed", failureReason: { message: MARKER } }) }],
+    ["a missing attempt", { note: MARKER }],
+  ];
+
+  it.each(MALFORMED)("%s: the existing checking screen renders — Check status offered, nothing sent, nothing false, nothing raw", async (_name, body) => {
+    const api = await send(() => jsonResponse(200, body));
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+    expect(screen.getByText(UNKNOWN_HEADLINE)).toBeInTheDocument();
+    expect(screen.getByText(NEUTRAL)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check status" })).toBeEnabled();
+    absentButtons(["Review", "Continue", "Cancel payment", "Approve", "Edit", "Try again", "Send another payment"]);
+    for (const id of ["real-pay-sending", "real-pay-resume", "real-pay-stranded", "real-pay-form", "real-pay-review", "real-pay-failed", "real-pay-confirmed", "real-pay-status-unavailable"]) {
+      expect(screen.queryByTestId(id), id).toBeNull();
+    }
+    expect(screen.queryByText("Sent")).toBeNull();
+    expect(screen.queryByText("Sending…")).toBeNull();
+    const text = document.body.textContent ?? "";
+    expect(text.length).toBeGreaterThan(0); // not a blank section
+    expect(text).not.toContain(MARKER);
+    expect(text).not.toContain("0xabc123");
+    expect(text).not.toMatch(RAW_TEXT);
+    // The mount read, one prepare, one submit of the one approval — nothing else, and nothing by itself.
+    expect(api.keys()).toEqual(["latest", "prepare", "submit"]);
+    expect(api.calls[2]!.body).toEqual(APPROVAL);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
+    expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "awaiting_authorization" });
+  });
+
+  it("Check status asks about the ORIGINAL payment id, never the one the malformed answer carried", async () => {
+    const api = await send(() => jsonResponse(200, { attempt: attemptFixture({ id: "payment-attempt-evil", state: "submitted" }) }), { status: () => statusOf("submitted") });
+    await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+    await waitFor(() => expect(api.count("status")).toBe(1));
+
+    const statusCall = api.calls.find((call) => call.key === "status")!;
+    expect(statusCall.url).toContain("/payment-attempt-1/status");
+    expect(api.calls.some((call) => call.url.includes("payment-attempt-evil"))).toBe(false);
+    expect(api.count("submit")).toBe(1);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("Check status 'still waiting' -> explicit Continue re-sends the SAME retained approval — no second passkey prompt", async () => {
+    let submits = 0;
+    const api = await send(
+      () => {
+        submits += 1;
+        return submits === 1 ? jsonResponse(200, { attempt: attemptFixture({ state: "teleported" }) }) : jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }) });
+      },
+      { status: () => statusOf("awaiting_authorization") },
+    );
+    await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+    absentButtons(["Continue"]); // not offered until the server says the payment is still waiting
+
+    fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    expect(api.count("submit")).toBe(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(api.count("submit")).toBe(2));
+
+    expect(api.calls.filter((call) => call.key === "submit").map((call) => call.body)).toEqual([APPROVAL, APPROVAL]);
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("Check status can establish 'confirmed' through the existing status path after a rejected answer", async () => {
+    const api = await send(() => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123" }) }), {
+      status: () => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123" }), serverNowSeconds: nowSeconds(), reconciliationDeferred: false }),
+      balance: () => jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "19000000" }),
+    });
+    await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+    expect(screen.queryByText("Sent")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-confirmed")).toBeInTheDocument());
+    expect(screen.getByText("Sent")).toBeInTheDocument();
+    expect(api.count("submit")).toBe(1);
+  });
+
+  it("an honest answer is unchanged: 'failed' with a reason shows the failed screen with that reason", async () => {
+    await send(() => jsonResponse(200, { attempt: attemptFixture({ state: "failed", failureReason: "The payment could not be sent." }) }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-failed")).toBeInTheDocument());
+    expect(screen.getByText("The payment could not be sent.")).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+  });
+
+  it("an honest 'submitted' answer is unchanged: the sending screen, then the existing status check", async () => {
+    const api = await send(() => jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }) }), { status: () => statusOf("submitted") });
+    await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+    expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+    expect(api.count("submit")).toBe(1);
   });
 });
