@@ -184,6 +184,15 @@ export type RealPaymentStore = {
    * it. Memory only; never persisted; dropped by init/reset/detach.
    */
   prepareNeedsCheck: null | "uncertain" | "in_progress";
+  /**
+   * L-2 D-8: why the last submit or status read of THIS payment ended in an HTTP
+   * 401 ("signed_out") or an HTTP 404 ("not_accessible") — exact status only.
+   * It only picks fixed wording and whether the unknown screen offers the
+   * explicit session check; it says nothing about the payment, which may well
+   * have been sent. Memory only; never persisted; dropped by init/reset/detach,
+   * a successful Cancel, a new submit and any answered status read.
+   */
+  sessionRecovery: null | "signed_out" | "not_accessible";
   /** L-2 D-1: where the explicit status check stands. "nothing_found" is the confirmation that no active payment exists (shown once; cleared by the next Review). "unavailable" means the check itself failed — it proves nothing about any payment. */
   prepareCheck: "idle" | "checking" | "unavailable" | "nothing_found";
   /** L-2 D-1: true while this page's one Cancel request is on its way. A second press is ignored; nothing is retried or released locally. */
@@ -405,6 +414,26 @@ function isSubmitBudgetDenial(error: unknown): error is ApiError {
  * text are never shown; nothing here says the payment was or was not sent.
  */
 export const SUBMIT_UNCONFIRMED_MESSAGE = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
+
+/**
+ * L-2 D-8: fixed client copy for an HTTP 401 / 404 from POST /submit or GET
+ * /status. Neither status proves the payment was never sent, so neither text
+ * says so; the server's own sentence is never shown.
+ */
+export const SIGNED_OUT_PAYMENT_MESSAGE = "You're signed out, so we can't confirm this payment yet. Sign in again to check its status.";
+export const PAYMENT_NOT_ACCESSIBLE_MESSAGE = "We can't check this payment with the current sign-in. It may still have gone through. Check that you're using the account that started it.";
+
+/**
+ * L-2 D-8: the ONE place a 401 / 404 is recognised — `error instanceof
+ * ApiError` and the status EXACTLY 401 or 404. No message matching, and no
+ * other 4xx (400, 403, 409, 429 …) or network / non-JSON failure qualifies.
+ */
+function classifySessionFailure(error: unknown): { reason: "signed_out" | "not_accessible"; message: string } | null {
+  if (!(error instanceof ApiError)) return null;
+  if (error.status === 401) return { reason: "signed_out", message: SIGNED_OUT_PAYMENT_MESSAGE };
+  if (error.status === 404) return { reason: "not_accessible", message: PAYMENT_NOT_ACCESSIBLE_MESSAGE };
+  return null;
+}
 
 /**
  * L-2 D-6: the client's own bound on one POST /submit, counted from the moment
@@ -665,7 +694,7 @@ async function authorizeAndSubmit(
 
   // Any status read already on its way predates the submit: its answer must not be applied after it.
   markTransition();
-  set({ status: "submitting", isAuthorizing: false, pendingSubmission: signed, error: null });
+  set({ status: "submitting", isAuthorizing: false, pendingSubmission: signed, error: null, sessionRecovery: null });
   // Another handler may have changed the payment while this one awaited: only
   // an attempt still waiting for approval, or still being sent, may be moved.
   const stillOpen = () => {
@@ -687,7 +716,7 @@ async function authorizeAndSubmit(
     // Only the lifecycle, attempt and account that sent it, and only while it is still shown as sending.
     if (!isCurrent() || get().status !== "submitting") return;
     markTransition();
-    set({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE });
+    set({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE, sessionRecovery: null });
   });
   try {
     const result = await api<{ attempt: RealPaymentAttempt }>("/api/real/payments/submit", {
@@ -710,7 +739,7 @@ async function authorizeAndSubmit(
     if (!isHonestSubmitResponse(result as unknown, { id: attempt.id, recipient: attempt.recipient, amountBaseUnits: attempt.amountBaseUnits })) {
       if (!stillOpen()) return;
       markTransition();
-      set({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE });
+      set({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE, sessionRecovery: null });
       return;
     }
     const nextStatus = mapAttemptStateToStatus(result.attempt.state);
@@ -721,7 +750,7 @@ async function authorizeAndSubmit(
       return;
     }
     markTransition();
-    set({ status: nextStatus, attempt: result.attempt, pendingSubmission: null, error: null });
+    set({ status: nextStatus, attempt: result.attempt, pendingSubmission: null, error: null, sessionRecovery: null });
     if (result.attempt.state === "confirmed") void useRealBalanceStore.getState().fetchBalance();
   } catch (error) {
     stopDeadline();
@@ -765,13 +794,18 @@ async function authorizeAndSubmit(
     // network failure after a signature exists (the request may have
     // reached the server, or even the bundler, before failing) — either way
     // this is genuinely ambiguous and must never unlock an automatic resend.
+    // L-2 D-8: an exact HTTP 401 / 404 is the same "unknown" with the same
+    // retained attempt, approval and context — only the fixed wording differs
+    // (and the marker that lets the screen offer the explicit session check).
+    // Neither proves the payment was not sent; nothing is retried or checked.
     // The approval stays in memory: if a status check later shows the
     // attempt still awaiting, "Continue" re-sends it (the server's CAS keeps
     // that to at most one dispatch) rather than asking for a new signature.
     // L-2 D-4: the detail shown is fixed — never the server's sentence, a state
     // name, or raw network/parse text.
     markTransition();
-    set({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE });
+    const sessionFailure = classifySessionFailure(error);
+    set({ status: "unknown", error: sessionFailure?.message ?? SUBMIT_UNCONFIRMED_MESSAGE, sessionRecovery: sessionFailure?.reason ?? null });
   }
 }
 
@@ -1141,7 +1175,8 @@ export function createRealPaymentStore() {
         if (verdict.kind === "malformed") {
           // The attempt in this answer is not trusted either: keep the last reliable one, back off, say so plainly.
           noteDeferral(attempt.id, null);
-          set({ error: STATUS_UNUSABLE_MESSAGE });
+          // An answered read (even an unusable one) proves the session works: no sign-in prompt for it.
+          set({ error: STATUS_UNUSABLE_MESSAGE, sessionRecovery: null });
           return;
         }
         const nextStatus = mapAttemptStateToStatus(result.attempt.state);
@@ -1159,6 +1194,7 @@ export function createRealPaymentStore() {
           // isAttemptPastValidity from before this response.
           isAttemptPastValidity: isAttemptPastValidityNow(result.attempt, nextStatus, offset),
           error: null,
+          sessionRecovery: null,
           ...(verdict.kind === "settled" ? { isStatusDeferred: false, statusRetryAfterSeconds: null } : {}),
         });
         if (verdict.kind === "deferred") noteDeferral(attempt.id, verdict.seconds);
@@ -1174,7 +1210,12 @@ export function createRealPaymentStore() {
         }
         // A failure of a read that predates a transition says nothing about the payment as it is now.
         if (isCurrent() && (!read || read.epoch === statusEpoch)) {
-          set({ error: error instanceof StatusTimeoutError ? STATUS_TIMED_OUT_MESSAGE : error instanceof Error ? error.message : "Could not check payment status." });
+          // L-2 D-8: an exact 401 / 404 gets fixed wording and the marker for the explicit session check. Nothing else changes —
+          // the status, attempt, approval and cooldown stay as they were, and nothing is requested because of it. Any other failure
+          // keeps its existing wording and leaves an earlier marker as it was (the lifecycle clears it).
+          const sessionFailure = classifySessionFailure(error);
+          if (sessionFailure) set({ error: sessionFailure.message, sessionRecovery: sessionFailure.reason });
+          else set({ error: error instanceof StatusTimeoutError ? STATUS_TIMED_OUT_MESSAGE : error instanceof Error ? error.message : "Could not check payment status." });
         }
       }
     }
@@ -1414,6 +1455,7 @@ export function createRealPaymentStore() {
         authorizingCredentialId: json.authorizingCredentialId ?? null,
         clockOffsetSeconds: typeof json.serverNowSeconds === "number" ? computeClockOffsetSeconds(json.serverNowSeconds) : 0,
         error: notResumable ? OTHER_PASSKEY_MESSAGE : null,
+        sessionRecovery: null,
         ...extra,
       });
       // A retry deadline the server gave for THIS attempt and account still applies after a remount.
@@ -1446,6 +1488,7 @@ export function createRealPaymentStore() {
       isSubmitRetryBeyondApproval: false,
       prepareNeedsCheck: null,
       prepareCheck: "idle",
+      sessionRecovery: null,
       isCancelling: false,
       clockOffsetSeconds: 0,
       isAttemptPastValidity: false,
@@ -1462,7 +1505,7 @@ export function createRealPaymentStore() {
         // this (see components/real/real-pay-form.tsx's account-change
         // effect). Without this, a stale recipient/amount typed under one
         // account could survive into a different signed-in account.
-        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, prepareNeedsCheck: null, prepareCheck: "idle", isCancelling: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
+        set({ status: "idle", recipientInput: "", recipientLookup: { status: "idle" }, amountInput: "", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, prepareNeedsCheck: null, prepareCheck: "idle", sessionRecovery: null, isCancelling: false, clockOffsetSeconds: 0, isAttemptPastValidity: false, error: null });
         // L-2 D-3a: the answer belongs to the lifecycle (generation) and account
         // that asked. Each init() is its own generation, so a newer init, a
         // reset, a detach or another account makes this one's answer — success,
@@ -1740,6 +1783,7 @@ export function createRealPaymentStore() {
             isSubmitCoolingDown: false,
             submitCooldownSeconds: null,
             isSubmitRetryBeyondApproval: false,
+            sessionRecovery: null,
             error: null,
           });
           return;
@@ -1786,6 +1830,7 @@ export function createRealPaymentStore() {
             attempt: result.attempt,
             clockOffsetSeconds: computeClockOffsetSeconds(result.serverNowSeconds),
             error: CANCEL_LOST_RACE_MESSAGE,
+            sessionRecovery: null,
             ...(verdict.kind === "settled" ? { isStatusDeferred: false, statusRetryAfterSeconds: null } : {}),
           });
           if (verdict.kind === "deferred") noteDeferral(attempt.id, verdict.seconds);
@@ -1920,7 +1965,7 @@ export function createRealPaymentStore() {
         lookupSequence++;
         clearFollowUpState();
         // The submit wait's deadline is kept for the same account and attempt; only what the screen showed goes.
-        set({ isManualCheckCoolingDown: false, isStatusDeferred: false, isSubmitCoolingDown: false, isCancelling: false, ...(get().prepareCheck === "checking" ? { prepareCheck: "idle" as const } : {}) });
+        set({ isManualCheckCoolingDown: false, isStatusDeferred: false, isSubmitCoolingDown: false, isCancelling: false, sessionRecovery: null, ...(get().prepareCheck === "checking" ? { prepareCheck: "idle" as const } : {}) });
       },
 
       reset: () => {
@@ -1930,7 +1975,7 @@ export function createRealPaymentStore() {
         // A new compose flow / sign-out: the previous attempt's deadline has nothing left to govern.
         clearDeadline();
         submitCooldown = null;
-        set({ isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, prepareNeedsCheck: null, prepareCheck: "idle", isCancelling: false, status: "editing", recipientLookup: { status: "idle" }, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
+        set({ isManualCheckCoolingDown: false, isFollowUpExhausted: false, isStatusDeferred: false, statusRetryAfterSeconds: null, isSubmitCoolingDown: false, submitCooldownSeconds: null, isSubmitRetryBeyondApproval: false, prepareNeedsCheck: null, prepareCheck: "idle", sessionRecovery: null, isCancelling: false, status: "editing", recipientLookup: { status: "idle" }, attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, recipientInput: "", amountInput: "", error: null });
       },
     };
   });

@@ -10,7 +10,20 @@ vi.mock("@/lib/real/payments/client-sign", () => ({
   signPreparedPayment: (...args: unknown[]) => signPreparedPaymentMock(...(args as [never])),
 }));
 
+// L-2 D-8: the page-level tests render the real RealPayView (so the form really unmounts and remounts with the account);
+// the ceremony and the three widgets that are not part of this flow are stubbed. No other test in this file renders them.
+vi.mock("@/lib/real/account/webauthn-client", () => ({
+  performLoginCeremony: vi.fn(async () => ({ response: { userHandle: "user-handle" } })),
+  performRegistrationCeremony: vi.fn(),
+  signalAccountLabel: vi.fn(),
+  isWebAuthnCancellation: () => false,
+}));
+vi.mock("@/components/real/real-passkeys-manager", () => ({ RealPasskeysManager: () => null }));
+vi.mock("@/components/real/cash-balance", () => ({ CashBalance: () => null }));
+vi.mock("@/components/real/real-payment-history", () => ({ RealPaymentHistory: () => null }));
+
 const { RealPayForm } = await import("@/components/real/real-pay-form");
+const { RealPayView } = await import("@/components/real/real-pay-view");
 
 const ACCOUNT = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
 const RECIPIENT = "0x3333333333333333333333333333333333333333";
@@ -2758,8 +2771,7 @@ describe("RealPayForm — L-2 D-4: submit refused for another passkey, and uncon
       ["an HTTP 409 with a non-string code", () => jsonResponse(409, { error: OTHER_PASSKEY, code: 409 })],
       ["an HTTP 409 with an unreadable body", () => new Response("<html>409 wrong_passkey</html>", { status: 409 })],
       ["an HTTP 500 carrying the code", () => jsonResponse(500, WRONG_PASSKEY_BODY)],
-      ["an HTTP 401", () => jsonResponse(401, { error: "Not authenticated." })],
-      ["an HTTP 404", () => jsonResponse(404, { error: "Payment not found." })],
+      // L-2 D-8: HTTP 401 / 404 left this list — they have their own fixed wording and actions (see the D-8 section).
       ["an HTTP 400", () => jsonResponse(400, { error: "This payment's signature could not be verified." })],
       ["an HTTP 500", () => jsonResponse(500, { error: "Something went wrong. Please try again." })],
       [
@@ -4030,5 +4042,491 @@ describe("RealPayForm — L-2 D-7: malformed submit response recovery", () => {
     await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
     expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
     expect(api.count("submit")).toBe(1);
+  });
+});
+
+describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
+  const SIGNED_OUT = "You're signed out, so we can't confirm this payment yet. Sign in again to check its status.";
+  const NOT_ACCESSIBLE = "We can't check this payment with the current sign-in. It may still have gone through. Check that you're using the account that started it.";
+  const NEUTRAL = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
+  const UNKNOWN_HEADLINE = "We're checking on this payment";
+  const STILL_SIGNED_IN = "You're signed in. You can check this payment's status again.";
+  const SESSION_CHECK_FAILED = "We couldn't check your sign-in just now. Try again in a moment.";
+  const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d8", activityId: "activity-d8" };
+  const RAW_TEXT = /Not authenticated|Payment not found|Failed to fetch|Unexpected|not valid JSON|session-gone/;
+  const NOT_SENT_CLAIM = /wasn't sent|was not sent|not sent|never sent|didn't go through|did not go through|no money moved|nothing was sent/i;
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const PAYMENT_KEYS = ["latest", "prepare", "submit", "status", "cancel", "balance"] as const;
+
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Key = "latest" | "prepare" | "submit" | "status" | "balance" | "cancel" | "session" | "signout" | "loginOptions" | "loginVerify";
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    signPreparedPaymentMock.mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId });
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    cleanup();
+    useRealPaymentStore.getState().reset();
+    useRealAccountStore.setState({ account: null, status: "idle", error: null });
+    signPreparedPaymentMock.mockReset();
+    vi.restoreAllMocks();
+  });
+
+  const sessionOf = (account: typeof ACCOUNT | typeof ACCOUNT_B) => jsonResponse(200, { authenticated: true, ...account });
+  const signedOutSession = () => jsonResponse(200, { authenticated: false });
+
+  function stub(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string; body: unknown }> = [];
+    const counts = {} as Record<Key, number>;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/latest")
+          ? "latest"
+          : url.endsWith("/api/real/payments/prepare")
+            ? "prepare"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/api/real/payments/submit")
+                ? "submit"
+                : url.endsWith("/status")
+                  ? "status"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : url.endsWith("/api/real/session")
+                      ? method === "DELETE"
+                        ? "signout"
+                        : "session"
+                      : url.endsWith("/api/real/account/login/options")
+                        ? "loginOptions"
+                        : url.endsWith("/api/real/account/login/verify")
+                          ? "loginVerify"
+                          : null;
+        calls.push({ key: key ?? "other", url, method, body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+        counts[key] = (counts[key] ?? 0) + 1;
+        return handler(counts[key]);
+      }),
+    );
+    const count = (key: Key) => calls.filter((call) => call.key === key).length;
+    return {
+      calls,
+      count,
+      keys: () => calls.map((call) => call.key),
+      /** Requests that concern payments or money — nothing of these may follow a session check. */
+      paymentRequests: () => calls.filter((call) => (PAYMENT_KEYS as readonly string[]).includes(call.key)).length,
+    };
+  }
+
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  const unauthenticated = () => jsonResponse(401, { error: "Not authenticated." });
+  const notFound = () => jsonResponse(404, { error: "Payment not found." });
+  const absentButtons = (names: string[]) => {
+    for (const name of names) expect(screen.queryByRole("button", { name }), name).toBeNull();
+  };
+  const NO_PAYMENT_ACTIONS = ["Review", "Continue", "Cancel payment", "Approve", "Edit", "Try again", "Send another payment", "Check payment status", "Check again"];
+
+  /** The whole page, as Pay renders it: the form only while an account exists, and the account setup below it. */
+  function renderPage() {
+    return render(<RealPayView />);
+  }
+
+  /** The page after an Approve whose submit ended with `submit`, leaving the unknown screen with the full signing context. */
+  async function afterSubmit(submit: Handler, others: Partial<Record<Key, Handler>> = {}) {
+    const api = stub({
+      session: () => sessionOf(ACCOUNT),
+      latest: () => jsonResponse(200, { attempt: null }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
+      submit,
+      ...others,
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+    return api;
+  }
+
+  /** The page restored on an unknown payment (the server says it is still being sent), as after a reload. */
+  async function restoredUnknown(others: Partial<Record<Key, Handler>>) {
+    const api = stub({
+      session: () => sessionOf(ACCOUNT),
+      latest: () => jsonResponse(200, { attempt: attemptFixture({ state: "unknown", prepared: null }), serverNowSeconds: nowSeconds() }),
+      ...others,
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+    return api;
+  }
+
+  /** What every D-8 unknown screen must be: the unchanged checking screen, fixed copy only, no payment action but Check status. */
+  function expectUnknownScreen(message: string, afterPress = false) {
+    const unknown = screen.getByTestId("real-pay-unknown");
+    expect(screen.getByText(UNKNOWN_HEADLINE)).toBeInTheDocument();
+    expect(screen.getByText(message)).toBeInTheDocument();
+    // Check status stays the page's own control; right after a press the existing cooldown (unchanged by D-8) shows instead.
+    if (afterPress) expect(screen.getByRole("button", { name: "Checked just now" })).toBeDisabled();
+    else expect(screen.getByRole("button", { name: "Check status" })).toBeEnabled();
+    absentButtons(NO_PAYMENT_ACTIONS);
+    for (const id of ["real-pay-stranded", "real-pay-resume", "real-pay-form", "real-pay-review", "real-pay-failed", "real-pay-confirmed", "real-pay-sending", "real-pay-status-unavailable"]) {
+      expect(screen.queryByTestId(id), id).toBeNull();
+    }
+    expect(unknown.textContent).not.toMatch(RAW_TEXT);
+    expect(unknown.textContent).not.toMatch(NOT_SENT_CLAIM);
+    expect(screen.queryByText("Sent")).toBeNull();
+  }
+
+  describe("the unknown screen", () => {
+    it("submit HTTP 401: fixed signed-out copy, 'Sign in again' and Check status — nothing raw, nothing false, nothing sent twice", async () => {
+      const api = await afterSubmit(unauthenticated);
+
+      expectUnknownScreen(SIGNED_OUT);
+      expect(screen.getByRole("button", { name: "Sign in again" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Check account" })).toBeNull();
+      expect(api.calls.filter((call) => call.key !== "session").map((call) => call.key)).toEqual(["latest", "prepare", "submit"]);
+      expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", sessionRecovery: "signed_out", pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
+      expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "awaiting_authorization" });
+    });
+
+    it("submit HTTP 404: fixed neutral copy, 'Check account' as the secondary action — no 'Sign in again', no claim that nothing was sent", async () => {
+      const api = await afterSubmit(notFound);
+
+      expectUnknownScreen(NOT_ACCESSIBLE);
+      expect(screen.getByRole("button", { name: "Check account" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+      expect(screen.getByText(/It may still have gone through\./)).toBeInTheDocument();
+      expect(api.calls.filter((call) => call.key !== "session").map((call) => call.key)).toEqual(["latest", "prepare", "submit"]);
+      expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", sessionRecovery: "not_accessible", pendingSubmission: APPROVAL });
+    });
+
+    it("manual Check status 401: the same screen, signed-out copy and 'Sign in again'; the payment stays as it was", async () => {
+      const api = await restoredUnknown({ status: unauthenticated });
+      expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull(); // no marker before anything was refused
+      expect(screen.queryByRole("button", { name: "Check account" })).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+      await waitFor(() => expect(screen.getByText(SIGNED_OUT)).toBeInTheDocument());
+
+      expectUnknownScreen(SIGNED_OUT, true);
+      expect(screen.getByRole("button", { name: "Sign in again" })).toBeEnabled();
+      expect(api.count("status")).toBe(1);
+      expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "unknown" });
+      expect(api.count("submit") + api.count("prepare") + api.count("cancel") + api.count("balance")).toBe(0);
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+
+    it("manual Check status 404: neutral copy and 'Check account'; the payment is not shown as failed, cancelled or editable", async () => {
+      const api = await restoredUnknown({ status: notFound });
+
+      fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+      await waitFor(() => expect(screen.getByText(NOT_ACCESSIBLE)).toBeInTheDocument());
+
+      expectUnknownScreen(NOT_ACCESSIBLE, true);
+      expect(screen.getByRole("button", { name: "Check account" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", sessionRecovery: "not_accessible" });
+      expect(api.count("status")).toBe(1);
+    });
+
+    it.each([
+      ["HTTP 500", () => jsonResponse(500, { error: "Something went wrong." })],
+      ["HTTP 403", () => jsonResponse(403, { error: "Forbidden." })],
+      ["a network failure", () => Promise.reject(new TypeError("Failed to fetch"))],
+    ] as Array<[string, Handler]>)("a status read that fails with %s offers neither session action", async (_name, status) => {
+      await restoredUnknown({ status });
+
+      fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+      await waitFor(() => expect(useRealPaymentStore.getState().error).not.toBeNull());
+
+      expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Check account" })).toBeNull();
+      expect(useRealPaymentStore.getState().sessionRecovery).toBeNull();
+    });
+
+    it("a submit that fails the generic way offers neither session action (the unknown screen is exactly what it was)", async () => {
+      await afterSubmit(() => jsonResponse(500, { error: "Something went wrong." }));
+      expectUnknownScreen(NEUTRAL);
+      expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Check account" })).toBeNull();
+    });
+
+    it("on the other screens the fixed copy replaces the raw text; the sign-in action is offered on the unknown screen only", async () => {
+      stub({
+        session: () => sessionOf(ACCOUNT),
+        latest: () => jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), serverNowSeconds: nowSeconds() }),
+        status: unauthenticated,
+      });
+      renderPage();
+      await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+      await waitFor(() => expect(screen.getByText(SIGNED_OUT)).toBeInTheDocument());
+
+      expect(screen.getByTestId("real-pay-sending").textContent).not.toMatch(RAW_TEXT);
+      expect(screen.getByText("Sending…")).toBeInTheDocument();
+      // Spec boundary: the action lives on the unknown screen. (A remaining limitation, recorded in the D-8 documentation.)
+      expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+      expect(useRealPaymentStore.getState().status).toBe("submitted");
+    });
+  });
+
+  describe("'Sign in again' (401)", () => {
+    it("is exactly one session check: no payment request, no signature, no sign-out — and with a still-valid session the screen stays, with a plain note", async () => {
+      const api = await afterSubmit(unauthenticated);
+      const sessionsBefore = api.count("session");
+      const requestsBefore = api.calls.length;
+      // Every payment action is replaced by a spy for the click, so a call the store would quietly ignore on this screen is still caught.
+      const ACTIONS = ["resumeAuthorization", "confirmAndSend", "cancel", "checkStatus", "checkPreparedPayment", "checkPaymentsAgain", "review", "init", "reset"] as const;
+      const originals = Object.fromEntries(ACTIONS.map((name) => [name, useRealPaymentStore.getState()[name]]));
+      const spies = Object.fromEntries(ACTIONS.map((name) => [name, vi.fn()]));
+      useRealPaymentStore.setState(spies as never);
+      try {
+        fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+        await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+        for (const name of ACTIONS) expect(spies[name], name).not.toHaveBeenCalled();
+      } finally {
+        useRealPaymentStore.setState(originals as never);
+      }
+
+      expect(api.count("session")).toBe(sessionsBefore + 1);
+      expect(api.calls.slice(requestsBefore).map((call) => call.key)).toEqual(["session"]);
+      expect(api.count("signout")).toBe(0);
+      expect(api.count("submit")).toBe(1);
+      expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId("real-pay-session-note").textContent).toBe(STILL_SIGNED_IN);
+      expectUnknownScreen(SIGNED_OUT);
+      // Nothing is repeated by itself afterwards.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(api.calls.slice(requestsBefore).map((call) => call.key)).toEqual(["session"]);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", pendingSubmission: APPROVAL, sessionRecovery: "signed_out" });
+    });
+
+    it("pressing Check status afterwards drops the note, so it never contradicts a fresh 'signed out' answer", async () => {
+      await afterSubmit(unauthenticated, { status: unauthenticated });
+      fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+
+      await waitFor(() => expect(screen.queryByTestId("real-pay-session-note")).toBeNull());
+      expect(screen.getByText(SIGNED_OUT)).toBeInTheDocument();
+    });
+
+    it("a repeated press while the check is running is ignored — one session request, a busy label", async () => {
+      let release: (response: Response) => void = () => {};
+      let sessionCalls = 0;
+      const api = await afterSubmit(unauthenticated, {
+        session: () => {
+          sessionCalls += 1;
+          return sessionCalls === 1 ? sessionOf(ACCOUNT) : new Promise<Response>((resolve) => (release = resolve));
+        },
+      });
+      const sessionsBefore = api.count("session");
+
+      const button = screen.getByRole("button", { name: "Sign in again" });
+      // All three presses land before the page can re-render (one batch), so only the handler's own guard stands between them and three requests.
+      act(() => {
+        fireEvent.click(button);
+        fireEvent.click(button);
+        fireEvent.click(button);
+      });
+      await waitFor(() => expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled());
+
+      expect(api.count("session")).toBe(sessionsBefore + 1);
+      release(sessionOf(ACCOUNT));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+      expect(api.count("session")).toBe(sessionsBefore + 1);
+    });
+
+    it("a session check that fails (HTTP 500) leaves the screen and the account as they were, with a plain note", async () => {
+      let sessionCalls = 0;
+      const api = await afterSubmit(unauthenticated, { session: () => (++sessionCalls === 1 ? sessionOf(ACCOUNT) : jsonResponse(500, { error: "Something went wrong." })) });
+
+      fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      expect(screen.getByTestId("real-pay-session-note").textContent).toBe(SESSION_CHECK_FAILED);
+      expect(useRealAccountStore.getState().account).toMatchObject({ appUserId: ACCOUNT.appUserId });
+      expectUnknownScreen(SIGNED_OUT);
+      expect(api.count("signout")).toBe(0);
+    });
+
+    it("unmounting while the check is in flight is safe: nothing is thrown, logged or requested afterwards", async () => {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      let release: (response: Response) => void = () => {};
+      let sessionCalls = 0;
+      const api = await afterSubmit(unauthenticated, { session: () => (++sessionCalls === 1 ? sessionOf(ACCOUNT) : new Promise<Response>((resolve) => (release = resolve))) });
+      const requestsBefore = api.calls.length;
+
+      fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+      await waitFor(() => expect(api.calls.length).toBe(requestsBefore + 1));
+      cleanup();
+      release(sessionOf(ACCOUNT));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(api.calls.slice(requestsBefore).map((call) => call.key)).toEqual(["session"]);
+      expect(errors).not.toHaveBeenCalled();
+      expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    });
+
+    describe("when the session is gone (authenticated: false)", () => {
+      /** The server no longer knows this browser; a later sign-in is answered by `signInAs`. */
+      async function signedOutPage(signInAs: typeof ACCOUNT | typeof ACCOUNT_B, latestAfter: Handler) {
+        let signedOut = false;
+        const api = await afterSubmit(unauthenticated, {
+          session: () => (signedOut ? signedOutSession() : sessionOf(ACCOUNT)),
+          latest: (n) => (n === 1 ? jsonResponse(200, { attempt: null }) : latestAfter(n)),
+          loginOptions: () => jsonResponse(200, { optionsJSON: { rpId: "localhost", challenge: "c" } }),
+          loginVerify: () => jsonResponse(200, signInAs),
+        });
+        signedOut = true;
+        return api;
+      }
+
+      it("the existing login appears and the Pay form unmounts — and the click itself sent nothing about the payment", async () => {
+        const api = await signedOutPage(ACCOUNT, () => jsonResponse(200, { attempt: null }));
+        const requestsBefore = api.calls.length;
+
+        fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+        await waitFor(() => expect(screen.getByTestId("real-account-setup")).toBeInTheDocument());
+
+        expect(screen.getByRole("button", { name: "I already have an account" })).toBeEnabled();
+        for (const id of ["real-pay-unknown", "real-pay-form", "real-pay-review", "real-pay-resume", "real-pay-stranded"]) expect(screen.queryByTestId(id), id).toBeNull();
+        expect(api.calls.slice(requestsBefore).map((call) => call.key)).toEqual(["session"]);
+        expect(api.count("signout")).toBe(0);
+        expect(api.count("submit")).toBe(1);
+        expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+        // The form's own cleanup ran: no sign-in prompt is left behind in the payment store.
+        expect(useRealPaymentStore.getState().sessionRecovery).toBeNull();
+      });
+
+      it("signing in as the SAME account: the form re-reads /latest, restores the payment from the server, and sends or signs nothing by itself", async () => {
+        const api = await signedOutPage(ACCOUNT, () => jsonResponse(200, { attempt: attemptFixture({ state: "unknown", prepared: null }), serverNowSeconds: nowSeconds() }));
+        fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+        await waitFor(() => expect(screen.getByTestId("real-account-setup")).toBeInTheDocument());
+        const latestBefore = api.count("latest");
+
+        fireEvent.click(screen.getByRole("button", { name: "I already have an account" }));
+        await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+
+        expect(api.count("latest")).toBe(latestBefore + 1);
+        expect(screen.getByText(UNKNOWN_HEADLINE)).toBeInTheDocument();
+        expect(screen.queryByText(SIGNED_OUT)).toBeNull();
+        expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+        expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", sessionRecovery: null, pendingSubmission: null, error: null });
+        expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "unknown" });
+        expect(api.count("submit")).toBe(1);
+        expect(api.count("prepare")).toBe(1);
+        expect(api.count("cancel")).toBe(0);
+        expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+      });
+
+      it("a payment the server still shows as waiting after sign-in asks for a NEW approval — the old one is not reused", async () => {
+        const api = await signedOutPage(ACCOUNT, () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }));
+        fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+        await waitFor(() => expect(screen.getByTestId("real-account-setup")).toBeInTheDocument());
+        fireEvent.click(screen.getByRole("button", { name: "I already have an account" }));
+        await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+        expect(useRealPaymentStore.getState().pendingSubmission).toBeNull();
+        expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+        expect(api.count("submit")).toBe(1);
+
+        signPreparedPaymentMock.mockResolvedValueOnce({ signature: "0xsig-new", activityId: "activity-new" });
+        const submitsBefore = api.count("submit");
+        fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+        await waitFor(() => expect(signPreparedPaymentMock).toHaveBeenCalledTimes(2));
+        // The explicit Continue asked for a fresh passkey approval and sent THAT one — never the in-memory one from before the sign-out.
+        await waitFor(() => expect(api.count("submit")).toBe(submitsBefore + 1));
+        expect(api.calls.filter((call) => call.key === "submit").at(-1)!.body).toEqual({ attemptId: "payment-attempt-1", signature: "0xsig-new", activityId: "activity-new" });
+      });
+
+      it("signing in as a DIFFERENT account: the old payment, approval and wording do not appear, and only that account's own /latest is read", async () => {
+        const api = await signedOutPage(ACCOUNT_B, () => jsonResponse(200, { attempt: null }));
+        fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+        await waitFor(() => expect(screen.getByTestId("real-account-setup")).toBeInTheDocument());
+        const before = api.calls.length;
+
+        fireEvent.click(screen.getByRole("button", { name: "I already have an account" }));
+        await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+
+        expect(useRealAccountStore.getState().account).toMatchObject({ appUserId: ACCOUNT_B.appUserId });
+        expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+        expect(screen.queryByText(SIGNED_OUT)).toBeNull();
+        expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, pendingSubmission: null, authorizingCredentialId: null, subOrganizationId: null, sessionRecovery: null, error: null });
+        const after = api.calls.slice(before).filter((call) => (PAYMENT_KEYS as readonly string[]).includes(call.key));
+        expect(after.map((call) => call.key)).toEqual(["latest"]);
+        expect(api.calls.slice(before).some((call) => call.url.includes("payment-attempt-1"))).toBe(false);
+        expect(api.count("submit")).toBe(1);
+        expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+      });
+    });
+  });
+
+  describe("'Check account' (404) — it only checks the session", () => {
+    it("with the same account still signed in: one session request, a plain note, nothing else — and no promise of switching accounts", async () => {
+      const api = await afterSubmit(notFound);
+      const requestsBefore = api.calls.length;
+
+      fireEvent.click(screen.getByRole("button", { name: "Check account" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      expect(api.calls.slice(requestsBefore).map((call) => call.key)).toEqual(["session"]);
+      expect(screen.getByTestId("real-pay-session-note").textContent).toBe(STILL_SIGNED_IN);
+      expectUnknownScreen(NOT_ACCESSIBLE);
+      expect(screen.getByRole("button", { name: "Check account" })).toBeEnabled();
+      expect(api.count("signout")).toBe(0);
+      expect(api.count("loginOptions")).toBe(0);
+      expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+      expect(useRealAccountStore.getState().account).toMatchObject({ appUserId: ACCOUNT.appUserId });
+    });
+
+    it("when the browser's real session belongs to ANOTHER account: the page follows that session — it shows that account, never the old payment, and never claims to restore the first one", async () => {
+      let sessionCalls = 0;
+      const api = await afterSubmit(notFound, {
+        session: () => (++sessionCalls === 1 ? sessionOf(ACCOUNT) : sessionOf(ACCOUNT_B)),
+        latest: () => jsonResponse(200, { attempt: null }),
+      });
+      const before = api.calls.length;
+
+      fireEvent.click(screen.getByRole("button", { name: "Check account" }));
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+
+      expect(useRealAccountStore.getState().account).toMatchObject({ appUserId: ACCOUNT_B.appUserId, safeAddress: ACCOUNT_B.safeAddress });
+      expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+      expect(screen.queryByText(NOT_ACCESSIBLE)).toBeNull();
+      expect(screen.queryByRole("button", { name: "Check account" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, pendingSubmission: null, authorizingCredentialId: null, subOrganizationId: null, sessionRecovery: null, error: null });
+      // The session check, then the new account's own /latest — nothing about the old payment, no sign-out, no new sign-in.
+      expect(api.calls.slice(before).map((call) => call.key)).toEqual(["session", "latest"]);
+      expect(api.calls.slice(before).some((call) => call.url.includes("payment-attempt-1"))).toBe(false);
+      expect(api.count("signout")).toBe(0);
+      expect(api.count("loginOptions")).toBe(0);
+      expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("with the session gone: the existing login appears, exactly as for 'Sign in again'", async () => {
+      let sessionCalls = 0;
+      await afterSubmit(notFound, { session: () => (++sessionCalls === 1 ? sessionOf(ACCOUNT) : signedOutSession()) });
+
+      fireEvent.click(screen.getByRole("button", { name: "Check account" }));
+
+      await waitFor(() => expect(screen.getByTestId("real-account-setup")).toBeInTheDocument());
+      expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+    });
   });
 });

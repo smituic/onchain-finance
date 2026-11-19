@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -54,6 +54,9 @@ export function RealPayForm() {
   const isSubmitRetryBeyondApproval = useRealPaymentStore((s) => s.isSubmitRetryBeyondApproval);
   const balanceStatus = useRealBalanceStore((s) => s.status);
   const error = useRealPaymentStore((s) => s.error);
+  const sessionRecovery = useRealPaymentStore((s) => s.sessionRecovery);
+  const accountStatus = useRealAccountStore((s) => s.status);
+  const checkSession = useRealAccountStore((s) => s.checkSession);
   const prepareNeedsCheck = useRealPaymentStore((s) => s.prepareNeedsCheck);
   const prepareCheck = useRealPaymentStore((s) => s.prepareCheck);
   const isCancelling = useRealPaymentStore((s) => s.isCancelling);
@@ -77,6 +80,44 @@ export function RealPayForm() {
   // Format and "that's you" feedback waits until the field is left (or Review
   // is pressed) — never while the name is still being typed.
   const [recipientTouched, setRecipientTouched] = useState(false);
+
+  // L-2 D-8: the explicit session check offered on the unknown screen after an HTTP 401 / 404. It calls the account
+  // store's existing checkSession() once per press and nothing else — no payment request, signing, retry or sign-out.
+  // The note is plain feedback for the case where nothing else changes on screen (the session is still valid), and
+  // belongs to one account and one payment: it is shown for no other.
+  const [sessionChecking, setSessionChecking] = useState(false);
+  const [sessionNote, setSessionNote] = useState<{ subject: string; attemptId: string | null; kind: "signed_in" | "unavailable" } | null>(null);
+  const sessionCheckInFlight = useRef(false);
+  const isMounted = useRef(true);
+  useEffect(() => {
+    isMounted.current = true;
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  async function runSessionCheck() {
+    // One check per press, however fast it is pressed again (the ref closes the gap before the re-render).
+    if (sessionCheckInFlight.current || accountStatus === "checking-session" || !account) return;
+    const subject = account.appUserId;
+    const attemptId = attempt?.id ?? null;
+    sessionCheckInFlight.current = true;
+    setSessionNote(null);
+    setSessionChecking(true);
+    try {
+      await checkSession();
+    } finally {
+      sessionCheckInFlight.current = false;
+    }
+    if (!isMounted.current) return;
+    setSessionChecking(false);
+    // Signed out, or another account: the account store has already changed what the page shows (sign-in, or a fresh
+    // read for the other account) — nothing to add here.
+    const { account: now, status: sessionStatus } = useRealAccountStore.getState();
+    if (now?.appUserId !== subject) return;
+    if (sessionStatus === "ready") setSessionNote({ subject, attemptId, kind: "signed_in" });
+    else if (sessionStatus === "error") setSessionNote({ subject, attemptId, kind: "unavailable" });
+  }
 
   // Declared before the init effect so the store knows whether the page is in
   // view before init's first reconciliation decides whether it may run.
@@ -463,7 +504,31 @@ export function RealPayForm() {
         </div>
         {showDeferred ? <p className="text-sm text-muted-foreground">{STATUS_DEFERRED_MESSAGE}</p> : null}
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        <CheckStatusButton onClick={() => void checkStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} />
+        {/* L-2 D-8: after an HTTP 401 / 404 the status may be unreachable with this sign-in. The one extra action only
+            re-checks the session; it never sends, signs, retries or cancels anything, and the payment stays as it is. */}
+        {sessionRecovery !== null && sessionNote && sessionNote.subject === account.appUserId && sessionNote.attemptId === (attempt?.id ?? null) ? (
+          <p className="text-sm text-muted-foreground" role="status" data-testid="real-pay-session-note">
+            {sessionNote.kind === "signed_in" ? SESSION_STILL_SIGNED_IN_MESSAGE : SESSION_CHECK_FAILED_MESSAGE}
+          </p>
+        ) : null}
+        {sessionRecovery === "signed_out" ? (
+          <Button type="button" size="lg" className="h-12 w-full" disabled={sessionChecking || accountStatus === "checking-session"} onClick={() => void runSessionCheck()}>
+            {sessionChecking ? "Checking…" : "Sign in again"}
+          </Button>
+        ) : null}
+        <CheckStatusButton
+          onClick={() => {
+            setSessionNote(null);
+            void checkStatus();
+          }}
+          isCoolingDown={isCoolingDown}
+          isDeferred={showDeferred}
+        />
+        {sessionRecovery === "not_accessible" ? (
+          <Button type="button" variant="ghost" className="h-11 w-full" disabled={sessionChecking || accountStatus === "checking-session"} onClick={() => void runSessionCheck()}>
+            {sessionChecking ? "Checking…" : "Check account"}
+          </Button>
+        ) : null}
       </div>
     );
   }
@@ -471,6 +536,9 @@ export function RealPayForm() {
   return null;
 }
 
+// L-2 D-8: plain feedback after the explicit session check, for the case where the page itself shows no change.
+const SESSION_STILL_SIGNED_IN_MESSAGE = "You're signed in. You can check this payment's status again.";
+const SESSION_CHECK_FAILED_MESSAGE = "We couldn't check your sign-in just now. Try again in a moment.";
 const STILL_WAITING_MESSAGE = "This is taking longer than usual. Your payment is still waiting for an update.";
 const CHECKED_JUST_NOW_LABEL = "Checked just now";
 // While the SERVER has asked us to wait (possibly hours): not "just now", and no claim about the payment.

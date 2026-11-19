@@ -8,6 +8,8 @@ import {
   MAX_AUTOMATIC_FOLLOW_UPS,
   MAX_FOLLOW_UP_INTERVAL_MS,
   parseSubmitRetryAfter,
+  PAYMENT_NOT_ACCESSIBLE_MESSAGE,
+  SIGNED_OUT_PAYMENT_MESSAGE,
   STATUS_FALLBACK_DEADLINE_MS,
   STATUS_REQUEST_DEADLINE_MS,
   SUBMIT_REQUEST_DEADLINE_MS,
@@ -6278,15 +6280,15 @@ describe("real-payment-store — L-2 D-4: submit refusal disambiguation (exact w
       expectUnconfirmed(api, store, before);
     });
 
-    it.each([400, 401, 403, 404, 410, 422, 429, 500, 502, 503, 504] as const)("an HTTP %i carrying the exact refusal body is not the refusal: the status decides first", async (status) => {
+    // L-2 D-8: 401 and 404 left this list — they now have their own fixed wording (see the D-8 section, which still proves the refusal body does not make them the refusal).
+    it.each([400, 403, 410, 422, 429, 500, 502, 503, 504] as const)("an HTTP %i carrying the exact refusal body is not the refusal: the status decides first", async (status) => {
       const { api, store, before } = await afterSubmit(() => jsonResponse(status, WRONG_PASSKEY_BODY));
 
       expectUnconfirmed(api, store, before);
     });
 
     it.each([
-      ["401 (signed out)", 401, { error: "Not authenticated." }],
-      ["404 (not this account's payment)", 404, { error: "Payment not found." }],
+      // L-2 D-8: the real 401 and 404 answers moved to the D-8 section (fixed 401/404 wording).
       ["400 (signature refused)", 400, { error: "This payment's signature could not be verified." }],
       ["409 wrong_state (prepared)", 409, { error: "This payment is no longer awaiting authorization (state: prepared)." }],
       ["409 wrong_state (signed)", 409, { error: "This payment is no longer awaiting authorization (state: signed)." }],
@@ -6917,8 +6919,9 @@ describe("real-payment-store — L-2 D-6: bounded submit wait", () => {
     ["retryable 503", () => jsonResponse(503, { error: UNAVAILABLE_SENTENCE, retryable: true }), { status: "awaiting_authorization", error: UNAVAILABLE_SENTENCE, pendingSubmission: APPROVAL }],
     ["wrong_passkey", wrongPasskey, { status: "stranded", error: OTHER_PASSKEY, authorizingCredentialId: null, pendingSubmission: null }],
     ["code-less 409", () => jsonResponse(409, { error: "This payment is no longer awaiting authorization (state: submitted)." }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
-    ["HTTP 401", () => jsonResponse(401, { error: "Not authenticated." }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
-    ["HTTP 404", () => jsonResponse(404, { error: "Payment not found." }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
+    // L-2 D-8: the status is unchanged (unknown, approval kept); only the fixed wording differs.
+    ["HTTP 401", () => jsonResponse(401, { error: "Not authenticated." }), { status: "unknown", error: SIGNED_OUT_PAYMENT_MESSAGE, pendingSubmission: APPROVAL }],
+    ["HTTP 404", () => jsonResponse(404, { error: "Payment not found." }), { status: "unknown", error: PAYMENT_NOT_ACCESSIBLE_MESSAGE, pendingSubmission: APPROVAL }],
     ["HTTP 500", () => jsonResponse(500, { error: "Something went wrong." }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
     ["network error", () => Promise.reject(new TypeError("Failed to fetch")), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
     ["malformed HTTP 200", () => jsonResponse(200, { nothing: true }), { status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL }],
@@ -7740,6 +7743,645 @@ describe("real-payment-store — L-2 D-7: malformed submit response recovery", (
       expect(vi.getTimerCount()).toBe(0);
       expect(api.keys()).toEqual(["submit"]);
       expect(store.getState().status).toBe("unknown");
+    });
+  });
+});
+
+/**
+ * L-2 D-8: an exact HTTP 401 / 404 from POST /submit or GET /status gets fixed,
+ * financially safe wording and a memory-only marker (`sessionRecovery`) that
+ * lets the unknown screen offer an explicit session check. It changes nothing
+ * about the payment: the status, attempt, approval and account context stay,
+ * and nothing is requested, signed, retried, cancelled or refreshed because of
+ * it. No D-8 test touches a real network, database, provider or passkey.
+ */
+describe("real-payment-store — L-2 D-8: HTTP 401 / 404 recovery", () => {
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const T0_MS = 1_800_000_000_000;
+  const NEUTRAL = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
+  const SIGNED_OUT = "You're signed out, so we can't confirm this payment yet. Sign in again to check its status.";
+  const NOT_ACCESSIBLE = "We can't check this payment with the current sign-in. It may still have gone through. Check that you're using the account that started it.";
+  const APPROVAL = { attemptId: "attempt-1", signature: "0xsig-d8", activityId: "activity-d8" };
+  const DEADLINE = SUBMIT_REQUEST_DEADLINE_MS;
+  const RAW = /Not authenticated|Payment not found|Failed to fetch|Unexpected|not valid JSON|session-gone|cookie-gone/;
+
+  type Key = "prepare" | "latest" | "cancel" | "status" | "submit" | "balance";
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Store = ReturnType<typeof createRealPaymentStore>;
+  const stores: Store[] = [];
+
+  const unauthenticated = () => jsonResponse(401, { error: "Not authenticated." });
+  const notFound = () => jsonResponse(404, { error: "Payment not found." });
+  const SESSION_FAILURES: Array<["signed_out" | "not_accessible", string, () => Response]> = [
+    ["signed_out", SIGNED_OUT, unauthenticated],
+    ["not_accessible", NOT_ACCESSIBLE, notFound],
+  ];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0_MS);
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+  });
+
+  afterEach(async () => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockReset();
+    useRealAccountStore.setState({ account: null });
+    (await import("@/lib/stores/real-balance-store")).useRealBalanceStore.getState().reset();
+  });
+
+  /** Every request is recorded — including one no handler expects, which also fails the request. */
+  function server(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string; body: unknown }> = [];
+    const counts: Record<Key, number> = { prepare: 0, latest: 0, cancel: 0, status: 0, submit: 0, balance: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/prepare")
+          ? "prepare"
+          : url.endsWith("/api/real/payments/latest")
+            ? "latest"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/status")
+                ? "status"
+                : url.endsWith("/api/real/payments/submit")
+                  ? "submit"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : null;
+        calls.push({ key: key ?? "other", url, method, body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, keys: () => calls.map((call) => call.key), count: (key: Key) => calls.filter((call) => call.key === key).length };
+  }
+
+  function held() {
+    let resolve: (response: Response) => void = () => {};
+    let reject: (error: unknown) => void = () => {};
+    const promise = new Promise<Response>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  const settle = () => vi.advanceTimersByTimeAsync(0);
+  const offsetFor = (secondsBeforeExpiry: number) => VALID_UNTIL - secondsBeforeExpiry - T0_MS / 1000;
+  const serverNow = (secondsBeforeExpiry = 100_000) => Math.floor(Date.now() / 1000) + offsetFor(secondsBeforeExpiry);
+  const statusReply = (state: string, extra: Record<string, unknown> = {}) =>
+    jsonResponse(200, { attempt: { ...baseAttempt(), state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null }, serverNowSeconds: serverNow(), reconciliationDeferred: false, ...extra });
+  const visible = (store: Store) => JSON.parse(JSON.stringify(store.getState())) as Record<string, unknown>;
+  const accepted = (state: string) => () => jsonResponse(200, { attempt: { ...baseAttempt(), state, prepared: state === "awaiting_authorization" ? PREPARED_FIELDS : null } });
+
+  function awaiting(): Store {
+    const store = createRealPaymentStore();
+    stores.push(store);
+    store.setState({ attempt: baseAttempt(), status: "awaiting_authorization", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: offsetFor(100_000) });
+    return store;
+  }
+
+  /** One Continue whose POST /submit is held open; returns once the request is on its way. */
+  async function sending(handlers: Partial<Record<Key, Handler>> = {}) {
+    const gate = held();
+    const api = server({ submit: () => gate.promise, ...handlers });
+    const store = awaiting();
+    const done = store.getState().resumeAuthorization();
+    await settle();
+    expect(store.getState().status).toBe("submitting");
+    return { gate, api, store, done };
+  }
+
+  /** A submit that ended with `submit`'s answer: the page is on the unknown screen. */
+  async function afterSubmit(submit: Handler, others: Partial<Record<Key, Handler>> = {}) {
+    const api = server({ submit, ...others });
+    const store = awaiting();
+    const before = structuredClone(store.getState().attempt);
+    await store.getState().resumeAuthorization();
+    await settle();
+    return { api, store, before };
+  }
+
+  /** What stays exactly as it was: the approval and the whole signing context. */
+  const RETAINED = { pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1", isAuthorizing: false };
+
+  it("the exported wording is exactly the approved copy, and says nothing about the payment not being sent", () => {
+    expect(SIGNED_OUT_PAYMENT_MESSAGE).toBe(SIGNED_OUT);
+    expect(PAYMENT_NOT_ACCESSIBLE_MESSAGE).toBe(NOT_ACCESSIBLE);
+    for (const copy of [SIGNED_OUT_PAYMENT_MESSAGE, PAYMENT_NOT_ACCESSIBLE_MESSAGE]) {
+      expect(copy).not.toMatch(/wasn't sent|was not sent|not sent|didn't go through|failed|cancel|retry|try again/i);
+    }
+    expect(PAYMENT_NOT_ACCESSIBLE_MESSAGE).toContain("It may still have gone through.");
+  });
+
+  describe("A. submit 401 / 404", () => {
+    it.each(SESSION_FAILURES)("%s: the existing unknown state with the fixed wording — attempt, approval and context kept, one submit, nothing else", async (reason, message, answer) => {
+      const { api, store, before } = await afterSubmit(answer);
+
+      expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, ...RETAINED });
+      expect(store.getState().attempt).toEqual(before);
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "awaiting_authorization", failureReason: null, transactionHash: null });
+      expect(JSON.stringify(visible(store))).not.toMatch(RAW);
+      expect(api.calls.map(({ key, method, body }) => ({ key, method, body }))).toEqual([{ key: "submit", method: "POST", body: APPROVAL }]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+      // Nothing happens by itself afterwards: no status read, balance refresh, retry, cancel or prepare.
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(api.keys()).toEqual(["submit"]);
+      expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, ...RETAINED });
+    });
+
+    it.each(SESSION_FAILURES)("%s carrying the exact wrong_passkey body is still the 401/404 wording — never the cancel-only screen", async (reason, message) => {
+      const status = reason === "signed_out" ? 401 : 404;
+      const { api, store } = await afterSubmit(() => jsonResponse(status, { error: "This payment was started with a different passkey.", code: "wrong_passkey" }));
+
+      expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, ...RETAINED });
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    it.each(SESSION_FAILURES)("the fresh flow (Review, Approve, prepare, passkey, submit) gets the same %s outcome", async (reason, message, answer) => {
+      const api = server({
+        prepare: () => jsonResponse(200, { attempt: { ...baseAttempt(), id: "attempt-fresh" }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() }),
+        submit: answer,
+      });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      store.setState({ status: "editing" });
+      store.getState().setRecipientInput("0x3333333333333333333333333333333333333333");
+      store.getState().setAmountInput("1");
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+      await settle();
+
+      expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, pendingSubmission: { attemptId: "attempt-fresh", signature: APPROVAL.signature, activityId: APPROVAL.activityId } });
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-fresh" });
+      expect(api.keys()).toEqual(["prepare", "submit"]);
+    });
+  });
+
+  describe("B. exact classification: only an ApiError with status 401 or 404", () => {
+    const OTHERS: Array<[string, Handler]> = [
+      ["HTTP 400", () => jsonResponse(400, { error: "Not authenticated." })],
+      ["HTTP 403", () => jsonResponse(403, { error: "Not authenticated." })],
+      ["HTTP 409 (no code)", () => jsonResponse(409, { error: "Payment not found." })],
+      ["HTTP 410", () => jsonResponse(410, { error: "Payment not found." })],
+      ["HTTP 429 (not the budget denial)", () => jsonResponse(429, { error: "Not authenticated.", code: "rate_limited" })],
+      ["HTTP 500 whose text says 401", () => jsonResponse(500, { error: "401 Not authenticated." })],
+      ["HTTP 500 whose text says 404", () => jsonResponse(500, { error: "404 Payment not found." })],
+      ["HTTP 502", () => jsonResponse(502, { error: "Not authenticated." })],
+      ["HTTP 503 (not retryable)", () => jsonResponse(503, { error: "Payment not found." })],
+      ["a network failure", () => Promise.reject(new TypeError("Failed to fetch"))],
+      ["a plain Error whose message says 'Not authenticated.'", () => Promise.reject(new Error("Not authenticated."))],
+      ["a non-JSON 401 (the body cannot be read, so it is not an ApiError)", () => new Response("<html>401 session-gone</html>", { status: 401 })],
+      ["a non-JSON 404", () => new Response("<html>404 cookie-gone</html>", { status: 404 })],
+      ["a 401 whose body is JSON null", () => new Response("null", { status: 401 })],
+    ];
+
+    it.each(OTHERS)("submit: %s keeps the generic conservative wording and does not set the marker", async (_name, answer) => {
+      const { api, store } = await afterSubmit(answer);
+
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, sessionRecovery: null, ...RETAINED });
+      expect(api.keys()).toEqual(["submit"]);
+    });
+
+    // A JSON-null body makes api() read `json.error` off null; that throws a TypeError (not an ApiError), so even that 401 is not special.
+    it.each([400, 403, 409, 410, 429, 500, 502, 503] as const)("status read: HTTP %i keeps its existing wording and does not set the marker", async (code) => {
+      const submit = accepted("submitted");
+      const api = server({ submit, status: () => jsonResponse(code, { error: "The server's own sentence." }) });
+      const store = awaiting();
+      await store.getState().resumeAuthorization();
+      await settle();
+      await store.getState().checkStatus();
+
+      expect(store.getState().sessionRecovery).toBeNull();
+      expect(store.getState().error).toBe("The server's own sentence.");
+      expect(api.count("status")).toBe(1);
+    });
+
+    it.each([
+      ["401", 401, "signed_out", SIGNED_OUT],
+      ["404", 404, "not_accessible", NOT_ACCESSIBLE],
+    ] as const)("the status code decides, never the server's sentence: a %s with any (or no) text is still the fixed wording", async (_name, code, reason, message) => {
+      for (const body of [{ error: "Session expired." }, { error: "nope" }, {}, { error: "" }, { message: "Not authenticated." }]) {
+        const { api, store } = await afterSubmit(() => jsonResponse(code, body));
+        expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, ...RETAINED });
+        expect(api.keys()).toEqual(["submit"]);
+        store.getState().reset();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("status read: a network failure and a plain Error('Not authenticated.') do not set the marker", async () => {
+      const store = awaiting();
+      server({ status: () => Promise.reject(new Error("Not authenticated.")) });
+      await store.getState().checkStatus();
+
+      expect(store.getState().sessionRecovery).toBeNull();
+      expect(store.getState().error).toBe("Not authenticated.");
+    });
+  });
+
+  describe("C. status read 401 / 404", () => {
+    /** A submit that ended without an answer, leaving the unknown screen with the full signing context. */
+    async function unknownScreen(status: Handler, others: Partial<Record<Key, Handler>> = {}) {
+      const api = server({ submit: () => jsonResponse(500, { error: "Something went wrong." }), status, ...others });
+      const store = awaiting();
+      await store.getState().resumeAuthorization();
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, sessionRecovery: null, ...RETAINED });
+      return { api, store };
+    }
+
+    it.each(SESSION_FAILURES)("manual Check status %s: fixed wording and marker only — status, attempt, approval, context and cooldown stay; nothing else is requested", async (reason, message, answer) => {
+      const { api, store } = await unknownScreen(answer);
+      const attemptBefore = structuredClone(store.getState().attempt);
+
+      await store.getState().checkStatus();
+
+      expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, isManualCheckCoolingDown: true, ...RETAINED });
+      expect(store.getState().attempt).toEqual(attemptBefore);
+      expect(JSON.stringify(visible(store))).not.toMatch(RAW);
+      expect(api.keys()).toEqual(["submit", "status"]);
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      // The existing cooldown still applies, then ends — and nothing is requested by itself, ever.
+      await store.getState().checkStatus();
+      expect(api.count("status")).toBe(1);
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(api.keys()).toEqual(["submit", "status"]);
+      expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, isManualCheckCoolingDown: false, ...RETAINED });
+    });
+
+    it.each(SESSION_FAILURES)("the status read asks about the original payment only (%s)", async (_reason, _message, answer) => {
+      const { api, store } = await unknownScreen(answer);
+      await store.getState().checkStatus();
+
+      const read = api.calls.find((call) => call.key === "status")!;
+      expect(read.url).toContain("/attempt-1/status");
+      expect(read.method).toBe("GET");
+    });
+
+    it.each(SESSION_FAILURES)("on the other screens the same fixed wording replaces the raw text and the status does not change (%s)", async (reason, message, answer) => {
+      for (const state of ["awaiting_authorization", "stranded", "submitted"] as const) {
+        const api = server({ status: answer });
+        const store = createRealPaymentStore();
+        stores.push(store);
+        store.setState({ attempt: { ...baseAttempt(), state: state === "stranded" ? "signed" : state }, status: state, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: offsetFor(100_000) });
+
+        await store.getState().checkStatus();
+
+        expect(store.getState()).toMatchObject({ status: state, error: message, sessionRecovery: reason });
+        expect(JSON.stringify(visible(store))).not.toMatch(RAW);
+        expect(api.keys()).toEqual(["status"]);
+        store.getState().reset();
+      }
+    });
+
+    it.each(SESSION_FAILURES)("an AUTOMATIC status read (an expired approval found on mount) gets the same handling (%s) — and starts nothing extra", async (reason, message, answer) => {
+      const expiredNow = () => jsonResponse(200, { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow(-10) });
+      const api = server({ latest: expiredNow, status: answer });
+      const store = createRealPaymentStore();
+      stores.push(store);
+
+      await store.getState().init();
+      await settle();
+
+      expect(api.keys()).toEqual(["latest", "status"]);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isAttemptPastValidity: true, error: message, sessionRecovery: reason, authorizingCredentialId: "credential-1" });
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "awaiting_authorization" });
+      expect(api.keys()).not.toContain("submit");
+      expect(api.keys()).not.toContain("cancel");
+      expect(api.keys()).not.toContain("prepare");
+      expect(api.keys()).not.toContain("balance");
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it.each(SESSION_FAILURES)("the post-submit automatic check gets the same handling (%s); the payment stays 'submitted'", async (reason, message, answer) => {
+      const api = server({ submit: accepted("submitted"), status: answer });
+      const store = awaiting();
+      await store.getState().resumeAuthorization();
+      await settle();
+      expect(store.getState().status).toBe("submitted");
+
+      await store.getState().checkSubmittedStatus();
+
+      expect(store.getState()).toMatchObject({ status: "submitted", error: message, sessionRecovery: reason });
+      expect(api.keys()).toEqual(["submit", "status"]);
+      expect(api.keys()).not.toContain("balance");
+    });
+
+    it("a status read that returns 401, and a status read after it that is answered, clears the marker — a valid settled answer is the way back", async () => {
+      let n = 0;
+      const { store } = await unknownScreen(() => (++n === 1 ? unauthenticated() : statusReply("awaiting_authorization")));
+      await store.getState().checkStatus();
+      expect(store.getState()).toMatchObject({ error: SIGNED_OUT, sessionRecovery: "signed_out" });
+
+      await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS);
+      await store.getState().checkStatus();
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: null, sessionRecovery: null });
+    });
+
+    it("every answered read clears the marker: a deferral and a malformed verdict too (they prove the session works)", async () => {
+      for (const answer of [
+        () => statusReply("unknown", { reconciliationDeferred: true, retryAfterSeconds: 120 }),
+        () => statusReply("unknown", { reconciliationDeferred: "yes" }),
+        () => statusReply("submitted"),
+      ]) {
+        let n = 0;
+        const { store } = await unknownScreen(() => (++n === 1 ? notFound() : answer()));
+        await store.getState().checkStatus();
+        expect(store.getState().sessionRecovery).toBe("not_accessible");
+        await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+        await store.getState().checkStatus();
+        expect(store.getState().sessionRecovery).toBeNull();
+        expect(store.getState().error).not.toBe(NOT_ACCESSIBLE);
+        store.getState().reset();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("a later failure that is not a 401 / 404 keeps its own wording and leaves the earlier marker for the lifecycle to clear", async () => {
+      let n = 0;
+      const { store } = await unknownScreen(() => (++n === 1 ? unauthenticated() : jsonResponse(500, { error: "Something went wrong." })));
+      await store.getState().checkStatus();
+      await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS);
+      await store.getState().checkStatus();
+
+      expect(store.getState()).toMatchObject({ status: "unknown", error: "Something went wrong.", sessionRecovery: "signed_out", ...RETAINED });
+    });
+
+    it("401 then 404 (the session changed in between): the marker follows the latest classified failure", async () => {
+      let n = 0;
+      const { store } = await unknownScreen(() => (++n === 1 ? unauthenticated() : notFound()));
+      await store.getState().checkStatus();
+      await vi.advanceTimersByTimeAsync(MANUAL_CHECK_COOLDOWN_MS);
+      await store.getState().checkStatus();
+
+      expect(store.getState()).toMatchObject({ error: NOT_ACCESSIBLE, sessionRecovery: "not_accessible", ...RETAINED });
+    });
+  });
+
+  describe("D. the marker belongs to its lifecycle", () => {
+    async function marked(reason: "signed_out" | "not_accessible" = "signed_out", others: Partial<Record<Key, Handler>> = {}) {
+      const answer = reason === "signed_out" ? unauthenticated : notFound;
+      const api = server({ submit: answer, ...others });
+      const store = awaiting();
+      await store.getState().resumeAuthorization();
+      await settle();
+      expect(store.getState().sessionRecovery).toBe(reason);
+      return { api, store };
+    }
+
+    it("init() drops it (and, as ever, everything else), whatever /latest then answers", async () => {
+      const { store } = await marked("signed_out", { latest: () => jsonResponse(200, { attempt: null }) });
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "editing", sessionRecovery: null, attempt: null, pendingSubmission: null, error: null });
+    });
+
+    it("init() clears it synchronously, before its own request is answered", async () => {
+      const gate = held();
+      const { store } = await marked("not_accessible", { latest: () => gate.promise });
+      const pending = store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "idle", sessionRecovery: null, error: null, attempt: null, pendingSubmission: null });
+      gate.resolve(jsonResponse(200, { attempt: null }));
+      await pending;
+    });
+
+    it("init() restoring the same unknown payment from the server carries no marker and no stale wording", async () => {
+      const { store } = await marked("signed_out", { latest: () => jsonResponse(200, { attempt: { ...baseAttempt(), state: "unknown", prepared: null }, serverNowSeconds: serverNow() }) });
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "unknown", sessionRecovery: null, error: null, pendingSubmission: null, authorizingCredentialId: null });
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "unknown" });
+    });
+
+    it("reset() drops it", async () => {
+      const { store } = await marked();
+      store.getState().reset();
+      expect(store.getState()).toMatchObject({ sessionRecovery: null, attempt: null, pendingSubmission: null, error: null });
+    });
+
+    it("detach() drops it (the Pay form left the screen); the attempt is left for the next init to re-read", async () => {
+      const { store } = await marked("not_accessible");
+      store.getState().detach();
+      expect(store.getState()).toMatchObject({ sessionRecovery: null, status: "unknown" });
+      expect(store.getState().attempt).toMatchObject({ id: "attempt-1" });
+    });
+
+    it("a successful Cancel drops it", async () => {
+      const { store } = await marked("signed_out", { cancel: () => jsonResponse(200, { attempt: { ...baseAttempt(), state: "cancelled", prepared: null } }) });
+      await store.getState().cancel();
+      expect(store.getState()).toMatchObject({ status: "editing", sessionRecovery: null, attempt: null, error: null });
+    });
+
+    it("a new submit drops it, however it then ends", async () => {
+      const gate = held();
+      const api = server({ submit: () => gate.promise });
+      const store = awaiting();
+      store.setState({ sessionRecovery: "signed_out", error: SIGNED_OUT });
+      const done = store.getState().resumeAuthorization();
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "submitting", sessionRecovery: null, error: null });
+      gate.resolve(accepted("submitted")());
+      await done;
+      expect(store.getState()).toMatchObject({ status: "submitted", sessionRecovery: null });
+      expect(api.count("submit")).toBe(1);
+    });
+
+    it("the D-6 deadline and a malformed 200 (D-7) leave no marker: their wording is the generic one", async () => {
+      const { store, done, gate } = await sending();
+      store.setState({ sessionRecovery: "signed_out" });
+      await vi.advanceTimersByTimeAsync(DEADLINE);
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, sessionRecovery: null });
+      gate.resolve(unauthenticated());
+      await done;
+
+      const malformed = await afterSubmit(() => jsonResponse(200, { nothing: true }));
+      expect(malformed.store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, sessionRecovery: null, ...RETAINED });
+    });
+
+    it("a different account: the form's init() leaves nothing of the old marker, attempt or approval, and the new account reads only its own /latest", async () => {
+      const { store } = await marked();
+      const api = server({ latest: () => jsonResponse(200, { attempt: null }) });
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+
+      await store.getState().init();
+
+      expect(store.getState()).toMatchObject({ status: "editing", sessionRecovery: null, attempt: null, pendingSubmission: null, authorizingCredentialId: null, subOrganizationId: null, error: null });
+      expect(api.keys()).toEqual(["latest"]);
+      expect(api.calls.some((call) => call.url.includes("attempt-1"))).toBe(false);
+    });
+  });
+
+  describe("E. stale answers write nothing", () => {
+    it("a 401 for the payment of an ACCOUNT that has since been replaced is dropped (status read)", async () => {
+      const gate = held();
+      server({ status: () => gate.promise });
+      const store = awaiting();
+      const pending = store.getState().checkStatus();
+      await settle();
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+      const before = visible(store);
+
+      gate.resolve(unauthenticated());
+      await pending;
+
+      expect(store.getState().sessionRecovery).toBeNull();
+      expect(store.getState().error).toBeNull();
+      expect(visible(store)).toEqual(before);
+    });
+
+    it("a 404 after reset() / a new lifecycle is dropped (status read)", async () => {
+      for (const end of ["reset", "init", "detach"] as const) {
+        const gate = held();
+        server({ status: () => gate.promise, latest: () => jsonResponse(200, { attempt: null }) });
+        const store = awaiting();
+        const pending = store.getState().checkStatus();
+        await settle();
+        if (end === "reset") store.getState().reset();
+        else if (end === "init") await store.getState().init();
+        else store.getState().detach();
+        const after = visible(store);
+
+        gate.resolve(notFound());
+        await pending;
+
+        expect(visible(store), end).toEqual(after);
+        expect(store.getState().sessionRecovery, end).toBeNull();
+        store.getState().reset();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("an OLDER-EPOCH 401 (the read began before a submit) never overwrites the newer state", async () => {
+      const readGate = held();
+      const submitGate = held();
+      const api = server({ status: () => readGate.promise, submit: () => submitGate.promise });
+      const store = awaiting();
+      const read = store.getState().checkStatus();
+      await settle();
+      const sending = store.getState().resumeAuthorization();
+      await settle();
+      expect(store.getState().status).toBe("submitting");
+
+      readGate.resolve(unauthenticated());
+      await read;
+      await settle();
+
+      expect(store.getState()).toMatchObject({ status: "submitting", error: null, sessionRecovery: null });
+
+      submitGate.resolve(accepted("submitted")());
+      await sending;
+      expect(store.getState()).toMatchObject({ status: "submitted", error: null, sessionRecovery: null });
+      expect(api.count("submit")).toBe(1);
+    });
+
+    it("a late submit 401 / 404 after the D-6 deadline is ignored — the timeout state stays, and a Check status that moved on is not overwritten", async () => {
+      for (const [, , answer] of SESSION_FAILURES) {
+        const { gate, store, done } = await sending({ status: () => statusReply("awaiting_authorization") });
+        await vi.advanceTimersByTimeAsync(DEADLINE);
+        expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, sessionRecovery: null });
+
+        gate.resolve(answer());
+        await done;
+        expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, sessionRecovery: null, ...RETAINED });
+
+        await store.getState().checkStatus();
+        expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: null, sessionRecovery: null });
+        store.getState().reset();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("a late submit 401 / 404 that arrives AFTER a Check status re-opened the payment writes nothing", async () => {
+      for (const [, , answer] of SESSION_FAILURES) {
+        const { gate, store, done } = await sending({ status: () => statusReply("awaiting_authorization") });
+        await vi.advanceTimersByTimeAsync(DEADLINE);
+        await store.getState().checkStatus();
+        expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: null, sessionRecovery: null, ...RETAINED });
+        const after = visible(store);
+
+        gate.resolve(answer());
+        await done;
+
+        // The page is on a screen that would accept a submit answer, and still ignores this one: it belongs to the request the deadline already decided.
+        expect(visible(store)).toEqual(after);
+        expect(store.getState().sessionRecovery).toBeNull();
+        store.getState().reset();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("a timely submit 401 / 404 (just inside the deadline) is applied and stops the timer", async () => {
+      for (const [reason, message, answer] of SESSION_FAILURES) {
+        const { gate, store, done } = await sending();
+        await vi.advanceTimersByTimeAsync(DEADLINE - 1);
+        expect(store.getState().status).toBe("submitting");
+
+        gate.resolve(answer());
+        await done;
+
+        expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, ...RETAINED });
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(DEADLINE);
+        expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason });
+        store.getState().reset();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("a submit 401 for a context that has since been replaced writes nothing (reset, a new account)", async () => {
+      for (const change of ["reset", "account"] as const) {
+        const { gate, store, done } = await sending();
+        if (change === "reset") store.getState().reset();
+        else useRealAccountStore.setState({ account: ACCOUNT_B });
+        const after = visible(store);
+
+        gate.resolve(unauthenticated());
+        await done;
+
+        expect(visible(store), change).toEqual(after);
+        expect(store.getState().sessionRecovery, change).toBeNull();
+        store.getState().reset();
+        vi.unstubAllGlobals();
+        useRealAccountStore.setState({ account: ACCOUNT_A });
+      }
+    });
+  });
+
+  describe("F. what did not change", () => {
+    it("a valid submit 200 maps exactly as before, and the existing wrong_passkey refusal is still the cancel-only screen", async () => {
+      const ok = await afterSubmit(accepted("submitted"));
+      expect(ok.store.getState()).toMatchObject({ status: "submitted", error: null, pendingSubmission: null, sessionRecovery: null });
+
+      const wrong = await afterSubmit(() => jsonResponse(409, { error: "This payment was started with a different passkey.", code: "wrong_passkey" }));
+      expect(wrong.store.getState()).toMatchObject({ status: "stranded", pendingSubmission: null, authorizingCredentialId: null, sessionRecovery: null });
+    });
+
+    it("the budget denial and the retryable refusal are still handled before any 401 / 404 logic", async () => {
+      const denied = await afterSubmit(() => new Response(JSON.stringify({ error: "Too many tries.", code: "rate_limited", retryable: true }), { status: 429, headers: { "content-type": "application/json", "Retry-After": "30" } }));
+      expect(denied.store.getState()).toMatchObject({ status: "awaiting_authorization", sessionRecovery: null, pendingSubmission: APPROVAL });
+
+      const retryable = await afterSubmit(() => jsonResponse(503, { error: "Try again in a moment.", retryable: true }));
+      expect(retryable.store.getState()).toMatchObject({ status: "awaiting_authorization", error: "Try again in a moment.", sessionRecovery: null, pendingSubmission: APPROVAL });
+    });
+
+    it("init() still treats a 401 on /latest as before: the plain form, no marker, no fixed wording", async () => {
+      server({ latest: unauthenticated });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      await store.getState().init();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, sessionRecovery: null, error: null });
     });
   });
 });
