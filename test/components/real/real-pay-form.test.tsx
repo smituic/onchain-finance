@@ -4266,7 +4266,7 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
       expect(screen.queryByRole("button", { name: "Check account" })).toBeNull();
     });
 
-    it("on the other screens the fixed copy replaces the raw text; the sign-in action is offered on the unknown screen only", async () => {
+    it("on the sending screen the fixed copy replaces the raw text, and (L-2 D-9) the matching sign-in action is now offered there too", async () => {
       stub({
         session: () => sessionOf(ACCOUNT),
         latest: () => jsonResponse(200, { attempt: attemptFixture({ state: "submitted", prepared: null }), serverNowSeconds: nowSeconds() }),
@@ -4278,8 +4278,9 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
 
       expect(screen.getByTestId("real-pay-sending").textContent).not.toMatch(RAW_TEXT);
       expect(screen.getByText("Sending…")).toBeInTheDocument();
-      // Spec boundary: the action lives on the unknown screen. (A remaining limitation, recorded in the D-8 documentation.)
-      expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+      // L-2 D-9 (supersedes the D-8 boundary "unknown screen only"): the Sending screen offers the same explicit session check.
+      expect(screen.getByRole("button", { name: "Sign in again" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Check account" })).toBeNull();
       expect(useRealPaymentStore.getState().status).toBe("submitted");
     });
   });
@@ -4527,6 +4528,685 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
 
       await waitFor(() => expect(screen.getByTestId("real-account-setup")).toBeInTheDocument());
       expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+    });
+  });
+});
+
+describe("RealPayForm — L-2 D-9: Pay session recovery completion", () => {
+  const SIGNED_OUT = "You're signed out, so we can't confirm this payment yet. Sign in again to check its status.";
+  const NOT_ACCESSIBLE = "We can't check this payment with the current sign-in. It may still have gone through. Check that you're using the account that started it.";
+  const STILL_SIGNED_IN = "You're signed in. You can check this payment's status again.";
+  const SIGNED_IN_ONLY = "You're signed in.";
+  const SESSION_CHECK_FAILED = "We couldn't check your sign-in just now. Try again in a moment.";
+  const RAW_TEXT = /Not authenticated|Payment not found|Failed to fetch|Unexpected|not valid JSON|session-gone/;
+  const FALSE_CLAIMS = /wasn't sent|was not sent|not sent|never sent|didn't go through|did not go through|no money moved|nothing was sent|has been sent|was sent|switched|signed in as/i;
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const CONTEXT = { subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" };
+  const ACTIONS = ["resumeAuthorization", "confirmAndSend", "cancel", "checkStatus", "checkPreparedPayment", "checkPaymentsAgain", "review", "init", "reset"] as const;
+
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Key = "latest" | "prepare" | "submit" | "status" | "balance" | "cancel" | "session";
+  type Reason = { code: 401 | 404; marker: "signed_out" | "not_accessible"; message: string; label: "Sign in again" | "Check account"; other: "Sign in again" | "Check account"; respond: Handler };
+  const REASONS: Reason[] = [
+    { code: 401, marker: "signed_out", message: SIGNED_OUT, label: "Sign in again", other: "Check account", respond: () => jsonResponse(401, { error: "Not authenticated." }) },
+    { code: 404, marker: "not_accessible", message: NOT_ACCESSIBLE, label: "Check account", other: "Sign in again", respond: () => jsonResponse(404, { error: "Payment not found." }) },
+  ];
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    signPreparedPaymentMock.mockResolvedValue({ signature: "0xsig-d9", activityId: "activity-d9" });
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    cleanup();
+    useRealPaymentStore.getState().reset();
+    useRealAccountStore.setState({ account: null, status: "idle", error: null });
+    signPreparedPaymentMock.mockReset();
+    vi.restoreAllMocks();
+  });
+
+  const sessionOf = (account: typeof ACCOUNT | typeof ACCOUNT_B) => jsonResponse(200, { authenticated: true, ...account });
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  const openWindow = () => ({ ...PREPARED_FIELDS, validUntil: nowSeconds() + 3_600 });
+  const latestJson = (attempt: unknown) => jsonResponse(200, { attempt, ...CONTEXT, serverNowSeconds: nowSeconds() });
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((res) => (resolve = res));
+    return { promise, resolve };
+  }
+
+  function stub(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string }> = [];
+    const counts = {} as Record<Key, number>;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/latest")
+          ? "latest"
+          : url.endsWith("/api/real/payments/prepare")
+            ? "prepare"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/api/real/payments/submit")
+                ? "submit"
+                : url.endsWith("/status")
+                  ? "status"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : url.endsWith("/api/real/session")
+                      ? "session"
+                      : null;
+        calls.push({ key: key ?? "other", url, method });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+        counts[key] = (counts[key] ?? 0) + 1;
+        return handler(counts[key]);
+      }),
+    );
+    const count = (key: Key) => calls.filter((call) => call.key === key).length;
+    return { calls, count, keysSince: (from: number) => calls.slice(from).map((call) => call.key) };
+  }
+
+  const settle = () => act(async () => void (await new Promise((resolve) => setTimeout(resolve, 15))));
+  const button = (name: string) => screen.getByRole("button", { name });
+  const noButton = (name: string) => expect(screen.queryByRole("button", { name }), name).toBeNull();
+  const noNote = () => {
+    expect(screen.queryByTestId("real-pay-session-note")).toBeNull();
+    expect(screen.queryByText(/You're signed in/)).toBeNull();
+  };
+  const follows = (first: Element, second: Element) => Boolean(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const markerState = (reason: Reason) => useRealPaymentStore.setState({ sessionRecovery: reason.marker, error: reason.message });
+
+  /** The unknown screen, restored from the server, with the fixed 401 / 404 wording already on it (the marker set as the store sets it). */
+  async function unknownWithMarker(reason: Reason, handlers: Partial<Record<Key, Handler>>, latest?: Handler) {
+    const api = stub({ latest: latest ?? (() => latestJson(attemptFixture({ state: "unknown", prepared: null }))), ...handlers });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+    act(() => markerState(reason));
+    expect(screen.getByText(reason.message)).toBeInTheDocument();
+    return api;
+  }
+
+  describe("the three screens now offer the matching session action", () => {
+    type Variant = { name: string; screen: "sending" | "awaiting" | "stranded"; testId: string; checkStatus: boolean; real: boolean };
+    const VARIANTS: Variant[] = [
+      { name: "Sending (submitted), automatic status read", screen: "sending", testId: "real-pay-sending", checkStatus: true, real: true },
+      { name: "Awaiting authorization, no Check status button yet", screen: "awaiting", testId: "real-pay-resume", checkStatus: false, real: false },
+      { name: "Awaiting authorization, Check status shown", screen: "awaiting", testId: "real-pay-resume", checkStatus: true, real: true },
+      { name: "Stranded, no Check status button yet", screen: "stranded", testId: "real-pay-stranded", checkStatus: false, real: false },
+      { name: "Stranded, Check status shown", screen: "stranded", testId: "real-pay-stranded", checkStatus: true, real: true },
+    ];
+
+    function latestFor(screen: Variant["screen"]) {
+      if (screen === "sending") return () => latestJson(attemptFixture({ state: "submitted", prepared: null }));
+      if (screen === "awaiting") return () => latestJson(attemptFixture({ prepared: openWindow() }));
+      return () => latestJson(attemptFixture({ state: "signed", prepared: openWindow() }));
+    }
+
+    /** Arrives at the screen with the fixed wording: by a real 401 / 404 status read where Check status exists, by the marker alone where it does not. */
+    async function arrive(variant: Variant, reason: Reason, extra: Partial<Record<Key, Handler>> = {}) {
+      const api = stub({ latest: latestFor(variant.screen), status: reason.respond, session: () => sessionOf(ACCOUNT), ...extra });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId(variant.testId)).toBeInTheDocument());
+      if (variant.screen === "sending") {
+        await waitFor(() => expect(screen.getByText(reason.message)).toBeInTheDocument());
+      } else if (variant.checkStatus) {
+        act(() => useRealPaymentStore.setState({ isFollowUpExhausted: true }));
+        fireEvent.click(button("Check status"));
+        await waitFor(() => expect(screen.getByText(reason.message)).toBeInTheDocument());
+      } else {
+        act(() => markerState(reason));
+      }
+      return api;
+    }
+
+    describe.each(VARIANTS)("$name", (variant) => {
+      it.each(REASONS)("HTTP $code: fixed wording, the matching control, exactly one session check per press and nothing else", async (reason) => {
+        const api = await arrive(variant, reason);
+        const before = useRealPaymentStore.getState();
+        const requestsBefore = api.calls.length;
+        const statusReadsBefore = api.count("status");
+
+        // The screen, its wording and the buttons that were there before.
+        const root = screen.getByTestId(variant.testId);
+        expect(root.textContent).not.toMatch(RAW_TEXT);
+        expect(root.textContent).not.toMatch(FALSE_CLAIMS);
+        expect(screen.getByRole("button", { name: reason.label })).toBeEnabled();
+        noButton(reason.other);
+        const checkStatusLabel = variant.checkStatus ? /^(Checked just now|Check status)$/ : null;
+        if (checkStatusLabel) expect(screen.getByRole("button", { name: checkStatusLabel })).toBeInTheDocument();
+        else expect(screen.queryByRole("button", { name: /Check status|Checked just now|Check available later/ })).toBeNull();
+        if (variant.screen === "awaiting") {
+          expect(button("Continue")).toBeEnabled();
+          expect(button("Cancel payment")).toBeEnabled();
+        } else if (variant.screen === "stranded") {
+          noButton("Continue");
+          expect(button("Cancel payment")).toBeEnabled();
+        } else {
+          noButton("Continue");
+          noButton("Cancel payment");
+        }
+        // Placement: under the error, above the screen's own controls.
+        const control = button(reason.label);
+        expect(follows(screen.getByText(reason.message), control)).toBe(true);
+        for (const own of ["Continue", "Cancel payment", "Check status", "Checked just now"]) {
+          const other = screen.queryByRole("button", { name: own });
+          if (other) expect(follows(control, other), own).toBe(true);
+        }
+        if (variant.screen === "sending") expect(control.className).toContain("h-7");
+        else expect(control.className).toContain("w-full");
+
+        // Every payment action is replaced by a spy for the press, so a call the store would quietly ignore here is still caught.
+        const originals = Object.fromEntries(ACTIONS.map((name) => [name, useRealPaymentStore.getState()[name]]));
+        const spies = Object.fromEntries(ACTIONS.map((name) => [name, vi.fn()]));
+        useRealPaymentStore.setState(spies as never);
+        try {
+          fireEvent.click(control);
+          await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+          for (const name of ACTIONS) expect(spies[name], name).not.toHaveBeenCalled();
+        } finally {
+          useRealPaymentStore.setState(originals as never);
+        }
+
+        // One session GET; no payment request, status read, signing, submit, Cancel, prepare, init or sign-out.
+        expect(api.keysSince(requestsBefore)).toEqual(["session"]);
+        expect(api.count("status")).toBe(statusReadsBefore);
+        expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+        // The note says only what the session check found, and only as much as this screen can follow up on.
+        expect(screen.getByTestId("real-pay-session-note").textContent).toBe(variant.checkStatus ? STILL_SIGNED_IN : SIGNED_IN_ONLY);
+        expect(screen.getByTestId(variant.testId).textContent).not.toMatch(FALSE_CLAIMS);
+        expect(screen.getByText(reason.message)).toBeInTheDocument();
+        // The payment is exactly where it was.
+        const after = useRealPaymentStore.getState();
+        expect(after.status).toBe(before.status);
+        expect(after.attempt).toBe(before.attempt);
+        expect(after.sessionRecovery).toBe(reason.marker);
+        expect(after.isFollowUpExhausted).toBe(before.isFollowUpExhausted);
+        expect(screen.getByRole("button", { name: reason.label })).toBeEnabled();
+        // Nothing follows by itself.
+        await settle();
+        expect(api.keysSince(requestsBefore)).toEqual(["session"]);
+      });
+    });
+  });
+
+  describe("no recovery control without a reason to show one", () => {
+    it.each(["sending", "awaiting", "stranded", "unknown"] as const)("%s screen: no marker, no action", async (screenName) => {
+      const attempt = {
+        sending: attemptFixture({ state: "submitted", prepared: null }),
+        awaiting: attemptFixture({ prepared: openWindow() }),
+        stranded: attemptFixture({ state: "signed", prepared: openWindow() }),
+        unknown: attemptFixture({ state: "unknown", prepared: null }),
+      }[screenName];
+      stub({ latest: () => latestJson(attempt), status: () => jsonResponse(500, { error: "Something went wrong." }) });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId({ sending: "real-pay-sending", awaiting: "real-pay-resume", stranded: "real-pay-stranded", unknown: "real-pay-unknown" }[screenName])).toBeInTheDocument());
+      await settle();
+      noButton("Sign in again");
+      noButton("Check account");
+      expect(screen.queryByTestId("real-pay-session-note")).toBeNull();
+    });
+
+    it("a failed status read that is neither 401 nor 404 leaves a screen without the action", async () => {
+      stub({ latest: () => latestJson(attemptFixture({ state: "submitted", prepared: null })), status: () => jsonResponse(500, { error: "Something went wrong." }) });
+      render(<RealPayForm />);
+      await waitFor(() => expect(useRealPaymentStore.getState().error).not.toBeNull());
+      noButton("Sign in again");
+      noButton("Check account");
+    });
+
+    // The marker may outlive some branches (accepted residual); the control is shown only where a payment is actually waiting on a sign-in.
+    it.each([
+      ["Confirmed", { status: "confirmed", attempt: attemptFixture({ state: "confirmed", prepared: null, transactionHash: "0xabc" }) }, "real-pay-confirmed"],
+      ["Failed", { status: "failed", attempt: attemptFixture({ state: "failed", prepared: null, failureReason: "This payment could not be sent." }) }, "real-pay-failed"],
+      ["Editing", { status: "editing", attempt: null }, "real-pay-form"],
+      ["Reviewing", { status: "reviewing", attempt: null, recipientInput: RECIPIENT, amountInput: "1.00" }, "real-pay-review"],
+      ["Preparing", { status: "preparing", attempt: null }, "real-pay-preparing"],
+      ["Passkey prompt", { status: "awaiting_authorization", attempt: attemptFixture({ prepared: openWindow() }), isAuthorizing: true }, "real-pay-authorizing"],
+      ["Status unavailable", { status: "status_unavailable", attempt: null }, "real-pay-status-unavailable"],
+    ] as Array<[string, Record<string, unknown>, string]>)("%s: no control and no note, even with a marker in memory", async (_name, state, testId) => {
+      stub({ latest: () => jsonResponse(200, { attempt: null }) });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+      act(() => useRealPaymentStore.setState({ ...state, sessionRecovery: "signed_out", error: SIGNED_OUT } as never));
+      await waitFor(() => expect(screen.getByTestId(testId)).toBeInTheDocument());
+      noButton("Sign in again");
+      noButton("Check account");
+      expect(screen.queryByTestId("real-pay-session-note")).toBeNull();
+    });
+  });
+
+  describe("the unknown screen keeps its D-8 layout", () => {
+    it("'Sign in again' above Check status; 'Check account' below it", async () => {
+      await unknownWithMarker(REASONS[0], {});
+      expect(follows(button("Sign in again"), button("Check status"))).toBe(true);
+      cleanup();
+      useRealPaymentStore.getState().reset();
+      await unknownWithMarker(REASONS[1], {});
+      expect(follows(button("Check status"), button("Check account"))).toBe(true);
+      noButton("Sign in again");
+    });
+  });
+
+  describe("every Check status button drops the older note, and calls the store action exactly once", () => {
+    const SCREENS = [
+      ["unknown", "real-pay-unknown", () => attemptFixture({ state: "unknown", prepared: null }), {}],
+      ["sending", "real-pay-sending", () => attemptFixture({ state: "submitted", prepared: null }), {}],
+      ["awaiting", "real-pay-resume", () => attemptFixture({ prepared: openWindow() }), { isFollowUpExhausted: true }],
+      ["stranded", "real-pay-stranded", () => attemptFixture({ state: "signed", prepared: openWindow() }), { isFollowUpExhausted: true }],
+    ] as const;
+    it.each(SCREENS)("%s screen", async (_name, testId, attempt, extra) => {
+      const api = stub({ latest: () => latestJson(attempt()), status: () => jsonResponse(500, { error: "Something went wrong." }), session: () => sessionOf(ACCOUNT) });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId(testId)).toBeInTheDocument());
+      await settle();
+      act(() => useRealPaymentStore.setState({ ...extra, ...markerPatch(REASONS[0]) } as never));
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      const original = useRealPaymentStore.getState().checkStatus;
+      const checkStatus = vi.fn(async () => {});
+      act(() => useRealPaymentStore.setState({ checkStatus } as never));
+      try {
+        fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+        await waitFor(() => expect(screen.queryByTestId("real-pay-session-note")).toBeNull());
+        expect(checkStatus).toHaveBeenCalledTimes(1);
+      } finally {
+        // The store outlives the test: put the real action back.
+        useRealPaymentStore.setState({ checkStatus: original });
+      }
+      noNote();
+      expect(api.count("session")).toBe(1);
+    });
+    function markerPatch(reason: Reason) {
+      return { sessionRecovery: reason.marker, error: reason.message };
+    }
+  });
+
+  describe("the note cannot outlive the status or the attempt it was written for", () => {
+    it("a note shown on 'unknown' does not come back after the status leaves and returns", async () => {
+      await unknownWithMarker(REASONS[0], { session: () => sessionOf(ACCOUNT) });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      act(() => useRealPaymentStore.setState({ status: "stranded" }));
+      noNote();
+      act(() => useRealPaymentStore.setState({ status: "unknown" }));
+
+      noNote();
+      expect(screen.getByText(SIGNED_OUT)).toBeInTheDocument();
+    });
+
+    it("a note written for one attempt is not shown for another, nor when the first attempt returns", async () => {
+      await unknownWithMarker(REASONS[0], { session: () => sessionOf(ACCOUNT) });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+      const first = useRealPaymentStore.getState().attempt!;
+
+      act(() => useRealPaymentStore.setState({ attempt: { ...first, id: "payment-attempt-2" } }));
+      noNote();
+      act(() => useRealPaymentStore.setState({ attempt: first }));
+      noNote();
+    });
+
+    it("the payment's status changing while the session check runs: no note, now or when the status comes back", async () => {
+      const gate = deferred<Response>();
+      await unknownWithMarker(REASONS[0], { session: () => gate.promise });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+
+      act(() => useRealPaymentStore.setState({ status: "stranded" }));
+      await act(async () => gate.resolve(sessionOf(ACCOUNT)));
+      noNote();
+      act(() => useRealPaymentStore.setState({ status: "unknown" }));
+      await settle();
+
+      noNote();
+      expect(screen.getByRole("button", { name: "Sign in again" })).toBeEnabled();
+    });
+
+    it("the attempt changing while the session check runs: no note", async () => {
+      const gate = deferred<Response>();
+      await unknownWithMarker(REASONS[0], { session: () => gate.promise });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+      const first = useRealPaymentStore.getState().attempt!;
+
+      act(() => useRealPaymentStore.setState({ attempt: { ...first, id: "payment-attempt-2" } }));
+      act(() => useRealPaymentStore.setState({ attempt: first }));
+      await act(async () => gate.resolve(sessionOf(ACCOUNT)));
+      await settle();
+
+      noNote();
+    });
+
+    it("a reset while the session check runs: the editing form, no note", async () => {
+      const gate = deferred<Response>();
+      const api = await unknownWithMarker(REASONS[0], { session: () => gate.promise });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+      const requestsBefore = api.calls.length;
+
+      act(() => useRealPaymentStore.getState().reset());
+      await act(async () => gate.resolve(sessionOf(ACCOUNT)));
+      await settle();
+
+      expect(screen.getByTestId("real-pay-form")).toBeInTheDocument();
+      noNote();
+      noButton("Sign in again");
+      expect(api.keysSince(requestsBefore)).toEqual([]);
+    });
+
+    it("the marker clearing while the session check runs: no note", async () => {
+      const gate = deferred<Response>();
+      await unknownWithMarker(REASONS[0], { session: () => gate.promise });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+
+      act(() => useRealPaymentStore.setState({ sessionRecovery: null, error: null }));
+      await act(async () => gate.resolve(sessionOf(ACCOUNT)));
+      act(() => useRealPaymentStore.setState({ sessionRecovery: "signed_out", error: SIGNED_OUT }));
+
+      noNote();
+    });
+  });
+
+  describe("races between the session check and Check status", () => {
+    it.each(REASONS)("HTTP $code: the session check starts first, Check status answers again, then the session returns — no contradicting note", async (reason) => {
+      const session = deferred<Response>();
+      const api = await unknownWithMarker(reason, { session: () => session.promise, status: reason.respond });
+      fireEvent.click(button(reason.label));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+
+      fireEvent.click(button("Check status"));
+      await waitFor(() => expect(api.count("status")).toBe(1));
+      await settle();
+      await act(async () => session.resolve(sessionOf(ACCOUNT)));
+      await waitFor(() => expect(button(reason.label)).toBeEnabled());
+      await settle();
+
+      noNote();
+      expect(screen.getByText(reason.message)).toBeInTheDocument();
+      expect(api.count("session")).toBe(1);
+      expect(api.count("status")).toBe(1);
+    });
+
+    it.each(REASONS)("HTTP $code: Check status starts first and answers late; the note shown meanwhile is gone when the answer arrives", async (reason) => {
+      const status = deferred<Response>();
+      const api = await unknownWithMarker(reason, { session: () => sessionOf(ACCOUNT), status: () => status.promise });
+      fireEvent.click(button("Check status"));
+      await waitFor(() => expect(api.count("status")).toBe(1));
+      fireEvent.click(button(reason.label));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      await act(async () => status.resolve(reason.respond(1) as Response));
+      await settle();
+
+      noNote();
+      expect(screen.getByText(reason.message)).toBeInTheDocument();
+    });
+
+    it("Check status answers late with a different status: the old note does not follow it", async () => {
+      const status = deferred<Response>();
+      const api = await unknownWithMarker(REASONS[0], { session: () => sessionOf(ACCOUNT), status: () => status.promise }, () => latestJson(attemptFixture({ state: "unknown", prepared: null })));
+      fireEvent.click(button("Check status"));
+      await waitFor(() => expect(api.count("status")).toBe(1));
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      await act(async () => status.resolve(latestJson(attemptFixture({ prepared: openWindow() }))));
+      await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+
+      noNote();
+    });
+
+    it.each(REASONS)("HTTP $code: the session check pending, Check status shows 'awaiting', the session returns, Continue is pressed and the submit is refused — the old note does not come back", async (reason) => {
+      const session = deferred<Response>();
+      const api = await unknownWithMarker(reason, {
+        session: () => session.promise,
+        status: () => latestJson(attemptFixture({ prepared: openWindow() })),
+        submit: reason.respond,
+      });
+      fireEvent.click(button(reason.label));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+      fireEvent.click(button("Check status"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+      await act(async () => session.resolve(sessionOf(ACCOUNT)));
+      await settle();
+      noNote();
+      const readsBefore = api.count("status");
+
+      fireEvent.click(button("Continue"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
+      await settle();
+
+      expect(screen.getByText(reason.message)).toBeInTheDocument();
+      noNote();
+      expect(api.count("submit")).toBe(1);
+      expect(api.count("status")).toBe(readsBefore);
+      expect(api.count("session")).toBe(1);
+      expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("Check status stays usable while the session request hangs", async () => {
+      const session = deferred<Response>();
+      const api = await unknownWithMarker(REASONS[0], { session: () => session.promise, status: () => jsonResponse(500, { error: "Something went wrong." }) });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+
+      expect(button("Check status")).toBeEnabled();
+      fireEvent.click(button("Check status"));
+      await waitFor(() => expect(api.count("status")).toBe(1));
+      expect(button("Checking…")).toBeDisabled();
+      expect(api.count("session")).toBe(1);
+      await act(async () => session.resolve(sessionOf(ACCOUNT)));
+    });
+
+    it("on the Sending screen, too: Check status is enabled and works while the session request hangs", async () => {
+      const session = deferred<Response>();
+      const api = stub({ latest: () => latestJson(attemptFixture({ state: "submitted", prepared: null })), status: REASONS[0].respond, session: () => session.promise });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByText(SIGNED_OUT)).toBeInTheDocument());
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+      const reads = api.count("status");
+
+      expect(button("Check status")).toBeEnabled();
+      fireEvent.click(button("Check status"));
+      await waitFor(() => expect(api.count("status")).toBe(reads + 1));
+      await act(async () => session.resolve(sessionOf(ACCOUNT)));
+      await settle();
+      noNote();
+    });
+  });
+
+  describe("other interleavings", () => {
+    it("the account switches while both the session check and Check status are in flight: nothing of the first account is shown", async () => {
+      const session = deferred<Response>();
+      const status = deferred<Response>();
+      const api = await unknownWithMarker(
+        REASONS[0],
+        { session: () => session.promise, status: () => status.promise },
+        undefined,
+      );
+      // The other account's own payment read.
+      const latestCalls: number[] = [];
+      vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/api/real/session")) return session.promise;
+        if (url.endsWith("/status")) return status.promise;
+        if (url.endsWith("/api/real/payments/latest")) {
+          latestCalls.push(1);
+          return jsonResponse(200, { attempt: null });
+        }
+        throw new Error(`Unhandled fetch in test: ${url}`);
+      });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+      fireEvent.click(button("Check status"));
+      await settle();
+
+      await act(async () => session.resolve(sessionOf(ACCOUNT_B)));
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+      await act(async () => status.resolve(REASONS[0].respond(1) as Response));
+      await settle();
+
+      expect(useRealAccountStore.getState().account).toMatchObject({ appUserId: ACCOUNT_B.appUserId });
+      noNote();
+      expect(screen.queryByText(SIGNED_OUT)).toBeNull();
+      expect(screen.queryByTestId("real-pay-unknown")).toBeNull();
+      noButton("Sign in again");
+      noButton("Check account");
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, pendingSubmission: null, sessionRecovery: null, error: null });
+      expect(latestCalls.length).toBe(1);
+      expect(api.count("submit")).toBe(0);
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+
+    it("unmounting while the session check and a status read are in flight is safe: nothing thrown, logged or requested afterwards", async () => {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      const session = deferred<Response>();
+      const status = deferred<Response>();
+      const api = await unknownWithMarker(REASONS[0], { session: () => session.promise, status: () => status.promise });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+      fireEvent.click(button("Check status"));
+      await waitFor(() => expect(api.count("status")).toBe(1));
+      const requestsBefore = api.calls.length;
+
+      cleanup();
+      session.resolve(sessionOf(ACCOUNT));
+      status.resolve(REASONS[0].respond(1) as Response);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      expect(api.calls.length).toBe(requestsBefore);
+      expect(errors).not.toHaveBeenCalled();
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+
+    it.each(["awaiting", "stranded"] as const)("%s screen: a session network failure leaves the screen as it was, with only the fixed neutral note", async (screenName) => {
+      const api = stub({
+        latest: () => latestJson(screenName === "awaiting" ? attemptFixture({ prepared: openWindow() }) : attemptFixture({ state: "signed", prepared: openWindow() })),
+        session: () => Promise.reject(new TypeError("Failed to fetch")),
+      });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId(screenName === "awaiting" ? "real-pay-resume" : "real-pay-stranded")).toBeInTheDocument());
+      act(() => markerState(REASONS[0]));
+      const requestsBefore = api.calls.length;
+
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      expect(screen.getByTestId("real-pay-session-note").textContent).toBe(SESSION_CHECK_FAILED);
+      expect(screen.queryByText(/signed in/i)).toBeNull();
+      expect(document.body.textContent).not.toMatch(RAW_TEXT);
+      expect(api.keysSince(requestsBefore)).toEqual(["session"]);
+      expect(button("Sign in again")).toBeEnabled();
+      expect(useRealAccountStore.getState().account).toMatchObject({ appUserId: ACCOUNT.appUserId });
+    });
+
+    it.each(["sending", "awaiting", "stranded"] as const)("%s screen: repeated presses make one session request while the check runs", async (screenName) => {
+      const session = deferred<Response>();
+      const attempt = { sending: attemptFixture({ state: "submitted", prepared: null }), awaiting: attemptFixture({ prepared: openWindow() }), stranded: attemptFixture({ state: "signed", prepared: openWindow() }) }[screenName];
+      const api = stub({ latest: () => latestJson(attempt), status: REASONS[0].respond, session: () => session.promise });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId({ sending: "real-pay-sending", awaiting: "real-pay-resume", stranded: "real-pay-stranded" }[screenName])).toBeInTheDocument());
+      act(() => markerState(REASONS[0]));
+      const control = button("Sign in again");
+
+      act(() => {
+        fireEvent.click(control);
+        fireEvent.click(control);
+        fireEvent.click(control);
+      });
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+      fireEvent.click(button("Checking…"));
+
+      expect(api.count("session")).toBe(1);
+      await act(async () => session.resolve(sessionOf(ACCOUNT)));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+      expect(api.count("session")).toBe(1);
+    });
+
+    it("a different account's session on the Awaiting screen: the page follows it; the first account's payment and wording are gone", async () => {
+      let latestCalls = 0;
+      const api = stub({
+        latest: () => (++latestCalls === 1 ? latestJson(attemptFixture({ prepared: openWindow() })) : jsonResponse(200, { attempt: null })),
+        session: () => sessionOf(ACCOUNT_B),
+      });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+      act(() => markerState(REASONS[1]));
+
+      fireEvent.click(button("Check account"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+
+      noNote();
+      expect(screen.queryByText(NOT_ACCESSIBLE)).toBeNull();
+      expect(screen.queryByText(/0x3333/)).toBeNull();
+      expect(useRealPaymentStore.getState()).toMatchObject({ attempt: null, pendingSubmission: null, sessionRecovery: null });
+      expect(api.count("cancel") + api.count("submit") + api.count("prepare")).toBe(0);
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("what the page says while a status read is still pending", () => {
+    it.each(REASONS)("HTTP $code: a session check that began before the Check status press leaves no note while that read is pending, nor after it answers", async (reason) => {
+      const session = deferred<Response>();
+      const status = deferred<Response>();
+      const api = await unknownWithMarker(reason, { session: () => session.promise, status: () => status.promise });
+      fireEvent.click(button(reason.label));
+      await waitFor(() => expect(button("Checking…")).toBeDisabled());
+      fireEvent.click(button("Check status"));
+      await waitFor(() => expect(api.count("status")).toBe(1));
+
+      await act(async () => session.resolve(sessionOf(ACCOUNT)));
+      await waitFor(() => expect(button(reason.label)).toBeEnabled());
+      await settle();
+      noNote(); // the read is still pending: a note now would sit next to wording it is about to be replaced by
+
+      await act(async () => status.resolve(reason.respond(1) as Response));
+      await settle();
+      noNote();
+      expect(screen.getByText(reason.message)).toBeInTheDocument();
+    });
+
+    it("the marker clearing after the note was written takes the note with it", async () => {
+      await unknownWithMarker(REASONS[0], { session: () => sessionOf(ACCOUNT) });
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      act(() => useRealPaymentStore.setState({ sessionRecovery: null, error: null }));
+      expect(screen.queryByTestId("real-pay-session-note")).toBeNull();
+      noButton("Sign in again");
+      act(() => useRealPaymentStore.setState({ sessionRecovery: "signed_out", error: SIGNED_OUT }));
+
+      noNote();
+    });
+
+    it("the Sending screen without a Check status button says only 'You're signed in.'", async () => {
+      stub({ latest: () => latestJson(attemptFixture({ state: "submitted", prepared: null })), status: () => jsonResponse(500, { error: "Something went wrong." }), session: () => sessionOf(ACCOUNT) });
+      render(<RealPayForm />);
+      await waitFor(() => expect(screen.getByTestId("real-pay-sending")).toBeInTheDocument());
+      await settle();
+      act(() => useRealPaymentStore.setState({ status: "submitting", sessionRecovery: "signed_out", error: SIGNED_OUT }));
+      noButton("Check status");
+      noButton("Checked just now");
+
+      fireEvent.click(button("Sign in again"));
+      await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
+
+      expect(screen.getByTestId("real-pay-session-note").textContent).toBe(SIGNED_IN_ONLY);
+      noButton("Check status");
+      expect(screen.getByTestId("real-pay-sending").textContent).not.toMatch(FALSE_CLAIMS);
     });
   });
 });

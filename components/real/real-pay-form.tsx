@@ -81,13 +81,16 @@ export function RealPayForm() {
   // is pressed) — never while the name is still being typed.
   const [recipientTouched, setRecipientTouched] = useState(false);
 
-  // L-2 D-8: the explicit session check offered on the unknown screen after an HTTP 401 / 404. It calls the account
-  // store's existing checkSession() once per press and nothing else — no payment request, signing, retry or sign-out.
-  // The note is plain feedback for the case where nothing else changes on screen (the session is still valid), and
-  // belongs to one account and one payment: it is shown for no other.
+  // L-2 D-8 / D-9: the explicit session check offered after an HTTP 401 / 404 (D-9: on every screen that can show the
+  // fixed sign-in message). It calls the account store's existing checkSession() once per press and nothing else — no
+  // payment request, signing, retry or sign-out. The note is plain feedback for the case where nothing else changes on
+  // screen (the session is still valid), and belongs to one account, one payment and one status: it is shown for no other.
   const [sessionChecking, setSessionChecking] = useState(false);
-  const [sessionNote, setSessionNote] = useState<{ subject: string; attemptId: string | null; kind: "signed_in" | "unavailable" } | null>(null);
+  const [sessionNote, setSessionNote] = useState<{ subject: string; attemptId: string | null; status: string; kind: "signed_in" | "unavailable" } | null>(null);
   const sessionCheckInFlight = useRef(false);
+  // D-9: every moment the payment's picture may have moved on (a Check status press and its answer, a status change, another
+  // attempt) bumps this; a session check may only leave a note if it is unchanged when the check ends. Form-only, memory-only.
+  const noteEpoch = useRef(0);
   const isMounted = useRef(true);
   useEffect(() => {
     isMounted.current = true;
@@ -96,14 +99,39 @@ export function RealPayForm() {
     };
   }, []);
 
+  function invalidateSessionNote() {
+    noteEpoch.current += 1;
+    if (isMounted.current) setSessionNote(null);
+  }
+
+  // D-9: a note never outlives the status, the attempt or the sign-in problem it was written for (and cannot come back for the same ones later).
+  useEffect(() => {
+    invalidateSessionNote();
+  }, [status, attempt?.id, sessionRecovery]);
+
+  /** The one handler behind every "Check status" button: the same store action, once, with the older note dropped before and after it. */
+  async function handleCheckStatus() {
+    invalidateSessionNote();
+    try {
+      await checkStatus();
+    } finally {
+      // The answer may have changed what the page says (e.g. the signed-out wording): a note written meanwhile no longer fits it.
+      invalidateSessionNote();
+    }
+  }
+
   async function runSessionCheck() {
     // One check per press, however fast it is pressed again (the ref closes the gap before the re-render).
     if (sessionCheckInFlight.current || accountStatus === "checking-session" || !account) return;
     const subject = account.appUserId;
-    const attemptId = attempt?.id ?? null;
+    // Read from the stores, not from this render's closure: the comparison after the await must be against what is true then.
+    const started = useRealPaymentStore.getState();
+    const startedStatus = started.status;
+    const startedAttemptId = started.attempt?.id ?? null;
     sessionCheckInFlight.current = true;
     setSessionNote(null);
     setSessionChecking(true);
+    const startedEpoch = noteEpoch.current;
     try {
       await checkSession();
     } finally {
@@ -115,8 +143,12 @@ export function RealPayForm() {
     // read for the other account) — nothing to add here.
     const { account: now, status: sessionStatus } = useRealAccountStore.getState();
     if (now?.appUserId !== subject) return;
-    if (sessionStatus === "ready") setSessionNote({ subject, attemptId, kind: "signed_in" });
-    else if (sessionStatus === "error") setSessionNote({ subject, attemptId, kind: "unavailable" });
+    // D-9: the payment moved on (another Check status, a status change, another attempt, a reset) while the check ran, or the
+    // sign-in problem is gone: whatever the page says now is newer than this check, so it adds nothing.
+    const current = useRealPaymentStore.getState();
+    if (noteEpoch.current !== startedEpoch || current.status !== startedStatus || (current.attempt?.id ?? null) !== startedAttemptId || current.sessionRecovery === null) return;
+    if (sessionStatus === "ready") setSessionNote({ subject, attemptId: startedAttemptId, status: startedStatus, kind: "signed_in" });
+    else if (sessionStatus === "error") setSessionNote({ subject, attemptId: startedAttemptId, status: startedStatus, kind: "unavailable" });
   }
 
   // Declared before the init effect so the store knows whether the page is in
@@ -182,6 +214,18 @@ export function RealPayForm() {
 
   // A deferral only matters while its wait is running; the store flips both flags together.
   const showDeferred = isStatusDeferred && isCoolingDown;
+  // L-2 D-9: the session-recovery action and note, shared by the screens that can show the fixed 401 / 404 wording. The marker
+  // alone decides whether the action shows; the note also has to belong to this account, this payment and this status.
+  const sessionBusy = sessionChecking || accountStatus === "checking-session";
+  const sessionNoteShown =
+    sessionRecovery !== null && sessionNote !== null && sessionNote.subject === account.appUserId && sessionNote.attemptId === (attempt?.id ?? null) && sessionNote.status === status;
+  /** The note's words depend on whether a Check status button is really on this screen; it never speaks about the payment itself. */
+  const renderSessionNote = (checkStatusShown: boolean, className: string) =>
+    sessionNoteShown && sessionNote ? (
+      <p className={className} role="status" data-testid="real-pay-session-note">
+        {sessionNote.kind === "unavailable" ? SESSION_CHECK_FAILED_MESSAGE : checkStatusShown ? SESSION_STILL_SIGNED_IN_MESSAGE : SESSION_SIGNED_IN_ONLY_MESSAGE}
+      </p>
+    ) : null;
   const amountBaseUnits = parseCashInputToBaseUnits(amountInput);
   const recipient = resolveRecipientView(recipientInput, recipientLookup, account.handle ?? null);
   // Slice D: once a payment is prepared, who it is to comes from the attempt
@@ -403,8 +447,10 @@ export function RealPayForm() {
           {showDeferred ? <p className="text-xs text-muted-foreground">{isFollowUpExhausted ? STATUS_DEFERRED_MESSAGE : STATUS_DEFERRED_AUTOMATIC_MESSAGE}</p> : null}
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
+        {renderSessionNote(isFollowUpExhausted, "text-sm text-muted-foreground")}
+        {sessionRecovery !== null ? <SessionRecoveryControl reason={sessionRecovery} checking={sessionChecking} busy={sessionBusy} layout="block" onClick={() => void runSessionCheck()} /> : null}
         <div className="flex flex-col gap-2">
-          {isFollowUpExhausted ? <CheckStatusButton onClick={() => void checkStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} /> : null}
+          {isFollowUpExhausted ? <CheckStatusButton onClick={() => void handleCheckStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} /> : null}
           {isPastValidity || isSubmitRetryBeyondApproval ? null : (
             <Button size="lg" className="h-12 w-full" disabled={isSubmitCoolingDown} onClick={() => void resumeAuthorization()}>
               Continue
@@ -436,7 +482,9 @@ export function RealPayForm() {
           {showDeferred ? <p className="text-xs text-muted-foreground">{isFollowUpExhausted ? STATUS_DEFERRED_MESSAGE : STATUS_DEFERRED_AUTOMATIC_MESSAGE}</p> : null}
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        {isFollowUpExhausted ? <CheckStatusButton onClick={() => void checkStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} /> : null}
+        {renderSessionNote(isFollowUpExhausted, "text-sm text-muted-foreground")}
+        {sessionRecovery !== null ? <SessionRecoveryControl reason={sessionRecovery} checking={sessionChecking} busy={sessionBusy} layout="block" onClick={() => void runSessionCheck()} /> : null}
+        {isFollowUpExhausted ? <CheckStatusButton onClick={() => void handleCheckStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} /> : null}
         <Button variant="outline" className="h-11 w-full" disabled={isCancelling} onClick={() => void cancel()}>
           Cancel payment
         </Button>
@@ -451,8 +499,10 @@ export function RealPayForm() {
         {paidTo?.kind === "handle" ? <p className="break-words text-xs text-muted-foreground">To {paidTo.label}</p> : null}
         {showDeferred ? <p className="text-xs text-muted-foreground">{STATUS_DEFERRED_MESSAGE}</p> : null}
         {error ? <p className="text-xs text-destructive">{error}</p> : null}
+        {renderSessionNote(status === "submitted", "text-xs text-muted-foreground")}
+        {sessionRecovery !== null ? <SessionRecoveryControl reason={sessionRecovery} checking={sessionChecking} busy={sessionBusy} layout="compact" onClick={() => void runSessionCheck()} /> : null}
         {status === "submitted" ? (
-          <Button variant="outline" size="sm" disabled={isCoolingDown} onClick={() => void checkStatus()}>
+          <Button variant="outline" size="sm" disabled={isCoolingDown} onClick={() => void handleCheckStatus()}>
             {isCoolingDown ? (showDeferred ? CHECK_LATER_LABEL : CHECKED_JUST_NOW_LABEL) : "Check status"}
           </Button>
         ) : null}
@@ -506,29 +556,10 @@ export function RealPayForm() {
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
         {/* L-2 D-8: after an HTTP 401 / 404 the status may be unreachable with this sign-in. The one extra action only
             re-checks the session; it never sends, signs, retries or cancels anything, and the payment stays as it is. */}
-        {sessionRecovery !== null && sessionNote && sessionNote.subject === account.appUserId && sessionNote.attemptId === (attempt?.id ?? null) ? (
-          <p className="text-sm text-muted-foreground" role="status" data-testid="real-pay-session-note">
-            {sessionNote.kind === "signed_in" ? SESSION_STILL_SIGNED_IN_MESSAGE : SESSION_CHECK_FAILED_MESSAGE}
-          </p>
-        ) : null}
-        {sessionRecovery === "signed_out" ? (
-          <Button type="button" size="lg" className="h-12 w-full" disabled={sessionChecking || accountStatus === "checking-session"} onClick={() => void runSessionCheck()}>
-            {sessionChecking ? "Checking…" : "Sign in again"}
-          </Button>
-        ) : null}
-        <CheckStatusButton
-          onClick={() => {
-            setSessionNote(null);
-            void checkStatus();
-          }}
-          isCoolingDown={isCoolingDown}
-          isDeferred={showDeferred}
-        />
-        {sessionRecovery === "not_accessible" ? (
-          <Button type="button" variant="ghost" className="h-11 w-full" disabled={sessionChecking || accountStatus === "checking-session"} onClick={() => void runSessionCheck()}>
-            {sessionChecking ? "Checking…" : "Check account"}
-          </Button>
-        ) : null}
+        {renderSessionNote(true, "text-sm text-muted-foreground")}
+        {sessionRecovery === "signed_out" ? <SessionRecoveryControl reason="signed_out" checking={sessionChecking} busy={sessionBusy} layout="unknown" onClick={() => void runSessionCheck()} /> : null}
+        <CheckStatusButton onClick={() => void handleCheckStatus()} isCoolingDown={isCoolingDown} isDeferred={showDeferred} />
+        {sessionRecovery === "not_accessible" ? <SessionRecoveryControl reason="not_accessible" checking={sessionChecking} busy={sessionBusy} layout="unknown" onClick={() => void runSessionCheck()} /> : null}
       </div>
     );
   }
@@ -538,6 +569,8 @@ export function RealPayForm() {
 
 // L-2 D-8: plain feedback after the explicit session check, for the case where the page itself shows no change.
 const SESSION_STILL_SIGNED_IN_MESSAGE = "You're signed in. You can check this payment's status again.";
+// D-9: where this screen has no Check status button, the note says only what the session check found.
+const SESSION_SIGNED_IN_ONLY_MESSAGE = "You're signed in.";
 const SESSION_CHECK_FAILED_MESSAGE = "We couldn't check your sign-in just now. Try again in a moment.";
 const STILL_WAITING_MESSAGE = "This is taking longer than usual. Your payment is still waiting for an update.";
 const CHECKED_JUST_NOW_LABEL = "Checked just now";
@@ -566,6 +599,41 @@ function balanceUnavailableLabel(status: "idle" | "loading" | "ready" | "unauthe
   if (status === "error") return "Couldn’t check your balance";
   if (status === "unauthenticated") return "Sign in to see your balance";
   return "Checking your balance…";
+}
+
+/**
+ * L-2 D-9: the one explicit session action behind the fixed 401 / 404 wording, on every screen that can show it. It only
+ * re-checks the session (the caller's runSessionCheck → the account store's checkSession): it never signs in by itself, switches
+ * accounts, signs out, or sends, signs, retries, cancels or prepares a payment.
+ */
+function SessionRecoveryControl({
+  reason,
+  checking,
+  busy,
+  layout,
+  onClick,
+}: {
+  reason: "signed_out" | "not_accessible";
+  checking: boolean;
+  busy: boolean;
+  layout: "unknown" | "block" | "compact";
+  onClick: () => void;
+}) {
+  const label = checking ? "Checking…" : reason === "signed_out" ? "Sign in again" : "Check account";
+  // The unknown screen keeps its D-8 look: a primary "Sign in again" before Check status, a quiet "Check account" after it.
+  const look =
+    layout === "compact"
+      ? { variant: "outline" as const, size: "sm" as const, className: undefined }
+      : layout === "block"
+        ? { variant: "outline" as const, size: "default" as const, className: "h-11 w-full" }
+        : reason === "signed_out"
+          ? { variant: "default" as const, size: "lg" as const, className: "h-12 w-full" }
+          : { variant: "ghost" as const, size: "default" as const, className: "h-11 w-full" };
+  return (
+    <Button type="button" variant={look.variant} size={look.size} className={look.className} disabled={busy} onClick={onClick}>
+      {label}
+    </Button>
+  );
 }
 
 /** The manual "Check status" action. Briefly unavailable after a press so repeated taps can't pile up requests. */
