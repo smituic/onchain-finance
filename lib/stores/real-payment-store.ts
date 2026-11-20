@@ -496,6 +496,55 @@ function isHonestSubmitResponse(json: unknown, held: { id: string; recipient: st
   return true;
 }
 
+/**
+ * L-2 D-10: is this GET /status HTTP 200 body the attempt THIS page holds, in a
+ * shape the page can safely adopt and show? Pure; strict; no trimming, case
+ * folding, rounding or repair. Sibling of isHonestSubmitResponse, but a status
+ * answer can honestly carry ANY of the nine states (the server reads the stored
+ * row, and may have moved it), so it uses KNOWN_ATTEMPT_STATES — never the
+ * narrower submit allow-list, and never a comparison with the previous local
+ * state. It checks what the status-response-to-render path reads: a finite
+ * serverNowSeconds (it feeds the advisory clock offset), the id (exactly the
+ * held id), the state, the recipient and amount (exactly the held attempt's —
+ * a payment's intent never changes after prepare), failureReason /
+ * transactionHash (always string-or-null from the server's serializer, and
+ * printed by the form), and `prepared` only as null-versus-object PRESENCE
+ * (its contents are not inspected here), one-way and state-aware: a held object
+ * must stay an object, in a state other than `prepared`; a held null stays null, except that a row held in state
+ * `prepared` (reserved, fields not yet written) may honestly come back with the
+ * completed object in any state other than `prepared`. An answer in state
+ * `prepared` never carries the object, whatever the page held. Additional
+ * keys are allowed and ignored; reconciliationDeferred / retryAfterSeconds stay
+ * with interpretStatusResult. A rejection says nothing about what happened to
+ * the payment.
+ */
+function isHonestStatusResponse(json: unknown, held: RealPaymentAttempt): json is StatusResult {
+  if (!isJsonObject(json)) return false;
+  if (typeof json.serverNowSeconds !== "number" || !Number.isFinite(json.serverNowSeconds)) return false;
+  const attempt = json.attempt;
+  if (!isJsonObject(attempt)) return false;
+  if (typeof attempt.id !== "string" || attempt.id !== held.id) return false;
+  if (typeof attempt.state !== "string" || !KNOWN_ATTEMPT_STATES.has(attempt.state)) return false;
+  if (typeof attempt.recipient !== "string" || attempt.recipient !== held.recipient) return false;
+  if (typeof attempt.amountBaseUnits !== "string" || !/^\d+$/.test(attempt.amountBaseUnits) || attempt.amountBaseUnits !== held.amountBaseUnits) return false;
+  if (attempt.failureReason !== null && typeof attempt.failureReason !== "string") return false;
+  if (attempt.transactionHash !== null && typeof attempt.transactionHash !== "string") return false;
+  // `prepared`: presence only (contents are never inspected), one-way and state-aware.
+  const heldPrepared = held.prepared as unknown;
+  if (isJsonObject(heldPrepared)) {
+    // Fields never disappear from a stored row (object -> null is not an honest answer), and no transition targets `prepared`:
+    // an answer in state `prepared` never carries the object, whatever the page held.
+    if (!isJsonObject(attempt.prepared) || attempt.state === "prepared") return false;
+  } else if (heldPrepared === null) {
+    // A held null stays null — except for a row held in the `prepared` state: the server reserves it without fields and its own
+    // atomic `prepared -> awaiting_authorization` write adds them, so a later honest answer may carry them, in a state past `prepared`.
+    if (attempt.prepared !== null && (held.state !== "prepared" || attempt.state === "prepared" || !isJsonObject(attempt.prepared))) return false;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 /** Stage 2C-2: how many times one caller waits behind an older-epoch read before giving up (each wait is itself bounded by the request deadline). */
 const MAX_STALE_READ_WAITS = 2;
 
@@ -1170,8 +1219,11 @@ export function createRealPaymentStore() {
         if (!read) return;
         const result = await read.promise;
         // A read that began before a local transition (submit, refused cancel) describes the payment as it WAS.
-        if (!isCurrent() || result.attempt.id !== attempt.id || read.epoch !== statusEpoch) return;
-        const verdict = interpretStatusResult(result);
+        // These guards run FIRST: a stale answer — malformed or not — never reaches the current lifecycle.
+        if (!isCurrent() || read.epoch !== statusEpoch) return;
+        // L-2 D-10: nothing in the answer is read, adopted or acted on until it is known to be this payment's own, well-formed;
+        // a rejection takes the existing unusable-answer branch below.
+        const verdict = isHonestStatusResponse(result as unknown, attempt) ? interpretStatusResult(result) : ({ kind: "malformed" } as const);
         if (verdict.kind === "malformed") {
           // The attempt in this answer is not trusted either: keep the last reliable one, back off, say so plainly.
           noteDeferral(attempt.id, null);
@@ -1815,8 +1867,9 @@ export function createRealPaymentStore() {
             return;
           }
           const result = await read.promise;
-          if (!isCurrent() || result.attempt.id !== attempt.id || read.epoch !== statusEpoch) return;
-          const verdict = interpretStatusResult(result);
+          if (!isCurrent() || read.epoch !== statusEpoch) return;
+          // L-2 D-10: the same status answer, the same check — after the guards, before any field is read. Same fallback as an unusable deferral.
+          const verdict = isHonestStatusResponse(result as unknown, attempt) ? interpretStatusResult(result) : ({ kind: "malformed" } as const);
           if (verdict.kind === "malformed") {
             noteDeferral(attempt.id, null);
             set({ error: CANCEL_UNCONFIRMED_MESSAGE });
