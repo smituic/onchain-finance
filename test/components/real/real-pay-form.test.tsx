@@ -5434,3 +5434,206 @@ describe("RealPayForm — L-2 D-10: malformed status answers", () => {
     }
   });
 });
+
+/**
+ * L-2 D-11: a POST /cancel HTTP 200 that is not an honest "this payment was cancelled" must never send the user back to an
+ * empty form (as if the payment were gone) or print the engine's or the server's text. The screen keeps its payment, its
+ * approval context and its controls and shows the existing fixed "Could not confirm whether this payment was cancelled…"
+ * message; pressing Cancel again is the user's own new request. The production form is unchanged by D-11: these tests only
+ * prove it copes with what the store now hands it. They do not cover the stranded screen's wording (a separate item).
+ */
+describe("RealPayForm — L-2 D-11: malformed Cancel answers", () => {
+  const CANCEL_UNCONFIRMED = "Could not confirm whether this payment was cancelled. Check its status before trying again.";
+  const SIGNED_OUT = "You're signed out, so we can't confirm this payment yet. Sign in again to check its status.";
+  const CONTEXT = { subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" };
+  const HELD_ID = "payment-attempt-1";
+  const LEAKS = /FOREIGN|refunded-by-bank|engine-secret|0xdead|Cannot read|TypeError|SyntaxError|Unexpected|not valid JSON|Failed to fetch|Unhandled fetch/;
+  /** Checked after the fixed message (which itself says "was cancelled") is removed: nothing may claim the payment is cancelled. */
+  const FALSE_CANCELLED = /was cancelled|has been cancelled|is cancelled|payment cancelled|cancelled/i;
+
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Key = "latest" | "cancel" | "status" | "submit" | "prepare" | "balance";
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    signPreparedPaymentMock.mockResolvedValue({ signature: "0xsig-d11", activityId: "activity-d11" });
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    cleanup();
+    useRealPaymentStore.getState().reset();
+    useRealAccountStore.setState({ account: null, status: "idle", error: null });
+    signPreparedPaymentMock.mockReset();
+    vi.restoreAllMocks();
+  });
+
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  const openWindow = () => ({ ...PREPARED_FIELDS, validUntil: nowSeconds() + 3_600 });
+  const latestJson = (attempt: unknown) => jsonResponse(200, { attempt, ...CONTEXT, serverNowSeconds: nowSeconds() });
+  const settle = () => act(async () => void (await new Promise((resolve) => setTimeout(resolve, 15))));
+  const cancelledBody = (over: Record<string, unknown> = {}) => ({ attempt: attemptFixture({ state: "cancelled", prepared: openWindow(), ...over }) });
+
+  function stub(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string }> = [];
+    const counts = {} as Record<Key, number>;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/latest")
+          ? "latest"
+          : url.endsWith("/api/real/payments/prepare")
+            ? "prepare"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/api/real/payments/submit")
+                ? "submit"
+                : url.endsWith("/status")
+                  ? "status"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : null;
+        calls.push({ key: key ?? "other", url, method });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+        counts[key] = (counts[key] ?? 0) + 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, keys: () => calls.map((call) => call.key), count: (key: Key) => calls.filter((call) => call.key === key).length };
+  }
+
+  type Screen = "approval" | "stranded";
+  const SCREENS: Array<[Screen, string]> = [
+    ["approval", "real-pay-resume"],
+    ["stranded", "real-pay-stranded"],
+  ];
+  const latestFor = (screen: Screen) => () => latestJson(attemptFixture({ state: screen === "approval" ? "awaiting_authorization" : "signed", prepared: openWindow() }));
+
+  async function arrive(screen: Screen, cancel: Handler) {
+    const api = stub({ latest: latestFor(screen), cancel });
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen_(screen === "approval" ? "real-pay-resume" : "real-pay-stranded")).toBeInTheDocument());
+    return api;
+  }
+  const screen_ = (id: string) => screen.getByTestId(id);
+  const pressCancel = async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+    await settle();
+  };
+  /** The payment's own card (amount and recipient), as the user reads it. */
+  const paymentLine = (id: string) => screen.getByTestId(id).firstElementChild!.textContent;
+
+  const MALFORMED: Array<[string, () => Response]> = [
+    ["an empty body", () => new Response("", { status: 200 })],
+    ["an HTML body", () => new Response("<html>engine-secret</html>", { status: 200 })],
+    ["attempt: null", () => jsonResponse(200, { attempt: null })],
+    ["another payment's cancelled answer", () => jsonResponse(200, cancelledBody({ id: "payment-FOREIGN" }))],
+    ["a payment that is not cancelled", () => jsonResponse(200, cancelledBody({ state: "submitted", transactionHash: null }))],
+    ["a cancelled answer for another recipient", () => jsonResponse(200, cancelledBody({ recipient: "0xdead000000000000000000000000000000000001" }))],
+    ["a cancelled answer for another amount", () => jsonResponse(200, cancelledBody({ amountBaseUnits: "9999999" }))],
+    ["a cancelled answer carrying a transaction hash", () => jsonResponse(200, cancelledBody({ transactionHash: "0xabc" }))],
+  ];
+
+  describe.each(SCREENS)("the %s screen", (name, id) => {
+    it.each(MALFORMED)("%s: the payment, its controls and the fixed message stay; no form, no false cancellation", async (_case, answer) => {
+      const api = await arrive(name, () => answer());
+      const lineBefore = paymentLine(id);
+      const attemptBefore = structuredClone(useRealPaymentStore.getState().attempt);
+      expect(lineBefore).toMatch(/1/); // the amount
+
+      await pressCancel();
+
+      expect(screen.getByTestId(id)).toBeInTheDocument();
+      expect(screen.queryByTestId("real-pay-form")).toBeNull();
+      expect(screen.queryByTestId("real-pay-confirmed")).toBeNull();
+      expect(screen.queryByTestId("real-pay-failed")).toBeNull();
+      expect(screen.getByText(CANCEL_UNCONFIRMED)).toBeInTheDocument();
+      expect(document.body.textContent).not.toMatch(LEAKS);
+      expect(document.body.textContent?.replace(CANCEL_UNCONFIRMED, "")).not.toMatch(FALSE_CANCELLED);
+      // The same payment, same card, same controls — Cancel is available again; Continue only where it was offered.
+      expect(paymentLine(id)).toBe(lineBefore);
+      expect(useRealPaymentStore.getState().attempt).toEqual(attemptBefore);
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: name === "approval" ? "awaiting_authorization" : "stranded", ...CONTEXT, isCancelling: false, error: CANCEL_UNCONFIRMED });
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+      if (name === "approval") expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+      else expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+      // One Cancel POST for this payment and nothing else; nothing is signed or sent, and nothing follows by itself.
+      await settle();
+      expect(api.keys()).toEqual(["latest", "cancel"]);
+      expect(api.calls[1]).toEqual({ key: "cancel", url: `/api/real/payments/${HELD_ID}/cancel`, method: "POST" });
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+
+    it("the D-9 session control stays beside the fixed message when its marker is set", async () => {
+      const api = await arrive(name, () => jsonResponse(200, { attempt: null }));
+      act(() => useRealPaymentStore.setState({ sessionRecovery: "signed_out", error: SIGNED_OUT }));
+      expect(screen.getByRole("button", { name: "Sign in again" })).toBeInTheDocument();
+
+      await pressCancel();
+
+      expect(screen.getByText(CANCEL_UNCONFIRMED)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Sign in again" })).toBeEnabled();
+      expect(useRealPaymentStore.getState().sessionRecovery).toBe("signed_out");
+      expect(screen.getByTestId(id)).toBeInTheDocument();
+      expect(screen.queryByTestId("real-pay-form")).toBeNull();
+      expect(api.keys()).toEqual(["latest", "cancel"]);
+    });
+
+    it("a second press is the user's own new request: after a malformed answer, an honest one returns to the form", async () => {
+      const api = await arrive(name, (n) => (n === 1 ? jsonResponse(200, { attempt: null }) : jsonResponse(200, cancelledBody())));
+      await pressCancel();
+      expect(screen.getByText(CANCEL_UNCONFIRMED)).toBeInTheDocument();
+      expect(api.count("cancel")).toBe(1);
+
+      await pressCancel();
+
+      expect(api.count("cancel")).toBe(2);
+      expect(screen.getByTestId("real-pay-form")).toBeInTheDocument();
+      expect(screen.queryByTestId(id)).toBeNull();
+      expect(screen.queryByText(CANCEL_UNCONFIRMED)).toBeNull();
+    });
+
+    it("an honest cancelled answer still returns to the form exactly as before (no leftover payment, no message)", async () => {
+      const api = await arrive(name, () => jsonResponse(200, cancelledBody()));
+      await pressCancel();
+
+      expect(screen.getByTestId("real-pay-form")).toBeInTheDocument();
+      expect(screen.queryByTestId(id)).toBeNull();
+      expect(screen.queryByText(CANCEL_UNCONFIRMED)).toBeNull();
+      expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null, error: null });
+      expect(api.keys()).toEqual(["latest", "cancel"]);
+      expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    });
+
+    it("an honest answer that ignores fields the check does not read (no prepared, no clock, an odd reason) still returns to the form", async () => {
+      await arrive(name, () => jsonResponse(200, cancelledBody({ prepared: "n/a", failureReason: 5 })));
+      await pressCancel();
+      expect(screen.getByTestId("real-pay-form")).toBeInTheDocument();
+      expect(screen.queryByText(CANCEL_UNCONFIRMED)).toBeNull();
+    });
+
+    it("while the answer's body is still being read the Cancel button stays disabled and a click sends nothing more", async () => {
+      let release: (value: unknown) => void = () => {};
+      const body = new Promise<unknown>((resolve) => (release = resolve));
+      const api = await arrive(name, () => ({ ok: true, status: 200, headers: new Headers(), json: () => body }) as unknown as Response);
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+      await settle();
+      expect(screen.getByRole("button", { name: "Cancel payment" })).toBeDisabled();
+      fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+      await settle();
+      expect(api.count("cancel")).toBe(1);
+
+      release(cancelledBody());
+      await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+      expect(api.count("cancel")).toBe(1);
+    });
+  });
+});

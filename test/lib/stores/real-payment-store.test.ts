@@ -4662,7 +4662,7 @@ describe("real-payment-store — L-2 D-1: unresolved prepare and explicit status
       expect(store.getState().isCancelling).toBe(true);
       expect(api.count("cancel")).toBe(1);
 
-      gate.resolve(jsonResponse(200, { attempt: attemptIn("cancelled") }));
+      gate.resolve(jsonResponse(200, { attempt: attemptIn("cancelled", { id: "attempt-prepared" }) }));
       await Promise.all([first, second, third]);
 
       expect(api.count("cancel")).toBe(1);
@@ -4693,7 +4693,7 @@ describe("real-payment-store — L-2 D-1: unresolved prepare and explicit status
       expect(store.getState().isCancelling).toBe(false);
       // The new lifecycle has its own payment and its own, independent Cancel slot.
       store.setState({ status: "stranded", attempt: attemptIn("prepared", { id: "attempt-newer" }) });
-      gate.resolve(jsonResponse(200, { attempt: attemptIn("cancelled") }));
+      gate.resolve(jsonResponse(200, { attempt: attemptIn("cancelled", { id: "attempt-prepared" }) }));
       await pending;
       expect(store.getState()).toMatchObject({ status: "stranded", attempt: { id: "attempt-newer" }, isCancelling: false });
     });
@@ -4703,7 +4703,7 @@ describe("real-payment-store — L-2 D-1: unresolved prepare and explicit status
       const { store } = strandedStore(() => gate.promise);
       const pending = store.getState().cancel();
       useRealAccountStore.setState({ account: ACCOUNT_B });
-      gate.resolve(jsonResponse(200, { attempt: attemptIn("cancelled") }));
+      gate.resolve(jsonResponse(200, { attempt: attemptIn("cancelled", { id: "attempt-prepared" }) }));
       await pending;
       expect(store.getState()).toMatchObject({ status: "stranded", attempt: { id: "attempt-prepared" } });
     });
@@ -9459,6 +9459,707 @@ describe("real-payment-store — L-2 D-10: malformed status response recovery", 
       expect(store.getState().attempt?.id).toBe("attempt-1");
       expect(api.keys()).toEqual(["submit", "status"]);
       expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+/**
+ * L-2 D-11: malformed Cancel response recovery. POST /cancel HTTP 200 used to be
+ * believed on `response.ok` alone: the page dropped the payment and returned to
+ * the form without reading the body. Now the body is read while the Cancel
+ * request still owns its slot, and — after the lifecycle / account / attempt
+ * guard — the answer must be an honest "this payment was cancelled":
+ * `{ attempt }` with the exact held id, state exactly `cancelled`, the exact held
+ * recipient and digit-string amount, and `transactionHash` exactly null.
+ * `prepared`, `failureReason`, `recipientIdentity`, the timestamps, any other key
+ * and `serverNowSeconds` are deliberately ignored (a successful Cancel never
+ * adopts the answer's attempt). Anything else leaves the payment exactly as it
+ * was with the existing fixed "Could not confirm whether this payment was
+ * cancelled…" copy — the same as a network failure; nothing is retried, read,
+ * signed, submitted, prepared or released to the form. A rejection says nothing
+ * about whether the payment was cancelled. No D-11 test touches a real network,
+ * database, provider or passkey.
+ */
+describe("real-payment-store — L-2 D-11: malformed Cancel response recovery", () => {
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const T0_MS = 1_800_000_000_000;
+  const ADDRESS = "0x3333333333333333333333333333333333333333";
+  const CANCEL_UNCONFIRMED = "Could not confirm whether this payment was cancelled. Check its status before trying again.";
+  const CANCEL_LOST_RACE = "This payment could not be cancelled — it may already be on its way.";
+  const UNUSABLE = "We couldn’t check on this payment just now. Try again in a little while.";
+  const APPROVAL = { attemptId: "attempt-1", signature: "0xsig-d11", activityId: "activity-d11" };
+  const SNAPSHOT = { handle: "smit", displayName: "Smit" };
+  /** Distinctive malformed values: none of them may ever appear anywhere in the store. */
+  const LEAK = /FOREIGN|refunded-by-bank|0xdead|Cannot read|TypeError|SyntaxError|Unexpected|not valid JSON|Failed to fetch|unexpected fetch|<html>/;
+
+  type Key = "prepare" | "latest" | "cancel" | "status" | "submit" | "balance";
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Store = ReturnType<typeof createRealPaymentStore>;
+  const stores: Store[] = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0_MS);
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+  });
+
+  afterEach(async () => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockReset();
+    useRealAccountStore.setState({ account: null });
+    (await import("@/lib/stores/real-balance-store")).useRealBalanceStore.getState().reset();
+  });
+
+  /** Every request is recorded — including one no handler expects, which also fails the request. */
+  function server(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; url: string; method: string }> = [];
+    const counts: Record<Key, number> = { prepare: 0, latest: 0, cancel: 0, status: 0, submit: 0, balance: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/prepare")
+          ? "prepare"
+          : url.endsWith("/api/real/payments/latest")
+            ? "latest"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/status")
+                ? "status"
+                : url.endsWith("/api/real/payments/submit")
+                  ? "submit"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : null;
+        calls.push({ key: key ?? "other", url, method });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, keys: () => calls.map((call) => call.key), count: (key: Key) => calls.filter((call) => call.key === key).length };
+  }
+
+  function held<T = Response>() {
+    let resolve: (value: T) => void = () => {};
+    let reject: (reason: unknown) => void = () => {};
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  const settle = () => vi.advanceTimersByTimeAsync(0);
+  const offsetFor = (secondsBeforeExpiry: number) => VALID_UNTIL - secondsBeforeExpiry - T0_MS / 1000;
+  const serverNow = (secondsBeforeExpiry = 100_000) => Math.floor(Date.now() / 1000) + offsetFor(secondsBeforeExpiry);
+  const visible = (store: Store) => JSON.parse(JSON.stringify(store.getState())) as Record<string, unknown>;
+  const J = (body: unknown) => jsonResponse(200, body);
+  /** A 200-shaped reply whose body read the test controls (a body that rejects, hangs, or holds values JSON text cannot). */
+  const rawReply = (json: () => Promise<unknown>, over: Record<string, unknown> = {}) => ({ ok: true, status: 200, headers: new Headers(), json, ...over }) as unknown as Response;
+
+  /** The held payment, in the server's own shape (a stored row keeps its prepared fields after a transition). */
+  const attemptOf = (state: string, over: Record<string, unknown> = {}) => ({ ...baseAttempt(), state, prepared: PREPARED_FIELDS, ...over });
+  /** What POST /cancel honestly answers: the cancelled row (toPublicAttempt) — no serverNowSeconds, no reconciliation metadata. */
+  const cancelledOf = (over: Record<string, unknown> = {}) => attemptOf("cancelled", over);
+  const bodyOf = (over: Record<string, unknown> = {}, top: Record<string, unknown> = {}) => ({ attempt: cancelledOf(over), ...top });
+  const honest = (over: Record<string, unknown> = {}, top: Record<string, unknown> = {}) => J(bodyOf(over, top));
+  const withAttempt = (over: Record<string, unknown>) => () => J(bodyOf(over));
+  const withTop = (top: Record<string, unknown>) => () => J(bodyOf({}, top));
+
+  type HeldKind = "awaiting" | "stranded" | "reserved";
+  const SHAPES: Record<HeldKind, { state: string; status: string; context: boolean }> = {
+    awaiting: { state: "awaiting_authorization", status: "awaiting_authorization", context: true },
+    stranded: { state: "signed", status: "stranded", context: true },
+    // The real GET /latest returns the signing context only for a bound awaiting row: a reserved row (state prepared, no fields) has none.
+    reserved: { state: "prepared", status: "stranded", context: false },
+  };
+
+  /** A store holding the payment the way each screen does. The stranded (signed) screen also holds the saved approval. */
+  function holding(kind: HeldKind, over: Record<string, unknown> = {}): Store {
+    const store = createRealPaymentStore();
+    stores.push(store);
+    const { state, status, context } = SHAPES[kind];
+    store.setState({
+      attempt: attemptOf(state, kind === "reserved" ? { prepared: null, ...over } : over) as never,
+      status: status as never,
+      subOrganizationId: context ? "sub-org-1" : null,
+      authorizingCredentialId: context ? "credential-1" : null,
+      clockOffsetSeconds: offsetFor(100_000),
+      pendingSubmission: kind === "stranded" ? APPROVAL : null,
+    });
+    return store;
+  }
+
+  /** What an honest Cancel success leaves: exactly the pre-D-11 cleanup. */
+  const CLEARED = {
+    status: "editing",
+    attempt: null,
+    recipientLookup: { status: "idle" },
+    subOrganizationId: null,
+    authorizingCredentialId: null,
+    pendingSubmission: null,
+    isAuthorizing: false,
+    recipientInput: "",
+    amountInput: "",
+    isAttemptPastValidity: false,
+    isFollowUpExhausted: false,
+    isStatusDeferred: false,
+    statusRetryAfterSeconds: null,
+    isSubmitCoolingDown: false,
+    submitCooldownSeconds: null,
+    isSubmitRetryBeyondApproval: false,
+    sessionRecovery: null,
+    error: null,
+    isCancelling: false,
+  };
+  /** Pre-existing screen state an honest Cancel must clear. */
+  const DIRTY = { recipientInput: ADDRESS, amountInput: "1", sessionRecovery: "signed_out" as const, isAttemptPastValidity: true, isStatusDeferred: true, statusRetryAfterSeconds: 7, error: "an older message" };
+
+  /** Everything a rejected answer must leave exactly as it was: the whole visible store, except the one message. */
+  const unchangedExceptError = (store: Store, before: Record<string, unknown>) => expect({ ...visible(store), error: before.error }).toEqual(before);
+
+  // ---- honest success: exactly the pre-D-11 behavior ----------------------------------------------------------
+
+  describe("an honest cancelled answer is accepted and behaves exactly as before D-11", () => {
+    type Honest = [string, HeldKind, Record<string, unknown>, () => Response];
+    const HONEST: Honest[] = [
+      ["held awaiting (object) → cancelled (object)", "awaiting", {}, () => honest()],
+      ["held reserved prepared/null → cancelled (null)", "reserved", {}, () => honest({ prepared: null })],
+      ["held reserved prepared/null → cancelled (object) — preparation completed before Cancel", "reserved", {}, () => honest({ prepared: PREPARED_FIELDS })],
+      ["held signed / stranded → cancelled", "stranded", {}, () => honest()],
+      ["legacy awaiting row with no prepared fields (null validUntil)", "awaiting", { prepared: null }, () => honest({ prepared: null })],
+      ["legacy signed row with no prepared fields", "stranded", { prepared: null }, () => honest({ prepared: null })],
+      ["a handle payment (identity held and echoed)", "awaiting", { recipientIdentity: SNAPSHOT }, () => honest({ recipientIdentity: SNAPSHOT })],
+      ["a handle payment, the answer omits the identity", "awaiting", { recipientIdentity: SNAPSHOT }, () => honest({ recipientIdentity: undefined })],
+      ["extra unrelated fields (attempt and top level)", "awaiting", {}, () => honest({ extraThing: 1, nested: { a: [1] } }, { extraTop: "x", reconciliationDeferred: false, retryAfterSeconds: 5 })],
+      // The approved ignored-field policy: this check is not a schema check.
+      ["ignored: no prepared key", "awaiting", {}, () => honest({ prepared: undefined })],
+      ["ignored: prepared is a string", "awaiting", {}, () => honest({ prepared: "garbage" })],
+      ["ignored: prepared is an array", "awaiting", {}, () => honest({ prepared: [] })],
+      ["ignored: prepared is a number", "awaiting", {}, () => honest({ prepared: 5 })],
+      ["ignored: an irrelevant failureReason string", "awaiting", {}, () => honest({ failureReason: "No money moved." })],
+      ["ignored: a numeric failureReason", "awaiting", {}, () => honest({ failureReason: 5 })],
+      ["ignored: no failureReason key", "awaiting", {}, () => honest({ failureReason: undefined })],
+      ["ignored: no serverNowSeconds (the Cancel answer carries none)", "awaiting", {}, () => J({ attempt: cancelledOf() })],
+      ["ignored: a malformed serverNowSeconds", "awaiting", {}, withTop({ serverNowSeconds: "later" })],
+      ["ignored: no timestamps, a malformed recipientIdentity", "awaiting", {}, () => honest({ createdAt: undefined, updatedAt: undefined, recipientIdentity: "garbage" })],
+    ];
+
+    it.each(HONEST)("%s", async (_name, kind, over, answer) => {
+      const api = server({ cancel: () => answer() });
+      const store = holding(kind, over);
+      store.setState(DIRTY);
+      if (kind === "stranded") store.setState({ pendingSubmission: APPROVAL });
+
+      await store.getState().cancel();
+      await settle();
+
+      expect(store.getState()).toMatchObject(CLEARED);
+      expect(api.calls).toEqual([{ key: "cancel", url: "/api/real/payments/attempt-1/cancel", method: "POST" }]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      // Nothing is armed behind the cleanup.
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+      expect(api.keys()).toEqual(["cancel"]);
+    });
+
+    it("a reserved row adopted through /latest (real null signing context), then an honest cancelled/null answer", async () => {
+      const api = server({
+        latest: () => J({ attempt: attemptOf("prepared", { prepared: null }), subOrganizationId: null, authorizingCredentialId: null, serverNowSeconds: serverNow() }),
+        cancel: () => honest({ prepared: null }),
+      });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      await store.getState().init();
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "stranded", attempt: { state: "prepared", prepared: null }, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null });
+
+      await store.getState().cancel();
+      await settle();
+
+      expect(store.getState()).toMatchObject(CLEARED);
+      expect(api.keys()).toEqual(["latest", "cancel"]);
+    });
+
+    it("a reserved row adopted through /latest whose preparation finished before Cancel: cancelled/object is honest and accepted", async () => {
+      const api = server({
+        latest: () => J({ attempt: attemptOf("prepared", { prepared: null }), subOrganizationId: null, authorizingCredentialId: null, serverNowSeconds: serverNow() }),
+        cancel: () => honest({ prepared: PREPARED_FIELDS }),
+      });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      await store.getState().init();
+      await settle();
+      expect(store.getState().attempt?.prepared).toBeNull();
+
+      await store.getState().cancel();
+      await settle();
+
+      expect(store.getState()).toMatchObject(CLEARED);
+      expect(api.keys()).toEqual(["latest", "cancel"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---- malformed success: the payment is left exactly as it was -----------------------------------------------
+
+  type Case = [string, () => Response];
+  const STATES_OTHER_THAN_CANCELLED = ["prepared", "awaiting_authorization", "signed", "submitting", "submitted", "confirmed", "failed", "unknown"];
+  const MALFORMED: Case[] = [
+    // the body itself
+    ["empty success body", () => new Response("", { status: 200 })],
+    ["non-JSON success body", () => new Response("<html>oops</html>", { status: 200 })],
+    ["a body read that rejects", () => rawReply(async () => Promise.reject(new SyntaxError("Unexpected token FOREIGN in JSON")))],
+    ["top-level null", () => J(null)],
+    ["top-level string", () => J("cancelled")],
+    ["top-level number", () => J(5)],
+    ["top-level true", () => J(true)],
+    ["top-level array holding the honest body", () => J([bodyOf()])],
+    // the attempt
+    ["no attempt", () => J({})],
+    ["attempt: null", withTop({ attempt: null })],
+    ["attempt: a string", withTop({ attempt: "attempt-1" })],
+    ["attempt: a number", withTop({ attempt: 1 })],
+    ["attempt: an array holding the honest attempt", withTop({ attempt: [cancelledOf()] })],
+    // the id
+    ["no id", withAttempt({ id: undefined })],
+    ["empty id", withAttempt({ id: "" })],
+    ["numeric id", withAttempt({ id: 1 })],
+    ["null id", withAttempt({ id: null })],
+    ["object id", withAttempt({ id: {} })],
+    ["foreign id", withAttempt({ id: "attempt-FOREIGN" })],
+    ["case-folded id", withAttempt({ id: "ATTEMPT-1" })],
+    ["leading-space id", withAttempt({ id: " attempt-1" })],
+    ["trailing-space id", withAttempt({ id: "attempt-1 " })],
+    // the state
+    ["no state", withAttempt({ state: undefined })],
+    ["unknown state", withAttempt({ state: "refunded-by-bank" })],
+    ["case-folded state", withAttempt({ state: "CANCELLED" })],
+    ["padded state", withAttempt({ state: "cancelled " })],
+    ["numeric state", withAttempt({ state: 5 })],
+    ["null state", withAttempt({ state: null })],
+    ["array state", withAttempt({ state: ["cancelled"] })],
+    ...STATES_OTHER_THAN_CANCELLED.map((state): Case => [`known state '${state}'`, withAttempt({ state })]),
+    // the recipient
+    ["no recipient", withAttempt({ recipient: undefined })],
+    ["another recipient", withAttempt({ recipient: "0xdead000000000000000000000000000000000001" })],
+    ["padded recipient", withAttempt({ recipient: "0x2222222222222222222222222222222222222222 " })],
+    ["numeric recipient", withAttempt({ recipient: 5 })],
+    ["null recipient", withAttempt({ recipient: null })],
+    // the amount
+    ["no amount", withAttempt({ amountBaseUnits: undefined })],
+    ["another amount", withAttempt({ amountBaseUnits: "1000001" })],
+    ["decimal amount", withAttempt({ amountBaseUnits: "1000000.0" })],
+    ["padded amount", withAttempt({ amountBaseUnits: " 1000000" })],
+    ["exponent amount", withAttempt({ amountBaseUnits: "1e6" })],
+    ["numeric amount", withAttempt({ amountBaseUnits: 1_000_000 })],
+    ["negative amount", withAttempt({ amountBaseUnits: "-1000000" })],
+    ["empty amount", withAttempt({ amountBaseUnits: "" })],
+    ["zero-padded amount", withAttempt({ amountBaseUnits: "01000000" })],
+    ["null amount", withAttempt({ amountBaseUnits: null })],
+    // transactionHash: a pre-dispatch (cancelled) row never has one
+    ["no transactionHash", withAttempt({ transactionHash: undefined })],
+    ["a transactionHash string", withAttempt({ transactionHash: "0xabc" })],
+    ["an empty transactionHash string", withAttempt({ transactionHash: "" })],
+    ["numeric transactionHash", withAttempt({ transactionHash: 0 })],
+    ["object transactionHash", withAttempt({ transactionHash: {} })],
+    ["boolean transactionHash", withAttempt({ transactionHash: false })],
+  ];
+
+  it("the case list has no duplicates and covers every rejection class", () => {
+    expect(new Set(MALFORMED.map(([name]) => name)).size).toBe(MALFORMED.length);
+    expect(MALFORMED.length).toBeGreaterThanOrEqual(55);
+  });
+
+  describe("a malformed 200 from Cancel: the existing neutral message, and nothing else", () => {
+    it.each(MALFORMED)("from the approval screen — %s", async (_name, answer) => {
+      const api = server({ cancel: () => answer() });
+      const store = holding("awaiting");
+      // The saved approval and an earlier session marker must survive untouched.
+      store.setState({ pendingSubmission: APPROVAL, sessionRecovery: "signed_out" });
+      const before = visible(store);
+
+      await store.getState().cancel();
+      await settle();
+
+      unchangedExceptError(store, before);
+      expect(store.getState()).toMatchObject({ error: CANCEL_UNCONFIRMED, isCancelling: false, status: "awaiting_authorization", sessionRecovery: "signed_out", pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
+      expect(store.getState().attempt?.id).toBe("attempt-1");
+      expect(api.keys()).toEqual(["cancel"]); // exactly one POST; no status, latest, prepare or submit by itself
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      expect(JSON.stringify(visible(store))).not.toMatch(LEAK);
+      // No automatic retry, ever.
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(api.keys()).toEqual(["cancel"]);
+    });
+
+    // Representative context retention on the other screens (the full table above is not multiplied across screens).
+    const byName = (name: string): Case => MALFORMED.find(([candidate]) => candidate === name) as Case;
+    const REPRESENTATIVE: Case[] = [byName("empty success body"), byName("foreign id"), byName("known state 'submitted'")];
+
+    describe.each(["stranded", "reserved"] as const)("from the %s screen", (kind) => {
+      it.each(REPRESENTATIVE)("%s", async (_name, answer) => {
+        const api = server({ cancel: () => answer() });
+        const store = holding(kind);
+        store.setState({ sessionRecovery: "not_accessible" });
+        const before = visible(store);
+
+        await store.getState().cancel();
+        await settle();
+
+        unchangedExceptError(store, before);
+        expect(store.getState()).toMatchObject({ error: CANCEL_UNCONFIRMED, isCancelling: false, status: "stranded", sessionRecovery: "not_accessible", pendingSubmission: kind === "stranded" ? APPROVAL : null });
+        expect(store.getState().attempt?.id).toBe("attempt-1");
+        expect(api.keys()).toEqual(["cancel"]);
+        expect(signPreparedPayment).not.toHaveBeenCalled();
+      });
+    });
+
+    it("a malformed 200 for a reserved row adopted through /latest keeps its real null signing context and invents none", async () => {
+      const api = server({
+        latest: () => J({ attempt: attemptOf("prepared", { prepared: null }), subOrganizationId: null, authorizingCredentialId: null, serverNowSeconds: serverNow() }),
+        cancel: () => J({ attempt: null }),
+      });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      await store.getState().init();
+      await settle();
+      const before = visible(store);
+
+      await store.getState().cancel();
+      await settle();
+
+      unchangedExceptError(store, before);
+      expect(store.getState()).toMatchObject({ status: "stranded", error: CANCEL_UNCONFIRMED, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null });
+      expect(api.keys()).toEqual(["latest", "cancel"]);
+    });
+
+    it("a recipient that differs only in letter case is rejected (no case-folding)", async () => {
+      const mixed = "0xAbCdEf0000000000000000000000000000000001";
+      const api = server({ cancel: withAttempt({ recipient: mixed.toLowerCase() }) });
+      const store = holding("awaiting", { recipient: mixed });
+      await store.getState().cancel();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: CANCEL_UNCONFIRMED });
+      expect(api.keys()).toEqual(["cancel"]);
+    });
+
+    it("the amount digit-string check stands on its own: a held non-digit amount is rejected even when the answer repeats it exactly", async () => {
+      for (const odd of ["1e6", "1.5", "-1", " 1", "0x10", ""]) {
+        const api = server({ cancel: withAttempt({ amountBaseUnits: odd }) });
+        const store = holding("awaiting", { amountBaseUnits: odd });
+        await store.getState().cancel();
+        expect(store.getState(), `held amount ${JSON.stringify(odd)}`).toMatchObject({ status: "awaiting_authorization", error: CANCEL_UNCONFIRMED });
+        expect(api.keys()).toEqual(["cancel"]);
+      }
+    });
+
+    it("a non-2xx answer is never parsed by the success check: its body is not read, whatever it claims", async () => {
+      const json = vi.fn(async () => bodyOf());
+      const api = server({ cancel: () => rawReply(json, { ok: false, status: 409 }), status: () => J({ attempt: attemptOf("submitted"), serverNowSeconds: serverNow(), reconciliationDeferred: false }) });
+      const store = holding("awaiting");
+      await store.getState().cancel();
+      await settle();
+      expect(json).not.toHaveBeenCalled();
+      // The existing refused-Cancel path ran (D-4 / D-10): one read, the real state shown beside the refusal.
+      expect(store.getState()).toMatchObject({ status: "submitted", error: CANCEL_LOST_RACE });
+      expect(api.keys()).toEqual(["cancel", "status"]);
+    });
+
+    it.each([409, 500, 401, 404])("an honest-looking cancelled body on HTTP %i does not release the payment to the form", async (code) => {
+      const api = server({ cancel: () => jsonResponse(code, bodyOf()), status: () => J({ attempt: attemptOf("awaiting_authorization"), serverNowSeconds: serverNow(), reconciliationDeferred: false }) });
+      const store = holding("awaiting");
+      await store.getState().cancel();
+      await settle();
+      expect(store.getState().status).not.toBe("editing");
+      expect(store.getState().attempt?.id).toBe("attempt-1");
+      expect(api.count("cancel")).toBe(1);
+    });
+  });
+
+  // ---- the request slot: the body is read while THIS request owns it ------------------------------------------
+
+  describe("Cancel request slot", () => {
+    it("a second press while the fetch is pending sends no second POST", async () => {
+      const gate = held();
+      const api = server({ cancel: () => gate.promise });
+      const store = holding("awaiting");
+      const first = store.getState().cancel();
+      const second = store.getState().cancel();
+      expect(store.getState().isCancelling).toBe(true);
+      expect(api.count("cancel")).toBe(1);
+      gate.resolve(honest());
+      await Promise.all([first, second]);
+      expect(api.count("cancel")).toBe(1);
+      expect(store.getState()).toMatchObject(CLEARED);
+    });
+
+    it("a second press while the successful body is still being read sends no second POST, and the slot is released only afterwards", async () => {
+      const body = held<unknown>();
+      const api = server({ cancel: () => rawReply(() => body.promise) });
+      const store = holding("awaiting");
+      const first = store.getState().cancel();
+      await settle(); // the fetch has resolved; response.json() is pending
+      expect(store.getState().isCancelling).toBe(true);
+
+      await store.getState().cancel();
+      await store.getState().cancel();
+      expect(api.count("cancel")).toBe(1);
+      expect(store.getState().isCancelling).toBe(true);
+
+      body.resolve(bodyOf());
+      await first;
+      expect(api.count("cancel")).toBe(1);
+      expect(store.getState()).toMatchObject(CLEARED);
+    });
+
+    it("a body read that fails releases the slot; a later explicit press is a new request and an honest answer works", async () => {
+      const api = server({ cancel: (n) => (n === 1 ? rawReply(async () => Promise.reject(new SyntaxError("Unexpected end of JSON input"))) : honest()) });
+      const store = holding("awaiting");
+      await store.getState().cancel();
+      expect(store.getState()).toMatchObject({ isCancelling: false, error: CANCEL_UNCONFIRMED, status: "awaiting_authorization" });
+      expect(api.count("cancel")).toBe(1);
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(api.count("cancel")).toBe(1); // nothing retried by itself
+
+      await store.getState().cancel();
+      expect(api.count("cancel")).toBe(2);
+      expect(store.getState()).toMatchObject(CLEARED);
+    });
+
+    it("a malformed answer releases the slot too", async () => {
+      const api = server({ cancel: (n) => (n === 1 ? J({ attempt: null }) : honest()) });
+      const store = holding("awaiting");
+      await store.getState().cancel();
+      expect(store.getState()).toMatchObject({ isCancelling: false, error: CANCEL_UNCONFIRMED });
+      await store.getState().cancel();
+      expect(api.count("cancel")).toBe(2);
+      expect(store.getState()).toMatchObject(CLEARED);
+    });
+
+    it("after a malformed answer, an explicit second press that gets an honest 409 uses the unchanged refused-Cancel path (one status read, the existing wording)", async () => {
+      const api = server({
+        cancel: (n) => (n === 1 ? J({ attempt: null }) : jsonResponse(409, { error: "This payment can no longer be cancelled (state: cancelled)." })),
+        status: () => J({ attempt: attemptOf("cancelled"), serverNowSeconds: serverNow(), reconciliationDeferred: false }),
+      });
+      const store = holding("awaiting");
+      await store.getState().cancel();
+      expect(store.getState().error).toBe(CANCEL_UNCONFIRMED);
+
+      await store.getState().cancel();
+      await settle();
+
+      expect(api.keys()).toEqual(["cancel", "cancel", "status"]);
+      // The first Cancel may in fact have worked: the real state is shown beside the (existing, cautious) refusal wording.
+      expect(store.getState()).toMatchObject({ status: "editing", error: CANCEL_LOST_RACE });
+      expect(store.getState().attempt?.state).toBe("cancelled");
+    });
+
+    it("…and a malformed status answer on that path still takes D-10's unchanged fallback and deferral", async () => {
+      const api = server({
+        cancel: (n) => (n === 1 ? J({ attempt: null }) : jsonResponse(409, { error: "no" })),
+        status: () => J(null),
+      });
+      const store = holding("awaiting");
+      await store.getState().cancel();
+      await store.getState().cancel();
+      await settle();
+      expect(api.keys()).toEqual(["cancel", "cancel", "status"]);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: CANCEL_UNCONFIRMED, isStatusDeferred: true, statusRetryAfterSeconds: null });
+      expect(store.getState().attempt?.id).toBe("attempt-1");
+    });
+  });
+
+  // ---- late answers: after the final await the guard runs before anything is validated or written -------------
+
+  describe("a late answer never writes into a newer lifecycle", () => {
+    type Event = [string, (store: Store) => void];
+    const EVENTS: Event[] = [
+      ["an account switch", () => useRealAccountStore.setState({ account: ACCOUNT_B })],
+      ["reset", (store) => store.getState().reset()],
+      ["detach", (store) => store.getState().detach()],
+      ["an attempt replacement", (store) => store.setState({ status: "awaiting_authorization", attempt: attemptOf("awaiting_authorization", { id: "attempt-2" }) as never })],
+    ];
+    const ANSWERS: Array<[string, unknown | "reject"]> = [
+      ["an honest cancelled answer", bodyOf()],
+      ["a malformed answer", { attempt: null }],
+      ["an answer for another payment", bodyOf({ id: "attempt-FOREIGN" })],
+      ["a body that fails to parse", "reject"],
+    ];
+
+    describe.each(EVENTS)("%s", (_event, happen) => {
+      it.each(ANSWERS)("while the fetch is pending, then %s arrives", async (_name, answer) => {
+        const gate = held();
+        const api = server({ cancel: () => gate.promise });
+        const store = holding("awaiting");
+        const pending = store.getState().cancel();
+        await settle();
+
+        happen(store);
+        const after = { ...visible(store), isCancelling: false };
+        gate.resolve(answer === "reject" ? rawReply(async () => Promise.reject(new SyntaxError("Unexpected token FOREIGN"))) : J(answer));
+        await pending;
+        await settle();
+
+        expect({ ...visible(store), isCancelling: false }).toEqual(after); // nothing written: no clear, no error
+        expect(store.getState().error).toBeNull();
+        expect(api.keys()).toEqual(["cancel"]);
+        expect(JSON.stringify(visible(store))).not.toMatch(LEAK);
+      });
+
+      it.each(ANSWERS)("after the fetch resolved but while response.json() is still pending, then %s arrives", async (_name, answer) => {
+        const body = held<unknown>();
+        const api = server({ cancel: () => rawReply(() => body.promise) });
+        const store = holding("awaiting");
+        const pending = store.getState().cancel();
+        await settle(); // fetch settled; the body read is the pending await
+
+        happen(store);
+        const after = { ...visible(store), isCancelling: false };
+        if (answer === "reject") body.reject(new SyntaxError("Unexpected token FOREIGN"));
+        else body.resolve(answer);
+        await pending;
+        await settle();
+
+        expect({ ...visible(store), isCancelling: false }).toEqual(after);
+        expect(store.getState().error).toBeNull();
+        expect(api.keys()).toEqual(["cancel"]);
+        expect(JSON.stringify(visible(store))).not.toMatch(LEAK);
+      });
+    });
+
+    it("a late answer from an older lifecycle does not release a newer lifecycle's Cancel slot", async () => {
+      const staleBody = held<unknown>();
+      const newerGate = held();
+      const api = server({ cancel: (n) => (n === 1 ? rawReply(() => staleBody.promise) : newerGate.promise) });
+      const store = holding("awaiting");
+      const stale = store.getState().cancel();
+      await settle();
+
+      // A new lifecycle with its own payment and its own Cancel request in flight.
+      store.getState().reset();
+      store.setState({ status: "awaiting_authorization", attempt: attemptOf("awaiting_authorization", { id: "attempt-2" }) as never });
+      const newer = store.getState().cancel();
+      await settle();
+      expect(store.getState().isCancelling).toBe(true);
+      expect(api.count("cancel")).toBe(2);
+
+      staleBody.resolve(bodyOf()); // honest for the OLD payment
+      await stale;
+      await settle();
+      // Still the newer request's slot: a repeat press sends nothing, and the newer payment is untouched.
+      expect(store.getState()).toMatchObject({ isCancelling: true, error: null, attempt: { id: "attempt-2" }, status: "awaiting_authorization" });
+      await store.getState().cancel();
+      expect(api.count("cancel")).toBe(2);
+
+      newerGate.resolve(honest({ id: "attempt-2" }));
+      await newer;
+      expect(store.getState()).toMatchObject(CLEARED);
+    });
+  });
+
+  // ---- what a rejection must leave running --------------------------------------------------------------------
+
+  describe("a rejected answer leaves the existing timers, deferral and follow-ups alone", () => {
+    const latestAboutToExpire = () => J({ attempt: attemptOf("awaiting_authorization"), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow(100) });
+
+    it("the pending expiry timer still fires (no new D-11 request: the one read is the existing timer's)", async () => {
+      const api = server({ latest: latestAboutToExpire, cancel: () => J({ attempt: null }), status: () => J(null) });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      await store.getState().init();
+      await settle();
+      expect(api.keys()).toEqual(["latest"]);
+
+      await store.getState().cancel();
+      expect(api.keys()).toEqual(["latest", "cancel"]);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: CANCEL_UNCONFIRMED });
+
+      await vi.advanceTimersByTimeAsync(100_999); // validUntil + 1 s is the existing arm point
+      expect(api.count("status")).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(api.count("status")).toBe(1);
+      expect(api.keys().filter((key) => key !== "status")).toEqual(["latest", "cancel"]);
+    });
+
+    it("contrast: an honest success clears that timer (nothing fires later)", async () => {
+      const api = server({ latest: latestAboutToExpire, cancel: () => honest(), status: () => J(null) });
+      const store = createRealPaymentStore();
+      stores.push(store);
+      await store.getState().init();
+      await store.getState().cancel();
+      expect(store.getState()).toMatchObject(CLEARED);
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+      expect(api.keys()).toEqual(["latest", "cancel"]);
+    });
+
+    it("D-10's 60 s deferral and cooldown stand: a malformed Cancel neither extends nor ends them", async () => {
+      const api = server({ status: () => J(null), cancel: () => J(null) });
+      const store = holding("awaiting");
+      await store.getState().checkStatus();
+      await settle();
+      expect(store.getState()).toMatchObject({ error: UNUSABLE, isStatusDeferred: true });
+      expect(api.keys()).toEqual(["status"]);
+
+      await store.getState().cancel();
+      await settle();
+      expect(store.getState()).toMatchObject({ error: CANCEL_UNCONFIRMED, isStatusDeferred: true, statusRetryAfterSeconds: null, status: "awaiting_authorization" });
+      expect(api.keys()).toEqual(["status", "cancel"]);
+
+      // Still inside the original window: Check status sends nothing; at the original 60 s it works again.
+      await vi.advanceTimersByTimeAsync(STATUS_FALLBACK_DEADLINE_MS - 1);
+      await store.getState().checkStatus();
+      expect(api.count("status")).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await store.getState().checkStatus();
+      await settle();
+      expect(api.count("status")).toBe(2);
+    });
+
+    it("a status read already in flight is not made stale by a malformed Cancel answer (no local transition is recorded): its honest answer is still applied", async () => {
+      const read = held();
+      const api = server({ status: () => read.promise, cancel: () => J({ attempt: null }) });
+      const store = holding("awaiting");
+      const checking = store.getState().checkStatus();
+      await settle();
+      expect(api.count("status")).toBe(1);
+
+      await store.getState().cancel(); // a rejected answer: the payment did not change locally
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: CANCEL_UNCONFIRMED });
+
+      read.resolve(J({ attempt: attemptOf("submitted"), serverNowSeconds: serverNow(), reconciliationDeferred: false }));
+      await checking;
+      await settle();
+
+      expect(store.getState()).toMatchObject({ status: "submitted", error: null });
+      expect(store.getState().attempt?.state).toBe("submitted");
+      expect(api.keys()).toEqual(["status", "cancel"]);
+    });
+
+    // The form offers no Cancel on the Sending screen, so this is a store-API path, not a screen the user can reach; it pins that the
+    // rejection does not touch D-6's deadline (an honest success clears it, as before).
+    it("(store API only) D-6: the 60 s submit deadline is not cleared by a malformed Cancel answer", async () => {
+      const gate = held();
+      const api = server({ submit: () => gate.promise, cancel: () => J({ attempt: null }) });
+      const store = holding("awaiting");
+      const sending = store.getState().resumeAuthorization();
+      await settle();
+      expect(api.count("submit")).toBe(1);
+
+      await store.getState().cancel();
+      expect(store.getState().error).toBe(CANCEL_UNCONFIRMED);
+
+      await vi.advanceTimersByTimeAsync(SUBMIT_REQUEST_DEADLINE_MS);
+      expect(store.getState()).toMatchObject({ status: "unknown", pendingSubmission: APPROVAL });
+      expect(api.keys()).toEqual(["submit", "cancel"]);
+      gate.resolve(J({ attempt: attemptOf("submitted") }));
+      await sending;
     });
   });
 });

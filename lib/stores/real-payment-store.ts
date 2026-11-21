@@ -545,6 +545,35 @@ function isHonestStatusResponse(json: unknown, held: RealPaymentAttempt): json i
   return true;
 }
 
+/**
+ * L-2 D-11: is this POST /cancel HTTP 200 body an honest "this payment was
+ * cancelled"? Pure; strict; no trimming, case folding or repair. Sibling of the
+ * submit and status validators, narrower than both: a successful Cancel
+ * discards the answer's attempt (it is never adopted), so this checks only what
+ * the confirmation itself claims — `{ attempt }` with the id exactly the held
+ * id, state exactly `cancelled`, the recipient and amount exactly the held
+ * attempt's (a payment's intent never changes after prepare), and
+ * transactionHash exactly null (a pre-dispatch row never has one). `prepared`
+ * is deliberately NOT inspected: the server answers cancelled/null for a row it
+ * reserved without fields and cancelled/object for a completed one — and a page
+ * that held prepared/null may honestly get cancelled/object when preparation
+ * finished before Cancel — and nothing here reads it. failureReason,
+ * recipientIdentity, the timestamps and any other key are ignored; no
+ * serverNowSeconds is required. A rejection says nothing about whether the
+ * payment was cancelled.
+ */
+function isHonestCancelResponse(json: unknown, held: { id: string; recipient: string; amountBaseUnits: string }): boolean {
+  if (!isJsonObject(json)) return false;
+  const attempt = json.attempt;
+  if (!isJsonObject(attempt)) return false;
+  if (typeof attempt.id !== "string" || attempt.id !== held.id) return false;
+  if (attempt.state !== "cancelled") return false;
+  if (typeof attempt.recipient !== "string" || attempt.recipient !== held.recipient) return false;
+  if (typeof attempt.amountBaseUnits !== "string" || !/^\d+$/.test(attempt.amountBaseUnits) || attempt.amountBaseUnits !== held.amountBaseUnits) return false;
+  if (attempt.transactionHash !== null) return false;
+  return true;
+}
+
 /** Stage 2C-2: how many times one caller waits behind an older-epoch read before giving up (each wait is itself bounded by the request deadline). */
 const MAX_STALE_READ_WAITS = 2;
 
@@ -1804,10 +1833,23 @@ export function createRealPaymentStore() {
           if (isCurrent()) set({ error: CANCEL_UNCONFIRMED_MESSAGE });
           return;
         }
-        releaseCancel();
-        if (!isCurrent()) return;
-
         if (response.ok) {
+          // L-2 D-11: the confirmation is read while THIS request still owns the slot (a repeat press during the body read must not
+          // dispatch a second POST). Everything after the final await — release, guard, validation, result — is synchronous.
+          let body: unknown;
+          let bodyReadable = true;
+          try {
+            body = await response.json();
+          } catch {
+            bodyReadable = false;
+          }
+          releaseCancel();
+          if (!isCurrent()) return;
+          if (!bodyReadable || !isHonestCancelResponse(body, attempt)) {
+            // An unreadable or mismatched confirmation proves nothing either way: same neutral message as a network failure, payment untouched.
+            set({ error: CANCEL_UNCONFIRMED_MESSAGE });
+            return;
+          }
           clearExpiryTimeout();
           clearSubmitRequestDeadline();
           endManualCooldown();
@@ -1840,6 +1882,10 @@ export function createRealPaymentStore() {
           });
           return;
         }
+
+        // Non-2xx: never parsed by the success check above.
+        releaseCancel();
+        if (!isCurrent()) return;
 
         // Part D: a non-2xx (e.g. 409 — a concurrent submit already won the
         // race) means cancellation did NOT happen. Never show a false
