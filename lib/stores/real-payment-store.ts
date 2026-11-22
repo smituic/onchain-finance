@@ -660,6 +660,57 @@ function isHonestPrepareResponse(json: unknown, intent: PrepareIntent): json is 
   return isWellFormedPreparedFields(attempt.prepared);
 }
 
+/**
+ * L-2 D-13: is this GET /latest HTTP 200 body an answer the page may act on —
+ * release D-1's prepare uncertainty, leave D-3a's unavailable state, or adopt a
+ * payment and its signing context? Pure; strict; no trimming, case folding,
+ * coercion or repair. Sibling of the submit, status, Cancel and prepare
+ * validators (untouched); readLatestForCheck and adoptLatestAttempt still run
+ * unchanged after it.
+ *
+ * - Empty: `attempt` exactly null (a missing or undefined attempt is not
+ *   empty), with subOrganizationId / authorizingCredentialId each absent or
+ *   null. No clock is required.
+ * - Payment: a finite serverNowSeconds and an object attempt with an
+ *   isValidUuid id, one of the nine known states (the route returns the stored
+ *   row as is — terminal ones included), a 0x + 40-hex recipient (any case), a
+ *   non-empty ASCII-digit amount, transactionHash / failureReason each null or
+ *   a string (missing rejected), and `prepared` null or an object (missing
+ *   rejected; exactly null in state `prepared`). Recipient and amount are NOT
+ *   compared with the form: a recovered payment is the server's, not the draft.
+ * - Signing context: both keys present, and either both null, or both
+ *   non-empty strings on an awaiting_authorization attempt whose `prepared` is
+ *   well formed (isWellFormedPreparedFields) — the one combination that can
+ *   reach the passkey prompt. Shape only: not proof of credential ownership,
+ *   and nothing is decoded or compared with the payment's intent.
+ *
+ * recipientIdentity (the display falls back to the address on its own),
+ * createdAt / updatedAt and extra keys are ignored. A rejection says nothing
+ * about whether any payment exists.
+ */
+function isHonestLatestResponse(json: unknown): boolean {
+  if (!isJsonObject(json)) return false;
+  const attempt = json.attempt;
+  if (attempt === null) {
+    return (!("subOrganizationId" in json) || json.subOrganizationId === null) && (!("authorizingCredentialId" in json) || json.authorizingCredentialId === null);
+  }
+  if (typeof json.serverNowSeconds !== "number" || !Number.isFinite(json.serverNowSeconds)) return false;
+  if (!isJsonObject(attempt)) return false;
+  if (typeof attempt.id !== "string" || !isValidUuid(attempt.id)) return false;
+  if (typeof attempt.state !== "string" || !KNOWN_ATTEMPT_STATES.has(attempt.state)) return false;
+  if (!isPrimitiveMatch(attempt.recipient, PREPARED_ADDRESS_PATTERN)) return false;
+  if (!isPrimitiveMatch(attempt.amountBaseUnits, DECIMAL_DIGITS_PATTERN)) return false;
+  if (attempt.transactionHash !== null && typeof attempt.transactionHash !== "string") return false;
+  if (attempt.failureReason !== null && typeof attempt.failureReason !== "string") return false;
+  if (attempt.prepared !== null && !isJsonObject(attempt.prepared)) return false;
+  if (attempt.state === "prepared" && attempt.prepared !== null) return false;
+  if (!("subOrganizationId" in json) || !("authorizingCredentialId" in json)) return false;
+  const { subOrganizationId, authorizingCredentialId } = json;
+  if (subOrganizationId === null && authorizingCredentialId === null) return true;
+  if (typeof subOrganizationId !== "string" || subOrganizationId === "" || typeof authorizingCredentialId !== "string" || authorizingCredentialId === "") return false;
+  return attempt.state === "awaiting_authorization" && isWellFormedPreparedFields(attempt.prepared);
+}
+
 /** Stage 2C-2: how many times one caller waits behind an older-epoch read before giving up (each wait is itself bounded by the request deadline). */
 const MAX_STALE_READ_WAITS = 2;
 
@@ -1720,6 +1771,12 @@ export function createRealPaymentStore() {
               markUnavailable();
               return;
             }
+            // L-2 D-13: a 2xx that is not a well-formed answer is not one either — after the guards above, before anything is
+            // classified or adopted, with no await in between. The same "we couldn't check" state; nothing is adopted or scheduled.
+            if (!isHonestLatestResponse(json)) {
+              markUnavailable();
+              return;
+            }
             // Fail closed, with D-1's reader: only an explicit `attempt: null` means "no payment".
             const latest = readLatestForCheck(json);
             if (latest.kind === "unusable") {
@@ -2064,6 +2121,12 @@ export function createRealPaymentStore() {
           // Exactly one read, and nothing else: no prepare, cancel, status, signing or submit.
           const json = await Promise.race([api<unknown>("/api/real/payments/latest", { signal: controller.signal }), deadline]);
           if (!isCurrent()) return;
+          // L-2 D-13: a malformed answer never releases the requirement or adopts anything — after the guard, before classification.
+          // The same failed-check line as an unreadable reply; prepareNeedsCheck, the draft, error, timers and epoch stay as they are.
+          if (!isHonestLatestResponse(json)) {
+            set({ prepareCheck: "unavailable" });
+            return;
+          }
           const latest = readLatestForCheck(json);
           if (latest.kind === "unusable") {
             // An answer we can't trust is never "no payment": the requirement stays.
