@@ -49,6 +49,15 @@ const PREPARED_FIELDS: WirePreparedFields = {
   validUntil: 1_900_000_600,
 };
 
+/**
+ * L-2 D-12: an honest prepare 200 names a server-issued payment id
+ * (payment_attempts.id is a Postgres UUID; the store requires isValidUuid). The
+ * successful-prepare fixtures use these instead of "attempt-1"-style
+ * placeholders; fixtures for other routes keep their own ids.
+ */
+const PREPARED_ID = "5f0c3b2a-7d1e-4c8a-9b6f-2e4d1a3c5b7e";
+const PREPARED_ID_2 = "a3e9c1d7-4b2f-4e8a-8c6d-0f1b2a3c4d5e";
+
 function baseAttempt() {
   return {
     id: "attempt-1",
@@ -589,7 +598,12 @@ describe("real-payment-store — Slice C: paying by @name", () => {
     return { promise, resolve, reject };
   }
 
-  const prepareOk = () => jsonResponse(200, { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) });
+  /** L-2 D-12: what the server answers for THIS request — the amount sent; the address sent with a null identity, or, for a handle, its resolved lower-case Safe and the { handle, displayName } snapshot. */
+  const prepareOk = (body: unknown) => {
+    const sent = body as { recipient?: string; recipientHandle?: string; amountBaseUnits: string };
+    const recipient = sent.recipientHandle === undefined ? { recipient: sent.recipient, recipientIdentity: null } : { recipientIdentity: { handle: sent.recipientHandle, displayName: "Smit Patel" } };
+    return jsonResponse(200, { attempt: { ...baseAttempt(), id: PREPARED_ID, amountBaseUnits: sent.amountBaseUnits, ...recipient }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) });
+  };
 
   function editingStore() {
     const store = createRealPaymentStore();
@@ -988,7 +1002,7 @@ describe("real-payment-store — Slice C: paying by @name", () => {
    */
   describe("attempt.recipientIdentity — the one post-prepare identity (Slice D)", () => {
     const SNAPSHOT = { handle: "smit", displayName: "Smit P. (stored)" };
-    const handleAttempt = (overrides: Record<string, unknown> = {}) => ({ ...baseAttempt(), recipientIdentity: SNAPSHOT, ...overrides });
+    const handleAttempt = (overrides: Record<string, unknown> = {}) => ({ ...baseAttempt(), id: PREPARED_ID, recipientIdentity: SNAPSHOT, ...overrides });
     const prepareHandleOk = () => jsonResponse(200, { attempt: handleAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) });
 
     it("a successful handle prepare stores the SERVER's identity on the attempt — not the advisory lookup's — and keeps no separate label", async () => {
@@ -1016,7 +1030,7 @@ describe("real-payment-store — Slice C: paying by @name", () => {
       void store.getState().review();
       await store.getState().confirmAndSend();
       expect(api.prepares()).toHaveLength(1);
-      expect(store.getState().attempt).toMatchObject({ id: "attempt-1", recipientIdentity: null });
+      expect(store.getState().attempt).toMatchObject({ id: PREPARED_ID, recipientIdentity: null });
       store.getState().reset();
     });
 
@@ -1026,7 +1040,7 @@ describe("real-payment-store — Slice C: paying by @name", () => {
 
       await store.getState().init();
 
-      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", recipientInput: "", recipientLookup: { status: "idle" }, attempt: { id: "attempt-1", recipientIdentity: SNAPSHOT } });
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", recipientInput: "", recipientLookup: { status: "idle" }, attempt: { id: PREPARED_ID, recipientIdentity: SNAPSHOT } });
       expect(api.lookups()).toHaveLength(0);
       expect(api.calls.map((call) => call.url)).toEqual(["/api/real/payments/latest"]);
       store.getState().reset();
@@ -1072,8 +1086,8 @@ describe("real-payment-store — Slice C: paying by @name", () => {
       const mutations = api.calls.filter((call) => call.method === "POST" && !call.url.endsWith("/api/real/recipients/lookup"));
       expect(mutations.map((call) => [call.url, call.body])).toEqual([
         ["/api/real/payments/prepare", { recipientHandle: "smit", amountBaseUnits: "1000000" }],
-        ["/api/real/payments/submit", { attemptId: "attempt-1", signature: "0xsignature", activityId: "activity-1" }],
-        ["/api/real/payments/attempt-1/cancel", undefined],
+        ["/api/real/payments/submit", { attemptId: PREPARED_ID, signature: "0xsignature", activityId: "activity-1" }],
+        [`/api/real/payments/${PREPARED_ID}/cancel`, undefined],
       ]);
       for (const call of api.calls) expect(call.rawBody ?? "", call.url).not.toMatch(/recipientIdentity|displayName|Smit|stored/);
     });
@@ -4111,9 +4125,10 @@ describe("real-payment-store — 3A-2 Stage 2: submit cooldown and submit-respon
   it("a NEW payment prepared after the previous one was cancelled elsewhere does not inherit that attempt's published wait", async () => {
     const s = lab();
     const store = createRealPaymentStore();
-    const address = "0x3333333333333333333333333333333333333333";
+    // L-2 D-12: the typed address is the recipient this suite's status / cancel fixtures answer with (baseAttempt's), and each prepare answers the amount it was sent.
+    const address = baseAttempt().recipient;
     const baseFetch = globalThis.fetch;
-    const preparedIds = ["attempt-1", "attempt-new"];
+    const preparedIds = [PREPARED_ID, PREPARED_ID_2];
     const prepareCalls: string[] = [];
     vi.stubGlobal(
       "fetch",
@@ -4121,7 +4136,8 @@ describe("real-payment-store — 3A-2 Stage 2: submit cooldown and submit-respon
         if (!String(input).includes("/prepare")) return baseFetch(input, init);
         const id = preparedIds.shift()!;
         prepareCalls.push(id);
-        return Promise.resolve(jsonResponse(200, { attempt: { ...baseAttempt(), id }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) + s.offset }));
+        const { amountBaseUnits } = JSON.parse(init!.body as string) as { amountBaseUnits: string };
+        return Promise.resolve(jsonResponse(200, { attempt: { ...baseAttempt(), id, amountBaseUnits }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) + s.offset }));
       }),
     );
     // First approval is signed (then refused by the server's budget); the new payment's passkey sheet is dismissed.
@@ -4138,7 +4154,7 @@ describe("real-payment-store — 3A-2 Stage 2: submit cooldown and submit-respon
     expect(store.getState().status).toBe("reviewing");
     s.script(denial("600"));
     await store.getState().confirmAndSend();
-    expect(store.getState().attempt?.id).toBe("attempt-1");
+    expect(store.getState().attempt?.id).toBe(PREPARED_ID);
     expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isSubmitCoolingDown: true, submitCooldownSeconds: 600, isSubmitRetryBeyondApproval: false });
 
     // 4-5. The attempt is cancelled elsewhere; the existing status read observes it and the store returns to editing.
@@ -4146,7 +4162,7 @@ describe("real-payment-store — 3A-2 Stage 2: submit cooldown and submit-respon
     s.setStatusState("cancelled");
     await store.getState().checkStatus();
     expect(store.getState().status).toBe("editing");
-    expect(store.getState().attempt).toMatchObject({ id: "attempt-1", state: "cancelled" });
+    expect(store.getState().attempt).toMatchObject({ id: PREPARED_ID, state: "cancelled" });
     const submitsBefore = s.submits().length;
     const signsBefore = vi.mocked(signPreparedPayment).mock.calls.length;
 
@@ -4155,8 +4171,8 @@ describe("real-payment-store — 3A-2 Stage 2: submit cooldown and submit-respon
     store.getState().setAmountInput("2");
     await store.getState().review();
     await store.getState().confirmAndSend();
-    expect(prepareCalls).toEqual(["attempt-1", "attempt-new"]);
-    expect(store.getState().attempt?.id).toBe("attempt-new");
+    expect(prepareCalls).toEqual([PREPARED_ID, PREPARED_ID_2]);
+    expect(store.getState().attempt?.id).toBe(PREPARED_ID_2);
     expect(store.getState().status).toBe("awaiting_authorization");
 
     // 8. The old attempt's published wait is gone — all three fields.
@@ -4170,7 +4186,7 @@ describe("real-payment-store — 3A-2 Stage 2: submit cooldown and submit-respon
     // 9. The previous wait does not gate the new attempt: its Continue signs and submits at once.
     await store.getState().resumeAuthorization();
     expect(s.submits()).toHaveLength(submitsBefore + 1);
-    expect(s.submits().at(-1)!.body).toMatchObject({ attemptId: "attempt-new", signature: "0xsig-new", activityId: "activity-new" });
+    expect(s.submits().at(-1)!.body).toMatchObject({ attemptId: PREPARED_ID_2, signature: "0xsig-new", activityId: "activity-new" });
     store.getState().detach();
   });
 
@@ -5801,14 +5817,14 @@ describe("real-payment-store — L-2 D-2: prepare 409 disambiguation (account no
     it("a later attempt that the server accepts proceeds normally, with the message gone", async () => {
       // The passkey prompt is dismissed (set here, not left to whatever an earlier suite installed), so the accepted payment simply waits.
       vi.mocked(signPreparedPayment).mockRejectedValueOnce(Object.assign(new Error("dismissed"), { name: "NotAllowedError" }));
-      const ready = { attempt: baseAttempt(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) };
+      const ready = { attempt: { ...baseAttempt(), id: PREPARED_ID, recipient: ADDRESS }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000) };
       const { api, store } = await afterPrepare((n) => (n === 1 ? notReady() : jsonResponse(200, ready)));
 
       await store.getState().review();
       await store.getState().confirmAndSend();
 
       expect(api.keys()).toEqual(["prepare", "prepare"]);
-      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: "attempt-1" }, prepareNeedsCheck: null });
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: PREPARED_ID }, prepareNeedsCheck: null });
       expect(store.getState().error).not.toBe(FIXED_NOT_READY);
       expect(signPreparedPayment).toHaveBeenCalledTimes(1); // the stubbed passkey prompt, dismissed — for the accepted payment only
       expect(api.count("submit")).toBe(0);
@@ -6041,7 +6057,7 @@ describe("real-payment-store — L-2 D-4: submit refusal disambiguation (exact w
 
     it("the fresh flow (Review, Approve, prepare, passkey, submit) ends the same way, on the server's attempt", async () => {
       const api = server({
-        prepare: () => jsonResponse(200, { attempt: { ...baseAttempt(), id: "attempt-fresh", recipient: ADDRESS }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() }),
+        prepare: () => jsonResponse(200, { attempt: { ...baseAttempt(), id: PREPARED_ID, recipient: ADDRESS }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() }),
         submit: wrongPasskey,
       });
       const store = createRealPaymentStore();
@@ -6055,9 +6071,9 @@ describe("real-payment-store — L-2 D-4: submit refusal disambiguation (exact w
       await store.getState().confirmAndSend();
 
       expect(store.getState()).toMatchObject({ status: "stranded", error: OTHER_PASSKEY, authorizingCredentialId: null, pendingSubmission: null, isAuthorizing: false, subOrganizationId: "sub-org-1", prepareNeedsCheck: null });
-      expect(store.getState().attempt).toMatchObject({ id: "attempt-fresh", state: "awaiting_authorization", amountBaseUnits: "1000000", recipient: ADDRESS });
+      expect(store.getState().attempt).toMatchObject({ id: PREPARED_ID, state: "awaiting_authorization", amountBaseUnits: "1000000", recipient: ADDRESS });
       expect(api.keys()).toEqual(["prepare", "submit"]);
-      expect(api.calls[1]!.body).toEqual({ attemptId: "attempt-fresh", signature: APPROVAL.signature, activityId: APPROVAL.activityId });
+      expect(api.calls[1]!.body).toEqual({ attemptId: PREPARED_ID, signature: APPROVAL.signature, activityId: APPROVAL.activityId });
       expect(signPreparedPayment).toHaveBeenCalledTimes(1);
     });
 
@@ -6881,7 +6897,7 @@ describe("real-payment-store — L-2 D-6: bounded submit wait", () => {
     it("the fresh flow (Review, Approve, prepare, passkey, submit) is bounded the same way", async () => {
       const gate = held();
       const api = server({
-        prepare: () => jsonResponse(200, { attempt: { ...baseAttempt(), id: "attempt-fresh" }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() }),
+        prepare: () => jsonResponse(200, { attempt: { ...baseAttempt(), id: PREPARED_ID, recipient: "0x3333333333333333333333333333333333333333" }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() }),
         submit: () => gate.promise,
       });
       const store = createRealPaymentStore();
@@ -6896,7 +6912,7 @@ describe("real-payment-store — L-2 D-6: bounded submit wait", () => {
 
       await vi.advanceTimersByTimeAsync(DEADLINE);
 
-      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, pendingSubmission: { attemptId: "attempt-fresh", signature: APPROVAL.signature, activityId: APPROVAL.activityId } });
+      expect(store.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, pendingSubmission: { attemptId: PREPARED_ID, signature: APPROVAL.signature, activityId: APPROVAL.activityId } });
       expect(api.keys()).toEqual(["prepare", "submit"]);
     });
   });
@@ -7951,7 +7967,7 @@ describe("real-payment-store — L-2 D-8: HTTP 401 / 404 recovery", () => {
 
     it.each(SESSION_FAILURES)("the fresh flow (Review, Approve, prepare, passkey, submit) gets the same %s outcome", async (reason, message, answer) => {
       const api = server({
-        prepare: () => jsonResponse(200, { attempt: { ...baseAttempt(), id: "attempt-fresh" }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() }),
+        prepare: () => jsonResponse(200, { attempt: { ...baseAttempt(), id: PREPARED_ID, recipient: "0x3333333333333333333333333333333333333333" }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() }),
         submit: answer,
       });
       const store = createRealPaymentStore();
@@ -7963,8 +7979,8 @@ describe("real-payment-store — L-2 D-8: HTTP 401 / 404 recovery", () => {
       await store.getState().confirmAndSend();
       await settle();
 
-      expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, pendingSubmission: { attemptId: "attempt-fresh", signature: APPROVAL.signature, activityId: APPROVAL.activityId } });
-      expect(store.getState().attempt).toMatchObject({ id: "attempt-fresh" });
+      expect(store.getState()).toMatchObject({ status: "unknown", error: message, sessionRecovery: reason, pendingSubmission: { attemptId: PREPARED_ID, signature: APPROVAL.signature, activityId: APPROVAL.activityId } });
+      expect(store.getState().attempt).toMatchObject({ id: PREPARED_ID });
       expect(api.keys()).toEqual(["prepare", "submit"]);
     });
   });
@@ -10160,6 +10176,512 @@ describe("real-payment-store — L-2 D-11: malformed Cancel response recovery", 
       expect(api.keys()).toEqual(["submit", "cancel"]);
       gate.resolve(J({ attempt: attemptOf("submitted") }));
       await sending;
+    });
+  });
+});
+
+/**
+ * L-2 D-12 — a prepare HTTP 200 is checked (isHonestPrepareResponse) against
+ * what THAT request sent before anything is adopted or signed. A rejected
+ * answer takes D-1's uncertain-prepare state exactly and nothing else: no
+ * adoption, no signing, no automatic request. Fixtures follow
+ * resolvePreparePayment's "ready" answer (toPublicAttempt).
+ */
+describe("real-payment-store — L-2 D-12: prepare answers are checked before adoption", () => {
+  const ACCOUNT = { appUserId: "app-user-d12", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-d12-b", ownerAddress: "0x6666666666666666666666666666666666666666", safeAddress: "0x7777777777777777777777777777777777777777" };
+  /** Lower-case (normalizeAddress) — what the client sends and the server stores for an address payment. */
+  const ADDRESS = "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed";
+  const CHECKSUMMED = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+  const OTHER_ADDRESS = "0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359";
+  /** A handle payment's recipient: pg_catalog.lower(safe_address) of @smit's account. */
+  const SMIT_SAFE = "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae";
+  const FOUND_SMIT = { found: true, handle: "smit", displayName: "Smit Patel", isSelf: false };
+  const SERVER_NOW = 1_900_000_000;
+  const T0_MS = (SERVER_NOW - 100) * 1000;
+  const UUID = PREPARED_ID;
+
+  type Json = Record<string, unknown>;
+  type Reply = { attempt: Json & { prepared: Json; recipientIdentity: unknown }; subOrganizationId: unknown; authorizingCredentialId: unknown; serverNowSeconds: unknown } & Json;
+
+  /** A deployed Safe, sponsored: what server/payments.ts serializes for a fresh preparation. */
+  const fields = (): Json => ({
+    sender: "0x2222222222222222222222222222222222222222",
+    nonce: "1844674407370955161600",
+    factory: null,
+    factoryData: null,
+    callData: "0x7bb374280000000000000000000000000000000000000000000000000000000000000001",
+    callGasLimit: "86143",
+    verificationGasLimit: "120371",
+    preVerificationGas: "55264",
+    maxFeePerGas: "1200000",
+    maxPriorityFeePerGas: "1000000",
+    paymaster: "0x777777777777AeC03fd955926DbF81597e66834C",
+    paymasterData: "0x01000066d1a1a4000000000000",
+    paymasterVerificationGasLimit: "37193",
+    paymasterPostOpGasLimit: "1",
+    validUntil: SERVER_NOW + 600,
+  });
+
+  function addressReply(): Reply {
+    return {
+      attempt: { id: UUID, state: "awaiting_authorization", recipient: ADDRESS, recipientIdentity: null, amountBaseUnits: "1000000", transactionHash: null, failureReason: null, createdAt: "2030-03-17T17:46:40.000Z", updatedAt: "2030-03-17T17:46:41.000Z", prepared: fields() },
+      subOrganizationId: "4f8d1c2b-9a3e-4b7f-8c6d-1e2f3a4b5c6d",
+      authorizingCredentialId: "Zm9vYmFyLWNyZWRlbnRpYWwtaWQ",
+      serverNowSeconds: SERVER_NOW,
+    };
+  }
+
+  function handleReply(displayName: string | null = "Smit P. (stored)"): Reply {
+    const reply = addressReply();
+    reply.attempt.recipient = SMIT_SAFE;
+    reply.attempt.recipientIdentity = { handle: "smit", displayName };
+    return reply;
+  }
+
+  /** A Response-like object for bodies JSON cannot carry (a non-finite number). `api()` reads only ok, status, json() and headers. */
+  const runtimeReply = (body: unknown) => ({ ok: true, status: 200, headers: new Headers(), json: async () => body }) as unknown as Response;
+
+  const stores: Array<ReturnType<typeof createRealPaymentStore>> = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0_MS);
+    useRealAccountStore.setState({ account: ACCOUNT });
+    vi.mocked(signPreparedPayment).mockReset();
+    // The passkey sheet is dismissed: an accepted payment simply waits for approval, nothing is submitted.
+    vi.mocked(signPreparedPayment).mockRejectedValue(Object.assign(new Error("dismissed"), { name: "NotAllowedError" }));
+  });
+
+  afterEach(() => {
+    for (const store of stores.splice(0)) store.getState().detach();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockReset();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  type Handler = (body: unknown) => Response | Promise<Response>;
+  function server(handlers: { prepare: Handler; latest?: () => Response; lookup?: () => Response }) {
+    const calls: Array<{ url: string; method: string; body: unknown }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+        calls.push({ url, method, body });
+        if (url === "/api/real/payments/prepare" && method === "POST") return handlers.prepare(body);
+        if (url === "/api/real/payments/latest" && handlers.latest) return handlers.latest();
+        if (url === "/api/real/recipients/lookup" && handlers.lookup) return handlers.lookup();
+        throw new Error(`unexpected fetch: ${method} ${url}`);
+      }),
+    );
+    return { calls, urls: () => calls.map((call) => `${call.method} ${call.url}`) };
+  }
+
+  async function reviewing(to: string, amount = "1") {
+    const store = createRealPaymentStore();
+    stores.push(store);
+    store.setState({ status: "editing" });
+    store.getState().setRecipientInput(to);
+    store.getState().setAmountInput(amount);
+    await store.getState().review();
+    expect(store.getState().status).toBe("reviewing");
+    return store;
+  }
+
+  function deferred() {
+    let resolve: (response: Response) => void = () => {};
+    const promise = new Promise<Response>((res) => (resolve = res));
+    return { promise, resolve };
+  }
+
+  const PREPARE_POST = "POST /api/real/payments/prepare";
+
+  /** Values a rejection must leave exactly as they were — set as sentinels so any adoption step shows up. */
+  const SENTINELS = { clockOffsetSeconds: 1234, isManualCheckCoolingDown: true, isSubmitCoolingDown: true, submitCooldownSeconds: 42, isSubmitRetryBeyondApproval: true, isAttemptPastValidity: true, isFollowUpExhausted: true, isStatusDeferred: true, statusRetryAfterSeconds: 9 } as const;
+
+  /** Approves from Review with the given answer; asserts D-1's uncertain state is the ONLY change and that nothing follows it for an hour. */
+  async function expectRejected(store: ReturnType<typeof createRealPaymentStore>, api: ReturnType<typeof server>) {
+    store.setState(SENTINELS);
+    const before = store.getState();
+    await store.getState().confirmAndSend();
+    expect(store.getState()).toEqual({ ...before, status: "editing", error: null, prepareNeedsCheck: "uncertain", prepareCheck: "idle" });
+    expect(store.getState()).toMatchObject({ attempt: null, subOrganizationId: null, authorizingCredentialId: null, pendingSubmission: null });
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+    expect(api.urls()).toEqual([PREPARE_POST]);
+    expect(signPreparedPayment).not.toHaveBeenCalled();
+    expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain", error: null });
+  }
+
+  function expectAdopted(store: ReturnType<typeof createRealPaymentStore>, reply: Reply) {
+    expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: reply.attempt, subOrganizationId: reply.subOrganizationId, authorizingCredentialId: reply.authorizingCredentialId, clockOffsetSeconds: 100, prepareNeedsCheck: null, error: null, pendingSubmission: null });
+    expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(signPreparedPayment).mock.calls[0]![0]).toMatchObject({ fields: reply.attempt.prepared, subOrganizationId: reply.subOrganizationId, authorizingCredentialId: reply.authorizingCredentialId });
+  }
+
+  describe("honest answers keep the existing flow: adopted, then the one passkey prompt", () => {
+    const ADDRESS_CASES: Array<[string, string, string, string, (reply: Reply) => void]> = [
+      ["a canonical address", ADDRESS, "1", "1000000", () => {}],
+      ["a mixed-case address typed with spaces (sent, and answered, lower-case)", `  ${CHECKSUMMED}  `, "1", "1000000", () => {}],
+      ["an amount of 1.5", ADDRESS, "1.5", "1500000", () => {}],
+      ["an amount of 0.01", ADDRESS, "0.01", "10000", () => {}],
+      ["every nullable prepared field null", ADDRESS, "1", "1000000", (r) => Object.assign(r.attempt.prepared, { factory: null, factoryData: null, paymaster: null, paymasterData: null, paymasterVerificationGasLimit: null, paymasterPostOpGasLimit: null })],
+      ["every nullable prepared field populated (an undeployed Safe), checksummed addresses kept", ADDRESS, "1", "1000000", (r) => Object.assign(r.attempt.prepared, { factory: "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67", factoryData: "0x1688f0b900000000000000000000000029fcB43b46531BcA003ddC8FCB67FFE91900C7620000000000000000000000000000000000000000000000000000000000000060" })],
+      ["a checksummed sender", ADDRESS, "1", "1000000", (r) => (r.attempt.prepared.sender = "0xCAFEcafeCAFEcafeCAFEcafeCAFEcafeCAFEcafe")],
+      ["empty paymasterData and upper-case hex data", ADDRESS, "1", "1000000", (r) => Object.assign(r.attempt.prepared, { paymasterData: "0x", callData: "0x7BB37428ABCDEF" })],
+      ["empty callData", ADDRESS, "1", "1000000", (r) => (r.attempt.prepared.callData = "0x")],
+      ["zero gas values", ADDRESS, "1", "1000000", (r) => Object.assign(r.attempt.prepared, { nonce: "0", preVerificationGas: "0", paymasterPostOpGasLimit: "0" })],
+      ["unrelated extra keys at every level", ADDRESS, "1", "1000000", (r) => Object.assign(r, { requestId: "x", attempt: { ...r.attempt, chainId: 84532, prepared: { ...r.attempt.prepared, extra: true } } })],
+      ["no timestamps", ADDRESS, "1", "1000000", (r) => { delete r.attempt.createdAt; delete r.attempt.updatedAt; }],
+      ["odd timestamps", ADDRESS, "1", "1000000", (r) => Object.assign(r.attempt, { createdAt: 5, updatedAt: null })],
+    ];
+
+    it.each(ADDRESS_CASES)("%s", async (_name, to, amount, sentAmount, edit) => {
+      const reply = addressReply();
+      reply.attempt.amountBaseUnits = sentAmount;
+      edit(reply);
+      const api = server({ prepare: () => jsonResponse(200, reply) });
+      const store = await reviewing(to, amount);
+
+      await store.getState().confirmAndSend();
+
+      expect(api.calls[0]!.body).toEqual({ recipient: ADDRESS, amountBaseUnits: sentAmount });
+      expectAdopted(store, reply);
+    });
+
+    it.each([
+      ["a stored display name that differs from the earlier lookup", "Smit P. (stored)"],
+      ["no stored display name", null],
+    ] as const)("a handle payment: the lower-case resolved Safe and %s", async (_name, displayName) => {
+      const reply = handleReply(displayName);
+      const api = server({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: () => jsonResponse(200, reply) });
+      const store = await reviewing("@Smit");
+
+      await store.getState().confirmAndSend();
+
+      expect(api.calls.find((call) => call.url.endsWith("/prepare"))!.body).toEqual({ recipientHandle: "smit", amountBaseUnits: "1000000" });
+      expectAdopted(store, reply);
+      expect(store.getState().attempt?.recipientIdentity).toEqual({ handle: "smit", displayName });
+    });
+  });
+
+  describe("anything else is not adopted: D-1's uncertain state, and nothing happens by itself", () => {
+    type Case = [string, (reply: Reply) => unknown];
+    const without = (key: string) => (r: Reply) => {
+      delete r.attempt[key];
+      return r;
+    };
+    const withAttempt = (patch: Json) => (r: Reply) => ({ ...r, attempt: { ...r.attempt, ...patch } });
+    const withTop = (patch: Json) => (r: Reply) => ({ ...r, ...patch });
+    const withoutTop = (key: string) => (r: Reply) => {
+      delete r[key];
+      return r;
+    };
+    const withPrepared = (patch: Json) => (r: Reply) => ({ ...r, attempt: { ...r.attempt, prepared: { ...r.attempt.prepared, ...patch } } });
+    const withoutPrepared = (key: string) => (r: Reply) => {
+      delete r.attempt.prepared[key];
+      return r;
+    };
+
+    const BODY: Case[] = [
+      ["a null body", () => null],
+      ["a number", () => 42],
+      ["a string", () => "ok"],
+      ["an array", (r) => [r]],
+      ["an empty object", () => ({})],
+      ["no attempt", withoutTop("attempt")],
+      ["a null attempt", withTop({ attempt: null })],
+      ["a string attempt", withTop({ attempt: "attempt" })],
+      ["an array attempt", (r) => ({ ...r, attempt: [r.attempt] })],
+    ];
+    const IDENTITY: Case[] = [
+      ["no id", without("id")],
+      ["a numeric id", withAttempt({ id: 1 })],
+      ["an empty id", withAttempt({ id: "" })],
+      ["a placeholder id", withAttempt({ id: "attempt-1" })],
+      ["a path-like id", withAttempt({ id: "../../latest" })],
+      ["a UUID with a path suffix", withAttempt({ id: `${UUID}/cancel` })],
+      ["a UUID with a space", withAttempt({ id: ` ${UUID}` })],
+      ["the nil UUID (not a server-issued version)", withAttempt({ id: "00000000-0000-0000-0000-000000000000" })],
+      ["no state", without("state")],
+      ["an unknown state", withAttempt({ state: "approved" })],
+      ...(["prepared", "signed", "submitting", "submitted", "confirmed", "failed", "cancelled", "unknown"] as const).map((state): Case => [`the known state '${state}'`, withAttempt({ state })]),
+      ["another recipient", withAttempt({ recipient: OTHER_ADDRESS })],
+      ["the recipient in upper case", withAttempt({ recipient: `0x${ADDRESS.slice(2).toUpperCase()}` })],
+      ["the recipient checksummed", withAttempt({ recipient: CHECKSUMMED })],
+      ["no recipient", without("recipient")],
+      ["a non-string recipient", withAttempt({ recipient: 5 })],
+      ["an identity on an address payment", withAttempt({ recipientIdentity: { handle: "smit", displayName: null } })],
+      ["no recipientIdentity", without("recipientIdentity")],
+      ["no amount", without("amountBaseUnits")],
+      ["a numeric amount", withAttempt({ amountBaseUnits: 1000000 })],
+      ["another amount", withAttempt({ amountBaseUnits: "2000000" })],
+      ["a zero-padded amount", withAttempt({ amountBaseUnits: "01000000" })],
+      ["a decimal amount", withAttempt({ amountBaseUnits: "1000000.0" })],
+      ["an exponent amount", withAttempt({ amountBaseUnits: "1e6" })],
+      ["no transactionHash", without("transactionHash")],
+      ["a transactionHash", withAttempt({ transactionHash: `0x${"ab".repeat(32)}` })],
+      ["an empty transactionHash", withAttempt({ transactionHash: "" })],
+      ["no failureReason", without("failureReason")],
+      ["a failureReason", withAttempt({ failureReason: "Could not prepare this payment right now." })],
+      ["an empty failureReason", withAttempt({ failureReason: "" })],
+    ];
+    const SIGNING: Case[] = [
+      ["no subOrganizationId", withoutTop("subOrganizationId")],
+      ["a null subOrganizationId", withTop({ subOrganizationId: null })],
+      ["a numeric subOrganizationId", withTop({ subOrganizationId: 7 })],
+      ["an empty subOrganizationId", withTop({ subOrganizationId: "" })],
+      ["no authorizingCredentialId", withoutTop("authorizingCredentialId")],
+      ["a null authorizingCredentialId", withTop({ authorizingCredentialId: null })],
+      ["an object authorizingCredentialId", withTop({ authorizingCredentialId: { id: "x" } })],
+      ["an empty authorizingCredentialId", withTop({ authorizingCredentialId: "" })],
+    ];
+    const CLOCK: Case[] = [
+      ["no serverNowSeconds", withoutTop("serverNowSeconds")],
+      ["a string serverNowSeconds", withTop({ serverNowSeconds: String(SERVER_NOW) })],
+      ["a null serverNowSeconds", withTop({ serverNowSeconds: null })],
+    ];
+    const PREPARED: Case[] = [
+      ["no prepared", without("prepared")],
+      ["a null prepared", withAttempt({ prepared: null })],
+      ["a string prepared", withAttempt({ prepared: "n/a" })],
+      ["an array prepared", (r) => withAttempt({ prepared: [r.attempt.prepared] })(r)],
+      ...["sender", "nonce", "callData", "callGasLimit", "verificationGasLimit", "preVerificationGas", "maxFeePerGas", "maxPriorityFeePerGas", "validUntil"].map((key): Case => [`no required '${key}'`, withoutPrepared(key)]),
+      ...["factory", "factoryData", "paymaster", "paymasterData", "paymasterVerificationGasLimit", "paymasterPostOpGasLimit"].map((key): Case => [`no nullable '${key}' key`, withoutPrepared(key)]),
+      ["a short sender", withPrepared({ sender: "0x2222" })],
+      ["a non-hex sender", withPrepared({ sender: `0x${"g".repeat(40)}` })],
+      ["a sender with an upper-case 0X", withPrepared({ sender: `0X${"2".repeat(40)}` })],
+      ["a sender with a space", withPrepared({ sender: ` 0x${"2".repeat(40)}` })],
+      ["a numeric sender", withPrepared({ sender: 1 })],
+      ["a negative nonce", withPrepared({ nonce: "-1" })],
+      ["a fractional callGasLimit", withPrepared({ callGasLimit: "86143.5" })],
+      ["an exponent verificationGasLimit", withPrepared({ verificationGasLimit: "1e5" })],
+      ["a hex preVerificationGas", withPrepared({ preVerificationGas: "0xd7e0" })],
+      ["a maxFeePerGas with a space", withPrepared({ maxFeePerGas: " 1200000" })],
+      ["a maxPriorityFeePerGas with a trailing newline", withPrepared({ maxPriorityFeePerGas: "1000000\n" })],
+      ["an empty nonce", withPrepared({ nonce: "" })],
+      ["a numeric callGasLimit", withPrepared({ callGasLimit: 86143 })],
+      ["non-ASCII digits", withPrepared({ maxFeePerGas: "١٢٠٠٠٠٠" })],
+      ["callData without 0x", withPrepared({ callData: "7bb37428" })],
+      ["non-hex callData", withPrepared({ callData: "0xzz" })],
+      ["odd-length callData", withPrepared({ callData: "0x7bb3742" })],
+      ["empty-string callData", withPrepared({ callData: "" })],
+      ["numeric callData", withPrepared({ callData: 0 })],
+      ["a malformed factory", withPrepared({ factory: "0x4e1d" })],
+      ["a numeric factory", withPrepared({ factory: 0 })],
+      ["odd-length factoryData", withPrepared({ factory: "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67", factoryData: "0x168" })],
+      ["a malformed paymaster", withPrepared({ paymaster: "paymaster" })],
+      ["non-hex paymasterData", withPrepared({ paymasterData: "0xgg" })],
+      ["a numeric paymasterData", withPrepared({ paymasterData: 1 })],
+      ["a negative paymasterVerificationGasLimit", withPrepared({ paymasterVerificationGasLimit: "-5" })],
+      ["a numeric paymasterVerificationGasLimit", withPrepared({ paymasterVerificationGasLimit: 37193 })],
+      ["a fractional paymasterPostOpGasLimit", withPrepared({ paymasterPostOpGasLimit: "1.0" })],
+      ["a string validUntil", withPrepared({ validUntil: String(SERVER_NOW + 600) })],
+      ["a fractional validUntil", withPrepared({ validUntil: SERVER_NOW + 600.5 })],
+      ["a zero validUntil", withPrepared({ validUntil: 0 })],
+      ["a negative validUntil", withPrepared({ validUntil: -1 })],
+      ["an unsafe validUntil", withPrepared({ validUntil: 2 ** 53 })],
+      ["a null validUntil", withPrepared({ validUntil: null })],
+    ];
+
+    it.each([...BODY, ...IDENTITY, ...SIGNING, ...CLOCK, ...PREPARED])("an address payment answered with %s", async (_name, make) => {
+      const api = server({ prepare: () => jsonResponse(200, make(addressReply())) });
+      await expectRejected(await reviewing(ADDRESS), api);
+    });
+
+    it.each([
+      ["an empty body", () => new Response("", { status: 200 })],
+      ["a non-JSON body", () => new Response("<html>ok</html>", { status: 200 })],
+      ["an infinite serverNowSeconds", () => runtimeReply({ ...addressReply(), serverNowSeconds: Infinity })],
+      ["a NaN serverNowSeconds", () => runtimeReply({ ...addressReply(), serverNowSeconds: Number.NaN })],
+      ["an infinite validUntil", () => runtimeReply(withPrepared({ validUntil: Infinity })(addressReply()))],
+      ["a NaN validUntil", () => runtimeReply(withPrepared({ validUntil: Number.NaN })(addressReply()))],
+    ] as const)("an address payment answered with %s (a runtime body)", async (_name, respond) => {
+      const api = server({ prepare: () => respond() });
+      await expectRejected(await reviewing(ADDRESS), api);
+    });
+
+    it.each([
+      ["a checksummed resolved address", (r: Reply) => withAttempt({ recipient: "0xdE0B295669a9FD93d5F28D9Ec85E40f4cb697BAe" })(r)],
+      ["a resolved address with 0X", (r: Reply) => withAttempt({ recipient: `0X${SMIT_SAFE.slice(2)}` })(r)],
+      ["a short resolved address", (r: Reply) => withAttempt({ recipient: "0xde0b" })(r)],
+      ["no recipient", (r: Reply) => without("recipient")(r)],
+      ["the handle as the recipient", (r: Reply) => withAttempt({ recipient: "smit" })(r)],
+      ["a null identity", (r: Reply) => withAttempt({ recipientIdentity: null })(r)],
+      ["no identity", (r: Reply) => without("recipientIdentity")(r)],
+      ["another handle", (r: Reply) => withAttempt({ recipientIdentity: { handle: "smith", displayName: "Smit P. (stored)" } })(r)],
+      ["a non-canonical handle", (r: Reply) => withAttempt({ recipientIdentity: { handle: "Smit", displayName: null } })(r)],
+      ["an @-prefixed handle", (r: Reply) => withAttempt({ recipientIdentity: { handle: "@smit", displayName: null } })(r)],
+      ["a padded handle", (r: Reply) => withAttempt({ recipientIdentity: { handle: " smit", displayName: null } })(r)],
+      ["an extra identity key", (r: Reply) => withAttempt({ recipientIdentity: { handle: "smit", displayName: null, appUserId: "app-user-9" } })(r)],
+      ["no displayName key", (r: Reply) => withAttempt({ recipientIdentity: { handle: "smit" } })(r)],
+      ["an empty displayName", (r: Reply) => withAttempt({ recipientIdentity: { handle: "smit", displayName: "" } })(r)],
+      ["a blank displayName", (r: Reply) => withAttempt({ recipientIdentity: { handle: "smit", displayName: "   " } })(r)],
+      ["a numeric displayName", (r: Reply) => withAttempt({ recipientIdentity: { handle: "smit", displayName: 5 } })(r)],
+      ["an array identity", (r: Reply) => withAttempt({ recipientIdentity: [{ handle: "smit", displayName: null }] })(r)],
+      ["a string identity", (r: Reply) => withAttempt({ recipientIdentity: "smit" })(r)],
+    ] as const)("a handle payment answered with %s", async (_name, make) => {
+      const api = server({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: () => jsonResponse(200, make(handleReply())) });
+      const store = await reviewing("@smit");
+      api.calls.length = 0; // the advisory lookup Review made
+      await expectRejected(store, api);
+    });
+  });
+
+  describe("captured intent, lifecycle and placement", () => {
+    it("the answer is compared with what THIS request sent, not with inputs edited while it was on its way: a match is adopted", async () => {
+      const gate = deferred();
+      const reply = addressReply();
+      server({ prepare: () => gate.promise });
+      const store = await reviewing(ADDRESS, "1");
+      const pending = store.getState().confirmAndSend();
+      store.getState().setRecipientInput(OTHER_ADDRESS);
+      store.getState().setAmountInput("2");
+
+      gate.resolve(jsonResponse(200, reply));
+      await pending;
+
+      expectAdopted(store, reply);
+      expect(store.getState()).toMatchObject({ recipientInput: OTHER_ADDRESS, amountInput: "2" });
+    });
+
+    it("an answer that matches the edited inputs but not the request is rejected", async () => {
+      const gate = deferred();
+      const reply = addressReply();
+      reply.attempt.recipient = OTHER_ADDRESS;
+      reply.attempt.amountBaseUnits = "2000000";
+      const api = server({ prepare: () => gate.promise });
+      const store = await reviewing(ADDRESS, "1");
+      store.setState(SENTINELS);
+      const pending = store.getState().confirmAndSend();
+      store.getState().setRecipientInput(OTHER_ADDRESS);
+      store.getState().setAmountInput("2");
+      const before = store.getState();
+
+      gate.resolve(jsonResponse(200, reply));
+      await pending;
+
+      expect(store.getState()).toEqual({ ...before, status: "editing", error: null, prepareNeedsCheck: "uncertain", prepareCheck: "idle" });
+      expect(store.getState()).toMatchObject({ attempt: null, recipientInput: OTHER_ADDRESS, amountInput: "2" });
+      expect(api.urls()).toEqual([PREPARE_POST]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("a handle answer is compared with the handle sent, even after the field names another one", async () => {
+      const gate = deferred();
+      const reply = handleReply();
+      server({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: () => gate.promise });
+      const store = await reviewing("@smit");
+      const pending = store.getState().confirmAndSend();
+      store.getState().setRecipientInput("@someone");
+
+      gate.resolve(jsonResponse(200, reply));
+      await pending;
+
+      expectAdopted(store, reply);
+    });
+
+    it.each([
+      ["malformed", () => ({ ...addressReply(), attempt: { ...addressReply().attempt, id: "attempt-1" } })],
+      ["honest", () => addressReply()],
+    ] as const)("a late %s answer after a reset and an account switch writes nothing and signs nothing", async (_name, body) => {
+      const gate = deferred();
+      const api = server({ prepare: () => gate.promise });
+      const store = await reviewing(ADDRESS);
+      const pending = store.getState().confirmAndSend();
+      useRealAccountStore.setState({ account: ACCOUNT_B });
+      store.getState().reset();
+      const after = store.getState();
+
+      gate.resolve(jsonResponse(200, body()));
+      await pending;
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+
+      expect(store.getState()).toBe(after);
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, prepareNeedsCheck: null, error: null, subOrganizationId: null, authorizingCredentialId: null });
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      expect(api.urls()).toEqual([PREPARE_POST]);
+    });
+
+    it.each([
+      ["malformed", () => ({ ...addressReply(), subOrganizationId: "" })],
+      ["honest", () => addressReply()],
+    ] as const)("a late %s answer after an unmount and a remount (detach, init) writes nothing and signs nothing", async (_name, body) => {
+      const gate = deferred();
+      const api = server({ prepare: () => gate.promise, latest: () => jsonResponse(200, { attempt: null }) });
+      const store = await reviewing(ADDRESS);
+      const pending = store.getState().confirmAndSend();
+      store.getState().detach();
+      await store.getState().init();
+      const after = store.getState();
+      expect(after).toMatchObject({ status: "editing", prepareNeedsCheck: null });
+
+      gate.resolve(jsonResponse(200, body()));
+      await pending;
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+
+      expect(store.getState()).toBe(after);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      expect(api.urls()).toEqual([PREPARE_POST, "GET /api/real/payments/latest"]);
+    });
+
+    it("a late malformed answer after a detach alone (no remount) writes nothing", async () => {
+      const gate = deferred();
+      server({ prepare: () => gate.promise });
+      const store = await reviewing(ADDRESS);
+      const pending = store.getState().confirmAndSend();
+      store.getState().detach();
+      const after = store.getState();
+
+      gate.resolve(jsonResponse(200, { attempt: null }));
+      await pending;
+
+      expect(store.getState()).toBe(after);
+      expect(store.getState().prepareNeedsCheck).toBeNull();
+    });
+  });
+
+  describe("recovery stays the user's explicit D-1 check", () => {
+    it("after a rejected answer, Review is refused, and only Check payment status reads /latest — which can restore the payment without a passkey prompt", async () => {
+      const reply = addressReply();
+      const latest = { attempt: reply.attempt, subOrganizationId: reply.subOrganizationId, authorizingCredentialId: reply.authorizingCredentialId, serverNowSeconds: SERVER_NOW };
+      const api = server({ prepare: () => jsonResponse(200, { ...reply, authorizingCredentialId: null }), latest: () => jsonResponse(200, latest) });
+      const store = await reviewing(ADDRESS);
+
+      await store.getState().confirmAndSend();
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain", attempt: null });
+
+      // Review and Approve are refused while the check is required; nothing is sent.
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+      expect(store.getState().status).toBe("editing");
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      expect(api.urls()).toEqual([PREPARE_POST]);
+
+      await store.getState().checkPreparedPayment();
+
+      expect(api.urls()).toEqual([PREPARE_POST, "GET /api/real/payments/latest"]);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: UUID }, authorizingCredentialId: reply.authorizingCredentialId, prepareNeedsCheck: null, isAuthorizing: false });
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("a check that finds no payment releases the requirement, and the next Review and Approve prepare once more", async () => {
+      const replies = [{ ...addressReply(), serverNowSeconds: "now" }, addressReply()];
+      const api = server({ prepare: () => jsonResponse(200, replies.shift()), latest: () => jsonResponse(200, { attempt: null }) });
+      const store = await reviewing(ADDRESS);
+      await store.getState().confirmAndSend();
+      expect(store.getState().prepareNeedsCheck).toBe("uncertain");
+
+      await store.getState().checkPreparedPayment();
+      expect(store.getState()).toMatchObject({ prepareNeedsCheck: null, prepareCheck: "nothing_found" });
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+
+      expect(api.urls()).toEqual([PREPARE_POST, "GET /api/real/payments/latest", PREPARE_POST]);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: UUID } });
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
     });
   });
 });

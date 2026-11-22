@@ -7,7 +7,8 @@ import { hasEnoughValidityToDispatch } from "@/lib/real/payments/validity";
 import { isWebAuthnCancellation } from "@/lib/real/signing/passkey";
 import type { WirePreparedFields } from "@/lib/real/payments/prepared-operation";
 import { ownHandleMessage, resolveRecipientView, type RecipientLookup, type RecipientView } from "@/lib/real/recipient-input";
-import type { PaymentRecipientIdentity } from "@/lib/real/display/payment-recipient";
+import { readRecipientIdentity, type PaymentRecipientIdentity } from "@/lib/real/display/payment-recipient";
+import { isValidUuid } from "@/lib/real/identifiers";
 import { useRealAccountStore } from "./real-account-store";
 import { useRealBalanceStore } from "./real-balance-store";
 
@@ -572,6 +573,91 @@ function isHonestCancelResponse(json: unknown, held: { id: string; recipient: st
   if (typeof attempt.amountBaseUnits !== "string" || !/^\d+$/.test(attempt.amountBaseUnits) || attempt.amountBaseUnits !== held.amountBaseUnits) return false;
   if (attempt.transactionHash !== null) return false;
   return true;
+}
+
+/**
+ * L-2 D-12: what THIS prepare request asked for, captured from its own request
+ * body before the await — never re-read from the live form afterwards. Exactly
+ * one selector: the canonical address sent, or the canonical handle sent.
+ */
+type PrepareIntent = { readonly kind: "address"; readonly recipient: string; readonly amountBaseUnits: string } | { readonly kind: "handle"; readonly handle: string; readonly amountBaseUnits: string };
+
+/** L-2 D-12 runtime format rules for the wire `prepared` object. Shape only: nothing is decoded, converted, hashed or compared with the payment's intent. */
+const PREPARED_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
+/** A handle payment's server-resolved recipient: pg_catalog.lower(safe_address), so lower-case only. */
+const LOWERCASE_ADDRESS_PATTERN = /^0x[0-9a-f]{40}$/;
+const DECIMAL_DIGITS_PATTERN = /^[0-9]+$/;
+const HEX_BYTES_PATTERN = /^0x(?:[0-9a-fA-F]{2})*$/;
+const PREPARED_DECIMAL_FIELDS = ["nonce", "callGasLimit", "verificationGasLimit", "preVerificationGas", "maxFeePerGas", "maxPriorityFeePerGas"] as const;
+const PREPARED_NULLABLE_DECIMAL_FIELDS = ["paymasterVerificationGasLimit", "paymasterPostOpGasLimit"] as const;
+const PREPARED_NULLABLE_ADDRESS_FIELDS = ["factory", "paymaster"] as const;
+const PREPARED_NULLABLE_HEX_FIELDS = ["factoryData", "paymasterData"] as const;
+
+const isPrimitiveMatch = (value: unknown, pattern: RegExp): boolean => typeof value === "string" && pattern.test(value);
+/** Present (a missing key is rejected) and either null or a string of the given format. */
+const isNullableMatch = (fields: Record<string, unknown>, key: string, pattern: RegExp): boolean => key in fields && (fields[key] === null || isPrimitiveMatch(fields[key], pattern));
+
+/**
+ * L-2 D-12: does `prepared` have the runtime shape server/payments.ts's
+ * toPublicAttempt serializes (WirePreparedFields)? Addresses 0x + 40 hex (any
+ * case — the Safe sender and the provider's factory / paymaster keep their
+ * casing), decimal fields ASCII digit strings (bigint.toString()), hex data
+ * whole bytes ("0x" allowed), every nullable key present, validUntil a positive
+ * safe integer. Not a verification of what the operation does.
+ */
+function isWellFormedPreparedFields(value: unknown): boolean {
+  if (!isJsonObject(value)) return false;
+  if (!isPrimitiveMatch(value.sender, PREPARED_ADDRESS_PATTERN)) return false;
+  if (!isPrimitiveMatch(value.callData, HEX_BYTES_PATTERN)) return false;
+  for (const key of PREPARED_DECIMAL_FIELDS) if (!isPrimitiveMatch(value[key], DECIMAL_DIGITS_PATTERN)) return false;
+  for (const key of PREPARED_NULLABLE_DECIMAL_FIELDS) if (!isNullableMatch(value, key, DECIMAL_DIGITS_PATTERN)) return false;
+  for (const key of PREPARED_NULLABLE_ADDRESS_FIELDS) if (!isNullableMatch(value, key, PREPARED_ADDRESS_PATTERN)) return false;
+  for (const key of PREPARED_NULLABLE_HEX_FIELDS) if (!isNullableMatch(value, key, HEX_BYTES_PATTERN)) return false;
+  return typeof value.validUntil === "number" && Number.isSafeInteger(value.validUntil) && value.validUntil > 0;
+}
+
+/**
+ * L-2 D-12: is this prepare HTTP 200 body the payment THIS request asked for, in
+ * the shape resolvePreparePayment's "ready" answer has, before anything is
+ * adopted or signed? Pure; strict; no trimming, case folding, coercion or
+ * repair. Sibling of the submit, status and Cancel validators (untouched).
+ *
+ * - Signing context: subOrganizationId and authorizingCredentialId non-empty
+ *   strings (presence and type only — not proof they are the right ones);
+ *   serverNowSeconds a finite number.
+ * - attempt: id a server-issued UUID (isValidUuid); state exactly
+ *   awaiting_authorization; amount the digit string sent; transactionHash and
+ *   failureReason exactly null (missing rejected); `prepared` well formed.
+ * - Recipient: an address payment answers exactly the canonical address sent,
+ *   with recipientIdentity exactly null. A handle payment answers a lower-case
+ *   address (the server resolves it; the client has no expectation for it)
+ *   and a strict identity (readRecipientIdentity) whose handle is exactly the
+ *   handle sent; its display name is the server's snapshot and is not compared
+ *   with the earlier lookup.
+ *
+ * createdAt / updatedAt and extra keys are ignored. A rejection says nothing
+ * about whether the server reserved or prepared the payment.
+ */
+function isHonestPrepareResponse(json: unknown, intent: PrepareIntent): json is { attempt: RealPaymentAttempt; subOrganizationId: string; authorizingCredentialId: string; serverNowSeconds: number } {
+  if (!isJsonObject(json)) return false;
+  if (typeof json.serverNowSeconds !== "number" || !Number.isFinite(json.serverNowSeconds)) return false;
+  if (typeof json.subOrganizationId !== "string" || json.subOrganizationId === "") return false;
+  if (typeof json.authorizingCredentialId !== "string" || json.authorizingCredentialId === "") return false;
+  const attempt = json.attempt;
+  if (!isJsonObject(attempt)) return false;
+  if (typeof attempt.id !== "string" || !isValidUuid(attempt.id)) return false;
+  if (attempt.state !== "awaiting_authorization") return false;
+  if (typeof attempt.amountBaseUnits !== "string" || !/^\d+$/.test(attempt.amountBaseUnits) || attempt.amountBaseUnits !== intent.amountBaseUnits) return false;
+  if (attempt.transactionHash !== null || attempt.failureReason !== null) return false;
+  if (intent.kind === "address") {
+    if (typeof attempt.recipient !== "string" || attempt.recipient !== intent.recipient) return false;
+    if (attempt.recipientIdentity !== null) return false;
+  } else {
+    if (!isPrimitiveMatch(attempt.recipient, LOWERCASE_ADDRESS_PATTERN)) return false;
+    const identity = readRecipientIdentity(attempt.recipientIdentity);
+    if (identity === null || identity.handle !== intent.handle) return false;
+  }
+  return isWellFormedPreparedFields(attempt.prepared);
 }
 
 /** Stage 2C-2: how many times one caller waits behind an older-epoch read before giving up (each wait is itself bounded by the request deadline). */
@@ -1729,6 +1815,8 @@ export function createRealPaymentStore() {
         // handle: the server derives the destination, and the lookup result
         // is never sent as (or treated as) the payment's authority.
         const body = view.kind === "address" ? { recipient: view.recipient, amountBaseUnits } : { recipientHandle: view.handle, amountBaseUnits };
+        // L-2 D-12: the answer is checked against what THIS request sent — captured here, never the live form after the await.
+        const intent: PrepareIntent = Object.freeze(view.kind === "address" ? { kind: "address", recipient: view.recipient, amountBaseUnits } : { kind: "handle", handle: view.handle, amountBaseUnits });
 
         set({ status: "preparing", error: null });
         // A prepare answer applies only to the lifecycle and account that asked,
@@ -1741,6 +1829,13 @@ export function createRealPaymentStore() {
             body: JSON.stringify(body),
           });
           if (detached || myGeneration !== generation || currentSubject() !== preparedFor) return;
+          // L-2 D-12: a 200 that is not this request's own payment, in the shape the server sends, is NOT adopted and NOT signed: it
+          // proves nothing about whether a payment was reserved, so it takes D-1's uncertain-prepare state exactly — the typed text,
+          // clock offset, cooldowns, timers and epoch stay; nothing is read, retried, cancelled or signed. After the guard above.
+          if (!isHonestPrepareResponse(result as unknown, intent)) {
+            set({ status: "editing", error: null, prepareNeedsCheck: "uncertain", prepareCheck: "idle" });
+            return;
+          }
           submitCooldown = null;
           clearSubmitCooldownTimer();
           set({

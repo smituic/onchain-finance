@@ -46,11 +46,22 @@ function routeFetch(handler: (url: string, method: string, body: unknown) => Res
   );
 }
 
+/**
+ * L-2 D-12: server-issued payment ids (payment_attempts.id is a Postgres UUID;
+ * the store requires isValidUuid of a prepare answer). PAYMENT_ID is the default
+ * fixture id; the other two keep the old "second" and "foreign" payments distinct.
+ */
+const PAYMENT_ID = "3f2b8c1e-5a4d-4e6f-8a9b-0c1d2e3f4a5b";
+const PAYMENT_ID_2 = "7d9e1f2a-3b4c-4d5e-9f6a-7b8c9d0e1f2a";
+const FOREIGN_PAYMENT_ID = "c0ffee00-1234-4abc-8def-0123456789ab";
+
+/** L-2 D-12: wire-shaped like toPublicAttempt's `prepared` (the Safe sender, whole-byte hex callData); validUntil is added per answer where a test needs it. */
 const PREPARED_FIELDS = {
+  sender: ACCOUNT.safeAddress,
   nonce: "0",
   factory: null,
   factoryData: null,
-  callData: "0xcalldata",
+  callData: "0x7bb37428",
   callGasLimit: "80000",
   verificationGasLimit: "150000",
   preVerificationGas: "60000",
@@ -62,9 +73,12 @@ const PREPARED_FIELDS = {
   paymasterPostOpGasLimit: null,
 };
 
+/** L-2 D-12: an honest prepare answer's `prepared` always carries validUntil (the server's 600 s window after its clock, 1_900_000_000 in these fixtures). */
+const PREPARE_FIELDS = { ...PREPARED_FIELDS, validUntil: 1_900_000_600 };
+
 function attemptFixture(overrides: Record<string, unknown> = {}) {
   return {
-    id: "payment-attempt-1",
+    id: PAYMENT_ID,
     state: "awaiting_authorization",
     recipient: RECIPIENT,
     recipientIdentity: null as unknown,
@@ -144,7 +158,7 @@ describe("RealPayForm", () => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
         return jsonResponse(200, {
-          attempt: attemptFixture({ recipient: (body as { recipient: string }).recipient }),
+          attempt: attemptFixture({ recipient: (body as { recipient: string }).recipient, prepared: PREPARE_FIELDS }),
           subOrganizationId: "sub-org-1",
           authorizingCredentialId: "credential-1",
           serverNowSeconds: 1_900_000_000,
@@ -154,7 +168,7 @@ describe("RealPayForm", () => {
         submitCalled = true;
         return jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }) });
       }
-      if (url.endsWith("/api/real/payments/payment-attempt-1/cancel") && method === "POST") {
+      if (url.endsWith(`/api/real/payments/${PAYMENT_ID}/cancel`) && method === "POST") {
         cancelCalled = true;
         return jsonResponse(200, { attempt: attemptFixture({ state: "cancelled" }) });
       }
@@ -174,7 +188,7 @@ describe("RealPayForm", () => {
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
     await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
-    expect(useRealPaymentStore.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: "payment-attempt-1", state: "awaiting_authorization" } });
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: PAYMENT_ID, state: "awaiting_authorization" } });
     expect(screen.getByText(RECIPIENT, { exact: false })).toBeInTheDocument();
     expect(screen.getByText(/Only continue if you started this payment/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Continue" })).toBeInTheDocument();
@@ -195,7 +209,7 @@ describe("RealPayForm", () => {
     routeFetch((url, method) => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
-        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" });
+        return jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 });
       }
       if (url.endsWith("/api/real/payments/submit") && method === "POST") {
         // L-2 D-7: submit never answers "confirmed" in HTTP 200 — it answers "submitted", and the existing status path establishes "confirmed".
@@ -233,7 +247,7 @@ describe("RealPayForm", () => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
         prepareCallCount += 1;
-        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" });
+        return jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 });
       }
       return null;
     });
@@ -306,7 +320,7 @@ describe("RealPayForm", () => {
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
         // A client-typed credential is never sent: prepare's body is recipient + amount only.
         expect(Object.keys(body as object).sort()).toEqual(["amountBaseUnits", "recipient"]);
-        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-P" });
+        return jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-P", serverNowSeconds: 1_900_000_000 });
       }
       if (url.endsWith("/api/real/payments/submit") && method === "POST") {
         submitBodies.push(body);
@@ -326,7 +340,7 @@ describe("RealPayForm", () => {
 
     await waitFor(() => expect(submitBodies).toHaveLength(1));
     expect(signPreparedPaymentMock).toHaveBeenCalledWith(expect.objectContaining({ authorizingCredentialId: "credential-P" }));
-    expect(submitBodies[0]).toEqual({ attemptId: "payment-attempt-1", signature: "0xsignature", activityId: "activity-P-1" });
+    expect(submitBodies[0]).toEqual({ attemptId: PAYMENT_ID, signature: "0xsignature", activityId: "activity-P-1" });
   });
 
   it("Slice S1: a payment bound to a different passkey restores as cancel-only with an explanation — never a Continue that would sign", async () => {
@@ -351,7 +365,7 @@ describe("RealPayForm", () => {
     routeFetch((url, method, body) => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
-        return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-P" });
+        return jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-P", serverNowSeconds: 1_900_000_000 });
       }
       if (url.endsWith("/api/real/payments/submit") && method === "POST") {
         submitBodies.push(body);
@@ -475,11 +489,14 @@ describe("RealPayForm", () => {
     expect(screen.queryByText(/confirming nothing moved/)).not.toBeInTheDocument();
   });
 
-  it("Slice S1: a prepare response with no bound passkey never reaches the signing call — cancel-only", async () => {
+  // L-2 D-12 (authorized S1 change): this answer used to be adopted and shown as the stranded screen. The server always names the
+  // session's own passkey, so an answer without one is not its answer: D-1's uncertain recovery instead, and still never a signature.
+  it("Slice S1 (re-scoped by D-12): a prepare response with no bound passkey is not adopted and never reaches the signing call — the existing uncertain-prepare recovery", async () => {
     useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
     routeFetch((url, method) => {
       if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
-      if (url.endsWith("/api/real/payments/prepare") && method === "POST") return jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1" });
+      // Honest in every other respect: only authorizingCredentialId is missing.
+      if (url.endsWith("/api/real/payments/prepare") && method === "POST") return jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", serverNowSeconds: 1_900_000_000 });
       return null;
     });
 
@@ -491,8 +508,21 @@ describe("RealPayForm", () => {
     await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
-    await waitFor(() => expect(screen.getByTestId("real-pay-stranded")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(screen.getByText("We couldn't confirm whether your payment was set up. Check its status before trying again.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check payment status" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    expect(screen.queryByTestId("real-pay-stranded")).toBeNull();
+    expect(screen.queryByText(/different passkey/)).toBeNull();
+    expect(screen.getByLabelText("To")).toHaveValue(RECIPIENT);
+    expect(screen.getByLabelText("Amount")).toHaveValue("1.00");
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, subOrganizationId: null, authorizingCredentialId: null, prepareNeedsCheck: "uncertain", prepareCheck: "idle", error: null });
     expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    // The mount read and the one prepare — nothing automatic after it.
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url))).toEqual(["/api/real/payments/latest", "/api/real/payments/prepare"]);
   });
 });
 
@@ -538,7 +568,7 @@ describe("RealPayForm — Slice C: paying by @name", () => {
     return { lookups, prepares };
   }
 
-  const prepareOk = () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 });
+  const prepareOk = () => jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 });
 
   async function renderForm() {
     render(<RealPayForm />);
@@ -706,7 +736,7 @@ describe("RealPayForm — Slice C: paying by @name", () => {
   it("Review shows the advisory lookup; after prepare the approval, sending, and sent screens show the attempt's AUTHORITATIVE identity — the stored snapshot wins over the lookup's name", async () => {
     const { prepares, lookups } = stubRoutes({
       lookup: () => jsonResponse(200, FOUND_SMIT), // advisory: "Smit Patel"
-      prepare: () => jsonResponse(200, { attempt: attemptFixture({ recipientIdentity: STORED }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture({ recipientIdentity: STORED, prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 }),
       // L-2 D-7: submit answers "submitted"; the existing status path establishes "confirmed".
       submit: () => jsonResponse(200, { attempt: attemptFixture({ state: "submitted", transactionHash: "0xabc123", recipientIdentity: STORED }) }),
       status: () => jsonResponse(200, { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123", recipientIdentity: STORED }), serverNowSeconds: 1_900_000_000 }),
@@ -755,7 +785,7 @@ describe("RealPayForm — Slice C: paying by @name", () => {
   it("a handle payment with no display name is named by its @name alone on the approval screen", async () => {
     stubRoutes({
       lookup: () => jsonResponse(200, { ...FOUND_SMIT, displayName: null }),
-      prepare: () => jsonResponse(200, { attempt: attemptFixture({ recipientIdentity: { handle: "smit", displayName: null } }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture({ recipientIdentity: { handle: "smit", displayName: null }, prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: 1_900_000_000 }),
     });
     signPreparedPaymentMock.mockRejectedValueOnce(Object.assign(new Error("cancelled"), { name: "NotAllowedError" }));
     const input = await renderForm();
@@ -1539,13 +1569,13 @@ describe("RealPayForm — 3A-2 Stage 2: submit wait", () => {
         calls.submit += 1;
         return new Response(JSON.stringify({ error: "Too many tries right now. Wait a moment, then tap Continue.", code: "rate_limited", retryable: true }), { status: 429, headers: { "content-type": "application/json", "Retry-After": "600" } });
       }
-      if (url.includes("/payment-attempt-1/status")) {
+      if (url.includes(`/${PAYMENT_ID}/status`)) {
         return jsonResponse(200, { attempt: attemptFixture({ state: "cancelled", prepared: { ...PREPARED_FIELDS, validUntil } }), serverNowSeconds: Math.floor(Date.now() / 1000), reconciliationDeferred: false });
       }
       if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
         expect(body).toMatchObject({ recipient: RECIPIENT });
         return jsonResponse(200, {
-          attempt: attemptFixture({ id: "payment-attempt-2", prepared: { ...PREPARED_FIELDS, validUntil } }),
+          attempt: attemptFixture({ id: PAYMENT_ID_2, prepared: { ...PREPARED_FIELDS, validUntil } }),
           subOrganizationId: "sub-org-1",
           authorizingCredentialId: "credential-1",
           serverNowSeconds: Math.floor(Date.now() / 1000),
@@ -1574,7 +1604,7 @@ describe("RealPayForm — 3A-2 Stage 2: submit wait", () => {
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
     await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
 
-    expect(useRealPaymentStore.getState().attempt?.id).toBe("payment-attempt-2");
+    expect(useRealPaymentStore.getState().attempt?.id).toBe(PAYMENT_ID_2);
     expect(screen.queryByTestId("real-pay-submit-wait")).toBeNull();
     expect(screen.queryByTestId("real-pay-approval-expiring")).toBeNull();
     expect(screen.queryByText(/Too many attempts/)).toBeNull();
@@ -1654,7 +1684,7 @@ describe("RealPayForm — L-2 D-1: unresolved prepare recovery", () => {
     return { calls, count: (key: Key) => calls.filter((call) => call.key === key).length };
   }
 
-  const active = (state: string, overrides: Record<string, unknown> = {}) => attemptFixture({ id: "payment-attempt-1", state, ...overrides });
+  const active = (state: string, overrides: Record<string, unknown> = {}) => attemptFixture({ id: PAYMENT_ID, state, ...overrides });
   const latestOf = (state: string, extra: Record<string, unknown> = {}, overrides: Record<string, unknown> = {}) => () =>
     jsonResponse(200, { attempt: active(state, overrides), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: Math.floor(Date.now() / 1000), ...extra });
 
@@ -2568,7 +2598,7 @@ describe("RealPayForm — L-2 D-4: submit refused for another passkey, and uncon
   const STRANDED_HEADLINE = "This payment can’t be continued here";
   const STRANDED_DETAIL = "This payment may still go through. Select Cancel payment and wait for the result before starting another payment.";
   const RAW_TEXT = /Failed to fetch|Cannot read|Unexpected|not valid JSON|Not authenticated|Payment not found|no longer awaiting|\(state:|could not be verified|Something went wrong|Request failed|wrong_passkey|wrong_state|awaiting_authorization|TypeError|SyntaxError/;
-  const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d4", activityId: "activity-d4" };
+  const APPROVAL = { attemptId: PAYMENT_ID, signature: "0xsig-d4", activityId: "activity-d4" };
 
   type Handler = (n: number) => Response | Promise<Response>;
   type Key = "latest" | "prepare" | "cancel" | "submit" | "status" | "lookup";
@@ -2629,16 +2659,16 @@ describe("RealPayForm — L-2 D-4: submit refused for another passkey, and uncon
   const statusOf = (state: string) => jsonResponse(200, { attempt: attemptFixture({ state }), serverNowSeconds: nowSeconds(), reconciliationDeferred: false });
 
   /** Mounts the form, types an address payment, approves it (one passkey approval) and lets `submit` decide how the send ends. */
-  async function send(submit: Handler, others: Partial<Record<Key, Handler>> = {}, attempt: Record<string, unknown> = {}) {
+  async function send(submit: Handler, others: Partial<Record<Key, Handler>> = {}, attempt: Record<string, unknown> = {}, to = RECIPIENT) {
     const api = stub({
       latest: none,
-      prepare: () => jsonResponse(200, { attempt: attemptFixture(attempt), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS, ...attempt }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
       submit,
       ...others,
     });
     render(<RealPayForm />);
     await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
-    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: to } });
     fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
     fireEvent.click(screen.getByRole("button", { name: "Review" }));
     await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
@@ -2678,7 +2708,8 @@ describe("RealPayForm — L-2 D-4: submit refused for another passkey, and uncon
     });
 
     it("a handle payment names the person from the server's stored attempt", async () => {
-      await send(wrongPasskey, {}, { recipientIdentity: { handle: "smit", displayName: "Smit Patel" } });
+      // L-2 D-12: a payment carrying a handle identity is a handle payment — typed as @smit and found, as the server requires.
+      await send(wrongPasskey, { lookup: () => jsonResponse(200, { found: true, handle: "smit", displayName: "Smit Patel", isSelf: false }) }, { recipientIdentity: { handle: "smit", displayName: "Smit Patel" } }, "@smit");
 
       await waitFor(() => expect(screen.getByTestId("real-pay-stranded-details")).toHaveTextContent("$1.00 to Smit Patel (@smit)"));
       expect(screen.getByTestId("real-pay-stranded-details")).not.toHaveTextContent("0x3333");
@@ -2909,7 +2940,7 @@ describe("RealPayForm — L-2 D-5: stranded screen copy safety", () => {
   const CANCEL_LOST_RACE = "This payment could not be cancelled — it may already be on its way.";
   const CANCEL_UNCONFIRMED = "Could not confirm whether this payment was cancelled. Check its status before trying again.";
   const C1_BODY = { error: "We couldn't confirm this payment's setup. No money was sent by this request. Refresh the app to check its status before trying again.", code: "prepare_outcome_uncertain" };
-  const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d5", activityId: "activity-d5" };
+  const APPROVAL = { attemptId: PAYMENT_ID, signature: "0xsig-d5", activityId: "activity-d5" };
   const ADDRESS_DETAILS = "$1.00 to 0x3333…3333";
   const NO_CONTEXT = { subOrganizationId: null, authorizingCredentialId: null };
   const CONTEXT = { subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" };
@@ -2993,7 +3024,7 @@ describe("RealPayForm — L-2 D-5: stranded screen copy safety", () => {
   const prepareOk =
     (attempt: Overrides = {}, context: Overrides = CONTEXT): Handler =>
     () =>
-      jsonResponse(200, { attempt: attemptFixture(attempt), ...context, serverNowSeconds: nowSeconds() });
+      jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS, ...attempt }), ...context, serverNowSeconds: nowSeconds() });
   const wrongPasskey: Handler = () => jsonResponse(409, { error: OTHER_PASSKEY, code: "wrong_passkey" });
   const cancelRefused: Handler = () => jsonResponse(409, { error: "This payment can no longer be cancelled." });
   const cancelled: Handler = () => jsonResponse(200, { attempt: attemptFixture({ state: "cancelled" }) });
@@ -3084,6 +3115,8 @@ describe("RealPayForm — L-2 D-5: stranded screen copy safety", () => {
    * driven through the form and the fake server exactly as the existing suites
    * do — the store is never set by hand. `keys` is every request the path
    * makes, in order; `signs` is how many passkey approvals it involves.
+   * (L-2 D-12 removed P3's "no authorizing passkey in the prepare answer"
+   * entry: that answer no longer reaches this screen.)
    */
   type Path = { name: string; arrive: (attempt: Overrides) => Promise<Api>; keys: Array<Key | "other">; signs: number; error: string | null; onlyWithoutWindow?: true };
   const PATHS: Path[] = [
@@ -3108,13 +3141,8 @@ describe("RealPayForm — L-2 D-5: stranded screen copy safety", () => {
       signs: 0,
       error: OTHER_PASSKEY,
     },
-    {
-      name: "P3 — Approve with no authorizing passkey in the prepare answer",
-      arrive: (attempt) => approve({ prepare: prepareOk(attempt, { subOrganizationId: "sub-org-1" }) }),
-      keys: ["latest", "prepare"],
-      signs: 0,
-      error: OTHER_PASSKEY,
-    },
+    // L-2 D-12 (S1, extended to this path by the operator): "P3 — Approve with no authorizing passkey in the prepare answer" no longer
+    // reaches this screen — that answer is rejected and takes D-1's uncertain recovery. See the re-scoped P3 test below.
     {
       name: "P3 — Continue after the refusal, once a status read shows the payment waiting again",
       arrive: async (attempt) => {
@@ -3249,7 +3277,7 @@ describe("RealPayForm — L-2 D-5: stranded screen copy safety", () => {
     const api = await approve({ prepare: prepareOk({}), submit: () => jsonResponse(500, { error: "Something went wrong. Please try again." }), status: statusOf("prepared", {}) });
     await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
     const before = structuredClone(useRealPaymentStore.getState().attempt);
-    expect(before).toMatchObject({ id: "payment-attempt-1", state: "awaiting_authorization" });
+    expect(before).toMatchObject({ id: PAYMENT_ID, state: "awaiting_authorization" });
 
     fireEvent.click(screen.getByRole("button", { name: "Check status" }));
     await waitFor(() => expect(screen.getByText(UNUSABLE)).toBeInTheDocument());
@@ -3264,6 +3292,21 @@ describe("RealPayForm — L-2 D-5: stranded screen copy safety", () => {
     // Exactly the requests that led here plus the one read: nothing was signed, submitted, cancelled or prepared again.
     expect(api.keys()).toEqual(["latest", "prepare", "submit", "status"]);
     expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("P3 (re-scoped by D-12) — a prepare answer with no authorizing passkey (honest otherwise): D-1's uncertain recovery, never this screen, nothing signed", async () => {
+    const api = await approve({ prepare: prepareOk(openWindow(), { subOrganizationId: "sub-org-1" }) });
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+    await quiet();
+
+    expect(screen.getByText("We couldn't confirm whether your payment was set up. Check its status before trying again.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check payment status" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    expect(screen.queryByTestId("real-pay-stranded")).toBeNull();
+    expect(screen.queryByText(OTHER_PASSKEY)).toBeNull();
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, subOrganizationId: null, authorizingCredentialId: null, prepareNeedsCheck: "uncertain" });
+    expect(api.keys()).toEqual(["latest", "prepare"]);
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
   });
 
   describe("the payment's own line is unchanged", () => {
@@ -3538,7 +3581,7 @@ describe("RealPayForm — L-2 D-5: stranded screen copy safety", () => {
       expect(document.body.textContent).not.toMatch(/Failed to fetch|boom|TypeError/);
       expect(api.keys()).toEqual(keys);
       expect(useRealPaymentStore.getState()).toMatchObject({ status: "stranded" });
-      expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "signed" });
+      expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: PAYMENT_ID, state: "signed" });
     });
   });
 
@@ -3655,7 +3698,7 @@ describe("RealPayForm — L-2 D-6: bounded submit wait", () => {
   const UNKNOWN_DETAIL = "It may have already gone through. We'll show the result here once we know — sending another payment is disabled until this one resolves.";
   const OTHER_PASSKEY = "This payment was started with a different passkey. Cancel it and start a new payment.";
   const RAW_TEXT = /Failed to fetch|Cannot read|Unexpected|not valid JSON|Not authenticated|Payment not found|no longer awaiting|\(state:|Something went wrong|Request failed|wrong_passkey|TypeError|SyntaxError|aborted/;
-  const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d6", activityId: "activity-d6" };
+  const APPROVAL = { attemptId: PAYMENT_ID, signature: "0xsig-d6", activityId: "activity-d6" };
   const DEADLINE = 60_000;
 
   type Handler = (n: number) => Response | Promise<Response>;
@@ -3732,7 +3775,7 @@ describe("RealPayForm — L-2 D-6: bounded submit wait", () => {
   async function send(submit: Handler, others: Partial<Record<Key, Handler>> = {}) {
     const api = stub({
       latest: () => jsonResponse(200, { attempt: null }),
-      prepare: () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
       balance: () => jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }),
       submit,
       ...others,
@@ -3889,7 +3932,7 @@ describe("RealPayForm — L-2 D-7: malformed submit response recovery", () => {
   const NEUTRAL = "We couldn't confirm whether this payment was sent. Check its status before trying again.";
   const UNKNOWN_HEADLINE = "We're checking on this payment";
   const MARKER = "D7-RAW-MARKER-must-never-be-shown";
-  const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d7", activityId: "activity-d7" };
+  const APPROVAL = { attemptId: PAYMENT_ID, signature: "0xsig-d7", activityId: "activity-d7" };
   const RAW_TEXT = /Cannot read|Unexpected|not valid JSON|Objects are not valid|\[object Object\]|undefined|TypeError|wrong_passkey/;
 
   type Handler = (n: number) => Response | Promise<Response>;
@@ -3951,7 +3994,7 @@ describe("RealPayForm — L-2 D-7: malformed submit response recovery", () => {
   async function send(submit: Handler, others: Partial<Record<Key, Handler>> = {}) {
     const api = stub({
       latest: () => jsonResponse(200, { attempt: null }),
-      prepare: () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
       submit,
       ...others,
     });
@@ -3968,7 +4011,7 @@ describe("RealPayForm — L-2 D-7: malformed submit response recovery", () => {
   const MALFORMED: Array<[string, unknown]> = [
     ["an unknown state", { attempt: attemptFixture({ state: "teleported", failureReason: MARKER }) }],
     ["an empty attempt object", { attempt: {} }],
-    ["a wrong-id 'submitted' attempt", { attempt: attemptFixture({ id: "payment-attempt-evil", state: "submitted", failureReason: MARKER }) }],
+    ["a wrong-id 'submitted' attempt", { attempt: attemptFixture({ id: FOREIGN_PAYMENT_ID, state: "submitted", failureReason: MARKER }) }],
     ["a disallowed 'confirmed' state", { attempt: attemptFixture({ state: "confirmed", transactionHash: "0xabc123", failureReason: MARKER }) }],
     ["a disallowed 'cancelled' state", { attempt: attemptFixture({ state: "cancelled", failureReason: MARKER }) }],
     ["a disallowed 'awaiting_authorization' state", { attempt: attemptFixture({ state: "awaiting_authorization", failureReason: MARKER }) }],
@@ -3999,19 +4042,19 @@ describe("RealPayForm — L-2 D-7: malformed submit response recovery", () => {
     expect(api.calls[2]!.body).toEqual(APPROVAL);
     expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
     expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", error: NEUTRAL, pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
-    expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "awaiting_authorization" });
+    expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: PAYMENT_ID, state: "awaiting_authorization" });
   });
 
   it("Check status asks about the ORIGINAL payment id, never the one the malformed answer carried", async () => {
-    const api = await send(() => jsonResponse(200, { attempt: attemptFixture({ id: "payment-attempt-evil", state: "submitted" }) }), { status: () => statusOf("submitted") });
+    const api = await send(() => jsonResponse(200, { attempt: attemptFixture({ id: FOREIGN_PAYMENT_ID, state: "submitted" }) }), { status: () => statusOf("submitted") });
     await waitFor(() => expect(screen.getByTestId("real-pay-unknown")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: "Check status" }));
     await waitFor(() => expect(api.count("status")).toBe(1));
 
     const statusCall = api.calls.find((call) => call.key === "status")!;
-    expect(statusCall.url).toContain("/payment-attempt-1/status");
-    expect(api.calls.some((call) => call.url.includes("payment-attempt-evil"))).toBe(false);
+    expect(statusCall.url).toContain(`/${PAYMENT_ID}/status`);
+    expect(api.calls.some((call) => call.url.includes(FOREIGN_PAYMENT_ID))).toBe(false);
     expect(api.count("submit")).toBe(1);
     expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
   });
@@ -4076,7 +4119,7 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
   const UNKNOWN_HEADLINE = "We're checking on this payment";
   const STILL_SIGNED_IN = "You're signed in. You can check this payment's status again.";
   const SESSION_CHECK_FAILED = "We couldn't check your sign-in just now. Try again in a moment.";
-  const APPROVAL = { attemptId: "payment-attempt-1", signature: "0xsig-d8", activityId: "activity-d8" };
+  const APPROVAL = { attemptId: PAYMENT_ID, signature: "0xsig-d8", activityId: "activity-d8" };
   const RAW_TEXT = /Not authenticated|Payment not found|Failed to fetch|Unexpected|not valid JSON|session-gone/;
   const NOT_SENT_CLAIM = /wasn't sent|was not sent|not sent|never sent|didn't go through|did not go through|no money moved|nothing was sent/i;
   const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
@@ -4170,7 +4213,7 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
     const api = stub({
       session: () => sessionOf(ACCOUNT),
       latest: () => jsonResponse(200, { attempt: null }),
-      prepare: () => jsonResponse(200, { attempt: attemptFixture(), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
+      prepare: () => jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: nowSeconds() }),
       submit,
       ...others,
     });
@@ -4224,7 +4267,7 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
       expect(api.calls.filter((call) => call.key !== "session").map((call) => call.key)).toEqual(["latest", "prepare", "submit"]);
       expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
       expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", sessionRecovery: "signed_out", pendingSubmission: APPROVAL, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" });
-      expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "awaiting_authorization" });
+      expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: PAYMENT_ID, state: "awaiting_authorization" });
     });
 
     it("submit HTTP 404: fixed neutral copy, 'Check account' as the secondary action — no 'Sign in again', no claim that nothing was sent", async () => {
@@ -4250,7 +4293,7 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
       expectUnknownScreen(SIGNED_OUT, true);
       expect(screen.getByRole("button", { name: "Sign in again" })).toBeEnabled();
       expect(api.count("status")).toBe(1);
-      expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "unknown" });
+      expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: PAYMENT_ID, state: "unknown" });
       expect(api.count("submit") + api.count("prepare") + api.count("cancel") + api.count("balance")).toBe(0);
       expect(signPreparedPaymentMock).not.toHaveBeenCalled();
     });
@@ -4453,7 +4496,7 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
         expect(screen.queryByText(SIGNED_OUT)).toBeNull();
         expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
         expect(useRealPaymentStore.getState()).toMatchObject({ status: "unknown", sessionRecovery: null, pendingSubmission: null, error: null });
-        expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: "payment-attempt-1", state: "unknown" });
+        expect(useRealPaymentStore.getState().attempt).toMatchObject({ id: PAYMENT_ID, state: "unknown" });
         expect(api.count("submit")).toBe(1);
         expect(api.count("prepare")).toBe(1);
         expect(api.count("cancel")).toBe(0);
@@ -4476,7 +4519,7 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
         await waitFor(() => expect(signPreparedPaymentMock).toHaveBeenCalledTimes(2));
         // The explicit Continue asked for a fresh passkey approval and sent THAT one — never the in-memory one from before the sign-out.
         await waitFor(() => expect(api.count("submit")).toBe(submitsBefore + 1));
-        expect(api.calls.filter((call) => call.key === "submit").at(-1)!.body).toEqual({ attemptId: "payment-attempt-1", signature: "0xsig-new", activityId: "activity-new" });
+        expect(api.calls.filter((call) => call.key === "submit").at(-1)!.body).toEqual({ attemptId: PAYMENT_ID, signature: "0xsig-new", activityId: "activity-new" });
       });
 
       it("signing in as a DIFFERENT account: the old payment, approval and wording do not appear, and only that account's own /latest is read", async () => {
@@ -4494,7 +4537,7 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
         expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, pendingSubmission: null, authorizingCredentialId: null, subOrganizationId: null, sessionRecovery: null, error: null });
         const after = api.calls.slice(before).filter((call) => (PAYMENT_KEYS as readonly string[]).includes(call.key));
         expect(after.map((call) => call.key)).toEqual(["latest"]);
-        expect(api.calls.slice(before).some((call) => call.url.includes("payment-attempt-1"))).toBe(false);
+        expect(api.calls.slice(before).some((call) => call.url.includes(PAYMENT_ID))).toBe(false);
         expect(api.count("submit")).toBe(1);
         expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
       });
@@ -4538,7 +4581,7 @@ describe("RealPayForm — L-2 D-8: HTTP 401 / 404 recovery", () => {
       expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, pendingSubmission: null, authorizingCredentialId: null, subOrganizationId: null, sessionRecovery: null, error: null });
       // The session check, then the new account's own /latest — nothing about the old payment, no sign-out, no new sign-in.
       expect(api.calls.slice(before).map((call) => call.key)).toEqual(["session", "latest"]);
-      expect(api.calls.slice(before).some((call) => call.url.includes("payment-attempt-1"))).toBe(false);
+      expect(api.calls.slice(before).some((call) => call.url.includes(PAYMENT_ID))).toBe(false);
       expect(api.count("signout")).toBe(0);
       expect(api.count("loginOptions")).toBe(0);
       expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
@@ -4875,7 +4918,7 @@ describe("RealPayForm — L-2 D-9: Pay session recovery completion", () => {
       await waitFor(() => expect(screen.getByTestId("real-pay-session-note")).toBeInTheDocument());
       const first = useRealPaymentStore.getState().attempt!;
 
-      act(() => useRealPaymentStore.setState({ attempt: { ...first, id: "payment-attempt-2" } }));
+      act(() => useRealPaymentStore.setState({ attempt: { ...first, id: PAYMENT_ID_2 } }));
       noNote();
       act(() => useRealPaymentStore.setState({ attempt: first }));
       noNote();
@@ -4904,7 +4947,7 @@ describe("RealPayForm — L-2 D-9: Pay session recovery completion", () => {
       await waitFor(() => expect(button("Checking…")).toBeDisabled());
       const first = useRealPaymentStore.getState().attempt!;
 
-      act(() => useRealPaymentStore.setState({ attempt: { ...first, id: "payment-attempt-2" } }));
+      act(() => useRealPaymentStore.setState({ attempt: { ...first, id: PAYMENT_ID_2 } }));
       act(() => useRealPaymentStore.setState({ attempt: first }));
       await act(async () => gate.resolve(sessionOf(ACCOUNT)));
       await settle();
@@ -5249,7 +5292,7 @@ describe("RealPayForm — L-2 D-9: Pay session recovery completion", () => {
 describe("RealPayForm — L-2 D-10: malformed status answers", () => {
   const UNUSABLE = "We couldn’t check on this payment just now. Try again in a little while.";
   const CONTEXT = { subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" };
-  const HELD_ID = "payment-attempt-1";
+  const HELD_ID = PAYMENT_ID;
   const LEAKS = /FOREIGN|refunded-by-bank|engine-secret|0xdead|Cannot read|TypeError|Unexpected|not valid JSON|Failed to fetch|Unhandled fetch/;
 
   type Handler = (n: number) => Response | Promise<Response>;
@@ -5446,7 +5489,7 @@ describe("RealPayForm — L-2 D-11: malformed Cancel answers", () => {
   const CANCEL_UNCONFIRMED = "Could not confirm whether this payment was cancelled. Check its status before trying again.";
   const SIGNED_OUT = "You're signed out, so we can't confirm this payment yet. Sign in again to check its status.";
   const CONTEXT = { subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" };
-  const HELD_ID = "payment-attempt-1";
+  const HELD_ID = PAYMENT_ID;
   const LEAKS = /FOREIGN|refunded-by-bank|engine-secret|0xdead|Cannot read|TypeError|SyntaxError|Unexpected|not valid JSON|Failed to fetch|Unhandled fetch/;
   /** Checked after the fixed message (which itself says "was cancelled") is removed: nothing may claim the payment is cancelled. */
   const FALSE_CANCELLED = /was cancelled|has been cancelled|is cancelled|payment cancelled|cancelled/i;
@@ -5635,5 +5678,128 @@ describe("RealPayForm — L-2 D-11: malformed Cancel answers", () => {
       await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
       expect(api.count("cancel")).toBe(1);
     });
+  });
+});
+
+/** L-2 D-12 — the Pay form after a prepare HTTP 200 the store does not accept: the existing D-1 recovery, never Review, never a passkey prompt. */
+describe("RealPayForm — L-2 D-12: malformed prepare answers", () => {
+  const UNCERTAIN = "We couldn't confirm whether your payment was set up. Check its status before trying again.";
+  const FOUND_SMIT = { found: true, handle: "smit", displayName: "Smit Patel", isSelf: false };
+  const CONTEXT = { subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" };
+  /** A handle payment's recipient: the resolved Safe, lower-case. */
+  const SMIT_SAFE = "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae";
+
+  type Key = "latest" | "prepare" | "lookup" | "other";
+
+  beforeEach(() => {
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready", error: null, hasHydrated: true });
+    useRealBalanceStore.setState({ balance: { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" }, status: "ready", error: null });
+    useRealPaymentStore.getState().reset();
+    useRealPaymentStore.setState({ status: "idle" });
+    signPreparedPaymentMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  function stub(handlers: { prepare: () => Response; latest?: (n: number) => Response }) {
+    const calls: Array<{ key: Key; body: unknown }> = [];
+    let latestCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/api/real/account/balance")) return jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "20000000" });
+        const key: Key = url.endsWith("/api/real/payments/latest") ? "latest" : url.endsWith("/api/real/payments/prepare") ? "prepare" : url.endsWith("/api/real/recipients/lookup") ? "lookup" : "other";
+        calls.push({ key, body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
+        if (key === "latest") return handlers.latest ? handlers.latest(++latestCount) : jsonResponse(200, { attempt: null });
+        if (key === "prepare") return handlers.prepare();
+        if (key === "lookup") return jsonResponse(200, FOUND_SMIT);
+        throw new Error(`Unhandled fetch in test: ${url}`);
+      }),
+    );
+    return { calls, keys: () => calls.map((call) => call.key) };
+  }
+
+  async function approve(to: string) {
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: to } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+  }
+
+  const quiet = () =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+  const honest = (attempt: Record<string, unknown> = {}) => ({ attempt: attemptFixture({ prepared: PREPARE_FIELDS, ...attempt }), ...CONTEXT, serverNowSeconds: 1_900_000_000 });
+  const MARKER = "raw-engine-detail-d12";
+
+  it.each([
+    ["an id that is not a server-issued UUID", RECIPIENT, () => honest({ id: `payment-${MARKER}` })],
+    ["another recipient", RECIPIENT, () => honest({ recipient: "0x4444444444444444444444444444444444444444" })],
+    ["another amount", RECIPIENT, () => honest({ amountBaseUnits: "2000000" })],
+    ["a state other than awaiting approval", RECIPIENT, () => honest({ state: "submitted", failureReason: MARKER })],
+    ["prepared fields without validUntil", RECIPIENT, () => honest({ prepared: PREPARED_FIELDS })],
+    ["placeholder prepared data", RECIPIENT, () => honest({ prepared: { ...PREPARE_FIELDS, callData: `0x${MARKER}` } })],
+    ["no server clock", RECIPIENT, () => ({ attempt: attemptFixture({ prepared: PREPARE_FIELDS }), ...CONTEXT })],
+    ["a handle payment answered for another handle", "@smit", () => honest({ recipient: SMIT_SAFE, recipientIdentity: { handle: "smith", displayName: MARKER } })],
+    ["a handle payment answered with no identity", "@smit", () => honest({ recipient: SMIT_SAFE })],
+  ] as const)("%s: the existing uncertain notice and Check payment status — no Review, no passkey prompt, typed text kept, nothing by itself", async (_name, to, body) => {
+    const api = stub({ prepare: () => jsonResponse(200, body()) });
+    await approve(to);
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+    await quiet();
+
+    expect(screen.getByText(UNCERTAIN)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check payment status" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    for (const id of ["real-pay-review", "real-pay-resume", "real-pay-authorizing", "real-pay-stranded", "real-pay-sending", "real-pay-unknown"]) expect(screen.queryByTestId(id), id).toBeNull();
+    expect(document.body.textContent).not.toMatch(new RegExp(`${MARKER}|Unexpected|TypeError|Cannot read|different passkey`));
+    expect(screen.getByLabelText("To")).toHaveValue(to);
+    expect(screen.getByLabelText("Amount")).toHaveValue("1.00");
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "editing", attempt: null, subOrganizationId: null, authorizingCredentialId: null, prepareNeedsCheck: "uncertain", error: null });
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    expect(api.keys().filter((key) => key !== "lookup")).toEqual(["latest", "prepare"]);
+  });
+
+  it("explicit recovery: Check payment status reads /latest once and shows the server's waiting payment with Continue — no passkey prompt by itself", async () => {
+    const api = stub({
+      prepare: () => jsonResponse(200, honest({ id: "attempt-1" })),
+      latest: (n) => (n === 1 ? jsonResponse(200, { attempt: null }) : jsonResponse(200, { attempt: attemptFixture({ prepared: PREPARE_FIELDS }), ...CONTEXT, serverNowSeconds: 1_900_000_000 })),
+    });
+    await approve(RECIPIENT);
+    await waitFor(() => expect(screen.getByTestId("real-pay-prepare-recovery")).toBeInTheDocument());
+    await quiet();
+    expect(api.keys()).toEqual(["latest", "prepare"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Check payment status" }));
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    await quiet();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: PAYMENT_ID }, prepareNeedsCheck: null });
+    expect(signPreparedPaymentMock).not.toHaveBeenCalled();
+    expect(api.keys()).toEqual(["latest", "prepare", "latest"]);
+  });
+
+  it("an honest handle payment still reaches approval: the lower-case resolved Safe, the server's own name snapshot, one passkey prompt", async () => {
+    const reply = honest({ recipient: SMIT_SAFE, recipientIdentity: { handle: "smit", displayName: "Smit P. (stored)" } });
+    const api = stub({ prepare: () => jsonResponse(200, reply) });
+    signPreparedPaymentMock.mockRejectedValueOnce(Object.assign(new Error("cancelled"), { name: "NotAllowedError" }));
+    await approve("@Smit");
+
+    await waitFor(() => expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument());
+    expect(screen.getByText("To: Smit P. (stored) (@smit)")).toBeInTheDocument();
+    expect(screen.queryByText(UNCERTAIN)).toBeNull();
+    expect(api.calls.find((call) => call.key === "prepare")!.body).toEqual({ recipientHandle: "smit", amountBaseUnits: "1000000" });
+    expect(signPreparedPaymentMock).toHaveBeenCalledTimes(1);
+    expect(signPreparedPaymentMock).toHaveBeenCalledWith(expect.objectContaining({ fields: PREPARE_FIELDS, authorizingCredentialId: "credential-1", subOrganizationId: "sub-org-1" }));
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: PAYMENT_ID, recipient: SMIT_SAFE }, prepareNeedsCheck: null });
+    act(() => useRealPaymentStore.getState().reset());
   });
 });
