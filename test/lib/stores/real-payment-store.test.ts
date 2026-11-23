@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  CANCEL_REQUEST_DEADLINE_MS,
   createRealPaymentStore,
   EXPIRY_FOLLOW_UP_MS,
   followUpDelayMs,
@@ -9,6 +10,7 @@ import {
   MAX_FOLLOW_UP_INTERVAL_MS,
   parseSubmitRetryAfter,
   PAYMENT_NOT_ACCESSIBLE_MESSAGE,
+  PREPARE_REQUEST_DEADLINE_MS,
   SIGNED_OUT_PAYMENT_MESSAGE,
   STATUS_FALLBACK_DEADLINE_MS,
   STATUS_REQUEST_DEADLINE_MS,
@@ -11851,6 +11853,868 @@ describe("real-payment-store — L-1b: every new signature carries the held atte
       expect(api.calls.slice(0, 2)).toEqual(["POST /api/real/payments/prepare", `POST /api/real/payments/${(reply.attempt as Json).id}/cancel`]);
       expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
       expect(seen).toHaveLength(1);
+    });
+  });
+});
+
+/**
+ * R-03 / R-04 (post-L-2 D availability improvement — not a numbered D slice):
+ * the client's own bound on one POST /prepare (60 s) and one POST /cancel
+ * (45 s), in D-6's shape — a timer per request, a store-level identity marker,
+ * a per-request `timedOut` flag, the existing plain await and try/catch, no
+ * Promise.race and no abort. A deadline ends OUR wait only: a Prepare that ran
+ * out takes D-1's existing uncertain-prepare state, a Cancel that ran out frees
+ * its slot and shows the existing "could not confirm" message, and a late answer
+ * of either kind is inert. Nothing is retried, read, signed or cancelled by itself.
+ */
+describe("real-payment-store — R-03 / R-04: bounded Prepare and Cancel waits", () => {
+  const ACCOUNT_A = { appUserId: "app-user-1", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ACCOUNT_B = { appUserId: "app-user-2", ownerAddress: "0x4444444444444444444444444444444444444444", safeAddress: "0x5555555555555555555555555555555555555555" };
+  const T0_MS = 1_800_000_000_000; // a whole second, so boundary arithmetic is exact
+  const ADDRESS = "0x3333333333333333333333333333333333333333";
+  const PREPARE_DEADLINE = PREPARE_REQUEST_DEADLINE_MS;
+  const CANCEL_DEADLINE = CANCEL_REQUEST_DEADLINE_MS;
+  const CANCEL_UNCONFIRMED = "Could not confirm whether this payment was cancelled. Check its status before trying again.";
+  const CANCEL_LOST_RACE = "This payment could not be cancelled — it may already be on its way.";
+  const APPROVAL = { attemptId: ATTEMPT_ID, signature: "0xsig-r03", activityId: "activity-r03" };
+
+  type Key = "prepare" | "latest" | "cancel" | "status" | "submit" | "balance";
+  type Handler = (n: number) => Response | Promise<Response>;
+  type Store = ReturnType<typeof createRealPaymentStore>;
+  const stores: Store[] = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0_MS);
+    vi.mocked(signPreparedPayment).mockReset();
+    vi.mocked(signPreparedPayment).mockResolvedValue({ signature: APPROVAL.signature, activityId: APPROVAL.activityId } as never);
+    useRealAccountStore.setState({ account: ACCOUNT_A });
+  });
+
+  afterEach(async () => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockReset();
+    useRealAccountStore.setState({ account: null });
+    (await import("@/lib/stores/real-balance-store")).useRealBalanceStore.getState().reset();
+  });
+
+  /** Every request is recorded — including one no handler expects, which also fails the request. */
+  function server(handlers: Partial<Record<Key, Handler>>) {
+    const calls: Array<{ key: Key | "other"; method: string; signal: unknown }> = [];
+    const counts: Record<Key, number> = { prepare: 0, latest: 0, cancel: 0, status: 0, submit: 0, balance: 0 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const key: Key | null = url.endsWith("/api/real/payments/prepare")
+          ? "prepare"
+          : url.endsWith("/api/real/payments/latest")
+            ? "latest"
+            : url.endsWith("/cancel")
+              ? "cancel"
+              : url.endsWith("/status")
+                ? "status"
+                : url.endsWith("/api/real/payments/submit")
+                  ? "submit"
+                  : url.endsWith("/api/real/account/balance")
+                    ? "balance"
+                    : null;
+        calls.push({ key: key ?? "other", method, signal: init?.signal });
+        const handler = key ? handlers[key] : undefined;
+        if (!key || !handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        counts[key] += 1;
+        return handler(counts[key]);
+      }),
+    );
+    return { calls, keys: () => calls.map((call) => call.key), count: (key: Key) => calls.filter((call) => call.key === key).length };
+  }
+
+  function held<T = Response>() {
+    let resolve: (value: T) => void = () => {};
+    let reject: (reason: unknown) => void = () => {};
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  const settle = () => vi.advanceTimersByTimeAsync(0);
+  const offsetFor = (secondsBeforeExpiry: number) => VALID_UNTIL - secondsBeforeExpiry - T0_MS / 1000;
+  const serverNow = (secondsBeforeExpiry = 100_000) => Math.floor(Date.now() / 1000) + offsetFor(secondsBeforeExpiry);
+  const visible = (store: Store) => JSON.parse(JSON.stringify(store.getState())) as Record<string, unknown>;
+  const J = (body: unknown) => jsonResponse(200, body);
+  /** A 200-shaped reply whose body read the test controls (it hangs until the test says so). */
+  const rawReply = (json: () => Promise<unknown>) => ({ ok: true, status: 200, headers: new Headers(), json }) as unknown as Response;
+  const attemptOf = (state: string, over: Record<string, unknown> = {}) => ({ ...baseAttempt(), state, prepared: PREPARED_FIELDS, ...over });
+
+  /** An honest prepare 200 for the address payment the tests review (D-12's checks pass). */
+  const prepareBody = (id: string = PREPARED_ID) => ({ attempt: { ...baseAttempt(), id, recipient: ADDRESS }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: serverNow() });
+  const prepareReply = (id: string = PREPARED_ID) => J(prepareBody(id));
+  /** What POST /submit honestly answers for that prepared payment. */
+  const submitted = (id: string = PREPARED_ID) => () => J({ attempt: { ...baseAttempt(), id, recipient: ADDRESS, state: "submitted" } });
+  const statusReply = (state: string) => J({ attempt: attemptOf(state), serverNowSeconds: serverNow(), reconciliationDeferred: false });
+  /** POST /cancel's honest success: the cancelled row. */
+  const cancelledReply = () => J({ attempt: attemptOf("cancelled") });
+  const refused = () => jsonResponse(409, { error: "This payment can no longer be cancelled (state: submitting)." });
+
+  /** D-1's uncertain-prepare state with the draft kept, no attempt and no signing context. */
+  const UNCERTAIN = {
+    status: "editing",
+    error: null,
+    prepareNeedsCheck: "uncertain",
+    prepareCheck: "idle",
+    attempt: null,
+    recipientInput: ADDRESS,
+    amountInput: "1",
+    subOrganizationId: null,
+    authorizingCredentialId: null,
+    pendingSubmission: null,
+    isAuthorizing: false,
+  };
+
+  async function reviewing(store: Store = newStore()): Promise<Store> {
+    store.setState({ status: "editing" });
+    store.getState().setRecipientInput(ADDRESS);
+    store.getState().setAmountInput("1");
+    await store.getState().review();
+    expect(store.getState().status).toBe("reviewing");
+    return store;
+  }
+
+  function newStore(): Store {
+    const store = createRealPaymentStore();
+    stores.push(store);
+    return store;
+  }
+
+  /** One Approve whose POST /prepare is held open (headers never arrive); returns once the request is on its way. */
+  async function preparing(handlers: Partial<Record<Key, Handler>> = {}) {
+    const gate = held();
+    const api = server({ prepare: () => gate.promise, ...handlers });
+    const store = await reviewing();
+    const done = store.getState().confirmAndSend();
+    await settle();
+    expect(store.getState().status).toBe("preparing");
+    return { gate, api, store, done };
+  }
+
+  /** Prepare timed out, so the page is in D-1's uncertain state. */
+  async function timedOutPrepare(handlers: Partial<Record<Key, Handler>> = {}) {
+    const run = await preparing(handlers);
+    await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE);
+    expect(run.store.getState()).toMatchObject(UNCERTAIN);
+    return run;
+  }
+
+  /** The approval screen, holding a saved approval and its signing context (what Cancel must never drop on a timeout). */
+  function holding(): Store {
+    const store = newStore();
+    store.setState({
+      attempt: attemptOf("awaiting_authorization") as never,
+      status: "awaiting_authorization",
+      subOrganizationId: "sub-org-1",
+      authorizingCredentialId: "credential-1",
+      clockOffsetSeconds: offsetFor(100_000),
+      pendingSubmission: APPROVAL,
+    });
+    return store;
+  }
+
+  /** One Cancel press whose POST is held open (headers never arrive). */
+  async function cancelling(handlers: Partial<Record<Key, Handler>> = {}) {
+    const gate = held();
+    const api = server({ cancel: () => gate.promise, ...handlers });
+    const store = holding();
+    const before = visible(store);
+    const done = store.getState().cancel();
+    await settle();
+    expect(store.getState().isCancelling).toBe(true);
+    return { gate, api, store, done, before };
+  }
+
+  /** What a Cancel timeout leaves: the screen exactly as it was, except the fixed message — the slot is free again. */
+  const afterCancelTimeout = (store: Store, before: Record<string, unknown>) => expect(visible(store)).toEqual({ ...before, error: CANCEL_UNCONFIRMED, isCancelling: false });
+
+  describe("constants", () => {
+    it("Prepare waits 60 s and Cancel 45 s; the D-6 submit (60 s) and status (45 s) bounds are unchanged", () => {
+      expect(PREPARE_REQUEST_DEADLINE_MS).toBe(60_000);
+      expect(CANCEL_REQUEST_DEADLINE_MS).toBe(45_000);
+      expect(SUBMIT_REQUEST_DEADLINE_MS).toBe(60_000);
+      expect(STATUS_REQUEST_DEADLINE_MS).toBe(45_000);
+    });
+  });
+
+  describe("Prepare (R-04)", () => {
+    it("P1. an honest, timely answer is adopted and signed exactly as before; its timer is gone before signing", async () => {
+      const api = server({ prepare: () => prepareReply(), submit: submitted() });
+      const store = await reviewing();
+      await store.getState().confirmAndSend();
+
+      expect(store.getState()).toMatchObject({ status: "submitted", prepareNeedsCheck: null, error: null });
+      expect(store.getState().attempt).toMatchObject({ id: PREPARED_ID, state: "submitted" });
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(signPreparedPayment).mock.calls[0]![0]).toMatchObject({ expected: { recipient: ADDRESS, amountBaseUnits: "1000000" } });
+      expect(api.keys()).toEqual(["prepare", "submit"]);
+      // The prepare request is never given an abort signal.
+      expect(api.calls[0]!.signal).toBeUndefined();
+
+      // Nothing the deadline could do afterwards.
+      const after = visible(store);
+      await vi.advanceTimersByTimeAsync(10 * PREPARE_DEADLINE);
+      expect(visible(store)).toEqual(after);
+      expect(api.keys()).toEqual(["prepare", "submit"]);
+    });
+
+    it("P2. an honest handled failure keeps its existing classification (500 → uncertain, 409 → in progress, account_not_ready, 400 text)", async () => {
+      const cases: Array<[Response, Record<string, unknown>]> = [
+        [jsonResponse(500, { error: "boom", code: "prepare_outcome_uncertain" }), { status: "editing", prepareNeedsCheck: "uncertain", error: null }],
+        [jsonResponse(409, { error: "in progress" }), { status: "editing", prepareNeedsCheck: "in_progress", error: null }],
+        [jsonResponse(409, { error: "x", code: "account_not_ready" }), { status: "editing", prepareNeedsCheck: null, error: "We can't send payments from this account right now. This payment wasn't started." }],
+        [jsonResponse(400, { error: "You can't pay yourself." }), { status: "editing", prepareNeedsCheck: null, error: "You can't pay yourself." }],
+      ];
+      for (const [reply, expected] of cases) {
+        server({ prepare: () => reply });
+        const store = await reviewing();
+        await store.getState().confirmAndSend();
+        expect(store.getState()).toMatchObject(expected);
+        expect(signPreparedPayment).not.toHaveBeenCalled();
+        // The settled request's deadline is gone.
+        expect(vi.getTimerCount()).toBe(0);
+        const after = visible(store);
+        await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE);
+        expect(visible(store)).toEqual(after);
+      }
+    });
+
+    it("P3 / S1 / S2. no response headers: 'preparing' until 60 s − 1 ms, then exactly D-1's uncertain state — one request, nothing else", async () => {
+      const { api, store } = await preparing();
+
+      await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE - 1);
+      expect(store.getState()).toMatchObject({ status: "preparing", prepareNeedsCheck: null });
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.getState()).toMatchObject(UNCERTAIN);
+      expect(api.keys()).toEqual(["prepare"]);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+
+      // Nothing more happens by itself, however long the page stays open.
+      const atDeadline = visible(store);
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(visible(store)).toEqual(atDeadline);
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("P4. headers arrive but the body never finishes: the same D-1 outcome at 60 s", async () => {
+      const body = held<unknown>();
+      const api = server({ prepare: () => rawReply(() => body.promise) });
+      const store = await reviewing();
+      void store.getState().confirmAndSend();
+      await settle();
+      expect(store.getState().status).toBe("preparing");
+
+      await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE - 1);
+      expect(store.getState().status).toBe("preparing");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.getState()).toMatchObject(UNCERTAIN);
+
+      // The body finally arrives, honest and complete: dropped.
+      body.resolve(prepareBody());
+      await settle();
+      expect(store.getState()).toMatchObject(UNCERTAIN);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      expect(api.keys()).toEqual(["prepare"]);
+    });
+
+    it("P5. the server did reserve it: the user's own Check payment status adopts it through the existing read — not signed automatically", async () => {
+      const { api, store } = await timedOutPrepare({ latest: () => J(honestLatestBody(baseAttempt())) });
+
+      await store.getState().checkPreparedPayment();
+
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", prepareNeedsCheck: null, prepareCheck: "idle", subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", isAuthorizing: false });
+      expect(store.getState().attempt?.id).toBe(ATTEMPT_ID);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      expect(api.keys()).toEqual(["prepare", "latest"]);
+    });
+
+    it("P6. a late honest success after the deadline is not adopted, not scheduled and never signed", async () => {
+      const { gate, api, store, done } = await timedOutPrepare();
+      const before = visible(store);
+
+      gate.resolve(prepareReply());
+      await done;
+
+      expect(visible(store)).toEqual(before);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      expect(api.keys()).toEqual(["prepare"]);
+      // No expiry timer was armed for the late attempt, and Review stays hidden.
+      expect(vi.getTimerCount()).toBe(0);
+      await store.getState().review();
+      expect(store.getState().status).toBe("editing");
+    });
+
+    it("P7. a late failure changes nothing — while uncertain, and after the user's check released it", async () => {
+      const failures: Array<() => Response | Promise<Response>> = [
+        () => jsonResponse(400, { error: "You can't pay yourself." }),
+        () => jsonResponse(500, { error: "boom", code: "prepare_outcome_uncertain" }),
+        () => jsonResponse(409, { error: "x", code: "account_not_ready" }),
+        () => jsonResponse(409, { error: "in progress" }),
+        () => Promise.reject(new TypeError("Failed to fetch")),
+      ];
+      for (const failure of failures) {
+        // (a) still uncertain: a late 400 would otherwise put its own text on the form.
+        {
+          const { gate, store, done } = await timedOutPrepare();
+          const before = visible(store);
+          void Promise.resolve().then(failure).then(gate.resolve, gate.reject);
+          await done;
+          expect(visible(store)).toEqual(before);
+        }
+        // (b) released by "no payment is waiting": a late 500 / 409 would otherwise bring the requirement back.
+        {
+          const { gate, store, done } = await timedOutPrepare({ latest: () => J({ attempt: null }) });
+          await store.getState().checkPreparedPayment();
+          expect(store.getState()).toMatchObject({ prepareNeedsCheck: null, prepareCheck: "nothing_found" });
+          const before = visible(store);
+          void Promise.resolve().then(failure).then(gate.resolve, gate.reject);
+          await done;
+          expect(visible(store)).toEqual(before);
+        }
+      }
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("P8. a late malformed 200 does not take D-12's path: the released state stays released", async () => {
+      const { gate, store, done } = await timedOutPrepare({ latest: () => J({ attempt: null }) });
+      await store.getState().checkPreparedPayment();
+      const before = visible(store);
+
+      gate.resolve(J({ attempt: null }));
+      await done;
+
+      expect(visible(store)).toEqual(before);
+      expect(store.getState()).toMatchObject({ prepareNeedsCheck: null, prepareCheck: "nothing_found" });
+    });
+
+    it("P9. a late answer after the D-1 read adopted the server's payment leaves that recovered payment exactly as it is", async () => {
+      for (const late of [() => prepareReply(), () => jsonResponse(500, { error: "x" }), () => J({ attempt: null })]) {
+        const { gate, api, store, done } = await timedOutPrepare({ latest: () => J(honestLatestBody(baseAttempt())) });
+        await store.getState().checkPreparedPayment();
+        expect(store.getState()).toMatchObject({ status: "awaiting_authorization", prepareNeedsCheck: null });
+        const before = visible(store);
+
+        gate.resolve(late());
+        await done;
+
+        expect(visible(store)).toEqual(before);
+        expect(api.keys()).toEqual(["prepare", "latest"]);
+      }
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("P10. an older request settling during a newer Prepare neither clears the newer timer nor touches its state", async () => {
+      const gateA = held();
+      const gateB = held();
+      const api = server({ prepare: (n) => (n === 1 ? gateA.promise : gateB.promise), latest: () => J({ attempt: null }) });
+      const store = await reviewing();
+      const doneA = store.getState().confirmAndSend();
+      await settle();
+      await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE);
+      expect(store.getState()).toMatchObject(UNCERTAIN);
+      await store.getState().checkPreparedPayment();
+      await reviewing(store);
+      void store.getState().confirmAndSend();
+      await settle();
+      expect(store.getState().status).toBe("preparing");
+
+      // 10 s into B, A answers honestly — then A rejects in a second run below.
+      await vi.advanceTimersByTimeAsync(10_000);
+      gateA.resolve(prepareReply(PREPARED_ID));
+      await doneA;
+      expect(store.getState()).toMatchObject({ status: "preparing", attempt: null, prepareNeedsCheck: null });
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+
+      // B's own deadline still fires exactly 60 s after B started.
+      await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE - 10_000 - 1);
+      expect(store.getState().status).toBe("preparing");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.getState()).toMatchObject(UNCERTAIN);
+      expect(api.keys()).toEqual(["prepare", "latest", "prepare"]);
+    });
+
+    it("P10b. …and when the newer request answers in time, only ITS payment is adopted and signed", async () => {
+      const gateA = held();
+      const api = server({ prepare: (n) => (n === 1 ? gateA.promise : prepareReply(PREPARED_ID_2)), latest: () => J({ attempt: null }), submit: submitted(PREPARED_ID_2) });
+      const store = await reviewing();
+      const doneA = store.getState().confirmAndSend();
+      await settle();
+      await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE);
+      await store.getState().checkPreparedPayment();
+      await reviewing(store);
+      await store.getState().confirmAndSend();
+      expect(store.getState()).toMatchObject({ status: "submitted" });
+      expect(store.getState().attempt?.id).toBe(PREPARED_ID_2);
+
+      gateA.reject(new TypeError("Failed to fetch"));
+      await doneA;
+      expect(store.getState().attempt?.id).toBe(PREPARED_ID_2);
+      expect(store.getState().status).toBe("submitted");
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      expect(api.keys()).toEqual(["prepare", "latest", "prepare", "submit"]);
+    });
+
+    it("P11. an account switch: the deadline writes nothing for the other account, and a new lifecycle drops the timer", async () => {
+      // (a) the account changed but no new lifecycle yet: nothing is written at the deadline.
+      {
+        const { store, gate, done } = await preparing();
+        useRealAccountStore.setState({ account: ACCOUNT_B });
+        await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE);
+        expect(store.getState()).toMatchObject({ status: "preparing", prepareNeedsCheck: null });
+        gate.resolve(prepareReply());
+        await done;
+        expect(store.getState()).toMatchObject({ status: "preparing", attempt: null, prepareNeedsCheck: null });
+        useRealAccountStore.setState({ account: ACCOUNT_A });
+      }
+      // (b) the form's account-change init(): the timer goes with the lifecycle.
+      {
+        const { store, gate, done } = await preparing({ latest: () => J({ attempt: null }) });
+        useRealAccountStore.setState({ account: ACCOUNT_B });
+        await store.getState().init();
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE);
+        expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: null, attempt: null });
+        gate.resolve(prepareReply());
+        await done;
+        expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: null, attempt: null });
+      }
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("P12. reset() and detach() drop the timer: nothing is written at the deadline or by the late answer", async () => {
+      for (const end of ["reset", "detach"] as const) {
+        const { store, gate, done } = await preparing();
+        store.getState()[end]();
+        const after = visible(store);
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE);
+        expect(visible(store)).toEqual(after);
+        gate.resolve(prepareReply());
+        await done;
+        expect(visible(store)).toEqual(after);
+      }
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+    });
+
+    it("P13. after the deadline Review stays blocked — editing does not release it; only a successful check does", async () => {
+      const { api, store } = await timedOutPrepare({ latest: () => J({ attempt: null }) });
+
+      await store.getState().review();
+      expect(store.getState().status).toBe("editing");
+      store.getState().setAmountInput("2");
+      store.getState().setRecipientInput(ADDRESS);
+      await store.getState().review();
+      await store.getState().confirmAndSend();
+      expect(store.getState()).toMatchObject({ status: "editing", prepareNeedsCheck: "uncertain" });
+      expect(api.keys()).toEqual(["prepare"]);
+
+      await store.getState().checkPreparedPayment();
+      await store.getState().review();
+      expect(store.getState().status).toBe("reviewing");
+      expect(api.keys()).toEqual(["prepare", "latest"]);
+    });
+
+    it("P14. an answer at 60 s − 1 ms stops the timer before expiry scheduling and signing: it never fires into the passkey prompt", async () => {
+      const passkey = held<{ signature: string; activityId: string }>();
+      vi.mocked(signPreparedPayment).mockImplementation(() => passkey.promise as never);
+      const { gate, api, store } = await preparing({ submit: submitted() });
+
+      await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE - 1);
+      gate.resolve(prepareReply());
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isAuthorizing: true, prepareNeedsCheck: null });
+      expect(signPreparedPayment).toHaveBeenCalledTimes(1);
+      // The one timer left is the approval window's own (validUntil) — the prepare deadline did not survive into the prompt.
+      expect(vi.getTimerCount()).toBe(1);
+
+      // Well past the prepare deadline, with the passkey sheet still open.
+      await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", isAuthorizing: true, prepareNeedsCheck: null, error: null });
+      expect(store.getState().attempt?.id).toBe(PREPARED_ID);
+
+      passkey.resolve({ signature: APPROVAL.signature, activityId: APPROVAL.activityId });
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "submitted" });
+      expect(api.keys()).toEqual(["prepare", "submit"]);
+    });
+
+    it("the deadline never overwrites a screen that is no longer 'preparing' (a programmatic editAgain(); the form offers nothing while preparing)", async () => {
+      const { store } = await preparing();
+      store.getState().editAgain();
+      const after = visible(store);
+      await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE);
+      expect(visible(store)).toEqual(after);
+      expect(store.getState().prepareNeedsCheck).toBeNull();
+    });
+  });
+
+  describe("Cancel (R-03)", () => {
+    it("C1. an honest, timely success clears the payment exactly as before; no timer is left", async () => {
+      const api = server({ cancel: () => cancelledReply() });
+      const store = holding();
+      await store.getState().cancel();
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null, pendingSubmission: null, authorizingCredentialId: null, isCancelling: false, error: null });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(api.keys()).toEqual(["cancel"]);
+      expect(api.calls[0]!.signal).toBeUndefined();
+    });
+
+    it("C2. an honest, timely refusal takes the existing reconciliation (one status read) — and the POST deadline is gone before that read", async () => {
+      const status = held();
+      const { gate, api, store } = await cancelling({ status: () => status.promise });
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      gate.resolve(refused());
+      await settle();
+      expect(store.getState().isCancelling).toBe(false);
+      expect(api.keys()).toEqual(["cancel", "status"]);
+
+      // The POST's own 45 s passes while the status read is still waiting: the POST deadline writes nothing.
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE - 10_000);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: null });
+
+      status.resolve(statusReply("submitted"));
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "submitted", error: CANCEL_LOST_RACE });
+      expect(api.keys()).toEqual(["cancel", "status"]);
+    });
+
+    it("C3 / C15 / S1 / S2. no headers: still cancelling at 45 s − 1 ms; at 45 s the slot is free and only the fixed message changes", async () => {
+      const { api, store, before } = await cancelling();
+
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE - 1);
+      expect(store.getState()).toMatchObject({ isCancelling: true, error: null });
+
+      await vi.advanceTimersByTimeAsync(1);
+      afterCancelTimeout(store, before);
+      // The payment, its status, the saved approval and the signing context are all still there.
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", pendingSubmission: APPROVAL, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1" });
+      expect(visible(store).attempt).toEqual(before.attempt);
+      expect(api.keys()).toEqual(["cancel"]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("C4. headers arrive but the success body never finishes: the same outcome at 45 s, and the late body is dropped", async () => {
+      const body = held<unknown>();
+      const api = server({ cancel: () => rawReply(() => body.promise) });
+      const store = holding();
+      const before = visible(store);
+      const done = store.getState().cancel();
+      await settle();
+      expect(store.getState().isCancelling).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE - 1);
+      expect(store.getState().isCancelling).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
+      afterCancelTimeout(store, before);
+
+      body.resolve({ attempt: attemptOf("cancelled") });
+      await done;
+      afterCancelTimeout(store, before);
+      expect(api.keys()).toEqual(["cancel"]);
+    });
+
+    it("C5 / C6. the Cancel may well have succeeded: the timeout does not clear the payment, and a late honest success is not adopted", async () => {
+      const { gate, api, store, done, before } = await cancelling();
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+      afterCancelTimeout(store, before);
+
+      gate.resolve(cancelledReply());
+      await done;
+
+      afterCancelTimeout(store, before);
+      expect(store.getState().attempt?.id).toBe(ATTEMPT_ID);
+      expect(api.keys()).toEqual(["cancel"]);
+    });
+
+    it("C7. a late refusal moves no epoch and reads nothing: a status read the user started afterwards is still applied", async () => {
+      const status = held();
+      const { gate, api, store, done } = await cancelling({ status: () => status.promise });
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+
+      void store.getState().checkStatus();
+      await settle();
+      expect(api.keys()).toEqual(["cancel", "status"]);
+
+      gate.resolve(refused());
+      await done;
+      expect(api.keys()).toEqual(["cancel", "status"]);
+
+      status.resolve(statusReply("submitted"));
+      await settle();
+      expect(store.getState()).toMatchObject({ status: "submitted", error: null });
+      expect(api.keys()).toEqual(["cancel", "status"]);
+    });
+
+    it("C8. a late malformed answer (or a late rejection) is ignored: it does not bring the message back over a newer answered read", async () => {
+      const lates: Array<(gate: ReturnType<typeof held<Response>>) => void> = [
+        (gate) => gate.resolve(J({ attempt: null })),
+        (gate) => gate.resolve(J({ attempt: attemptOf("cancelled", { id: ATTEMPT_ID_2 }) })),
+        (gate) => gate.resolve(rawReply(async () => Promise.reject(new SyntaxError("Unexpected token")))),
+        (gate) => gate.reject(new TypeError("Failed to fetch")),
+      ];
+      for (const late of lates) {
+        const { gate, api, store, done } = await cancelling({ status: () => statusReply("awaiting_authorization") });
+        await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+        await store.getState().checkStatus();
+        expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: null });
+        const before = visible(store);
+
+        late(gate);
+        await done;
+
+        expect(visible(store)).toEqual(before);
+        expect(api.keys()).toEqual(["cancel", "status"]);
+      }
+    });
+
+    it("C9. a status read that answers while Cancel waits stays authoritative: the timeout changes only the message and the slot", async () => {
+      const { gate, api, store, done } = await cancelling({ status: () => statusReply("submitted") });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await store.getState().checkStatus();
+      expect(store.getState()).toMatchObject({ status: "submitted", isCancelling: true });
+      const answered = visible(store);
+
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE - 10_000);
+      // (The manual check's own 30 s cooldown has ended meanwhile — its timer, not the Cancel deadline.)
+      expect(visible(store)).toEqual({ ...answered, error: CANCEL_UNCONFIRMED, isCancelling: false, isManualCheckCoolingDown: false });
+
+      gate.resolve(cancelledReply());
+      await done;
+      expect(store.getState()).toMatchObject({ status: "submitted", error: CANCEL_UNCONFIRMED });
+      expect(store.getState().attempt).toMatchObject({ id: ATTEMPT_ID, state: "submitted" });
+      expect(api.keys()).toEqual(["cancel", "status"]);
+    });
+
+    it("C10. Cancel and Continue interleaved: the timeout starts nothing — one Cancel, one submit of the saved approval, no new signature", async () => {
+      const submit = held();
+      const { gate, api, store, done } = await cancelling({ submit: () => submit.promise });
+      void store.getState().resumeAuthorization();
+      await settle();
+      expect(store.getState().status).toBe("submitting");
+
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+      expect(store.getState()).toMatchObject({ status: "submitting", error: CANCEL_UNCONFIRMED, isCancelling: false, pendingSubmission: APPROVAL });
+
+      gate.resolve(refused());
+      await done;
+      expect(store.getState()).toMatchObject({ status: "submitting", pendingSubmission: APPROVAL });
+
+      // D-6 still bounds the submit, 60 s after it was sent.
+      await vi.advanceTimersByTimeAsync(SUBMIT_REQUEST_DEADLINE_MS - CANCEL_DEADLINE);
+      expect(store.getState()).toMatchObject({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE, pendingSubmission: APPROVAL });
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      expect(api.keys()).toEqual(["cancel", "submit"]);
+    });
+
+    it("C11. after the timeout an explicit second press sends exactly one more POST; a refusal then takes the existing reconciliation", async () => {
+      const second = held();
+      const api = server({ cancel: (n) => (n === 1 ? new Promise<Response>(() => {}) : second.promise), status: () => statusReply("cancelled") });
+      const store = holding();
+      void store.getState().cancel();
+      await settle();
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+      expect(store.getState()).toMatchObject({ isCancelling: false, error: CANCEL_UNCONFIRMED });
+
+      void store.getState().cancel();
+      await settle();
+      void store.getState().cancel();
+      await settle();
+      expect(store.getState().isCancelling).toBe(true);
+      expect(api.keys()).toEqual(["cancel", "cancel"]);
+
+      // The first POST won on the server; the second is refused against the already-cancelled row.
+      second.resolve(jsonResponse(409, { error: "This payment can no longer be cancelled (state: cancelled)." }));
+      await settle();
+      expect(api.keys()).toEqual(["cancel", "cancel", "status"]);
+      expect(store.getState()).toMatchObject({ status: "editing", isCancelling: false, error: CANCEL_LOST_RACE });
+      expect(store.getState().attempt).toMatchObject({ id: ATTEMPT_ID, state: "cancelled" });
+    });
+
+    it("C12. the old POST settling cannot release the newer press's slot or clear its deadline", async () => {
+      for (const late of ["success", "refusal", "rejection"] as const) {
+        const first = held();
+        const api = server({ cancel: (n) => (n === 1 ? first.promise : new Promise<Response>(() => {})) });
+        const store = holding();
+        const doneFirst = store.getState().cancel();
+        await settle();
+        await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+        void store.getState().cancel();
+        await settle();
+        await vi.advanceTimersByTimeAsync(10_000);
+        const during = visible(store);
+
+        if (late === "success") first.resolve(cancelledReply());
+        else if (late === "refusal") first.resolve(refused());
+        else first.reject(new TypeError("Failed to fetch"));
+        await doneFirst;
+
+        expect(visible(store)).toEqual(during);
+        expect(store.getState().isCancelling).toBe(true);
+        void store.getState().cancel();
+        await settle();
+        expect(api.keys()).toEqual(["cancel", "cancel"]);
+
+        // The second press's own deadline, 45 s after IT started.
+        await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE - 10_000 - 1);
+        expect(store.getState().isCancelling).toBe(true);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(store.getState()).toMatchObject({ isCancelling: false, error: CANCEL_UNCONFIRMED, status: "awaiting_authorization" });
+        expect(api.keys()).toEqual(["cancel", "cancel"]);
+        store.getState().reset();
+      }
+    });
+
+    it("C13. reset() / detach() drop the timer; an account switch makes the deadline free the slot without writing the message", async () => {
+      for (const end of ["reset", "detach"] as const) {
+        const { gate, store, done } = await cancelling();
+        store.getState()[end]();
+        const after = visible(store);
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+        expect(visible(store)).toEqual(after);
+        gate.resolve(cancelledReply());
+        await done;
+        expect(visible(store)).toEqual(after);
+      }
+      {
+        const { gate, store, done, before } = await cancelling();
+        useRealAccountStore.setState({ account: ACCOUNT_B });
+        await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+        expect(visible(store)).toEqual({ ...before, isCancelling: false });
+        gate.resolve(cancelledReply());
+        await done;
+        expect(visible(store)).toEqual({ ...before, isCancelling: false });
+      }
+    });
+
+    it("C14. nothing is retried or read by itself after the timeout, however long the page stays open", async () => {
+      const { api, store, before } = await cancelling();
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      afterCancelTimeout(store, before);
+      expect(api.keys()).toEqual(["cancel"]);
+    });
+  });
+
+  describe("shared", () => {
+    it("S3. late rejections after either deadline are handled: no unhandled rejection, no state change", async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        const prep = await timedOutPrepare();
+        const prepBefore = visible(prep.store);
+        prep.gate.reject(new TypeError("Failed to fetch"));
+        await prep.done;
+
+        const canc = await cancelling();
+        await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE);
+        const cancBefore = visible(canc.store);
+        canc.gate.reject(new TypeError("Failed to fetch"));
+        await canc.done;
+
+        // Real macrotask turns, so Node gets its chance to report an unhandled rejection.
+        vi.useRealTimers();
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        expect(visible(prep.store)).toEqual(prepBefore);
+        expect(visible(canc.store)).toEqual(cancBefore);
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
+    });
+
+    it("S4. an overdue timer that runs before the answer's continuation decides the request: the answer is then dropped", async () => {
+      {
+        const { gate, store, done } = await preparing({ submit: submitted() });
+        gate.resolve(prepareReply());
+        vi.advanceTimersByTime(PREPARE_DEADLINE); // synchronous: the timer runs before any continuation
+        expect(store.getState()).toMatchObject(UNCERTAIN);
+        await done;
+        expect(store.getState()).toMatchObject(UNCERTAIN);
+        expect(signPreparedPayment).not.toHaveBeenCalled();
+      }
+      {
+        const { gate, api, store, done, before } = await cancelling();
+        gate.resolve(cancelledReply());
+        vi.advanceTimersByTime(CANCEL_DEADLINE);
+        afterCancelTimeout(store, before);
+        await done;
+        afterCancelTimeout(store, before);
+        expect(api.keys()).toEqual(["cancel"]);
+      }
+    });
+
+    it("S5. an answer whose continuation runs before the overdue timer wins: adopted exactly as a timely one, and the timer never acts", async () => {
+      {
+        const { gate, api, store, done } = await preparing({ submit: submitted() });
+        vi.advanceTimersByTime(PREPARE_DEADLINE - 1);
+        gate.resolve(prepareReply());
+        await done;
+        expect(store.getState()).toMatchObject({ status: "submitted", prepareNeedsCheck: null });
+        vi.advanceTimersByTime(1);
+        await settle();
+        expect(store.getState()).toMatchObject({ status: "submitted", prepareNeedsCheck: null, error: null });
+        expect(api.keys()).toEqual(["prepare", "submit"]);
+      }
+      {
+        const { gate, api, store, done } = await cancelling();
+        vi.advanceTimersByTime(CANCEL_DEADLINE - 1);
+        gate.resolve(cancelledReply());
+        await done;
+        vi.advanceTimersByTime(1);
+        await settle();
+        expect(store.getState()).toMatchObject({ status: "editing", attempt: null, error: null, isCancelling: false });
+        expect(api.keys()).toEqual(["cancel"]);
+      }
+    });
+
+    it("S6. the D-6 submit deadline is unchanged after a Prepare that answered late in its window", async () => {
+      const submit = held();
+      const { gate, store } = await preparing({ submit: () => submit.promise });
+      await vi.advanceTimersByTimeAsync(30_000);
+      gate.resolve(prepareReply());
+      await settle();
+      expect(store.getState().status).toBe("submitting");
+
+      // The prepare's would-be deadline (60 s after it started) passes: nothing.
+      await vi.advanceTimersByTimeAsync(PREPARE_DEADLINE - 30_000);
+      expect(store.getState()).toMatchObject({ status: "submitting", prepareNeedsCheck: null });
+      // The submit's own 60 s.
+      await vi.advanceTimersByTimeAsync(SUBMIT_REQUEST_DEADLINE_MS - (PREPARE_DEADLINE - 30_000) - 1);
+      expect(store.getState().status).toBe("submitting");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.getState()).toMatchObject({ status: "unknown", error: SUBMIT_UNCONFIRMED_MESSAGE });
+    });
+
+    it("S7. a refused Cancel's status read keeps its own 45 s, counted from the read — not from the POST", async () => {
+      const { gate, api, store } = await cancelling({ status: () => new Promise<Response>(() => {}) });
+      await vi.advanceTimersByTimeAsync(20_000);
+      gate.resolve(refused());
+      await settle();
+      expect(api.keys()).toEqual(["cancel", "status"]);
+
+      await vi.advanceTimersByTimeAsync(CANCEL_DEADLINE - 20_000);
+      expect(store.getState()).toMatchObject({ error: null, status: "awaiting_authorization" });
+      await vi.advanceTimersByTimeAsync(STATUS_REQUEST_DEADLINE_MS - (CANCEL_DEADLINE - 20_000) - 1);
+      expect(store.getState().error).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.getState()).toMatchObject({ error: CANCEL_UNCONFIRMED, status: "awaiting_authorization" });
+      expect(api.keys()).toEqual(["cancel", "status"]);
     });
   });
 });

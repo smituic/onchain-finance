@@ -177,7 +177,8 @@ export type RealPaymentStore = {
    * L-2 D-1: set when a prepare request ended without a trustworthy answer
    * (HTTP 500 including the server's `prepare_outcome_uncertain`, HTTP 409 —
    * except, since L-2 D-2, the exact `account_not_ready` refusal — a network
-   * failure or an unreadable reply). A payment MAY exist on the server
+   * failure or an unreadable reply; R-04: or no answer within
+   * PREPARE_REQUEST_DEADLINE_MS). A payment MAY exist on the server
    * even though this page never saw it — and an existing one holds the account's
    * only active-payment slot. While set, Review is not offered and review() /
    * confirmAndSend() refuse: the one way out is a successful, current
@@ -196,7 +197,11 @@ export type RealPaymentStore = {
   sessionRecovery: null | "signed_out" | "not_accessible";
   /** L-2 D-1: where the explicit status check stands. "nothing_found" is the confirmation that no active payment exists (shown once; cleared by the next Review). "unavailable" means the check itself failed — it proves nothing about any payment. */
   prepareCheck: "idle" | "checking" | "unavailable" | "nothing_found";
-  /** L-2 D-1: true while this page's one Cancel request is on its way. A second press is ignored; nothing is retried or released locally. */
+  /**
+   * L-2 D-1: true while this page's one Cancel request is on its way. A second press is ignored; nothing is retried or released locally.
+   * R-03: once CANCEL_REQUEST_DEADLINE_MS passes without an answer, the page stops waiting — this turns false and the user may press
+   * Cancel again (one more POST per press, never automatically). The first request may still be cancelling on the server.
+   */
   isCancelling: boolean;
   /**
    * Reload/restore: never signs, never submits, never resends — see server/payments.ts's resolveLatestPayment.
@@ -443,6 +448,27 @@ function classifySessionFailure(error: unknown): { reason: "signed_out" | "not_a
  * outcome is then simply unknown, never "failed" and never "not sent".
  */
 export const SUBMIT_REQUEST_DEADLINE_MS = 60_000;
+
+/**
+ * R-04 (post-L-2 D, not a numbered slice): the client's own bound on one POST
+ * /prepare — the response headers AND the body read — counted from the moment
+ * the request is sent. It ends OUR wait only: the request is NOT aborted, and
+ * the server may still reserve or prepare the payment. When it passes, the page
+ * takes D-1's existing uncertain-prepare state; it never means the payment was
+ * not set up, and nothing is retried, read, signed or cancelled because of it.
+ */
+export const PREPARE_REQUEST_DEADLINE_MS = 60_000;
+
+/**
+ * R-03 (post-L-2 D, not a numbered slice): the client's own bound on one POST
+ * /cancel — the response headers AND the success body read. It ends OUR wait
+ * only: the request is NOT aborted and may still cancel the payment. When it
+ * passes, the page frees its Cancel slot and shows the existing "could not
+ * confirm" message; it never means the payment was or was not cancelled, and
+ * nothing is retried or read automatically. A refused Cancel's follow-up status
+ * read is a separate request with its own STATUS_REQUEST_DEADLINE_MS.
+ */
+export const CANCEL_REQUEST_DEADLINE_MS = 45_000;
 
 /**
  * L-2 D-4: the ONE submit refusal that is definitive about THIS request — HTTP
@@ -1094,12 +1120,19 @@ export function createRealPaymentStore() {
   // L-2 D-1: at most one explicit prepared-payment check (one /latest read) and
   // one Cancel request in flight per lifecycle. Identity markers, not booleans:
   // a lifecycle change drops them, and a late settle never clears a newer one.
+  // R-03: the Cancel slot is also freed when its POST's client deadline passes.
   let preparedCheck: object | null = null;
   let cancelRequest: object | null = null;
   // L-2 D-6: at most ONE submit deadline timer per store — the active submit
   // request's. An identity marker, not a boolean: a stopped, superseded or
   // lifecycle-dropped request's timer can never act for a newer one.
   let submitRequest: { timerId: ReturnType<typeof setTimeout> } | null = null;
+  // R-04 / R-03 (post-L-2 D): the same D-6 pattern for the ONE Prepare request
+  // and the ONE Cancel POST — at most one deadline timer each, held by an
+  // identity marker: a settled, superseded or lifecycle-dropped request's timer
+  // can never act, and an older request's cleanup never touches a newer marker.
+  let prepareRequestDeadline: { timerId: ReturnType<typeof setTimeout> } | null = null;
+  let cancelRequestDeadline: { timerId: ReturnType<typeof setTimeout> } | null = null;
 
   /** Ends the active submit request's deadline timer, if any. Idempotent; the request itself is untouched. */
   function clearSubmitRequestDeadline() {
@@ -1107,6 +1140,67 @@ export function createRealPaymentStore() {
       clearTimeout(submitRequest.timerId);
       submitRequest = null;
     }
+  }
+
+  /** Ends the active Prepare request's deadline timer, if any. Idempotent; the request itself is untouched. */
+  function clearPrepareRequestDeadline() {
+    if (prepareRequestDeadline !== null) {
+      clearTimeout(prepareRequestDeadline.timerId);
+      prepareRequestDeadline = null;
+    }
+  }
+
+  /** Ends the active Cancel POST's deadline timer, if any. Idempotent; the request itself is untouched. */
+  function clearCancelRequestDeadline() {
+    if (cancelRequestDeadline !== null) {
+      clearTimeout(cancelRequestDeadline.timerId);
+      cancelRequestDeadline = null;
+    }
+  }
+
+  /**
+   * R-04: arms the ONE client deadline for the Prepare request about to be sent.
+   * `onDeadline` runs only if this very request is still the active one when
+   * PREPARE_REQUEST_DEADLINE_MS passes (not stopped, not superseded, not dropped
+   * by a lifecycle change). Returns the function that stops it — called the
+   * moment the request settles, and a no-op for any other request's marker.
+   * Nothing is aborted.
+   */
+  function startPrepareRequestDeadline(onDeadline: () => void): () => void {
+    // A Prepare starts only from the review screen, never while one is waiting; a leftover marker is dropped, never allowed to act.
+    clearPrepareRequestDeadline();
+    const marker: { timerId: ReturnType<typeof setTimeout> } = {
+      timerId: setTimeout(() => {
+        if (prepareRequestDeadline !== marker) return;
+        prepareRequestDeadline = null;
+        onDeadline();
+      }, PREPARE_REQUEST_DEADLINE_MS),
+    };
+    prepareRequestDeadline = marker;
+    return () => {
+      if (prepareRequestDeadline !== marker) return;
+      clearTimeout(marker.timerId);
+      prepareRequestDeadline = null;
+    };
+  }
+
+  /** R-03: the same contract for the ONE Cancel POST (CANCEL_REQUEST_DEADLINE_MS). */
+  function startCancelRequestDeadline(onDeadline: () => void): () => void {
+    // A Cancel POST starts only when no other holds the slot; a leftover marker is dropped, never allowed to act.
+    clearCancelRequestDeadline();
+    const marker: { timerId: ReturnType<typeof setTimeout> } = {
+      timerId: setTimeout(() => {
+        if (cancelRequestDeadline !== marker) return;
+        cancelRequestDeadline = null;
+        onDeadline();
+      }, CANCEL_REQUEST_DEADLINE_MS),
+    };
+    cancelRequestDeadline = marker;
+    return () => {
+      if (cancelRequestDeadline !== marker) return;
+      clearTimeout(marker.timerId);
+      cancelRequestDeadline = null;
+    };
   }
 
   /** Milliseconds left on the retry deadline for this attempt and the signed-in account; 0 when none. A deadline that no longer applies is dropped on sight. */
@@ -1172,6 +1266,9 @@ export function createRealPaymentStore() {
     cancelRequest = null;
     // L-2 D-6: a submit request's deadline never outlives its lifecycle (the request's own answer is discarded by its generation check).
     clearSubmitRequestDeadline();
+    // R-04 / R-03: nor does a Prepare's or a Cancel POST's (their late answers are discarded by their own lifecycle checks).
+    clearPrepareRequestDeadline();
+    clearCancelRequestDeadline();
   }
 
   return create<RealPaymentStore>()((set, get) => {
@@ -1883,11 +1980,28 @@ export function createRealPaymentStore() {
         // and nothing may be signed for a context that has since been replaced.
         const myGeneration = generation;
         const preparedFor = currentSubject();
+        // R-04: the client's own bound on this one request (headers AND body — the whole api() call), started where the request
+        // is. Same shape as D-6: the request keeps its plain await and is NOT aborted. If the timer wins, this request is decided:
+        // the page takes D-1's existing uncertain-prepare state (the draft and the account context stay; Review stays hidden until
+        // the user's own Check payment status releases it), and whatever the request later answers or rejects with is dropped by
+        // `timedOut` — before every lifecycle guard, validation and adoption, so a late answer can never adopt a payment, arm a
+        // timer or open the passkey prompt. A timeout proves nothing about the server: a payment may well have been reserved.
+        let timedOut = false;
+        const stopDeadline = startPrepareRequestDeadline(() => {
+          timedOut = true;
+          // Only the lifecycle and account that sent it, and only while it is still shown as preparing.
+          if (detached || myGeneration !== generation || currentSubject() !== preparedFor || get().status !== "preparing") return;
+          set({ status: "editing", error: null, prepareNeedsCheck: "uncertain", prepareCheck: "idle" });
+        });
         try {
           const result = await api<{ attempt: RealPaymentAttempt; subOrganizationId: string; authorizingCredentialId: string; serverNowSeconds: number }>("/api/real/payments/prepare", {
             method: "POST",
             body: JSON.stringify(body),
           });
+          // Settled: the timer goes before anything is adopted, scheduled or signed — it can never fire into the passkey prompt.
+          stopDeadline();
+          // After the deadline this request was already answered for: its late answer is dropped, whatever it says.
+          if (timedOut) return;
           if (detached || myGeneration !== generation || currentSubject() !== preparedFor) return;
           // L-2 D-12: a 200 that is not this request's own payment, in the shape the server sends, is NOT adopted and NOT signed: it
           // proves nothing about whether a payment was reserved, so it takes D-1's uncertain-prepare state exactly — the typed text,
@@ -1915,6 +2029,9 @@ export function createRealPaymentStore() {
           endManualCooldown();
           await scheduleOrRunExpiryCheck();
         } catch (error) {
+          stopDeadline();
+          // A late rejection (network failure, unreadable body) after the deadline is dropped like a late answer.
+          if (timedOut) return;
           if (detached || myGeneration !== generation || currentSubject() !== preparedFor) return;
           // The server no longer finds the name (404) or refused the request
           // itself (400, e.g. paying yourself): the earlier lookup answer is
@@ -1976,10 +2093,27 @@ export function createRealPaymentStore() {
           set({ isCancelling: false });
         };
 
+        // R-03: the client's own bound on this one POST (headers AND the success body read), started where the request is. Same
+        // shape as D-6: the request keeps its plain awaits and is NOT aborted. If the timer wins, this request is decided: its slot
+        // is freed (so the user may explicitly press Cancel again — nothing is resent by itself) and, for the same lifecycle,
+        // attempt and account, the existing "could not confirm" message is shown — the status, attempt, approval and account
+        // context stay exactly as they are. Whatever the request later answers or rejects with is dropped by `timedOut` at every
+        // await: a late success never clears the payment, and a late refusal never moves the epoch or reads status. A timeout
+        // proves nothing: the payment may or may not have been cancelled.
+        let timedOut = false;
+        const stopDeadline = startCancelRequestDeadline(() => {
+          timedOut = true;
+          releaseCancel();
+          if (isCurrent()) set({ error: CANCEL_UNCONFIRMED_MESSAGE });
+        });
+
         let response: Response;
         try {
           response = await fetch(`/api/real/payments/${attempt.id}/cancel`, { method: "POST" });
         } catch {
+          stopDeadline();
+          // A late rejection after the deadline: already answered for.
+          if (timedOut) return;
           releaseCancel();
           // Part D: a network-level failure means we don't know whether the
           // request ever reached the server — never imply cancellation
@@ -1988,9 +2122,12 @@ export function createRealPaymentStore() {
           if (isCurrent()) set({ error: CANCEL_UNCONFIRMED_MESSAGE });
           return;
         }
+        // A late answer after the deadline — success, refusal or anything else — is dropped before it is read.
+        if (timedOut) return;
         if (response.ok) {
           // L-2 D-11: the confirmation is read while THIS request still owns the slot (a repeat press during the body read must not
           // dispatch a second POST). Everything after the final await — release, guard, validation, result — is synchronous.
+          // R-03: the body read is still inside this request's deadline.
           let body: unknown;
           let bodyReadable = true;
           try {
@@ -1998,6 +2135,9 @@ export function createRealPaymentStore() {
           } catch {
             bodyReadable = false;
           }
+          stopDeadline();
+          // The deadline won during the body read: this request was already answered for, whatever the body says.
+          if (timedOut) return;
           releaseCancel();
           if (!isCurrent()) return;
           if (!bodyReadable || !isHonestCancelResponse(body, attempt)) {
@@ -2038,7 +2178,9 @@ export function createRealPaymentStore() {
           return;
         }
 
-        // Non-2xx: never parsed by the success check above.
+        // Non-2xx: never parsed by the success check above. The POST's own deadline ends here (`timedOut` was checked above with
+        // no await since), before any follow-up status read — which has its own STATUS_REQUEST_DEADLINE_MS.
+        stopDeadline();
         releaseCancel();
         if (!isCurrent()) return;
 

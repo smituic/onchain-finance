@@ -489,3 +489,81 @@ The approved boundary above is explicit now. Its **effective checkpoint** depend
 ### 9. Evidence limitations
 
 Source-only audit; the Builder ran no tests, builds, provider, database, browser or passkey operation and no live payment. Nothing here proves that any recovery path works under a real network fault. Frozen production hashes are unchanged by this record: `lib/real/payments/client-sign.ts` `1c46fbe9…dfe9`, `lib/stores/real-payment-store.ts` `99e1be1e…2fef`, `components/real/real-pay-form.tsx` `eaec77ec…f92a`; they stay frozen (don't edit without a fresh audit).
+
+## R-03 / R-04 — Bounded Prepare and Cancel Client Waits (post-L-2 D availability improvement; not a numbered D slice, not D-14, no milestone number; client-only, payment store only; implementation COMPLETE; offline verification COMPLETE; independent combined technical/documentation audit PENDING; operator Git checkpoint PENDING; NOT closed; broader L-2 D stays CLOSED for its approved development scope; L-2 C and overall L-2 OPEN; NOT deployable)
+
+ARCHITECTURE.md's "R-03 / R-04 — Bounded Prepare and Cancel Client Waits" is the summary; this is the full record, dated 2026-11-23. Nothing above this line is edited. R-03 and R-04 stay recorded in the L-2 D closure register above as **accepted Low residuals at that checkpoint**; this entry records a later, separately authorized engineering change that addresses them. It does **not** reopen broader L-2 D, does not add a D number, and does not claim R-03 / R-04 are closed: that needs the independent combined audit and the operator's Git checkpoint, and Git history will be the identity of that commit (none is invented here).
+
+### 1. Authorization and scope
+
+- A separate independent scope audit returned **Verdict A: GO** (operator/control-room reported; the report itself was not supplied to the Builder). The control room approved the design and the policies below.
+- **Write scope used:** one production file, `lib/stores/real-payment-store.ts`; one test file, `test/lib/stores/real-payment-store.test.ts`; four documentation files (ARCHITECTURE.md, CLAUDE.md, ROADMAP.md, this archive). The conditional form test file was **not** needed and is untouched. No server, route, schema, migration, dependency, lint configuration, account store, signing helper, Pay form or Practice file changed.
+
+### 2. Contract
+
+| | Prepare (R-04) | Cancel (R-03) |
+|---|---|---|
+| Constant | `PREPARE_REQUEST_DEADLINE_MS = 60_000` | `CANCEL_REQUEST_DEADLINE_MS = 45_000` |
+| Armed | immediately before `POST /api/real/payments/prepare` | immediately before `POST /api/real/payments/{id}/cancel` |
+| Covers | the whole `api()` call: response headers **and** `response.json()` | the fetch **and** the success-body `response.json()` (the only body the existing path reads) |
+| Disarmed | the moment the request settles (success or catch), before D-12 validation, adoption, expiry scheduling or signing | after the success body is read, in the fetch catch, or on a non-2xx — always before the refused-Cancel status read |
+| On deadline (same lifecycle, account, and still `preparing` / same attempt) | D-1's existing uncertain-prepare state: `status: "editing"`, `error: null`, `prepareNeedsCheck: "uncertain"`, `prepareCheck: "idle"`; draft, recipient, amount, account and generation kept | the Cancel slot is released for this request only, `isCancelling: false`, and only the existing `CANCEL_UNCONFIRMED_MESSAGE` is shown; status, attempt, approval (`pendingSubmission`), signing context, expiry/recovery state and account kept |
+| Never on deadline | a second Prepare, a status read, authorization, Review, release of D-1 uncertainty | success, refusal, an automatic status read, another Cancel, a return to the editing form |
+
+A client deadline is **not** a server execution deadline. A timeout does not mean the payment was never reserved, that Cancel did or did not execute, that the payment failed, that a signature was revoked, or that a new payment can safely begin.
+
+### 3. Architecture (D-6 pattern)
+
+- One store-level identity marker per operation (`prepareRequestDeadline`, `cancelRequestDeadline`, each `{ timerId } | null`), a timer per request, a per-request captured `timedOut` flag, the existing plain `await` and `try/catch`. **No `Promise.race`, no `AbortController`, no extra network call, no shared deadline framework, no `Date.now()` arithmetic, no extra promise hop on the honest path.**
+- `startPrepareRequestDeadline` / `startCancelRequestDeadline` return a stop function that acts only while the marker is still its own, so an older request's settlement never clears a newer request's timer. The timer wrapper also acts only while its marker is current.
+- The Prepare callback writes only if the marker, the lifecycle (`detached`, `generation`), the account (`currentSubject()`) and the screen (`status === "preparing"`) all still agree; the Cancel callback writes the message only under the existing `isCurrent()` (generation, attempt id, account). Neither calls `markTransition()`.
+- Both markers are cleared by `clearFollowUpState()` (so by `init()`, `reset()`, `detach()` and the form's account-change `init()`), next to D-6's submit marker and D-3a's / status-read timers, which are unchanged.
+
+### 4. Late-result suppression
+
+- **Prepare:** `timedOut` is checked right after the settle — before the lifecycle guard, D-12 validation, adoption, `markTransition`, expiry scheduling and `authorizeAndSubmit` — in the success path **and** the catch. A late honest, failed or malformed answer cannot adopt an attempt, arm a timer, open the passkey prompt, clear or re-set `prepareNeedsCheck`, restore Review, overwrite a D-1 result or change account context. Because the timer is disarmed before adoption, a Prepare deadline can never fire during a valid passkey prompt.
+- **Cancel:** `timedOut` is checked in the fetch catch, after the fetch resolves (before the 2xx / non-2xx split), and after the success body is read. A late success never clears the payment; a late refusal never moves the epoch or reads status; a late malformed answer or rejection writes nothing; an old request never releases a newer press's slot.
+
+### 5. Repeat Cancel (control-room accepted)
+
+After 45 s the slot is free and the user may press Cancel again; each press sends exactly one POST, never automatically. The first POST may still be running on the server, so two client POSTs can overlap. The server's `resolveCancelPayment` (unchanged) transitions only from the row's own current state among `prepared` / `awaiting_authorization` / `signed` with exact-id, literal-source-state compare-and-set: at most one transition wins, and a repeat against an already-cancelled or progressed row answers HTTP 409. That 409 takes the existing refused-Cancel reconciliation (one bounded status read); a 409 is not treated as proof of dispatch. If the first POST had cancelled the row, the second press's reconciliation shows the cancelled row on the editing screen with the existing "could not be cancelled — it may already be on its way" wording — the already-accepted R-08 copy limitation, not a new unsafe state. Source review found no repeat-Cancel path that bypasses the server's compare-and-set.
+
+### 6. Accepted residuals and limitations
+
+- **R-10 window widens (accepted, bounded, localhost development).** After a Prepare timeout the original request may still be pending on the server. A D-1 check that reads `/latest` before that reservation commits can release the requirement under R-10's existing policy, and a new Prepare may follow; the server's one-active-payment rule and compare-and-set stay the safeguards (a second reservation is refused as in-progress). Not declared impossible; server guarantees unchanged.
+- **Message precedence.** A Cancel timeout for the current attempt writes `CANCEL_UNCONFIRMED_MESSAGE` even if a status read or Continue changed the screen while it waited — exactly what the existing Cancel network-failure path already does. It never changes status, attempt, approval or `sessionRecovery`; a stale (older-request or other-lifecycle) timeout writes nothing.
+- **Programmatic overlap.** The preparing screen offers no action, so a second Prepare cannot start while one is waiting. A programmatic `editAgain()` during `preparing` (not reachable from the form) would leave the deadline inert by its status check; that pre-existing interleaving is unchanged.
+- **Sleep / background.** Ordinary `setTimeout`: a suspended browser does not run the timer at the real-world deadline. On resume the timer and a settled answer may run in either order; both orders are safe (whichever runs first decides; the other is inert). No wall-clock progress during suspension is claimed.
+- **Unchanged:** no server or provider deadline (R-14, M3D); the 45 s status read, the 60 s D-6 submit and D-3a's 45 s first `/latest` read; the D-1, D-11, D-12, D-13 and L-1b checks; the copy limitations R-01, R-07, R-08, R-09, R-16; R-05 (`checkSession` has no deadline); R-12 (no signature revocation); R-13 (L-2 E, NOT AUTHORIZED).
+
+### 7. Verification (Builder-run, offline; mocked `fetch` and fake timers; no provider, RPC, database, browser, passkey or live payment)
+
+- **New tests: 35**, in one new block of `test/lib/stores/real-payment-store.test.ts` ("R-03 / R-04: bounded Prepare and Cancel waits"): a constants test (60 s / 45 s, and D-6's 60 s and the status read's 45 s unchanged); Prepare P1–P14 plus P10b and a "no longer preparing" guard test; Cancel C1–C14 (C15, S1 and S2 are asserted inside C3 and P3); shared S3–S7. S8 (Practice) is covered by the unchanged Practice suites below, not by a new test. Each asserts observable state, requests sent and signing calls; timer counts are used only as an extra check where a timer's lifetime is the point.
+- **Existing tests: none modified** (only two constants added to the import list). The scope audit expected about 11 existing tests to advance fake time ≥ 45 s while a Prepare or Cancel was held. A temporary, restored instrumentation of both deadline callbacks (writing the running test's name to stderr; positive control: 46 executions, all in the new block) recorded **0** executions in all 2,323 pre-existing store and form tests: every existing held Prepare / Cancel is settled before time is advanced. That count of 11 was therefore not reproduced against this source, and no fixture needed repair.
+- **Store + form files:** 2,358 passed / 0 failed. **Focused related suites** (`client-sign-content`, `client-sign-clock`, `practice-invariance`, `payments-wire-shape`, `payments-submit`, `simulation-store`, `test/simulation/**`): 396 passed / **1 failed** — the known Practice `simulation-store` "starts from createInitialState()" race. Rerun in isolation it failed in 2 of 3 runs, then passed 6 of 6 (and 3 of 3 by name); `simulation-store.ts` and its imports are unchanged from HEAD. Not fixed (standing rule).
+- **Full offline suite (initial run): 179 files passed / 5 skipped; 8,715 tests passed / 382 skipped / 0 failed.** No live-test gate variable was set. `pnpm exec tsc --noEmit` clean; ESLint on the two changed source/test files clean; `git diff --check` clean.
+- **Mutation probes: 33 executed, 30 detected, 3 survived — all three equivalent, none material.** Detected: late Prepare success / catch suppression removed (S01, S02), late adoption plus signing (S03), timeout clearing D-1 uncertainty or opening Review (S04, S05), automatic Prepare retry, Cancel retry or status read (S06, S07, S07b), late Cancel success clearing the payment (S08), late refusal reconciled (S09, S09b), an older request clearing the newer marker (S10a, S10b), lifecycle / account / status guards removed (S11, S11b, S11c), the Prepare timer surviving into signing or a handled failure (S12, S12b), timeout dropping the approval / context or changing status (S13, S14), late fetch rejection (S15), the POST deadline left armed into the refused-Cancel read (S16), both deadlines removed (A01, A02), the slot left held (A03), the body read uncovered (A04), lifecycle cleanup missing a timer (A05a, A05b), wrong durations (A06, A07). Survived: S10c / S10d (the timer wrapper's own identity check — unreachable, because every path that replaces or clears a marker also clears its timer) and S17 (an extra `markTransition()` on a Prepare timeout — only makes in-flight status reads stale, and none can be in flight on the preparing screen). Production source restored to `71c6290e…2d02a` after every probe; no mutation file remains.
+
+### 8. Files and hashes
+
+| File | SHA-256 at HEAD `c96a9d9` | SHA-256 now |
+|---|---|---|
+| `lib/stores/real-payment-store.ts` (freeze lifted for this change only) | `99e1be1e589e61af08f7a59e8e9a67d8912511b229b1b9f6078be46e9b9d2fef` | `71c6290e006f131a6c9383fe5e9411d8caeb2b0a2cbab8c93c926f1807c2d02a` |
+| `test/lib/stores/real-payment-store.test.ts` | `1b6c96156c9c5a17ce47d172e15f621d18dfd64148bbebab640d0304bda77e18` | `475d8a6a73088a2291c5e31aaa2366cff4c5217b808604599ae7555c470ceedd` |
+| `components/real/real-pay-form.tsx` (frozen, untouched) | `eaec77ec601eb0bf386cd2ca4876fe0b8ef03aea8932affb7f86b828f7e9f92a` | unchanged |
+| `lib/real/payments/client-sign.ts` (frozen, untouched) | `1c46fbe96aaf93fd9443ed7f9600804c73753612ec917868ff45bafe4fd0dfe9` | unchanged |
+| `test/components/real/real-pay-form.test.tsx` (not needed, untouched) | `8392bac45b7e28d47d7822a4c921c150a1994521e4c07973bb006dd6b6267d6b` | unchanged |
+
+The four documentation files' final hashes are in the Builder report (a file cannot record its own hash). The new store hash `71c6290e…2d02a` is frozen pending the independent audit — don't edit without a fresh audit.
+
+### 9. Status
+
+| Item | Status |
+|---|---|
+| R-03 / R-04 bounded waits | implementation COMPLETE; offline verification COMPLETE; independent combined technical/documentation audit **PENDING**; operator Git checkpoint **PENDING**; **NOT closed** |
+| R-03 / R-04 in the L-2 D register | still the accepted residuals of that checkpoint; superseded in implementation status only once this change is audited and committed |
+| Broader L-2 D | CLOSED for its approved development scope (unchanged) |
+| L-2 C, overall L-2, Milestone 3 | OPEN |
+| L-2 E | NOT STARTED / NOT AUTHORIZED |
+| M3D | separate, outstanding |
+| Deployment, mainnet, public launch | NOT AUTHORIZED |
