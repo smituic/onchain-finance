@@ -3039,6 +3039,57 @@ Unchanged and re-verified at HEAD: `components/real/real-pay-form.tsx` `ca1eb743
 
 **Closure condition.** L-1b is formally **CLOSED** only when (1) one independent combined technical and documentation audit passes, (2) the operator manually commits, (3) the operator pushes, and (4) Git verification succeeds. Before all four, L-1b is NOT closed. No post-commit documentation reconciliation is required; use Git history for the commit id. No future commit hash or audit result is recorded or invented here.
 
+### L-2 D — Consolidated Closure Boundary and Residual Register — broader L-2 D closure APPROVED by the control room for controlled localhost development on Base Sepolia, with explicitly accepted Low/Info residuals (independent source-only scope audit Verdict A; effective on the documentation checkpoint below; L-1b CLOSED at `e35c92a2f2842fd9eca82cf53a4f80608e2a2d12`; L-2 C, overall L-2 and Milestone 3 OPEN; L-2 E NOT AUTHORIZED; NOT deployable, NOT public-readiness)
+
+*Dated record (2026-11-23). It sits after the per-slice D sections and the L-1b section, which are preserved unchanged as the history of their moments; where this section says otherwise (for example L-1b's "PENDING" and "NOT closed"), this section supersedes them. The full register, with every owner, is in `docs/status/pay-integrity-l1-l2.md`.*
+
+**A policy decision, not a rediscovered requirement.** The source documentation had no formal closure rule for broader L-2 D; D-1 to D-13 were closed one by one and "broader L-2 D" stayed open as a catch-all. Closing it is the control room's explicit closure-policy decision, taken after the audit below found no source-supported blocker.
+
+**Approved closure boundary (verbatim).**
+
+> L-2 D covers the scoped client-side Pay recovery and Cancel UX safety work for controlled localhost development on Base Sepolia.
+>
+> The D-1 through D-13 implementations and the consolidated residual review establish the accepted development closure boundary.
+>
+> L-2 D closes with explicitly retained Low/Info recovery UX limitations and separate unresolved security workstreams.
+>
+> This closure does NOT certify public deployment readiness, exhaustive payment recovery, absence of every duplicate-payment scenario, or comprehensive authorization safety.
+
+**Audit evidence.** Independent, source-only, read-only, offline scope assessment at HEAD `e35c92a2f2842fd9eca82cf53a4f80608e2a2d12`. Verdict A — ready for broader L-2 D closure with accepted residuals. **0 Critical / 0 High / 0 Medium / 8 Low / 5 Info.** No source-supported L-2 D closure blocker was identified under the audited controlled-development scope. No tests, builds, provider calls, database operations or live payments were performed, so this is not evidence that any recovery path was exercised. The server's compare-and-set, ownership, one-active-payment and dispatch guards remain essential and are not relaxed. This does not say every recovery path is safe, that no duplicate payment is possible, that no payment risk remains, or that the product is production-ready.
+
+**Residual register (18 IDs; the auditor's classifications kept as given).**
+
+| Group | IDs | What they are (short) |
+|---|---|---|
+| Accepted Low (8) | R-01 | unknown-screen copy implies an automatic check that does not occur |
+| | R-02 | status adoption of an awaiting row without signing context can show Continue, then wrongly say "signed out" and return to editing while a reservation remains (the server's one-active-payment control stops an ordinary second payment; not safe, not fixed) |
+| | R-03 | Cancel has no client deadline; a hung Cancel can keep the control unavailable until reload |
+| | R-04 | Prepare has no client deadline; the preparing screen can wait until reload (newly identified by the consolidated audit; not previously known, not fixed) |
+| | R-06 | non-JSON error responses are handled conservatively but lose specific classifications |
+| | R-08 | refused-Cancel wording can overstate uncertainty; Cancel 401/404 lacks the session-marker behavior of other paths |
+| | R-09 | D-9 same-marker 401/404 race can leave a stale "You're signed in" note |
+| | R-18 | a 401 at initial load or Prepare can leave ordinary form content without a direct sign-in control |
+| Accepted Info (5) | R-05 | `checkSession` has no deadline (account-store ownership) |
+| | R-07 | status errors can show raw server or parser text |
+| | R-15 | Continue may stay enabled while Cancel is in flight (server compare-and-set decides the winner; no claim that no race exists) |
+| | R-16 | with Real Mode disabled, 404s may give imprecise D-8 wording |
+| | R-17 | after an L-1b refusal Continue stays and repeats the safe refusal (accepted L-1b UX residual) |
+| Previously accepted policy (1) | R-10 | D-1 Prepare uncertainty can be released by a valid older terminal `/latest` row before a concurrent reservation commits; safeguards: one active payment per account and exact-id, literal-source-state compare-and-set; not declared impossible; no new implementation authorized |
+| Separately owned (4) | R-11 | no cross-tab payment synchronization — separate architecture workstream |
+| | R-12 | an existing signature is not revoked by Cancel — separate signing-integrity residual, not resolved by L-1b |
+| | R-13 | server prepared rows have no general age-based expiry — L-2 E (NOT AUTHORIZED) |
+| | R-14 | no general server Neon/provider operation deadlines — M3D |
+
+8 Low + 5 Info are the audit's 13 findings; R-10 and R-11 to R-14 are register entries, not new findings (8 + 5 + 1 + 4 = 18).
+
+**Limits that remain true.** Prepare and Cancel may stay uncertain; a timeout is not proof a server write failed; a malformed or non-JSON response does not establish payment failure; a reload is sometimes needed; a prepared row can stay active (expiry does not resolve every state — R-13); copy can be imprecise; a signature already produced cannot simply be revoked; tabs may disagree; the server's compare-and-set and one-active-payment protections stay authoritative; no blind UserOperation retry and no automatic new Prepare, signing, Submit or Cancel after uncertainty.
+
+**Statuses.** L-1 and L-1a CLOSED. L-1b CLOSED at `e35c92a2f2842fd9eca82cf53a4f80608e2a2d12` (verified against `git log`; 11 files; its audit pass is operator-reported). D-1, D-2, D-3a and D-4 to D-13 individually CLOSED. Broader L-2 D: closure approved for the boundary above. **L-2 C OPEN; overall L-2 OPEN; L-2 E NOT AUTHORIZED; Milestone 3 OPEN; M3D separate and outstanding.** 3A and 3C-2 migrations APPLIED; 3C-1 NOT applied and NOT authorized. Deployment and mainnet NOT AUTHORIZED.
+
+**Pre-public readiness.** Appropriate only for controlled localhost development; not a public-launch approval. The unbounded Prepare and Cancel waits (R-03, R-04), the misleading recovery copy and the incomplete session-recovery UX remain items to reconsider before public-facing readiness. A later, separately scoped review may evaluate bounded client waits for Prepare and Cancel; none is authorized here, and no new D slice or milestone is introduced.
+
+**Effectiveness.** Effective after (1) an independent documentation audit, (2) the operator's manual commit, (3) the operator's push, (4) matching Git refs and (5) a verified final inventory. No audit result or commit hash is recorded or invented; Git history identifies the final documentation commit; no post-commit documentation pass is authorized.
+
 ## Explicitly Not Yet Decided
 
 - Remaining L-1 policy after "L-1a — Prepared UserOperation Structural Integrity": whether to set gas and fee ceilings, pin the paymaster address or fields, bound `paymasterData` size, verify the EntryPoint `AA94` limit, check fee ordering, re-validate at submit or in the browser, validate live Pimlico response shapes beyond the one deployed-Safe preparation-only observation already recorded (an undeployed-Safe observation would need its own separate authorization), and the rest of L-2 (the local post-prepare construction is now guarded by "L-2 A+B"; database-failure normalization, client Cancel recovery and age-based prepared-row recovery — C, D and E — remain undecided, except that the first part of C, "L-2 C-1", is implemented, CLOSED at `cadb39d7653a516a85119085d36d9723888909dc` and recorded above, in "L-2 C-1"; the rest of C stays open; a narrow part of D, "L-2 D-1" (client status check after an unresolved prepare), is implemented, independently audited and FORMALLY CLOSED at `1ed2c54af4c0d8ed9589dd62dba8adb5c92cef5f`, recorded in "L-2 D-1"; a second narrow part of D, "L-2 D-3a" (a safe initial payment status check on the Pay page's first load), is implemented, independently audited and FORMALLY CLOSED at `a7cbe8e432d07d270bdfdeb3fe739ae05fc8ff83`, recorded in "L-2 D-3a"; a third narrow part of D, "L-2 D-2" (telling the account-not-ready prepare 409 apart from a payment in progress), is implemented, independently audited and FORMALLY CLOSED at `39afeaec4863c8283fed14a1415f495e551c3918`, recorded in "L-2 D-2"; a fourth narrow part of D, "L-2 D-4" (telling the exact coded submit `wrong_passkey` refusal apart from an uncertain submit), is implemented, independently audited and FORMALLY CLOSED at `cde1d74d8c121c30162c06e2c3c7d9e35edf326b`, recorded in "L-2 D-4"; a fifth narrow part of D, "L-2 D-5" (neutral copy on the cancel-only screen, replacing "never sent / safely cancel"), is implemented, independently audited and FORMALLY CLOSED at `06ce25770cd19266bd9e5464ccf369af8ef0bd17`, recorded in "L-2 D-5"; a sixth narrow part of D, "L-2 D-6" (a 60-second client-only deadline on the submit wait; the POST is not aborted and the payment may still be sent), is implemented, independently audited and committed at `b8ec81ec188bcef3ef3e6336d1e1fca348ccc51b`, with its closure-status record committed at `38c44de4d86d0031406216b3ed3bf9434d7ed6ba`; it is at its final status-reconciliation stage and becomes formally CLOSED only once that final reconciliation is independently audited and committed by the operator, recorded in "L-2 D-6" — the rest of D, including the remaining D-3 items, and all of E stay open). None of the rest is scoped, approved or started.
