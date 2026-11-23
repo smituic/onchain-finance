@@ -1,11 +1,31 @@
 import type { Address, Hex } from "viem";
 import { createRealPublicClient } from "../chain/client";
 import { createRealSafeAccount } from "../account/safe";
+import { REAL_CASH_TOKEN } from "../constants";
+import { normalizeAddress } from "../identifiers";
 import { createVerifiedTurnkeyOwnerAccount } from "../signing/verified-account";
+import { isCanonicalBaseUnitsString, isZeroBaseUnits } from "./amount";
 import { parsePreparedFieldsFromWire, type WirePreparedFields } from "./prepared-operation";
+import { encodeCashTransfer } from "./transfer";
 import { hasEnoughValidityToDispatch, SAFE_OP_VALID_AFTER } from "./validity";
 
 export const PAYMENT_EXPIRED_BEFORE_APPROVAL = "This payment expired before it was approved. Nothing was sent — start a new payment.";
+
+/**
+ * L-1b: the one fixed message for a payment whose signed contents could not be
+ * verified against the held payment (an unusable expected recipient or amount,
+ * a local encoding that could not complete, or prepared callData that is not
+ * exactly the Cash transfer of that amount to that recipient). Thrown before
+ * any signing request, so no passkey prompt is shown and nothing is signed.
+ * Says nothing about whether the payment exists, failed or was sent.
+ */
+export const PAYMENT_DETAILS_UNVERIFIED = "We couldn't verify this payment's details. You can cancel it.";
+
+/** L-1b: the held payment's own intent, as plain strings (the store's attempt.recipient / attempt.amountBaseUnits). */
+export type ExpectedPaymentIntent = {
+  recipient: string;
+  amountBaseUnits: string;
+};
 
 export type SignPreparedPaymentInput = {
   /** Wire-shaped (every field a plain string) so callers outside lib/real/**
@@ -30,7 +50,33 @@ export type SignPreparedPaymentInput = {
    * independently and authoritatively re-checks at /submit regardless.
    */
   nowSeconds?: number;
+  /**
+   * L-1b (required — there is no unchecked form): the recipient and amount of
+   * the held payment this signature is for. The Cash transfer actually signed
+   * is rebuilt locally from these two values and must equal `fields.callData`
+   * exactly, or nothing is signed (PAYMENT_DETAILS_UNVERIFIED).
+   */
+  expected: ExpectedPaymentIntent;
 };
+
+/**
+ * L-1b: the held recipient and amount, read ONCE as primitives and validated —
+ * never re-read from the caller's object later. The recipient must be exactly
+ * 0x + 40 hex (any case; no surrounding whitespace, nothing repaired) and is
+ * lower-cased for ABI encoding, where case carries no meaning. The amount must
+ * be the canonical, non-zero base-unit digit string the server issues (no sign,
+ * no leading zero, no fraction). Null for anything else.
+ */
+function captureExpectedIntent(expected: unknown): { recipient: Address; amountBaseUnits: string } | null {
+  if (!expected || typeof expected !== "object") return null;
+  const { recipient, amountBaseUnits } = expected as { recipient?: unknown; amountBaseUnits?: unknown };
+  if (typeof recipient !== "string" || typeof amountBaseUnits !== "string") return null;
+  if (recipient !== recipient.trim()) return null;
+  const canonicalRecipient = normalizeAddress(recipient);
+  if (!canonicalRecipient) return null;
+  if (!isCanonicalBaseUnitsString(amountBaseUnits) || isZeroBaseUnits(amountBaseUnits)) return null;
+  return { recipient: canonicalRecipient as Address, amountBaseUnits };
+}
 
 export type SignedPreparedPayment = {
   signature: Hex;
@@ -64,6 +110,17 @@ export type SignedPreparedPayment = {
  * offering another passkey), and exactly one Turnkey approval must have
  * produced the signature — its activity id is returned for /submit. Still a
  * fresh WebAuthn ceremony per payment; nothing is kept or stored.
+ *
+ * L-1b: after the sender check, the exact Safe execution of
+ * transfer(expected.recipient, expected.amountBaseUnits) on REAL_CASH_TOKEN
+ * (value 0, CALL) is rebuilt by THIS account's own encoder — the same
+ * algorithm the server used at prepare (server/pimlico.ts) — and must be
+ * strictly equal to the prepared callData; that locally built value is what is
+ * signed. A mismatch (or an unusable expected intent, or an encoding that
+ * cannot complete) throws PAYMENT_DETAILS_UNVERIFIED before signUserOperation,
+ * so no Turnkey request, WebAuthn prompt or signature is ever made for it.
+ * This does not revoke a signature that already exists, and it checks only
+ * the transfer content — not gas, fee, paymaster, factory, nonce or window.
  */
 export async function signPreparedPayment(input: SignPreparedPaymentInput): Promise<SignedPreparedPayment> {
   if (!input.authorizingCredentialId) throw new Error("This payment has no approving passkey — refusing to sign.");
@@ -74,6 +131,9 @@ export async function signPreparedPayment(input: SignPreparedPaymentInput): Prom
   if (!hasEnoughValidityToDispatch(input.fields.validUntil, input.nowSeconds ?? Math.floor(Date.now() / 1000))) {
     throw new Error(PAYMENT_EXPIRED_BEFORE_APPROVAL);
   }
+  // L-1b: captured and validated synchronously, before any await below.
+  const expected = captureExpectedIntent(input.expected);
+  if (!expected) throw new Error(PAYMENT_DETAILS_UNVERIFIED);
   const fields = parsePreparedFieldsFromWire(input.fields);
   const publicClient = createRealPublicClient(input.rpcUrl);
   const activityIds: string[] = [];
@@ -91,12 +151,25 @@ export async function signPreparedPayment(input: SignPreparedPaymentInput): Prom
     throw new Error("The locally-derived Safe address does not match the prepared payment's sender — refusing to sign.");
   }
 
+  // L-1b: the transfer this signature authorizes, rebuilt locally (no network
+  // for a single call on this account configuration). Raw encoder errors are
+  // never shown; any failure is the same fixed refusal.
+  let expectedCallData: Hex;
+  try {
+    expectedCallData = await account.encodeCalls([{ to: REAL_CASH_TOKEN.address, data: encodeCashTransfer(expected.recipient, expected.amountBaseUnits), value: BigInt(0) }]);
+  } catch {
+    throw new Error(PAYMENT_DETAILS_UNVERIFIED);
+  }
+  // Strict, full-string equality — no case-folding, prefix or partial decode.
+  if (fields.callData !== expectedCallData) throw new Error(PAYMENT_DETAILS_UNVERIFIED);
+
   const signature = await account.signUserOperation({
     sender: account.address as Address,
     nonce: fields.nonce,
     factory: fields.factory,
     factoryData: fields.factoryData,
-    callData: fields.callData,
+    // L-1b: the verified, locally built value — never the response's string.
+    callData: expectedCallData,
     callGasLimit: fields.callGasLimit,
     verificationGasLimit: fields.verificationGasLimit,
     preVerificationGas: fields.preVerificationGas,

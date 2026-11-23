@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { freshRateLimiter } from "./fixtures/rate-limit";
-import { createPublicClient, custom, encodeAbiParameters, type Hex } from "viem";
+import { createPublicClient, custom, encodeAbiParameters, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { baseSepolia } from "viem/chains";
 import { rpcBlock } from "./fixtures/chain-block";
 import { splitSafeOpSignature } from "@/lib/real/payments/safe-op-preflight";
+import { REAL_CASH_TOKEN } from "@/lib/real/constants";
+import { encodeCashTransfer } from "@/lib/real/payments/transfer";
 
 /**
  * Regression test for a live incident: a real Batch 2d payment attempt sat
@@ -106,7 +108,8 @@ vi.mock("@/lib/real/chain/client", async (importOriginal) => {
 });
 
 const { createRealSafeAccount } = await import("@/lib/real/account/safe");
-const SAFE_ADDRESS = (await createRealSafeAccount({ owner, publicClient: signingPublicClient })).address;
+const SAFE_ACCOUNT = await createRealSafeAccount({ owner, publicClient: signingPublicClient });
+const SAFE_ADDRESS = SAFE_ACCOUNT.address;
 
 const PREPARED_OPERATION = {
   sender: SAFE_ADDRESS,
@@ -125,9 +128,19 @@ const PREPARED_OPERATION = {
   paymasterPostOpGasLimit: undefined,
 } as const;
 
-const prepareCashTransferUserOperationMock: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<typeof PREPARED_OPERATION>>> = vi.fn(async () => ({
-  ...PREPARED_OPERATION,
-}));
+/**
+ * L-1b: the mocked server preparation returns the real canonical callData for
+ * the transfer it was asked to prepare — the Safe execution of
+ * transfer(recipient, amount) on REAL_CASH_TOKEN, built by the real Safe
+ * account encoder exactly as server/pimlico.ts builds it — instead of the old
+ * "0x1234" placeholder, which the client now (correctly) refuses to sign.
+ */
+type PrepareInput = { recipient: Address; amountBaseUnits: string };
+const prepareCashTransferUserOperationMock: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<Omit<typeof PREPARED_OPERATION, "callData"> & { callData: Hex }>>> = vi.fn(async (input: unknown) => {
+  const { recipient, amountBaseUnits } = input as PrepareInput;
+  const callData = await SAFE_ACCOUNT.encodeCalls([{ to: REAL_CASH_TOKEN.address, data: encodeCashTransfer(recipient, amountBaseUnits), value: BigInt(0) }]);
+  return { ...PREPARED_OPERATION, callData };
+});
 vi.mock("@/lib/real/server/pimlico", () => ({
   prepareCashTransferUserOperation: (...args: unknown[]) => prepareCashTransferUserOperationMock(...(args as [never])),
   sendPreparedUserOperation: vi.fn(),
@@ -203,6 +216,9 @@ describe("live incident regression: prepared-fields wire shape must survive the 
     const wireAttempt = throughJson(prepared.attempt);
     expect(wireAttempt.prepared?.sender).toBeTruthy();
     expect(wireAttempt.prepared?.sender.toLowerCase()).toBe(SAFE_ADDRESS.toLowerCase());
+    // L-1b: the held intent the store passes is the attempt's own recipient and amount.
+    expect(wireAttempt.recipient).toBe(RECIPIENT.toLowerCase());
+    expect(wireAttempt.amountBaseUnits).toBe("10000");
 
     // The server-bound credential crosses the wire too, and it is the session's own.
     const wireSigning = throughJson({ authorizingCredentialId: prepared.authorizingCredentialId });
@@ -216,6 +232,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       ownerAddress: owner.address,
       rpcUrl: "http://unused.invalid",
       authorizingCredentialId: wireSigning.authorizingCredentialId,
+      expected: { recipient: wireAttempt.recipient, amountBaseUnits: wireAttempt.amountBaseUnits },
     });
     expect(signature).toMatch(/^0x[0-9a-f]+$/i);
     // Slice S1: the one passkey ceremony was pinned to exactly the bound credential, and its activity id comes back for /submit.
@@ -263,6 +280,8 @@ describe("live incident regression: prepared-fields wire shape must survive the 
 
     const wireAttempt = throughJson(latest.attempt);
     expect(wireAttempt.prepared?.sender).toBeTruthy();
+    expect(wireAttempt.recipient).toBe(RECIPIENT.toLowerCase());
+    expect(wireAttempt.amountBaseUnits).toBe("10000");
 
     // The user's "Continue" tap — a real signing attempt, still no /submit call.
     stamperAllowCredentials.length = 0;
@@ -273,6 +292,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       ownerAddress: owner.address,
       rpcUrl: "http://unused.invalid",
       authorizingCredentialId: latest.authorizingCredentialId!,
+      expected: { recipient: wireAttempt.recipient, amountBaseUnits: wireAttempt.amountBaseUnits },
     });
     expect(signature).toMatch(/^0x[0-9a-f]+$/i);
     expect(stamperAllowCredentials).toEqual([["credential-1"]]);
@@ -307,6 +327,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
         ownerAddress: owner.address,
         rpcUrl: "http://unused.invalid",
         authorizingCredentialId: "credential-1",
+        expected: { recipient: RECIPIENT, amountBaseUnits: "10000" },
       }),
     ).rejects.toThrow(/reading 'toLowerCase'|Cannot read propert/);
   });
@@ -329,7 +350,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       paymasterPostOpGasLimit: null,
     };
     const sign = (fields: unknown) =>
-      signPreparedPayment({ fields: fields as never, rpId: "localhost", subOrganizationId: "sub-org-1", ownerAddress: owner.address, rpcUrl: "http://unused.invalid", authorizingCredentialId: "credential-1" });
+      signPreparedPayment({ fields: fields as never, rpId: "localhost", subOrganizationId: "sub-org-1", ownerAddress: owner.address, rpcUrl: "http://unused.invalid", authorizingCredentialId: "credential-1", expected: { recipient: RECIPIENT, amountBaseUnits: "10000" } });
     signRawPayloadMock.mockClear();
 
     await expect(sign(base)).rejects.toThrow(PAYMENT_EXPIRED_BEFORE_APPROVAL);
@@ -357,7 +378,7 @@ describe("live incident regression: prepared-fields wire shape must survive the 
       validUntil: Math.floor(Date.now() / 1000) + 600,
     };
     await expect(
-      signPreparedPayment({ fields, rpId: "localhost", subOrganizationId: "sub-org-1", ownerAddress: owner.address, rpcUrl: "http://unused.invalid", authorizingCredentialId: "" }),
+      signPreparedPayment({ fields, rpId: "localhost", subOrganizationId: "sub-org-1", ownerAddress: owner.address, rpcUrl: "http://unused.invalid", authorizingCredentialId: "", expected: { recipient: RECIPIENT, amountBaseUnits: "10000" } }),
     ).rejects.toThrow(/no approving passkey/);
     expect(signRawPayloadMock).not.toHaveBeenCalled();
   });

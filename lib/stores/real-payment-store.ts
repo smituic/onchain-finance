@@ -879,6 +879,9 @@ async function authorizeAndSubmit(
         // never raw local time — so a skewed browser clock can't falsely
         // refuse a payment the server would still accept.
         nowSeconds: Math.floor(Date.now() / 1000) + clockOffsetSeconds,
+        // L-1b: the held attempt's own recipient and amount — the same snapshot
+        // as `fields` above, never the live form, a lookup or a later get().
+        expected: { recipient: attempt.recipient, amountBaseUnits: attempt.amountBaseUnits },
       });
       // A signature for a context that is gone is discarded: never kept, never submitted.
       if (!isCurrent()) return;

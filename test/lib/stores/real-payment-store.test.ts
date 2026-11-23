@@ -11493,3 +11493,364 @@ describe("real-payment-store — L-2 D-13: malformed /latest response recovery",
     });
   });
 });
+
+/**
+ * L-1b — the store's half of client Pay signing content binding.
+ *
+ * signPreparedPayment (mocked here) now requires the held payment's own intent
+ * and refuses, before any passkey prompt, prepared callData that is not exactly
+ * that Cash transfer (proven against the real signer in
+ * test/lib/real/client-sign-content.test.ts). These tests prove the store side:
+ *  - every new signature request carries `expected` = the recipient and amount
+ *    of the SAME held attempt object whose `prepared` is signed — never the
+ *    live form, a lookup, or a newer value (fresh address / handle prepare,
+ *    /latest resume, retry after a dismissed prompt, and after a D-10 status
+ *    answer replaced the prepared object);
+ *  - an L-1b refusal is handled by the existing non-cancellation signing-error
+ *    path: the payment, its signing context and its controls stay; nothing is
+ *    prepared, submitted, read, cancelled or re-signed by itself.
+ * A mocked rejection proves only the store's handling of the refusal — not that
+ * the real signer refuses (that is the helper suite's job).
+ *
+ * Where a live input differs from the held attempt only because a test called
+ * setRecipientInput / setAmountInput directly (the form hides those fields on
+ * these screens), the test says so; the store accepts those calls in any status.
+ */
+describe("real-payment-store — L-1b: every new signature carries the held attempt's own intent", () => {
+  const L1B_MESSAGE = "We couldn't verify this payment's details. You can cancel it.";
+  const ACCOUNT = { appUserId: "app-user-l1b", ownerAddress: "0x1111111111111111111111111111111111111111", safeAddress: "0x2222222222222222222222222222222222222222" };
+  const ADDRESS = "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed";
+  const CHECKSUMMED = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+  const OTHER = "0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359";
+  const SMIT_SAFE = "0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae";
+  const FOUND_SMIT = { found: true, handle: "smit", displayName: "Smit Patel", isSelf: false };
+  const SERVER_NOW = 1_900_000_000;
+  const T0_MS = (SERVER_NOW - 100) * 1000;
+  const SUB_ORG = "4f8d1c2b-9a3e-4b7f-8c6d-1e2f3a4b5c6d";
+  const CREDENTIAL = "Zm9vYmFyLWNyZWRlbnRpYWwtaWQ";
+  const DISMISSED = () => Object.assign(new Error("dismissed"), { name: "NotAllowedError" });
+
+  type Json = Record<string, unknown>;
+  type Store = ReturnType<typeof createRealPaymentStore>;
+  type SignInput = { fields: unknown; expected: unknown; subOrganizationId: unknown; authorizingCredentialId: unknown };
+
+  const fields = (callData = "0x541d63c8000000000000000000000000036cbd53842c5426634e7929541ec2318f3dcf7e"): Json => ({
+    sender: ACCOUNT.safeAddress,
+    nonce: "1844674407370955161600",
+    factory: null,
+    factoryData: null,
+    callData,
+    callGasLimit: "86143",
+    verificationGasLimit: "120371",
+    preVerificationGas: "55264",
+    maxFeePerGas: "1200000",
+    maxPriorityFeePerGas: "1000000",
+    paymaster: "0x777777777777AeC03fd955926DbF81597e66834C",
+    paymasterData: "0x01000066d1a1a4000000000000",
+    paymasterVerificationGasLimit: "37193",
+    paymasterPostOpGasLimit: "1",
+    validUntil: SERVER_NOW + 600,
+  });
+  const attemptOf = (over: Json = {}): Json => ({
+    id: PREPARED_ID,
+    state: "awaiting_authorization",
+    recipient: ADDRESS,
+    recipientIdentity: null,
+    amountBaseUnits: "1000000",
+    transactionHash: null,
+    failureReason: null,
+    createdAt: "2030-03-17T17:46:40.000Z",
+    updatedAt: "2030-03-17T17:46:41.000Z",
+    prepared: fields(),
+    ...over,
+  });
+  const signingReply = (attempt: Json) => ({ attempt, subOrganizationId: SUB_ORG, authorizingCredentialId: CREDENTIAL, serverNowSeconds: SERVER_NOW });
+
+  const stores: Store[] = [];
+  /** Each signing request, with the attempt the store held at that moment. */
+  let seen: Array<{ input: SignInput; held: RealPaymentAttemptLike | null }>;
+  type RealPaymentAttemptLike = { recipient: string; amountBaseUnits: string; prepared: unknown };
+
+  function newStore(): Store {
+    const store = createRealPaymentStore();
+    stores.push(store);
+    return store;
+  }
+  /** Records each request (and the held attempt at that moment), then answers with `outcome` (default: the prompt is dismissed). */
+  function signing(store: () => Store, outcome: () => Promise<unknown> = () => Promise.reject(DISMISSED())) {
+    vi.mocked(signPreparedPayment).mockImplementation(((input: SignInput) => {
+      seen.push({ input, held: store().getState().attempt as unknown as RealPaymentAttemptLike | null });
+      return outcome();
+    }) as never);
+  }
+
+  type Handler = (body: unknown) => Response | Promise<Response>;
+  function server(handlers: Partial<Record<"prepare" | "latest" | "lookup" | "status" | "cancel" | "submit" | "balance", Handler>>) {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+        calls.push(`${method} ${url}`);
+        const key = url.endsWith("/prepare")
+          ? "prepare"
+          : url.endsWith("/latest")
+            ? "latest"
+            : url.endsWith("/recipients/lookup")
+              ? "lookup"
+              : url.endsWith("/status")
+                ? "status"
+                : url.endsWith("/cancel")
+                  ? "cancel"
+                  : url.endsWith("/submit")
+                    ? "submit"
+                    : url.endsWith("/account/balance")
+                      ? "balance"
+                      : null;
+        const handler = key ? handlers[key] : undefined;
+        if (!handler) throw new Error(`unexpected fetch: ${method} ${url}`);
+        return handler(body);
+      }),
+    );
+    return { calls };
+  }
+
+  function deferred() {
+    let resolve: (response: Response) => void = () => {};
+    const promise = new Promise<Response>((res) => (resolve = res));
+    return { promise, resolve };
+  }
+
+  async function reviewing(store: Store, to: string, amount: string) {
+    store.setState({ status: "editing" });
+    store.getState().setRecipientInput(to);
+    store.getState().setAmountInput(amount);
+    await store.getState().review();
+    expect(store.getState().status).toBe("reviewing");
+  }
+
+  /** The request carries the held attempt's own recipient and amount, and the prepared object of that SAME attempt. */
+  function expectFromHeldAttempt(index: number, attempt: Json) {
+    const { input, held } = seen[index]!;
+    expect(input.expected).toEqual({ recipient: attempt.recipient, amountBaseUnits: attempt.amountBaseUnits });
+    expect(input.fields).toEqual(attempt.prepared);
+    expect(held).not.toBeNull();
+    expect(input.fields).toBe(held!.prepared); // the very object held, not a copy of something else
+    expect(input.expected).toEqual({ recipient: held!.recipient, amountBaseUnits: held!.amountBaseUnits });
+    expect(Object.keys(input.expected as Json).sort()).toEqual(["amountBaseUnits", "recipient"]);
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0_MS);
+    useRealAccountStore.setState({ account: ACCOUNT });
+    vi.mocked(signPreparedPayment).mockReset();
+    seen = [];
+  });
+
+  afterEach(() => {
+    for (const store of stores.splice(0)) store.getState().reset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.mocked(signPreparedPayment).mockReset();
+    useRealAccountStore.setState({ account: null });
+  });
+
+  describe("A–F: the expected intent is the held attempt's, on every path that creates a new signature", () => {
+    it("A. fresh address prepare: held lower-case recipient and base units — not the typed text, and not inputs changed while preparing", async () => {
+      const reply = signingReply(attemptOf());
+      const gate = deferred();
+      const api = server({ prepare: () => gate.promise });
+      const store = newStore();
+      signing(() => store);
+      await reviewing(store, `  ${CHECKSUMMED}  `, "1");
+
+      const pending = store.getState().confirmAndSend();
+      // Store-level only (the form shows no inputs while preparing): the live inputs move on before the answer arrives.
+      store.getState().setRecipientInput(OTHER);
+      store.getState().setAmountInput("7");
+      gate.resolve(jsonResponse(200, reply));
+      await pending;
+
+      expect(api.calls).toEqual(["POST /api/real/payments/prepare"]);
+      expect(seen).toHaveLength(1);
+      expectFromHeldAttempt(0, reply.attempt);
+      expect(seen[0]!.input.expected).toEqual({ recipient: ADDRESS, amountBaseUnits: "1000000" });
+      expect(store.getState()).toMatchObject({ recipientInput: OTHER, amountInput: "7" });
+    });
+
+    it("B. fresh handle prepare: the server-resolved Safe held in the attempt — never the handle or the lookup", async () => {
+      const reply = signingReply(attemptOf({ recipient: SMIT_SAFE, recipientIdentity: { handle: "smit", displayName: "Smit P." } }));
+      server({ lookup: () => jsonResponse(200, FOUND_SMIT), prepare: () => jsonResponse(200, reply) });
+      const store = newStore();
+      signing(() => store);
+      await reviewing(store, "@Smit", "1");
+
+      await store.getState().confirmAndSend();
+
+      expect(seen).toHaveLength(1);
+      expectFromHeldAttempt(0, reply.attempt);
+      expect(seen[0]!.input.expected).toEqual({ recipient: SMIT_SAFE, amountBaseUnits: "1000000" });
+      expect(store.getState().recipientInput).toBe("@Smit");
+    });
+
+    it("C. /latest resume: the restored attempt's recipient and amount — not whatever the inputs hold", async () => {
+      const restored = attemptOf({ id: ATTEMPT_ID, recipient: OTHER, amountBaseUnits: "2500000" });
+      server({ latest: () => jsonResponse(200, { attempt: restored, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: SERVER_NOW }) });
+      const store = newStore();
+      signing(() => store);
+      await store.getState().init();
+      expect(store.getState().status).toBe("awaiting_authorization");
+      expect(seen).toHaveLength(0); // nothing is signed by itself after a reload
+      // Store-level only (the resume screen shows no inputs).
+      store.getState().setRecipientInput(ADDRESS);
+      store.getState().setAmountInput("9");
+
+      await store.getState().resumeAuthorization();
+
+      expect(seen).toHaveLength(1);
+      expectFromHeldAttempt(0, restored);
+      expect(seen[0]!.input.expected).toEqual({ recipient: OTHER, amountBaseUnits: "2500000" });
+    });
+
+    it("D. retry after a dismissed prompt: the second request carries the same held intent and prepared object", async () => {
+      const reply = signingReply(attemptOf());
+      server({ prepare: () => jsonResponse(200, reply) });
+      const store = newStore();
+      signing(() => store);
+      await reviewing(store, ADDRESS, "1");
+      await store.getState().confirmAndSend();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: null });
+
+      await store.getState().resumeAuthorization();
+
+      expect(seen).toHaveLength(2);
+      expectFromHeldAttempt(0, reply.attempt);
+      expectFromHeldAttempt(1, reply.attempt);
+    });
+
+    it("E. retry after a signing error: the second request carries the same held intent", async () => {
+      const reply = signingReply(attemptOf());
+      server({ prepare: () => jsonResponse(200, reply) });
+      const store = newStore();
+      signing(() => store, () => Promise.reject(new Error("Turnkey returned a completed activity without a signature.")));
+      await reviewing(store, ADDRESS, "1");
+      await store.getState().confirmAndSend();
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", error: "Turnkey returned a completed activity without a signature." });
+
+      await store.getState().resumeAuthorization();
+
+      expect(seen).toHaveLength(2);
+      expectFromHeldAttempt(1, reply.attempt);
+    });
+
+    it("F. after a D-10 status answer REPLACED the prepared object, Continue signs the new object with the held intent", async () => {
+      const original = attemptOf({ id: ATTEMPT_ID });
+      const replacedFields = { ...fields("0x541d63c8ffff"), callGasLimit: "99999" };
+      const replaced = { ...original, prepared: replacedFields, updatedAt: "2030-03-17T17:50:00.000Z" };
+      const api = server({
+        latest: () => jsonResponse(200, { attempt: original, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", serverNowSeconds: SERVER_NOW }),
+        status: () => jsonResponse(200, { attempt: replaced, serverNowSeconds: SERVER_NOW, reconciliationDeferred: false }),
+      });
+      const store = newStore();
+      signing(() => store);
+      await store.getState().init();
+      await store.getState().checkStatus();
+      await vi.advanceTimersByTimeAsync(0);
+      // D-10 adopted the honest answer: same payment, new prepared contents.
+      expect(store.getState().status).toBe("awaiting_authorization");
+      expect(store.getState().attempt).toEqual(replaced);
+      expect(seen).toHaveLength(0);
+      store.getState().setRecipientInput(OTHER); // store-level only
+      store.getState().setAmountInput("3");
+
+      await store.getState().resumeAuthorization();
+
+      expect(api.calls.filter((call) => call.endsWith("/latest"))).toHaveLength(1);
+      expect(seen).toHaveLength(1);
+      expectFromHeldAttempt(0, replaced);
+      expect((seen[0]!.input.fields as Json).callData).toBe("0x541d63c8ffff"); // the replaced object reaches the signing boundary
+      expect(seen[0]!.input.expected).toEqual({ recipient: ADDRESS, amountBaseUnits: "1000000" });
+    });
+
+    it("an approval already held (pendingSubmission) is re-sent without a new signature request — unchanged by L-1b", async () => {
+      const held = attemptOf({ id: ATTEMPT_ID });
+      const api = server({ submit: () => new Promise<Response>(() => {}) });
+      const store = newStore();
+      signing(() => store);
+      store.setState({ status: "awaiting_authorization", attempt: held as never, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", clockOffsetSeconds: 100, pendingSubmission: { attemptId: ATTEMPT_ID, signature: "0xsig-held", activityId: "activity-held" } });
+
+      void store.getState().resumeAuthorization();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(seen).toHaveLength(0);
+      expect(signPreparedPayment).not.toHaveBeenCalled();
+      expect(api.calls).toEqual(["POST /api/real/payments/submit"]);
+    });
+  });
+
+  describe("an L-1b refusal: the payment and its controls stay; nothing happens by itself", () => {
+    async function refusedAfterPrepare() {
+      const reply = signingReply(attemptOf());
+      const api = server({
+        prepare: () => jsonResponse(200, reply),
+        cancel: () => jsonResponse(200, { attempt: { ...reply.attempt, state: "cancelled", prepared: null } }),
+        balance: () => jsonResponse(200, { token: "USDC", decimals: 6, balanceBaseUnits: "0" }),
+      });
+      const store = newStore();
+      signing(() => store, () => Promise.reject(new Error(L1B_MESSAGE)));
+      await reviewing(store, ADDRESS, "1");
+      await store.getState().confirmAndSend();
+      return { reply, api, store };
+    }
+
+    it("stays on the SAME payment, awaiting approval, with the fixed message — attempt, signing context and account untouched", async () => {
+      const { reply, api, store } = await refusedAfterPrepare();
+      expect(store.getState()).toMatchObject({
+        status: "awaiting_authorization",
+        attempt: reply.attempt,
+        subOrganizationId: SUB_ORG,
+        authorizingCredentialId: CREDENTIAL,
+        error: L1B_MESSAGE,
+        isAuthorizing: false,
+        pendingSubmission: null,
+        prepareNeedsCheck: null,
+        sessionRecovery: null,
+      });
+      expect(store.getState().attempt).toMatchObject({ id: PREPARED_ID, recipient: ADDRESS, amountBaseUnits: "1000000" });
+      expect(useRealAccountStore.getState().account).toEqual(ACCOUNT);
+      expect(seen).toHaveLength(1);
+      expectFromHeldAttempt(0, reply.attempt);
+
+      // Nothing follows by itself (well inside the payment's window): no prepare, submit, /latest, status read, Cancel or new prompt.
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(api.calls).toEqual(["POST /api/real/payments/prepare"]);
+      expect(seen).toHaveLength(1);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: reply.attempt, error: L1B_MESSAGE, subOrganizationId: SUB_ORG, authorizingCredentialId: CREDENTIAL });
+    });
+
+    it("an explicit Continue asks again with the same held intent; unchanged contents are refused again — still the same payment, nothing sent", async () => {
+      const { reply, api, store } = await refusedAfterPrepare();
+
+      await store.getState().resumeAuthorization();
+
+      expect(seen).toHaveLength(2);
+      expectFromHeldAttempt(1, reply.attempt);
+      expect(store.getState()).toMatchObject({ status: "awaiting_authorization", attempt: reply.attempt, error: L1B_MESSAGE, isAuthorizing: false, pendingSubmission: null });
+      expect(api.calls).toEqual(["POST /api/real/payments/prepare"]);
+    });
+
+    it("Cancel payment stays available and cancels exactly the held payment, by explicit action only", async () => {
+      const { reply, api, store } = await refusedAfterPrepare();
+
+      await store.getState().cancel();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(api.calls.slice(0, 2)).toEqual(["POST /api/real/payments/prepare", `POST /api/real/payments/${(reply.attempt as Json).id}/cancel`]);
+      expect(store.getState()).toMatchObject({ status: "editing", attempt: null });
+      expect(seen).toHaveLength(1);
+    });
+  });
+});

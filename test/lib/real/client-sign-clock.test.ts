@@ -55,6 +55,9 @@ function sign(nowSeconds?: number) {
     rpcUrl: "http://localhost",
     authorizingCredentialId: "credential-1",
     nowSeconds,
+    // L-1b: a valid held intent, so these tests still reach exactly the gate they test. The
+    // marker below fires before the calldata comparison, so `fields.callData` stays a placeholder.
+    expected: { recipient: "0x3333333333333333333333333333333333333333", amountBaseUnits: "1000000" },
   });
 }
 

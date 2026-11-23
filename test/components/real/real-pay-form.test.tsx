@@ -225,6 +225,67 @@ describe("RealPayForm", () => {
     expect(useRealPaymentStore.getState().attempt).toBeNull();
   });
 
+  it("L-1b: a payment whose details can't be verified stays on the SAME pending payment with the fixed message, Continue and Cancel payment — nothing is sent", async () => {
+    // The helper's refusal is mocked here; test/lib/real/client-sign-content.test.ts proves the real signer refuses before any prompt.
+    const L1B_MESSAGE = "We couldn't verify this payment's details. You can cancel it.";
+    useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
+    let submitCalled = false;
+    let cancelCalled = false;
+    routeFetch((url, method, body) => {
+      if (url.endsWith("/api/real/payments/latest") && method === "GET") return jsonResponse(200, { attempt: null });
+      if (url.endsWith("/api/real/payments/prepare") && method === "POST") {
+        return jsonResponse(200, {
+          attempt: attemptFixture({ recipient: (body as { recipient: string }).recipient, prepared: PREPARE_FIELDS }),
+          subOrganizationId: "sub-org-1",
+          authorizingCredentialId: "credential-1",
+          serverNowSeconds: 1_900_000_000,
+        });
+      }
+      if (url.endsWith("/api/real/payments/submit") && method === "POST") {
+        submitCalled = true;
+        return jsonResponse(200, { attempt: attemptFixture({ state: "submitted" }) });
+      }
+      if (url.endsWith(`/api/real/payments/${PAYMENT_ID}/cancel`) && method === "POST") {
+        cancelCalled = true;
+        return jsonResponse(200, { attempt: attemptFixture({ state: "cancelled" }) });
+      }
+      return null;
+    });
+    signPreparedPaymentMock.mockRejectedValue(new Error(L1B_MESSAGE));
+
+    render(<RealPayForm />);
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("To"), { target: { value: RECIPIENT } });
+    fireEvent.change(screen.getByLabelText("Amount"), { target: { value: "1.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-review")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await waitFor(() => expect(screen.getByText(L1B_MESSAGE)).toBeInTheDocument());
+    const held = useRealPaymentStore.getState().attempt!;
+    expect(useRealPaymentStore.getState()).toMatchObject({ status: "awaiting_authorization", attempt: { id: PAYMENT_ID }, subOrganizationId: "sub-org-1", authorizingCredentialId: "credential-1", error: L1B_MESSAGE });
+    expect(signPreparedPaymentMock).toHaveBeenCalledWith(expect.objectContaining({ fields: held.prepared, expected: { recipient: held.recipient, amountBaseUnits: held.amountBaseUnits } }));
+    expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument();
+    expect(screen.getByText(RECIPIENT, { exact: false })).toBeInTheDocument();
+    expect(screen.queryByTestId("real-pay-form")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Cancel payment" })).toBeEnabled();
+
+    // An explicit Continue asks again (same held intent) and is refused again: same screen, nothing sent.
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(signPreparedPaymentMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText(L1B_MESSAGE)).toBeInTheDocument());
+    expect(signPreparedPaymentMock.mock.calls[1]![0]).toMatchObject({ expected: { recipient: held.recipient, amountBaseUnits: held.amountBaseUnits } });
+    expect(screen.getByTestId("real-pay-resume")).toBeInTheDocument();
+    expect(submitCalled).toBe(false);
+    expect(cancelCalled).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel payment" }));
+    await waitFor(() => expect(screen.getByTestId("real-pay-form")).toBeInTheDocument());
+    expect(cancelCalled).toBe(true);
+    expect(submitCalled).toBe(false);
+  });
+
   it("a confirmed payment shows 'Sent' and refreshes the real Cash balance", async () => {
     useRealAccountStore.setState({ account: ACCOUNT, status: "ready" });
     let balanceFetchCount = 0;
