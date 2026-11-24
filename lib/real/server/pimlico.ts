@@ -227,14 +227,73 @@ export async function sendPreparedUserOperation(input: { pimlicoApiKey: string; 
   });
 }
 
+/**
+ * M3D Pimlico receipt-read caller deadline: how long the CALLER waits for one
+ * fetchUserOperationReceipt call. Approved initial value — provisional and not
+ * provider-latency calibrated. It applies to the receipt read only (never to
+ * sending or preparing). Not a whole-route deadline, a transport timeout, a
+ * remote cancellation or a retry-policy change: an already-started SDK request
+ * is not aborted and may still retry or settle later; its result is ignored.
+ */
+const USER_OPERATION_RECEIPT_READ_DEADLINE_MS = 15_000;
+
+/**
+ * The receipt read did not finish within the deadline. Fixed text — never a
+ * URL, key or provider text. An unavailable read, not evidence of anything
+ * about the payment.
+ */
+export class UserOperationReceiptReadDeadlineError extends Error {
+  constructor() {
+    super("The receipt read did not finish in time.");
+    this.name = "UserOperationReceiptReadDeadlineError";
+  }
+}
+
+/**
+ * Runs one receipt read under one caller deadline. The timer is armed before
+ * `run` starts any SDK work, and the returned promise settles once: on expiry
+ * it REJECTS with UserOperationReceiptReadDeadlineError (never a null, a
+ * receipt or any other value); otherwise the timer is cleared and the read's
+ * own value or error passes through unchanged. A late value or error lands on
+ * the already-settled promise and is ignored. All state is per call. `run` is
+ * an async function, so even a synchronous throw inside it becomes a rejection
+ * that clears the timer. `checkpoint` throws once the deadline has fired.
+ */
+function withUserOperationReceiptReadDeadline<T>(run: (checkpoint: () => void) => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let expired = false;
+    const timer = setTimeout(() => {
+      expired = true;
+      reject(new UserOperationReceiptReadDeadlineError());
+    }, USER_OPERATION_RECEIPT_READ_DEADLINE_MS);
+    const checkpoint = () => {
+      if (expired) throw new UserOperationReceiptReadDeadlineError();
+    };
+    run(checkpoint).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 export async function fetchUserOperationReceipt(input: { pimlicoApiKey: string; userOperationHash: Hash }): Promise<UserOperationReceiptLike | null> {
-  const client = createServerPimlicoClient(input.pimlicoApiKey);
-  const receipt = await client.getUserOperationReceipt({ hash: input.userOperationHash });
-  if (!receipt) return null;
-  return {
-    userOpHash: receipt.userOpHash,
-    sender: receipt.sender,
-    success: receipt.success,
-    receipt: { transactionHash: receipt.receipt.transactionHash, status: receipt.receipt.status },
-  };
+  return withUserOperationReceiptReadDeadline(async (checkpoint) => {
+    const client = createServerPimlicoClient(input.pimlicoApiKey);
+    const receipt = await client.getUserOperationReceipt({ hash: input.userOperationHash });
+    // After expiry the caller already has the rejection: a late receipt is never mapped or returned.
+    checkpoint();
+    if (!receipt) return null;
+    return {
+      userOpHash: receipt.userOpHash,
+      sender: receipt.sender,
+      success: receipt.success,
+      receipt: { transactionHash: receipt.receipt.transactionHash, status: receipt.receipt.status },
+    };
+  });
 }
