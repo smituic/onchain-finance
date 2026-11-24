@@ -691,3 +691,155 @@ Closure is approved for the defined controlled-development boundary; it is **eff
 ### 12. Evidence limitations
 
 Documentation-only pass: the Builder ran no project tests, builds, provider, RPC, database, SQL, browser or passkey operation and no live payment, and changed no code. Nothing here shows how a real Neon failure behaves. Frozen production hashes are unchanged by this record: `lib/stores/real-payment-store.ts` `71c6290e…2d02a`, `components/real/real-pay-form.tsx` `eaec77ec…f92a`, `lib/real/payments/client-sign.ts` `1c46fbe9…dfe9`; they stay frozen (don't edit without a fresh audit). Not production readiness, not public launch, not deployment.
+
+## Overall L-2 — Consolidated Controlled-Development Closure Record (overall L-2: closure APPROVED by the control room for controlled localhost development on Base Sepolia, with accepted Low/Info residuals; effective on the documentation checkpoint described below; L-2 A+B, C-1, broader L-2 C, D-1 to D-13, broader L-2 D and R-03 / R-04 CLOSED; L-2 E DEFERRED / NOT AUTHORIZED; M3D and Milestone 3 OPEN; NOT deployable, NOT public-readiness, NOT mainnet)
+
+ARCHITECTURE.md's "Overall L-2 — Consolidated Controlled-Development Closure" is the summary; this is the full record, dated 2026-11-23. Nothing above this line is edited. Every earlier "overall L-2 … OPEN" statement, and the L-2 C record's "closure approved … effective on the documentation checkpoint" wording, is the dated record of its moment and was accurate when written; where this entry says otherwise, it supersedes them. No slice is reopened, renumbered or given a milestone number.
+
+### 1. Original threat model and decomposition (verified in local Git history)
+
+- **Origin:** the L-1a residual R7 ("L-2"), first recorded with the CallData Binding slice (`bfc732974ce40fed256c2598c00041fe62da6385`, ARCHITECTURE.md at that commit: post-prepare hashing and patch construction outside the `try/catch` could leave an attempt `prepared` instead of `failed`; "separately scoped, open; pre-existing, availability-related"), then an independent read-only L-2 scope audit recorded at L-2 A+B's closure (`3fee9e0f2d15277bbf12a4542a4a883df05ba4b6`, ARCHITECTURE.md lines 1915 and 1939 at that commit).
+- **F-1:** chain-clock fields were used after the reservation without validation. **F-2:** a database failure or process crash after the reservation can leave an attempt in `prepared`.
+- **Threat:** availability and recovery — an account can hold a reserved, not-yet-authorized payment that blocks further payment preparation (`payment_in_progress`). The scope audit identified **no duplicate-payment vulnerability**; the stranded-row scenarios were all pre-signing and pre-submission.
+- **Decomposition:** **A+B** — preparation-failure safety (chain clock validated before reservation; local post-prepare exception safety); **C** — general database-failure normalization and recovery; **D** — client recovery and Cancel UX; **E** — automatic, age-based recovery of stale prepared rows.
+- **Policy decision, not a rediscovered rule.** The source contained **no formal closure rule for overall L-2**. Closing it under the boundary below is a **new control-room closure-policy decision**; it is not a historical requirement found in the source.
+
+### 2. Approved closure boundary (verbatim)
+
+> Overall L-2 covers the scoped payment-preparation failure safety, database-failure classification and conservative recovery handling, client-side payment recovery and Cancel UX, and bounded client Prepare/Cancel waits, for controlled localhost development on Base Sepolia.
+>
+> L-2 A+B, broader L-2 C, broader L-2 D, and the R-03/R-04 follow-up satisfy that limited development boundary, subject to their existing accepted residuals and evidence limits.
+>
+> Automatic age-based recovery of stale prepared reservations remains deferred as L-2 E and is NOT AUTHORIZED.
+>
+> Existing authenticated status and Cancel flows can recover an accessible prepared reservation, but recovery depends on access to the account, a functioning application and available required services.
+>
+> Prepared rows have no general automatic expiry and can continue blocking that account indefinitely without successful recovery.
+>
+> Closure does not certify exhaustive financial integrity, guaranteed recovery, live Neon/provider behavior, absence of every duplicate-payment scenario, public readiness, mainnet readiness, or deployment safety.
+>
+> L-2 E, M3D and separately owned signing and multi-tab risks remain outside this closure.
+
+### 3. Audit provenance
+
+- **Type:** independent, read-only, offline consolidated scope assessment of overall L-2 (source and documentation inspection).
+- **HEAD audited:** `a02b0db1c2f8859836912991444e6c400c6c63f9` ("docs: finalize L-2 C database failure closure", verified against `git log`; four files: `ARCHITECTURE.md`, `CLAUDE.md`, `ROADMAP.md`, this archive). The commit subject is taken from the Git record.
+- **Verdict (advisory): A — Ready for conditional development closure.** The control room approved the boundary in section 2 and the dispositions below.
+- **New findings: 0 Critical / 0 High / 0 Medium / 0 Low / 4 Info** (N-1 to N-4, section 8).
+- **Not performed:** no project execution, no dynamic reproduction, no live Neon or provider testing, no live Pay execution, no fault injection, no helper agents.
+- **Provenance note for this record:** the auditor's report itself was not supplied to the documentation Builder. The verdict, counts and N-1 to N-4 are **transcribed from the control room's closure instruction**; the Builder did not reproduce the audit. The Builder statically spot-checked, at HEAD and without running anything: that `toPublicAttempt` returns `prepared: null` unless the nonce, callData, gas and fee fields and a finite `validUntil` are all present (a freshly reserved `prepared` row has none of them); that `PRE_DISPATCH_EXPIRABLE_STATES` is `awaiting_authorization` / `signed` only (no `prepared`); that `CANCELLABLE_STATES` includes `prepared` and `resolveCancelPayment` transitions with exact id and the row's literal current state; that the stranded screen's non-expired copy reads "This payment may still go through…"; and that both Pimlico transports in `lib/real/server/pimlico.ts` are `http(url)` with no `retryCount` override, over installed viem 2.56.8, whose `createTransport` defaults `retryCount` to 3.
+- The statement is "no source-supported blocker to this limited development closure was identified" — narrower than proof that no defect exists. It does not say every recovery path works, that every payment state resolves, or that a duplicate payment is impossible.
+
+### 4. Completed workstreams (no completed slice is reopened)
+
+| Workstream | Status |
+|---|---|
+| L-1, L-1a, L-1b | CLOSED under their existing boundaries (L-1b at `e35c92a2f2842fd9eca82cf53a4f80608e2a2d12`) |
+| L-2 A+B | CLOSED at `3fee9e0f2d15277bbf12a4542a4a883df05ba4b6` |
+| L-2 C-1 | CLOSED at `cadb39d7653a516a85119085d36d9723888909dc` |
+| Broader L-2 C | **FORMALLY CLOSED** for controlled localhost Base Sepolia development; documentation checkpoint `a02b0db1c2f8859836912991444e6c400c6c63f9` (verified against `git log`; four files; its documentation-audit pass and the closure decision are control-room / operator-reported) |
+| L-2 D-1, D-2, D-3a, D-4 to D-13 | Individually CLOSED |
+| Broader L-2 D | FORMALLY CLOSED for its development boundary; documentation checkpoint `c96a9d9394f8f8f6a7761ab51bb5fab17c8d6509` |
+| R-03 / R-04 | FORMALLY CLOSED at `8bc2b3a466f492ea74015fafd2a7baa4b28878df` |
+| **Overall L-2** | **Conditional closure APPROVED; NOT yet formally effective** (section 13) |
+| L-2 E | DEFERRED; NOT AUTHORIZED |
+| M3D | OPEN, separate |
+| Milestone 3 | OPEN |
+| 3A and 3C-2 application migrations | APPLIED |
+| 3C-1 application migration | NOT applied, NOT authorized |
+| Deployment, mainnet | NOT AUTHORIZED |
+
+### 5. Retained L-2 C residuals (unchanged; all ACCEPTED, none fixed)
+
+| ID | Class | Residual (short; full text in the L-2 C record above) |
+|---|---|---|
+| C-L1 | Low | A `beginDispatch` that commits `signed → submitting` and then throws leaves a durable `submitting` row while the response carries a stale `signed` snapshot, possibly with a `failed` outcome label. The server does not dispatch after that thrown `beginDispatch`. Recovery depends on status reconciliation and finalized-block proof. **Actual Neon commit-then-throw behavior NOT verified. Not fixed.** |
+| C-I1 | Info | post-dispatch result persistence failure gives a generic 500 |
+| C-I2 | Info | T1 may commit with its response lost |
+| C-I3 | Info | generic database-failure classification in some paths |
+| C-I4 | Info | W3 null-result wording is imprecise |
+| C-I5 | Info | constraint-name / driver-error classification uncertainty (Neon shape not verified) |
+| C-I6 | Info | stale snapshot after a null reconciliation CAS |
+| C-I7 | Info | no dedicated operator observability for database failures |
+| C-I8 | Info | incomplete fault-injection coverage |
+
+The L-2 C audit's source-only evidence limits stand: no fault injection, no auditor-run tests, no live Neon, provider, RPC or SQL. No Neon smoke result exists or is claimed.
+
+### 6. Retained L-2 D residuals (R-01 to R-18; historical classifications unchanged)
+
+| ID | Residual (short) | Current disposition |
+|---|---|---|
+| R-01 | misleading unknown-screen copy | accepted Low; open |
+| R-02 | context-less awaiting payment may show Continue and misleading signed-out / editing behavior | accepted Low; open |
+| R-03 | no Cancel client deadline | accepted Low at the L-2 D checkpoint; **subsequently implemented and CLOSED** by the 45 s bounded Cancel wait (`8bc2b3a`) |
+| R-04 | no Prepare client deadline | accepted Low at the L-2 D checkpoint; **subsequently implemented and CLOSED** by the 60 s bounded Prepare wait (`8bc2b3a`) |
+| R-05 | no `checkSession` client deadline | accepted Info; open (account store) |
+| R-06 | non-JSON response classification limits | accepted Low; open |
+| R-07 | raw status error messaging | accepted Info; open |
+| R-08 | misleading refused-Cancel copy | accepted Low; open |
+| R-09 | same-marker session-note race | accepted Low; open |
+| R-10 | D-1 terminal-row release policy | previously accepted policy; its window **widened** after the R-03 / R-04 deadlines; server one-active-payment and compare-and-set remain the safeguards; not declared impossible |
+| R-11 | multi-tab behavior | separate workstream |
+| R-12 | signature lifetime after Cancel | separate signing-integrity work (see N-2) |
+| R-13 | automatic stale prepared-row recovery | **L-2 E, NOT AUTHORIZED** |
+| R-14 | provider / database deadlines | **M3D, OPEN** |
+| R-15 | Cancel / Continue interleaving | accepted Info; open |
+| R-16 | Real Mode disabled / route 404 message limits | accepted Info; open |
+| R-17 | Continue visible after a safe L-1b signing refusal | accepted Info; open |
+| R-18 | some 401 paths lack a direct sign-in control | accepted Low; open |
+
+Only R-03 and R-04 have changed disposition, and only through their own audited, committed change. No other residual is fixed, reclassified or resolved by this record.
+
+### 7. R-03 / R-04 supersession
+
+R-03 and R-04 stay in the L-2 D register as that checkpoint's accepted Lows; their implementation status is superseded by the closed bounded waits (`8bc2b3a466f492ea74015fafd2a7baa4b28878df`). A client wait is **not** a server operation deadline: a client timeout says nothing about whether a reservation or Cancel committed, and server/provider deadlines stay with M3D (R-14).
+
+### 8. New overall L-2 observations (N-1 to N-4; all Info)
+
+| ID | Class | Observation | Disposition |
+|---|---|---|---|
+| N-1 | Info | A stranded **prepared** payment has no signable prepared fields, so the stranded screen's "This payment may still go through" is over-cautious in that state. | Pre-public copy item; not a new financial operation. No change authorized. |
+| N-2 | Info / separate R-12 | A signature produced before Cancel is **not cryptographically revoked** by marking the database attempt `cancelled`. If someone obtained that signed operation and submitted it before its validity window ended, the Safe might execute it even though the app recorded the payment as cancelled. The audit found no ordinary non-attacker route to this; the precondition includes acquiring a usable signed operation. | Separately owned signing-integrity research (R-12), relevant before public readiness. Cancel does **not** revoke signatures, and the app is **not** claimed safe against every signature-exfiltration scenario. |
+| N-3 | Info / separate M3D | The installed viem HTTP transport has default retry behavior. The audit identified some retryable RPC / error classes but did **not** verify all timeout behavior for `eth_sendUserOperation`. | M3D / pre-public research. It is **not** asserted that the stack never retransmits a request, nor that a transport-level repeat would produce two on-chain payments. The operation hash and nonce properties remain relevant but do not replace verification. |
+| N-4 | Info / documentation | At the audited HEAD, CLAUDE.md's current status still described broader L-2 C closure as conditional, although the operator's documented Git checkpoint and the control-room closure decision were complete. | Reconciled in this pass: current status now reads **L-2 C FORMALLY CLOSED**. Historically accurate conditional wording in this append-only archive is not rewritten. Not a payment-security defect. |
+
+### 9. L-2 E — deferred, not a prerequisite
+
+- **Decided:** L-2 E is **not** a prerequisite for this localhost closure. It stays **DEFERRED and NOT AUTHORIZED**, tracked explicitly for future pre-public readiness decisions.
+- **Current source behavior:** a `prepared` row holds the account's active slot; `prepared` rows have no general server age-based expiry; a `prepared` row has no complete signable prepared context; `/latest` can discover the active row once it is committed; an authenticated user can attempt Cancel on their own `prepared` row; cancellation uses the server's exact-id, literal-source-state compare-and-set.
+- **Recovery limits:** Cancel does not always succeed; prepared rows do not always expire; recovery needs a valid session (the user may need to sign in again) and access to the account; a service or database outage can prevent recovery for as long as it lasts; nothing repairs prepared rows automatically.
+- **Not approved:** no expiry policy, duration, migration, worker or API operation. L-2 E implementation is not started.
+
+### 10. M3D and separately owned workstreams
+
+| Item | Owner / status |
+|---|---|
+| Server / provider deadlines; database operation deadlines; resource exhaustion from slow external operations; exact RPC transport retry behavior and configuration (N-3) | **M3D — OPEN** |
+| Multi-tab synchronization | R-11 — separate |
+| Signature lifetime and post-Cancel signed-operation risk | R-12 / N-2 — separate signing-integrity work |
+| Automatic age-based prepared-reservation recovery | **L-2 E — NOT AUTHORIZED** |
+| Signing / operation integrity and fee / paymaster policy residuals | L-1 family |
+| Remaining API abuse controls | Milestone 3 |
+
+No new implementation is approved in any of them. Client timeouts (D-6, R-03 / R-04) are not server operation deadlines.
+
+### 11. Open research register (unverified; not blocking this development closure; no live testing authorized)
+
+1. Neon HTTP / batch commit-then-throw behavior (C-L1).
+2. Neon constraint-error, SQLSTATE and message shape (C-I5).
+3. Opt-in Neon smoke compatibility with the current schema.
+4. Exact viem transport retry semantics for send operations, especially ambiguous timeouts (N-3).
+
+Also flagged for future review: the separately owned signature-after-Cancel safety question (R-12 / N-2). None of these was verified in this audit, and no provider or database behavior is claimed to be experimentally proven.
+
+### 12. Recovery controls this closure relies on (unchanged)
+
+The server's exact-id, literal-source-state compare-and-set and the one-active-payment constraint stay authoritative; reconciliation of dispatched rows uses only the precomputed expected UserOperation hash and never re-dispatches; pre-dispatch `awaiting_authorization` / `signed` rows resolve only by EntryPoint proof after `validUntil`; there is no blind retry, resend or automatic Prepare, signing, Submit or Cancel after an uncertain outcome; every recovery step is an explicit user action.
+
+### 13. Effectiveness and closure wording
+
+Overall L-2 controlled-development closure is **approved; effective upon a successful independent documentation audit and a verified operator Git checkpoint**: (1) the independent documentation audit, (2) the operator's manual Git commit, (3) the operator's push, (4) HEAD = `origin/main` = `origin/HEAD`, (5) an exact four-file commit inventory (`ARCHITECTURE.md`, `CLAUDE.md`, `ROADMAP.md`, this archive), and (6) a clean working tree. Until then overall L-2 is **not** formally closed. No audit result or commit hash is invented; **Git history identifies the closure-documentation commit**, and no post-commit pass is needed merely to change a status word.
+
+### 14. Evidence limitations and authority
+
+Documentation-only pass: the Builder ran no project tests, builds, provider, RPC, database, SQL, browser or passkey operation and no live payment, and changed no code. Nothing here shows how a real Neon or provider failure behaves. Frozen production hashes are unchanged: `lib/stores/real-payment-store.ts` `71c6290e…2d02a`, `components/real/real-pay-form.tsx` `eaec77ec…f92a`, `lib/real/payments/client-sign.ts` `1c46fbe9…dfe9` (don't edit without a fresh audit); `lib/real/server/payments.ts` is unchanged from HEAD. This record grants **no** deployment, mainnet, public-launch, migration, live-payment, L-2 E or M3D authority.
