@@ -575,21 +575,41 @@ describe("dispatch isolation (fake SDK only — no UserOperation is signed or se
     expect(sdk.sendUserOperation).toHaveBeenCalledTimes(1);
   });
 
-  it("F1: everything before the receipt-deadline section of pimlico.ts — client construction, verification, preparation and dispatch — is byte-identical to the L-1a baseline", () => {
+  it("F1: every region of pimlico.ts outside the approved preparation section — client construction, verification, dispatch and the whole receipt-deadline section — is byte-identical to the receipt checkpoint", () => {
     const source = readFileSync(path.resolve(process.cwd(), "lib/real/server/pimlico.ts"), "utf8");
     const sha = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
-    const sectionStart = source.indexOf("/**\n * M3D Pimlico receipt-read caller deadline");
-    expect(sectionStart).toBeGreaterThan(0);
-    const prefix = source.slice(0, sectionStart);
-    // HEAD f2d83e5 lines 1–229 of pimlico.ts (11 109 bytes).
-    expect(Buffer.byteLength(prefix, "utf8")).toBe(11_109);
-    expect(sha(prefix)).toBe("4aaa49cac2c21799eba3f0d8a98a4ec4f4e33a7c49524a844d5788e5e07c9b5b");
+    const bytes = Buffer.from(source, "utf8");
+    const shaBytes = (slice: Buffer) => createHash("sha256").update(slice).digest("hex");
+    // Constants taken from the receipt checkpoint 4cfef83 (pimlico.ts 797436ce…04e4, 14 095 bytes). The
+    // preparation exception may change only the bytes between these two regions; the receipt
+    // checkpoint's 11 109-byte prefix pin (4aaa49ca…9b5b) is superseded by it.
+    // Region A: bytes 0–6 667 — imports, the Pimlico URL and client construction, both error classes and verifyPreparedUserOperation.
+    expect(shaBytes(bytes.subarray(0, 6_667))).toBe("875c97540d4c1e5b9849429362312d2a3dbca8d7aa02b0b95b891f58ac45162b");
+    // Region B: the last 3 672 bytes — sendPreparedUserOperation and the entire receipt-deadline section, to end of file.
+    expect(shaBytes(bytes.subarray(bytes.length - 3_672))).toBe("3ef31c7d36f6e750eb074b28948cc931adf014c7b8996d440502ff802afe72cb");
     const fn = (start: string) => {
       const from = source.indexOf(start);
       return source.slice(from, source.indexOf("\n}\n", from) + 3);
     };
+    const once = (needle: string) => {
+      const from = source.indexOf(needle);
+      expect(from).toBeGreaterThan(0);
+      expect(source.indexOf(needle, from + 1)).toBe(-1);
+      return from;
+    };
+    // The same regions, by name (each must also still be unique in the file).
+    once("function pimlicoRpcUrl(");
+    once("function createServerPimlicoClient(");
+    const clientStart = once("/**\n * SERVER-ONLY");
+    expect(sha(source.slice(clientStart, source.indexOf("\n}\n", source.indexOf("function createServerPimlicoClient(")) + 3))).toBe("9611322df5869bac4ac3635bc544eda502a376c7825d9466ff41a9e6bfc9972a");
+    once("export function verifyPreparedUserOperation(");
+    expect(sha(fn("export function verifyPreparedUserOperation("))).toBe("733c27634d925b072b8e2889fd42a554a2924eb11ea3686d33f29bd445320ec1");
+    once("export async function sendPreparedUserOperation(");
     expect(sha(fn("export async function sendPreparedUserOperation("))).toBe("ade507f02dd960272e1bd17d7441231785b4bbd6848f4c40cc69b9bf1a42e540");
-    expect(sha(fn("export async function prepareCashTransferUserOperation("))).toBe("314c3512356675aff4feaa7393588a4d4e832ced2b7622b44e8609b0ce6be16b");
+    const sectionStart = once("/**\n * M3D Pimlico receipt-read caller deadline");
+    // The receipt section is the file's last 2 986 bytes, unchanged.
+    expect(Buffer.byteLength(source.slice(sectionStart), "utf8")).toBe(2_986);
+    expect(sha(source.slice(sectionStart))).toBe("b79ad44bf601a64c0fa3e1cfeee0b9f79c0d92d9193bd4298cf8404e38b5806d");
     // The new section adds no transport, abort, retry, send or preparation code.
     const section = source.slice(sectionStart);
     for (const token of ["sendUserOperation", "prepareUserOperation", "createSmartAccountClient", "http(", "retryCount", "retryDelay", "AbortController", "signal", "fetch("]) {

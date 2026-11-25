@@ -140,6 +140,66 @@ export function verifyPreparedUserOperation(prepared: Readonly<Record<string, un
 }
 
 /**
+ * M3D Pimlico preparation caller deadline: how long the CALLER waits for one
+ * whole prepareCashTransferUserOperation call — Safe account construction,
+ * local callData, the nonce / deployment reads, gas pricing, the paymaster
+ * stub, gas estimation, the final paymaster data and local verification, on
+ * ONE clock that is never reset between them. Approved initial value —
+ * provisional and not provider-latency calibrated. Preparation only (never
+ * sending or the receipt read). Not a whole-route deadline, a database
+ * deadline, a transport timeout, a remote cancellation or a retry-policy
+ * change: requests already in flight are not aborted and may still retry,
+ * wait or settle later; their results are ignored.
+ */
+const CASH_TRANSFER_PREPARATION_DEADLINE_MS = 25_000;
+
+/**
+ * The preparation did not finish within the deadline. Fixed text — never a
+ * URL, key or provider text. An unavailable preparation, not evidence that
+ * no provider work (sponsorship included) happened.
+ */
+export class CashTransferPreparationDeadlineError extends Error {
+  constructor() {
+    super("The payment preparation did not finish in time.");
+    this.name = "CashTransferPreparationDeadlineError";
+  }
+}
+
+/**
+ * Runs one preparation under one caller deadline. The timer is armed before
+ * `run` starts any work (account construction included), and the returned
+ * promise settles once: on expiry it REJECTS with
+ * CashTransferPreparationDeadlineError (never a null, partial or fabricated
+ * operation); otherwise the timer is cleared and the preparation's own value
+ * or error passes through unchanged. A late value or error lands on the
+ * already-settled promise and is ignored. All state is per call. `run` is an
+ * async function, so even a synchronous throw inside it becomes a rejection
+ * that clears the timer. `checkpoint` throws once the deadline has fired.
+ */
+function withCashTransferPreparationDeadline<T>(run: (checkpoint: () => void) => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let expired = false;
+    const timer = setTimeout(() => {
+      expired = true;
+      reject(new CashTransferPreparationDeadlineError());
+    }, CASH_TRANSFER_PREPARATION_DEADLINE_MS);
+    const checkpoint = () => {
+      if (expired) throw new CashTransferPreparationDeadlineError();
+    };
+    run(checkpoint).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
  * Prepares a sponsored Cash transfer UserOperation for `ownerAddress`'s
  * Safe. Uses a READ-ONLY stand-in owner (account/safe.ts's
  * createReadOnlyOwnerAccount) — this never signs, so the server never needs
@@ -153,6 +213,13 @@ export function verifyPreparedUserOperation(prepared: Readonly<Record<string, un
  * itself (one EntryPoint getNonce, one eth_getCode — no extra request), passed
  * in explicitly, and then required back unchanged; every other field must be a
  * structurally valid sponsored operation (verifyPreparedUserOperation).
+ *
+ * M3D: the whole call runs under CASH_TRANSFER_PREPARATION_DEADLINE_MS. After
+ * expiry no further stage of this function, and no guarded gas-price or
+ * paymaster callback, starts a new request, and a late prepared result is
+ * never verified or returned. Already-started requests, their transport
+ * retries and viem's own internal continuation (gas estimation included) are
+ * not stopped.
  */
 export async function prepareCashTransferUserOperation(input: {
   publicClient: RealPublicClient;
@@ -161,53 +228,95 @@ export async function prepareCashTransferUserOperation(input: {
   recipient: Address;
   amountBaseUnits: string;
 }): Promise<PreparedUserOperationFields> {
-  const owner = createReadOnlyOwnerAccount(input.ownerAddress);
-  const account = await createRealSafeAccount({ owner, publicClient: input.publicClient });
-  const pimlicoClient = createServerPimlicoClient(input.pimlicoApiKey);
+  return withCashTransferPreparationDeadline(async (checkpoint) => {
+    const owner = createReadOnlyOwnerAccount(input.ownerAddress);
+    const account = await createRealSafeAccount({ owner, publicClient: input.publicClient });
+    checkpoint();
+    const pimlicoClient = createServerPimlicoClient(input.pimlicoApiKey);
 
-  const smartAccountClient = createSmartAccountClient({
-    account,
-    chain: input.publicClient.chain,
-    client: input.publicClient,
-    bundlerTransport: http(pimlicoRpcUrl(input.pimlicoApiKey)),
-    paymaster: pimlicoClient,
-    userOperation: {
-      estimateFeesPerGas: async () => (await pimlicoClient.getUserOperationGasPrice()).fast,
-    },
-  });
+    const smartAccountClient = createSmartAccountClient({
+      account,
+      chain: input.publicClient.chain,
+      client: input.publicClient,
+      bundlerTransport: http(pimlicoRpcUrl(input.pimlicoApiKey)),
+      // The same Pimlico client's two paymaster methods — both, so viem keeps
+      // its stub-then-final selection — each guarded before the request starts
+      // and after it answers. The nested preparation inside gas estimation
+      // reaches these too (it reads this client's paymaster) unless the stub's
+      // own `paymaster` field redirects it: viem spreads the stub over the
+      // request, and a boolean `true` there selects viem's raw paymaster calls
+      // (outside this wrapper). So a stub whose `paymaster` is `true` is refused
+      // before viem sees it. With that, every paymaster request the installed
+      // viem makes goes through this wrapper, so none starts after expiry and
+      // no late paymaster answer is handed back. Arguments and results
+      // otherwise pass through untouched.
+      paymaster: {
+        getPaymasterStubData: async (parameters) => {
+          checkpoint();
+          const stub = await pimlicoClient.getPaymasterStubData(parameters);
+          checkpoint();
+          // Runtime check on the provider's JSON, whatever the declared type says.
+          const returned: Readonly<Record<string, unknown>> = stub;
+          if (returned.paymaster === true) throw new PreparedUserOperationIntegrityError();
+          return stub;
+        },
+        getPaymasterData: async (parameters) => {
+          checkpoint();
+          const finalData = await pimlicoClient.getPaymasterData(parameters);
+          checkpoint();
+          return finalData;
+        },
+      },
+      userOperation: {
+        // The existing fee tier (fast), with no new gas-price request after
+        // expiry and no late price handed back.
+        estimateFeesPerGas: async () => {
+          checkpoint();
+          const gasPrice = await pimlicoClient.getUserOperationGasPrice();
+          checkpoint();
+          return gasPrice.fast;
+        },
+      },
+    });
 
-  const calls = [{ to: REAL_CASH_TOKEN.address, data: encodeCashTransfer(input.recipient, input.amountBaseUnits), value: BigInt(0) }];
-  // The trusted encoding, built locally before any provider call by the same
-  // Safe account encoder prepareUserOperation itself uses (no network).
-  const expectedCallData = await account.encodeCalls(calls);
-  // Exactly the reads prepareUserOperation would otherwise make: getNonce()
-  // consumes ONE key from this account's own nonce-key manager (the same
-  // default lane), and getFactoryArgs() reads deployment state once (a
-  // deployed result is cached by the account, so viem's own later call makes
-  // no request). Both are passed in, so viem does not derive them again.
-  const [nonce, factoryArgs] = await Promise.all([account.getNonce(), account.getFactoryArgs()]);
-  const prepared = await smartAccountClient.prepareUserOperation({
-    calls,
-    nonce,
-    ...(factoryArgs.factory !== undefined ? { factory: factoryArgs.factory, factoryData: factoryArgs.factoryData } : {}),
-  });
+    const calls = [{ to: REAL_CASH_TOKEN.address, data: encodeCashTransfer(input.recipient, input.amountBaseUnits), value: BigInt(0) }];
+    // The trusted encoding, built locally before any provider call by the same
+    // Safe account encoder prepareUserOperation itself uses (no network).
+    const expectedCallData = await account.encodeCalls(calls);
+    checkpoint();
+    // Exactly the reads prepareUserOperation would otherwise make: getNonce()
+    // consumes ONE key from this account's own nonce-key manager (the same
+    // default lane), and getFactoryArgs() reads deployment state once (a
+    // deployed result is cached by the account, so viem's own later call makes
+    // no request). Both are passed in, so viem does not derive them again.
+    const [nonce, factoryArgs] = await Promise.all([account.getNonce(), account.getFactoryArgs()]);
+    checkpoint();
+    const prepared = await smartAccountClient.prepareUserOperation({
+      calls,
+      nonce,
+      ...(factoryArgs.factory !== undefined ? { factory: factoryArgs.factory, factoryData: factoryArgs.factoryData } : {}),
+    });
+    // After expiry the caller already has the rejection: a late prepared
+    // result is never compared, verified or returned.
+    checkpoint();
 
-  // viem spreads the raw paymaster stub/final responses over the request, so
-  // a `callData` key in either one replaces the local encoding. Refuse any
-  // returned callData that is not exactly the trusted one — never accept an
-  // alternate action because it is well-formed.
-  if (prepared.callData !== expectedCallData) throw new PreparedCallDataMismatchError();
+    // viem spreads the raw paymaster stub/final responses over the request, so
+    // a `callData` key in either one replaces the local encoding. Refuse any
+    // returned callData that is not exactly the trusted one — never accept an
+    // alternate action because it is well-formed.
+    if (prepared.callData !== expectedCallData) throw new PreparedCallDataMismatchError();
 
-  // The same spread can replace or delete every other field. A deployment
-  // race (undeployed at the read, deployed before inclusion) is not treated
-  // specially: the local factory fields are still required, and EntryPoint
-  // then refuses the operation rather than anything being guessed here.
-  return verifyPreparedUserOperation(prepared as unknown as Record<string, unknown>, {
-    sender: account.address,
-    nonce,
-    factory: factoryArgs.factory,
-    factoryData: factoryArgs.factoryData,
-    callData: expectedCallData,
+    // The same spread can replace or delete every other field. A deployment
+    // race (undeployed at the read, deployed before inclusion) is not treated
+    // specially: the local factory fields are still required, and EntryPoint
+    // then refuses the operation rather than anything being guessed here.
+    return verifyPreparedUserOperation(prepared as unknown as Record<string, unknown>, {
+      sender: account.address,
+      nonce,
+      factory: factoryArgs.factory,
+      factoryData: factoryArgs.factoryData,
+      callData: expectedCallData,
+    });
   });
 }
 
