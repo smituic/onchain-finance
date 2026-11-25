@@ -92,6 +92,56 @@ function identityEquals(attempt: RegistrationAttempt, identity: ProvisionedIdent
   );
 }
 
+/**
+ * M3D onboarding Safe-address derivation caller deadline: how long this
+ * caller waits for the public client and the Safe account to be built — the
+ * Safe address derivation (its proxyCreationCode read) included. Approved
+ * provisional value, not provider-latency calibrated. Read-only work only:
+ * finalize, sessions and every provisioning write stay outside it. Not a
+ * whole-route, database or transport deadline and not a remote cancellation;
+ * the SDK's in-flight read (and its own retries) may still continue.
+ */
+const ONBOARDING_SAFE_DERIVATION_DEADLINE_MS = 15_000;
+
+/**
+ * The account address could not be derived in time. Fixed text — never a
+ * URL, key or provider body — and never a substitute address: the caller
+ * gets no Safe, so this invocation cannot finalize or issue a session.
+ */
+export class OnboardingSafeDerivationDeadlineError extends Error {
+  constructor() {
+    super("The account address could not be derived in time.");
+    this.name = "OnboardingSafeDerivationDeadlineError";
+  }
+}
+
+/**
+ * Runs one derivation under one caller deadline. The timer is armed before
+ * `run` starts and never reset; the returned promise settles once: on expiry
+ * it REJECTS with OnboardingSafeDerivationDeadlineError, otherwise the timer
+ * is cleared and `run`'s own value or error passes through unchanged. A late
+ * value or error lands on the already-settled promise and is ignored. All
+ * state is per call. `run` is an async function, so a synchronous throw
+ * inside it becomes a rejection that clears the timer. No retry.
+ */
+function withOnboardingSafeDerivationDeadline<T>(run: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new OnboardingSafeDerivationDeadlineError());
+    }, ONBOARDING_SAFE_DERIVATION_DEADLINE_MS);
+    run().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 /** Test seam for the parent-key Turnkey transport (fetch / stamp / clock); production passes nothing. Re-exported so registration.ts and login.ts never import a Turnkey module themselves. */
 export type ProvisioningDeps = ParentTurnkeyDeps;
 
@@ -250,8 +300,15 @@ export async function runProvisioningPipeline(input: {
     subOrganizationId: attempt.subOrganizationId,
     ownerAddress: safeOwnerAddress,
   });
-  const publicClient = input.publicClient ?? createRealPublicClient(input.config.rpcUrl);
-  const safeAccount = await createRealSafeAccount({ owner, publicClient });
+  // M3D: only the client and Safe-account construction (the address read)
+  // run under the derivation deadline. On a rejection — the deadline or any
+  // ordinary error — this call stops here: it never calls finalize or issues
+  // a session, and writes nothing to the "turnkey_created" attempt, which a
+  // fresh sign-in with the same passkey can resume.
+  const safeAccount = await withOnboardingSafeDerivationDeadline(async () => {
+    const publicClient = input.publicClient ?? createRealPublicClient(input.config.rpcUrl);
+    return createRealSafeAccount({ owner, publicClient });
+  });
 
   const finalized = await input.attempts.finalize({
     credentialId: attempt.credentialId,
