@@ -10,6 +10,10 @@ export function createRealPublicClient(rpcUrl: string) {
   return createPublicClient({
     chain: baseSepolia,
     transport: http(rpcUrl),
+    // M3D: no contract read here needs CCIP-Read (EIP-3668). Disabled, an
+    // OffchainLookup revert rejects like any other failed call instead of
+    // fetching the URLs the response names. Server and browser alike.
+    ccipRead: false,
   });
 }
 
